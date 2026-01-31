@@ -144,7 +144,7 @@
 </div>
 
 @code {
-    private const string Version = "0.0.2";
+    private const string Version = "0.0.4";
 
     private enum AppMode { Select, StartConnection, JoinConnection }
 
@@ -180,6 +180,9 @@
     // Screen sharing state
     private bool _isSharingScreen;       // Am I sharing my screen?
     private bool _peerIsSharingScreen;   // Is my peer sharing their screen?
+
+    // Pending SDP offer (buffered if received before WebRTC init)
+    private SignalingMessage.SdpOffer? _pendingSdpOffer;
 
     // File transfer state
     private bool _showFileTransferDialog;
@@ -951,6 +954,12 @@
                         await SignalingClient.SendSdpAnswerAsync(offer.TargetId, answer);
                         Logger.LogInformation("SDP answer sent");
                     }
+                    else
+                    {
+                        // Buffer offer - WebRTC not yet initialized (race condition)
+                        Logger.LogWarning("WebRTC not ready, buffering SDP offer");
+                        _pendingSdpOffer = offer;
+                    }
                     break;
 
                 case SignalingMessage.SdpAnswer answer:
@@ -1033,6 +1042,17 @@
 
         await _webrtc.InitializeAsync();
         Logger.LogInformation("WebRTC initialized as joiner, waiting for offer");
+
+        // Process any buffered SDP offer (race condition fix)
+        if (_pendingSdpOffer != null)
+        {
+            Logger.LogInformation("Processing buffered SDP offer from {PeerId}", _pendingSdpOffer.TargetId);
+            await _webrtc.SetRemoteDescriptionAsync(_pendingSdpOffer.Sdp);
+            var answer = await _webrtc.CreateAnswerAsync();
+            await SignalingClient.SendSdpAnswerAsync(_pendingSdpOffer.TargetId, answer);
+            Logger.LogInformation("SDP answer sent for buffered offer");
+            _pendingSdpOffer = null;
+        }
     }
 
     private void HandleDisconnected(string? reason)
