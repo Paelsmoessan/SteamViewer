@@ -7,10 +7,13 @@
 @using SteamViewer.App.Components.FileTransfer
 @using Blake3
 @using System.Text
+@using Microsoft.JSInterop
 @implements IAsyncDisposable
 @inject SignalingClient SignalingClient
 @inject SessionManager SessionManager
 @inject CanvasRenderingService CanvasRenderer
+@inject IJSRuntime JSRuntime
+@inject ILoggerFactory LoggerFactory
 @inject ILogger<Home> Logger
 
 <div class="container">
@@ -171,6 +174,9 @@
     private string errorMessage = "";
     private bool _canvasInitialized;
     private bool _isRendering;
+
+    // WebRTC state
+    private WebRTCManager? _webrtc;
 
     // File transfer state
     private bool _showFileTransferDialog;
@@ -456,11 +462,58 @@
 
     private async Task AcceptConnection()
     {
-        await SignalingClient.RespondToConnectionAsync(incomingPeerId, true);
-        connectedPeerId = incomingPeerId;
-        connectionState = ConnectionState.Connected;
+        try
+        {
+            await SignalingClient.RespondToConnectionAsync(incomingPeerId, true);
+            connectedPeerId = incomingPeerId;
+            connectionState = ConnectionState.Connected;
+
+            // Initialize WebRTC as host
+            await InitializeWebRTCAsHost();
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Failed to accept connection");
+            errorMessage = ex.Message;
+        }
         StateHasChanged();
     }
+
+    private async Task InitializeWebRTCAsHost()
+    {
+        Logger.LogInformation("Initializing WebRTC as host");
+
+        _webrtc = new WebRTCManager(JSRuntime, LoggerFactory.CreateLogger<WebRTCManager>(), clientId, SendSignalingMessage);
+
+        // Subscribe to ICE candidates
+        _webrtc.OnIceCandidate += async (candidateJson) =>
+        {
+            var candidate = System.Text.Json.JsonSerializer.Deserialize<IceCandidateData>(candidateJson);
+            if (candidate != null)
+            {
+                await SignalingClient.SendIceCandidateAsync(connectedPeerId, candidate.candidate, candidate.sdpMid, (ushort?)candidate.sdpMLineIndex);
+            }
+        };
+
+        await _webrtc.InitializeAsync();
+        await _webrtc.CreateDataChannelAsync("data");
+
+        // Start screen capture
+        var captureStarted = await _webrtc.StartScreenCaptureAsync();
+        Logger.LogInformation("Screen capture started: {Success}", captureStarted);
+
+        // Create and send offer
+        var offer = await _webrtc.CreateOfferAsync();
+        await SignalingClient.SendSdpOfferAsync(connectedPeerId, offer);
+        Logger.LogInformation("SDP offer sent to {PeerId}", connectedPeerId);
+    }
+
+    private async Task SendSignalingMessage(SignalingMessage message)
+    {
+        await SignalingClient.SendAsync(message);
+    }
+
+    private record IceCandidateData(string candidate, string? sdpMid, int? sdpMLineIndex);
 
     private async Task RejectConnection()
     {
@@ -494,7 +547,7 @@
 
     private void HandleMessage(SignalingMessage message)
     {
-        InvokeAsync(() =>
+        InvokeAsync(async () =>
         {
             switch (message)
             {
@@ -508,6 +561,9 @@
                     {
                         connectedPeerId = response.TargetId;
                         connectionState = ConnectionState.Connected;
+
+                        // Initialize WebRTC as viewer
+                        await InitializeWebRTCAsViewer();
                     }
                     else
                     {
@@ -516,9 +572,47 @@
                     }
                     break;
 
+                case SignalingMessage.SdpOffer offer:
+                    Logger.LogInformation("Received SDP offer from {PeerId}", offer.TargetId);
+                    if (_webrtc != null)
+                    {
+                        await _webrtc.SetRemoteDescriptionAsync(offer.Sdp);
+                        var answer = await _webrtc.CreateAnswerAsync();
+                        await SignalingClient.SendSdpAnswerAsync(offer.TargetId, answer);
+                        Logger.LogInformation("SDP answer sent");
+                    }
+                    break;
+
+                case SignalingMessage.SdpAnswer answer:
+                    Logger.LogInformation("Received SDP answer from {PeerId}", answer.TargetId);
+                    if (_webrtc != null)
+                    {
+                        await _webrtc.SetRemoteDescriptionAsync(answer.Sdp);
+                    }
+                    break;
+
+                case SignalingMessage.IceCandidate ice:
+                    Logger.LogDebug("Received ICE candidate from {PeerId}", ice.TargetId);
+                    if (_webrtc != null)
+                    {
+                        var candidateJson = System.Text.Json.JsonSerializer.Serialize(new
+                        {
+                            candidate = ice.Candidate,
+                            sdpMid = ice.SdpMid,
+                            sdpMLineIndex = ice.SdpMLineIndex
+                        });
+                        await _webrtc.AddIceCandidateAsync(candidateJson);
+                    }
+                    break;
+
                 case SignalingMessage.Disconnected disconnected:
                     connectedPeerId = "";
                     connectionState = currentMode == AppMode.Host ? ConnectionState.Registered : ConnectionState.Idle;
+                    if (_webrtc != null)
+                    {
+                        await _webrtc.CloseAsync();
+                        _webrtc = null;
+                    }
                     break;
 
                 case SignalingMessage.Error error:
@@ -528,6 +622,26 @@
 
             StateHasChanged();
         });
+    }
+
+    private async Task InitializeWebRTCAsViewer()
+    {
+        Logger.LogInformation("Initializing WebRTC as viewer");
+
+        _webrtc = new WebRTCManager(JSRuntime, LoggerFactory.CreateLogger<WebRTCManager>(), "", SendSignalingMessage);
+
+        // Subscribe to ICE candidates
+        _webrtc.OnIceCandidate += async (candidateJson) =>
+        {
+            var candidate = System.Text.Json.JsonSerializer.Deserialize<IceCandidateData>(candidateJson);
+            if (candidate != null)
+            {
+                await SignalingClient.SendIceCandidateAsync(connectedPeerId, candidate.candidate, candidate.sdpMid, (ushort?)candidate.sdpMLineIndex);
+            }
+        };
+
+        await _webrtc.InitializeAsync();
+        Logger.LogInformation("WebRTC initialized as viewer, waiting for offer");
     }
 
     private void HandleDisconnected(string? reason)
@@ -559,6 +673,12 @@
         SessionManager.FileTransferProgress -= OnFileTransferProgress;
         SessionManager.FileTransferCompleted -= OnFileTransferCompleted;
         SessionManager.FileTransferFailed -= OnFileTransferFailed;
+
+        if (_webrtc != null)
+        {
+            await _webrtc.DisposeAsync();
+            _webrtc = null;
+        }
 
         if (_canvasInitialized)
         {

@@ -13,10 +13,12 @@ window.SteamViewerWebRTC = {
 
         const config = {
             iceServers: [
-                { urls: 'stun:stun.l.google.com:19302' },
-                { urls: 'stun:stun1.l.google.com:19302' },
-                { urls: 'stun:stun2.l.google.com:19302' }
-            ]
+                { urls: 'stun:stun.l.google.com:19302' }
+            ],
+            // Prefer UDP for lower latency
+            iceCandidatePoolSize: 10,
+            bundlePolicy: 'max-bundle',
+            rtcpMuxPolicy: 'require'
         };
 
         try {
@@ -142,13 +144,54 @@ window.SteamViewerWebRTC = {
         return false;
     },
 
+    // Modify SDP for lower latency
+    modifySdpForLowLatency(sdp) {
+        let modified = sdp;
+
+        // Lower bandwidth for faster encoding
+        if (!modified.includes('b=AS:')) {
+            modified = modified.replace(/m=video.*\r\n/g, '$&b=AS:3000\r\n');
+        }
+
+        // Prefer H264 Baseline profile (fastest encoding, most compatible)
+        // Move H264 to top of codec list if present
+        const lines = modified.split('\r\n');
+        let h264PayloadTypes = [];
+
+        // Find H264 payload types
+        lines.forEach(line => {
+            if (line.includes('a=rtpmap:') && line.toLowerCase().includes('h264')) {
+                const match = line.match(/a=rtpmap:(\d+)/);
+                if (match) h264PayloadTypes.push(match[1]);
+            }
+        });
+
+        // Reorder m=video line to prefer H264
+        if (h264PayloadTypes.length > 0) {
+            modified = modified.replace(/(m=video \d+ [^ ]+ )(.+)/, (match, prefix, payloads) => {
+                const payloadList = payloads.split(' ');
+                const reordered = [...h264PayloadTypes, ...payloadList.filter(p => !h264PayloadTypes.includes(p))];
+                return prefix + reordered.join(' ');
+            });
+        }
+
+        return modified;
+    },
+
     // Create SDP offer (for viewer initiating connection)
     async createOffer() {
         if (!this.peerConnection) {
             throw new Error('PeerConnection not initialized');
         }
 
-        const offer = await this.peerConnection.createOffer();
+        const offer = await this.peerConnection.createOffer({
+            offerToReceiveVideo: true,
+            offerToReceiveAudio: false
+        });
+
+        // Modify SDP for lower latency
+        offer.sdp = this.modifySdpForLowLatency(offer.sdp);
+
         await this.peerConnection.setLocalDescription(offer);
         console.log('SDP offer created');
         return JSON.stringify(offer);
@@ -161,6 +204,10 @@ window.SteamViewerWebRTC = {
         }
 
         const answer = await this.peerConnection.createAnswer();
+
+        // Modify SDP for lower latency
+        answer.sdp = this.modifySdpForLowLatency(answer.sdp);
+
         await this.peerConnection.setLocalDescription(answer);
         console.log('SDP answer created');
         return JSON.stringify(answer);
@@ -194,17 +241,39 @@ window.SteamViewerWebRTC = {
             this.localStream = await navigator.mediaDevices.getDisplayMedia({
                 video: {
                     cursor: 'always',
-                    width: { ideal: 1920, max: 2560 },
-                    height: { ideal: 1080, max: 1440 },
-                    frameRate: { ideal: 30, max: 60 }
+                    width: { ideal: 1280, max: 1920 },
+                    height: { ideal: 720, max: 1080 },
+                    frameRate: { ideal: 24, max: 30 }
                 },
-                audio: false
+                audio: false,
+                preferCurrentTab: false,
+                selfBrowserSurface: 'exclude',
+                systemAudio: 'exclude'
             });
 
-            // Add video track to peer connection
+            // Add video track to peer connection with encoding parameters
             this.localStream.getVideoTracks().forEach(track => {
                 console.log('Adding video track to peer connection');
-                this.peerConnection.addTrack(track, this.localStream);
+
+                // Set content hint for screen sharing (improves encoding for text/UI)
+                if (track.contentHint !== undefined) {
+                    track.contentHint = 'detail'; // Optimizes for sharp text/UI
+                }
+
+                const sender = this.peerConnection.addTrack(track, this.localStream);
+
+                // Configure encoding for lower latency
+                const params = sender.getParameters();
+                if (!params.encodings) {
+                    params.encodings = [{}];
+                }
+                params.encodings[0].maxBitrate = 3000000; // 3 Mbps (lower = less latency)
+                params.encodings[0].maxFramerate = 24;
+                params.encodings[0].priority = 'high';
+                params.encodings[0].networkPriority = 'high';
+                // Disable scalability for lower latency
+                params.encodings[0].scalabilityMode = 'L1T1';
+                sender.setParameters(params).catch(e => console.warn('Could not set encoding params:', e));
 
                 // Handle track ending (user stops sharing)
                 track.onended = () => {
