@@ -47,6 +47,9 @@ window.SteamViewerWebRTC = {
             // Handle ICE candidates
             this.peerConnection.onicecandidate = async (event) => {
                 if (event.candidate) {
+                    // Log candidate type: host (local), srflx (STUN), relay (TURN)
+                    const candidateType = event.candidate.candidate.match(/typ (\w+)/)?.[1] || 'unknown';
+                    console.log(`ICE candidate: ${candidateType}`, event.candidate.candidate.substring(0, 80));
                     await this.dotNetRef.invokeMethodAsync('OnIceCandidateCallback', JSON.stringify(event.candidate));
                 }
             };
