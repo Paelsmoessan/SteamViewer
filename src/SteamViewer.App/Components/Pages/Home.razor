@@ -144,7 +144,7 @@
 </div>
 
 @code {
-    private const string Version = "0.0.1";
+    private const string Version = "0.0.2";
 
     private enum AppMode { Select, StartConnection, JoinConnection }
 
@@ -1100,9 +1100,11 @@
     }
 
     .app-logo {
-        max-width: 280px;
+        max-width: 360px;
         height: auto;
-        margin-bottom: 1rem;
+        margin-bottom: 1.5rem;
+        filter: drop-shadow(0 4px 20px rgba(137, 180, 250, 0.3));
+        border-radius: 12px;
     }
 
     .container {
