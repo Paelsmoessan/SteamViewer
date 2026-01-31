@@ -7,6 +7,7 @@
 @using SteamViewer.App.Components.FileTransfer
 @using Blake3
 @using System.Text
+@using System.Text.Json
 @using Microsoft.JSInterop
 @implements IAsyncDisposable
 @inject SignalingClient SignalingClient
@@ -15,6 +16,7 @@
 @inject IJSRuntime JSRuntime
 @inject ILoggerFactory LoggerFactory
 @inject ILogger<Home> Logger
+@inject IInputInjector InputInjector
 
 <div class="container">
     @if (currentMode == AppMode.Select)
@@ -174,6 +176,8 @@
     private string errorMessage = "";
     private bool _canvasInitialized;
     private bool _isRendering;
+    private bool _inputCaptureInitialized;
+    private DotNetObjectReference<Home>? _inputDotNetRef;
 
     // WebRTC state
     private WebRTCManager? _webrtc;
@@ -197,7 +201,7 @@
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
-        // Initialize canvas when viewer is connected
+        // Initialize canvas and input capture when viewer is connected
         if (currentMode == AppMode.Viewer &&
             connectionState == ConnectionState.Connected &&
             !_canvasInitialized)
@@ -207,10 +211,22 @@
                 await CanvasRenderer.InitializeAsync("remoteCanvas");
                 _canvasInitialized = true;
                 Logger.LogInformation("Canvas initialized for video rendering");
+
+                // Initialize input capture on canvas
+                if (!_inputCaptureInitialized)
+                {
+                    _inputDotNetRef = DotNetObjectReference.Create(this);
+                    var success = await JSRuntime.InvokeAsync<bool>(
+                        "SteamViewerInput.initialize",
+                        "remoteCanvas",
+                        _inputDotNetRef);
+                    _inputCaptureInitialized = success;
+                    Logger.LogInformation("Input capture initialized: {Success}", success);
+                }
             }
             catch (Exception ex)
             {
-                Logger.LogError(ex, "Failed to initialize canvas");
+                Logger.LogError(ex, "Failed to initialize canvas/input");
             }
         }
     }
@@ -488,11 +504,17 @@
         // Subscribe to ICE candidates
         _webrtc.OnIceCandidate += async (candidateJson) =>
         {
-            var candidate = System.Text.Json.JsonSerializer.Deserialize<IceCandidateData>(candidateJson);
+            var candidate = JsonSerializer.Deserialize<IceCandidateData>(candidateJson);
             if (candidate != null)
             {
                 await SignalingClient.SendIceCandidateAsync(connectedPeerId, candidate.candidate, candidate.sdpMid, (ushort?)candidate.sdpMLineIndex);
             }
+        };
+
+        // Subscribe to data channel messages (for receiving input from viewer)
+        _webrtc.OnDataChannelMessage += async (json) =>
+        {
+            await HandleInputMessageAsync(json);
         };
 
         await _webrtc.InitializeAsync();
@@ -514,6 +536,126 @@
     }
 
     private record IceCandidateData(string candidate, string? sdpMid, int? sdpMLineIndex);
+
+    #region Input Event Handlers (Viewer -> Host)
+
+    [JSInvokable]
+    public async Task OnMouseMove(double x, double y)
+    {
+        if (_webrtc == null || !_webrtc.IsDataChannelOpen) return;
+        var inputEvent = new InputEvent.MouseMove(x, y);
+        await SendInputEventAsync(inputEvent);
+    }
+
+    [JSInvokable]
+    public async Task OnMouseDown(string button, double x, double y)
+    {
+        if (_webrtc == null || !_webrtc.IsDataChannelOpen) return;
+        var mouseButton = button.ToLowerInvariant() switch
+        {
+            "left" => MouseButton.Left,
+            "right" => MouseButton.Right,
+            "middle" => MouseButton.Middle,
+            _ => MouseButton.Left
+        };
+        var inputEvent = new InputEvent.MouseDown(mouseButton, x, y);
+        await SendInputEventAsync(inputEvent);
+    }
+
+    [JSInvokable]
+    public async Task OnMouseUp(string button, double x, double y)
+    {
+        if (_webrtc == null || !_webrtc.IsDataChannelOpen) return;
+        var mouseButton = button.ToLowerInvariant() switch
+        {
+            "left" => MouseButton.Left,
+            "right" => MouseButton.Right,
+            "middle" => MouseButton.Middle,
+            _ => MouseButton.Left
+        };
+        var inputEvent = new InputEvent.MouseUp(mouseButton, x, y);
+        await SendInputEventAsync(inputEvent);
+    }
+
+    [JSInvokable]
+    public async Task OnMouseWheel(double deltaX, double deltaY)
+    {
+        if (_webrtc == null || !_webrtc.IsDataChannelOpen) return;
+        var inputEvent = new InputEvent.MouseWheel(deltaX, deltaY);
+        await SendInputEventAsync(inputEvent);
+    }
+
+    [JSInvokable]
+    public async Task OnKeyDown(string key, JsonElement modifiers)
+    {
+        if (_webrtc == null || !_webrtc.IsDataChannelOpen) return;
+        var mods = ParseModifiers(modifiers);
+        var inputEvent = new InputEvent.KeyDown(key, mods);
+        await SendInputEventAsync(inputEvent);
+    }
+
+    [JSInvokable]
+    public async Task OnKeyUp(string key, JsonElement modifiers)
+    {
+        if (_webrtc == null || !_webrtc.IsDataChannelOpen) return;
+        var mods = ParseModifiers(modifiers);
+        var inputEvent = new InputEvent.KeyUp(key, mods);
+        await SendInputEventAsync(inputEvent);
+    }
+
+    private KeyModifiers ParseModifiers(JsonElement modifiers)
+    {
+        bool ctrl = false, shift = false, alt = false, meta = false;
+        if (modifiers.TryGetProperty("ctrl", out var ctrlProp)) ctrl = ctrlProp.GetBoolean();
+        if (modifiers.TryGetProperty("shift", out var shiftProp)) shift = shiftProp.GetBoolean();
+        if (modifiers.TryGetProperty("alt", out var altProp)) alt = altProp.GetBoolean();
+        if (modifiers.TryGetProperty("meta", out var metaProp)) meta = metaProp.GetBoolean();
+        return new KeyModifiers(ctrl, shift, alt, meta);
+    }
+
+    private async Task SendInputEventAsync(InputEvent inputEvent)
+    {
+        try
+        {
+            var json = System.Text.Json.JsonSerializer.Serialize(inputEvent);
+            await _webrtc!.SendDataAsync(json);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Failed to send input event");
+        }
+    }
+
+    #endregion
+
+    #region Input Injection (Host receives from Viewer)
+
+    private async Task HandleInputMessageAsync(string json)
+    {
+        if (currentMode != AppMode.Host) return;
+
+        try
+        {
+            var inputEvent = JsonSerializer.Deserialize<InputEvent>(json);
+            if (inputEvent != null)
+            {
+                // Get screen dimensions (use default if not capturing)
+                int screenWidth = 1920;
+                int screenHeight = 1080;
+
+                // Inject the input
+                InputInjector.InjectInput(inputEvent, screenWidth, screenHeight);
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Failed to process input message");
+        }
+
+        await Task.CompletedTask;
+    }
+
+    #endregion
 
     private async Task RejectConnection()
     {
@@ -685,6 +827,14 @@
             await CanvasRenderer.DisposeAsync();
             _canvasInitialized = false;
         }
+
+        if (_inputCaptureInitialized)
+        {
+            await JSRuntime.InvokeVoidAsync("SteamViewerInput.stop");
+            _inputCaptureInitialized = false;
+        }
+
+        _inputDotNetRef?.Dispose();
     }
 }
 
