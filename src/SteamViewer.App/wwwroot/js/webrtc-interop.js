@@ -47,7 +47,8 @@ window.SteamViewerWebRTC = {
         this.dotNetRef = dotNetReference;
 
         const iceServers = this.buildIceServers();
-        console.log('ICE servers:', iceServers.map(s => s.urls));
+        console.log('=== WebRTC INIT ===');
+        console.log('ICE servers configured:', JSON.stringify(iceServers, null, 2));
 
         const config = {
             iceServers,
@@ -59,26 +60,65 @@ window.SteamViewerWebRTC = {
 
         try {
             this.peerConnection = new RTCPeerConnection(config);
+            console.log('RTCPeerConnection created');
+
+            // Track candidate types found
+            const candidateTypes = { host: 0, srflx: 0, relay: 0, prflx: 0 };
 
             // Handle ICE candidates
             this.peerConnection.onicecandidate = async (event) => {
                 if (event.candidate) {
-                    // Log candidate type: host (local), srflx (STUN), relay (TURN)
                     const candidateType = event.candidate.candidate.match(/typ (\w+)/)?.[1] || 'unknown';
-                    console.log(`ICE candidate: ${candidateType}`, event.candidate.candidate.substring(0, 80));
+                    candidateTypes[candidateType] = (candidateTypes[candidateType] || 0) + 1;
+
+                    // Full candidate logging for debugging
+                    console.log(`=== ICE CANDIDATE: ${candidateType.toUpperCase()} ===`);
+                    console.log('Full candidate:', event.candidate.candidate);
+                    console.log('Candidate counts so far:', candidateTypes);
+
+                    if (candidateType === 'relay') {
+                        console.log('*** RELAY CANDIDATE FOUND - TURN SERVER WORKING! ***');
+                    }
+
                     await this.dotNetRef.invokeMethodAsync('OnIceCandidateCallback', JSON.stringify(event.candidate));
+                } else {
+                    console.log('=== ICE GATHERING COMPLETE ===');
+                    console.log('Final candidate counts:', candidateTypes);
+                    if (candidateTypes.relay === 0) {
+                        console.error('!!! NO RELAY CANDIDATES - TURN SERVER NOT WORKING !!!');
+                        console.error('Check: 1) TURN server running 2) Correct port 3) Credentials match');
+                    }
                 }
+            };
+
+            // Handle ICE gathering state
+            this.peerConnection.onicegatheringstatechange = () => {
+                console.log('ICE gathering state:', this.peerConnection.iceGatheringState);
             };
 
             // Handle connection state changes
             this.peerConnection.onconnectionstatechange = async () => {
-                console.log('Connection state:', this.peerConnection.connectionState);
+                console.log('=== CONNECTION STATE:', this.peerConnection.connectionState, '===');
+                if (this.peerConnection.connectionState === 'failed') {
+                    console.error('CONNECTION FAILED - Possible causes:');
+                    console.error('1. No relay candidates (TURN not working)');
+                    console.error('2. Firewall blocking');
+                    console.error('3. NAT traversal failed');
+                }
                 await this.dotNetRef.invokeMethodAsync('OnConnectionStateChangeCallback', this.peerConnection.connectionState);
             };
 
             // Handle ICE connection state for more debugging
             this.peerConnection.oniceconnectionstatechange = () => {
                 console.log('ICE connection state:', this.peerConnection.iceConnectionState);
+                if (this.peerConnection.iceConnectionState === 'failed') {
+                    console.error('ICE CONNECTION FAILED');
+                }
+            };
+
+            // Handle ICE candidate errors
+            this.peerConnection.onicecandidateerror = (event) => {
+                console.error('ICE candidate error:', event.errorCode, event.errorText, event.url);
             };
 
             // Handle incoming data channels
