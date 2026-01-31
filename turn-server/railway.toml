@@ -1,0 +1,10 @@
+[build]
+builder = "dockerfile"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+# Railway TCP port mapping
+# Note: Railway doesn't support UDP directly - use TCP relay
+# For full UDP support, deploy to a VPS with coturn
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 5

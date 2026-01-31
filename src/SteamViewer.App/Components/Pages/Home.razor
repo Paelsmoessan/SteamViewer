@@ -9,6 +9,7 @@
 @using System.Text
 @using System.Text.Json
 @using Microsoft.JSInterop
+@using Microsoft.Extensions.Configuration
 @implements IAsyncDisposable
 @inject SignalingClient SignalingClient
 @inject SessionManager SessionManager
@@ -17,6 +18,7 @@
 @inject ILoggerFactory LoggerFactory
 @inject ILogger<Home> Logger
 @inject IInputInjector InputInjector
+@inject IConfiguration Configuration
 
 <div class="container">
     @if (currentMode == AppMode.Select)
@@ -495,9 +497,43 @@
         StateHasChanged();
     }
 
+    private async Task SetTurnConfigFromSettings()
+    {
+        // Read TURN server config from appsettings.json
+        var turnEnabled = Configuration.GetValue<bool>("TurnServer:Enabled");
+        if (!turnEnabled)
+        {
+            Logger.LogInformation("TURN server disabled in config");
+            return;
+        }
+
+        var urls = Configuration.GetSection("TurnServer:Urls").Get<string[]>();
+        var username = Configuration["TurnServer:Username"];
+        var credential = Configuration["TurnServer:Credential"];
+
+        if (urls == null || urls.Length == 0 || string.IsNullOrEmpty(username))
+        {
+            Logger.LogWarning("TURN server enabled but not configured - edit appsettings.json");
+            return;
+        }
+
+        // Check if URL is placeholder
+        if (urls[0].Contains("YOUR_TURN_SERVER"))
+        {
+            Logger.LogWarning("TURN server URL is placeholder - edit appsettings.json with your TURN server address");
+            return;
+        }
+
+        Logger.LogInformation("Configuring TURN server: {Urls}", string.Join(", ", urls));
+        await JSRuntime.InvokeVoidAsync("SteamViewerWebRTC.setTurnConfig", urls, username, credential);
+    }
+
     private async Task InitializeWebRTCAsHost()
     {
         Logger.LogInformation("Initializing WebRTC as host");
+
+        // Configure TURN server before WebRTC init
+        await SetTurnConfigFromSettings();
 
         _webrtc = new WebRTCManager(JSRuntime, LoggerFactory.CreateLogger<WebRTCManager>(), clientId, SendSignalingMessage);
 
@@ -776,6 +812,9 @@
     private async Task InitializeWebRTCAsViewer()
     {
         Logger.LogInformation("Initializing WebRTC as viewer");
+
+        // Configure TURN server before WebRTC init
+        await SetTurnConfigFromSettings();
 
         _webrtc = new WebRTCManager(JSRuntime, LoggerFactory.CreateLogger<WebRTCManager>(), "", SendSignalingMessage);
 

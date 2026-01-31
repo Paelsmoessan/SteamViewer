@@ -7,57 +7,54 @@ window.SteamViewerWebRTC = {
     dotNetRef: null,
     localStream: null,
 
-    // Initialize WebRTC with STUN servers
+    // Custom TURN server config (set from C# via setTurnConfig)
+    customTurnServer: null,
+
+    // Set custom TURN server configuration
+    // Call this before initialize() to use your own TURN server
+    setTurnConfig(urls, username, credential) {
+        console.log('Setting custom TURN server:', urls);
+        this.customTurnServer = { urls, username, credential };
+    },
+
+    // Build ICE servers list
+    buildIceServers() {
+        const servers = [
+            // STUN servers for NAT discovery (always included)
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: 'stun:stun1.l.google.com:19302' },
+        ];
+
+        // Use custom TURN server if configured
+        if (this.customTurnServer && this.customTurnServer.urls && this.customTurnServer.urls.length > 0) {
+            console.log('Using custom TURN server');
+            for (const url of this.customTurnServer.urls) {
+                servers.push({
+                    urls: url,
+                    username: this.customTurnServer.username,
+                    credential: this.customTurnServer.credential
+                });
+            }
+        } else {
+            console.log('No custom TURN server configured - P2P only (may fail over internet)');
+        }
+
+        return servers;
+    },
+
+    // Initialize WebRTC with STUN/TURN servers
     async initialize(dotNetReference) {
         this.dotNetRef = dotNetReference;
 
+        const iceServers = this.buildIceServers();
+        console.log('ICE servers:', iceServers.map(s => s.urls));
+
         const config = {
-            iceServers: [
-                // STUN servers for NAT discovery
-                { urls: 'stun:stun.l.google.com:19302' },
-                { urls: 'stun:stun1.l.google.com:19302' },
-                { urls: 'stun:stun2.l.google.com:19302' },
-                { urls: 'stun:freestun.net:3478' },
-                // Free TURN servers for NAT traversal over internet
-                // FreeTURN - community shared
-                {
-                    urls: 'turn:freestun.net:3478',
-                    username: 'free',
-                    credential: 'free'
-                },
-                {
-                    urls: 'turns:freestun.net:5350',
-                    username: 'free',
-                    credential: 'free'
-                },
-                // ExpressTURN - free tier (1000GB/month)
-                {
-                    urls: 'turn:relay1.expressturn.com:3478',
-                    username: 'efFW1GXRLY8FD0ZJVQ',
-                    credential: 'yeCQQq8kTi5oTvgm'
-                },
-                // OpenRelay fallback
-                {
-                    urls: 'turn:openrelay.metered.ca:80',
-                    username: 'openrelayproject',
-                    credential: 'openrelayproject'
-                },
-                {
-                    urls: 'turn:openrelay.metered.ca:443',
-                    username: 'openrelayproject',
-                    credential: 'openrelayproject'
-                },
-                {
-                    urls: 'turn:openrelay.metered.ca:443?transport=tcp',
-                    username: 'openrelayproject',
-                    credential: 'openrelayproject'
-                }
-            ],
-            // Aggressive ICE gathering
+            iceServers,
             iceCandidatePoolSize: 10,
             bundlePolicy: 'max-bundle',
             rtcpMuxPolicy: 'require',
-            iceTransportPolicy: 'all'  // Try all candidates including relay
+            iceTransportPolicy: 'all'
         };
 
         try {

@@ -1,0 +1,17 @@
+# Local testing docker-compose for coturn TURN server
+# Run: docker-compose up
+
+version: '3.8'
+
+services:
+  coturn:
+    build: .
+    ports:
+      - "3478:3478/udp"
+      - "3478:3478/tcp"
+      - "5349:5349/tcp"
+      - "49152-49252:49152-49252/udp"
+    environment:
+      - DETECT_EXTERNAL_IP=yes
+      - DETECT_RELAY_IP=yes
+    restart: unless-stopped
