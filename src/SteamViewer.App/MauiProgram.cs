@@ -83,6 +83,9 @@ public static class MauiProgram
         // Register CanvasRenderingService (scoped for Blazor component lifetime)
         builder.Services.AddScoped<CanvasRenderingService>();
 
+        // Register RemoteViewerService for multi-window support
+        builder.Services.AddSingleton<RemoteViewerService>();
+
         // Register platform-specific services
 #if WINDOWS
         builder.Services.AddSingleton<IMonitorEnumerator, SteamViewer.Platform.Windows.WindowsMonitorEnumerator>();
@@ -94,6 +97,16 @@ public static class MauiProgram
         builder.Services.AddSingleton<IInputInjector, SteamViewer.Platform.macOS.Input.MacInputInjector>();
 #endif
 
-        return builder.Build();
+        var app = builder.Build();
+
+        // Store service provider for App to access
+        ServiceProvider = app.Services;
+
+        return app;
     }
+
+    /// <summary>
+    /// Global service provider for accessing services from non-DI contexts.
+    /// </summary>
+    public static IServiceProvider? ServiceProvider { get; private set; }
 }

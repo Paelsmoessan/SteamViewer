@@ -1,0 +1,267 @@
+@page "/viewer"
+@using Microsoft.JSInterop
+@using SteamViewer.App.Services
+@using SteamViewer.Client.Core.Capture
+@inject RemoteViewerService ViewerService
+@inject CanvasRenderingService CanvasRenderer
+@inject IJSRuntime JSRuntime
+@implements IDisposable
+
+<div class="viewer-container">
+    <div class="viewer-toolbar">
+        <div class="toolbar-left">
+            <span class="connection-indicator">Connected</span>
+        </div>
+        <div class="toolbar-center">
+            <span class="peer-info">Remote Desktop - @(ViewerService.PeerId ?? "Unknown")</span>
+        </div>
+        <div class="toolbar-right">
+            <button class="toolbar-btn" @onclick="CloseWindow" title="Close">
+                Close
+            </button>
+        </div>
+    </div>
+    <div class="canvas-container">
+        <canvas id="viewerCanvas" width="1920" height="1080"></canvas>
+    </div>
+</div>
+
+@code {
+    private DotNetObjectReference<RemoteViewer>? _dotNetRef;
+    private bool _canvasInitialized;
+    private bool _inputInitialized;
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+        {
+            // Subscribe to video frames
+            ViewerService.OnVideoFrame += HandleVideoFrame;
+
+            // Initialize canvas
+            await Task.Delay(100); // Wait for DOM
+            try
+            {
+                await CanvasRenderer.InitializeAsync("viewerCanvas");
+                _canvasInitialized = true;
+
+                // Initialize input capture
+                _dotNetRef = DotNetObjectReference.Create(this);
+                _inputInitialized = await JSRuntime.InvokeAsync<bool>(
+                    "SteamViewerInput.initialize",
+                    "viewerCanvas",
+                    _dotNetRef);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Failed to initialize viewer canvas: {ex.Message}");
+            }
+        }
+    }
+
+    private async void HandleVideoFrame(DecodedFrame frame)
+    {
+        if (_canvasInitialized)
+        {
+            try
+            {
+                await InvokeAsync(async () =>
+                {
+                    await CanvasRenderer.RenderFrameAsync(frame);
+                });
+            }
+            catch
+            {
+                // Ignore rendering errors during shutdown
+            }
+        }
+    }
+
+    private void CloseWindow()
+    {
+        ViewerService.CloseViewer();
+    }
+
+    #region Input Callbacks (relayed to main window)
+
+    [JSInvokable]
+    public void OnMouseMove(double x, double y)
+    {
+        ViewerService.SendInputEvent(new InputEventData
+        {
+            Type = InputEventType.MouseMove,
+            X = x,
+            Y = y
+        });
+    }
+
+    [JSInvokable]
+    public void OnMouseDown(double x, double y, int button)
+    {
+        ViewerService.SendInputEvent(new InputEventData
+        {
+            Type = InputEventType.MouseDown,
+            X = x,
+            Y = y,
+            Button = button
+        });
+    }
+
+    [JSInvokable]
+    public void OnMouseUp(double x, double y, int button)
+    {
+        ViewerService.SendInputEvent(new InputEventData
+        {
+            Type = InputEventType.MouseUp,
+            X = x,
+            Y = y,
+            Button = button
+        });
+    }
+
+    [JSInvokable]
+    public void OnWheel(double x, double y, double deltaX, double deltaY)
+    {
+        ViewerService.SendInputEvent(new InputEventData
+        {
+            Type = InputEventType.Wheel,
+            X = x,
+            Y = y,
+            DeltaX = deltaX,
+            DeltaY = deltaY
+        });
+    }
+
+    [JSInvokable]
+    public void OnKeyDown(string key, bool ctrl, bool shift, bool alt)
+    {
+        ViewerService.SendInputEvent(new InputEventData
+        {
+            Type = InputEventType.KeyDown,
+            Key = key,
+            Ctrl = ctrl,
+            Shift = shift,
+            Alt = alt
+        });
+    }
+
+    [JSInvokable]
+    public void OnKeyUp(string key, bool ctrl, bool shift, bool alt)
+    {
+        ViewerService.SendInputEvent(new InputEventData
+        {
+            Type = InputEventType.KeyUp,
+            Key = key,
+            Ctrl = ctrl,
+            Shift = shift,
+            Alt = alt
+        });
+    }
+
+    #endregion
+
+    public void Dispose()
+    {
+        ViewerService.OnVideoFrame -= HandleVideoFrame;
+        _dotNetRef?.Dispose();
+
+        // Notify service that window is closing
+        ViewerService.NotifyViewerClosed();
+    }
+}
+
+<style>
+    .viewer-container {
+        display: flex;
+        flex-direction: column;
+        height: 100vh;
+        background: #11111b;
+        color: #cdd6f4;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    }
+
+    .viewer-toolbar {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 0.5rem 1rem;
+        background: #1e1e2e;
+        border-bottom: 1px solid #45475a;
+        min-height: 48px;
+    }
+
+    .toolbar-left,
+    .toolbar-center,
+    .toolbar-right {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+    }
+
+    .toolbar-left {
+        flex: 1;
+    }
+
+    .toolbar-center {
+        flex: 2;
+        justify-content: center;
+    }
+
+    .toolbar-right {
+        flex: 1;
+        justify-content: flex-end;
+    }
+
+    .connection-indicator {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.5rem;
+        font-size: 0.875rem;
+        color: #a6e3a1;
+    }
+
+    .connection-indicator::before {
+        content: '';
+        width: 8px;
+        height: 8px;
+        background: #a6e3a1;
+        border-radius: 50%;
+    }
+
+    .peer-info {
+        font-size: 1rem;
+        font-weight: 500;
+    }
+
+    .toolbar-btn {
+        padding: 0.5rem 1rem;
+        background: #45475a;
+        border: 1px solid #585b70;
+        border-radius: 6px;
+        color: #cdd6f4;
+        font-size: 0.875rem;
+        cursor: pointer;
+        transition: all 0.2s;
+    }
+
+    .toolbar-btn:hover {
+        background: #585b70;
+        border-color: #f38ba8;
+        color: #f38ba8;
+    }
+
+    .canvas-container {
+        flex: 1;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        overflow: hidden;
+        background: #000;
+    }
+
+    .canvas-container canvas {
+        max-width: 100%;
+        max-height: 100%;
+        object-fit: contain;
+    }
+</style>

@@ -20,6 +20,7 @@
 @inject IInputInjector InputInjector
 @inject IConfiguration Configuration
 @inject FileLoggerService FileLogger
+@inject RemoteViewerService ViewerService
 
 <div class="version-tag">v@(Version)</div>
 <div class="container">
@@ -143,34 +144,9 @@
         OnCancel="@CancelFileTransfer" />
 </div>
 
-@* Fullscreen viewer overlay *@
-@if (_isFullscreenViewer && _peerIsSharingScreen)
-{
-    <div class="fullscreen-viewer">
-        <div class="fullscreen-toolbar">
-            <div class="toolbar-left">
-                <span class="connection-indicator">🟢 Connected</span>
-            </div>
-            <div class="toolbar-center">
-                <span class="peer-info">Remote Desktop</span>
-            </div>
-            <div class="toolbar-right">
-                <button class="fs-toolbar-btn" @onclick="ShowTransfersDialog" title="File Transfers">
-                    📁
-                </button>
-                <button class="fs-toolbar-btn" @onclick="CloseFullscreenViewer" title="Exit Fullscreen">
-                    ✕
-                </button>
-            </div>
-        </div>
-        <div class="fullscreen-canvas-container">
-            <canvas id="fullscreenCanvas" width="1920" height="1080"></canvas>
-        </div>
-    </div>
-}
 
 @code {
-    private const string Version = "0.0.8";
+    private const string Version = "0.1.0";
 
     private enum AppMode { Select, StartConnection, JoinConnection }
 
@@ -206,7 +182,6 @@
     // Screen sharing state
     private bool _isSharingScreen;       // Am I sharing my screen?
     private bool _peerIsSharingScreen;   // Is my peer sharing their screen?
-    private bool _isFullscreenViewer;    // Is the viewer in fullscreen mode?
 
     // Pending SDP offer (buffered if received before WebRTC init)
     private SignalingMessage.SdpOffer? _pendingSdpOffer;
@@ -247,8 +222,8 @@
                 <div class="remote-screen-container">
                     <div class="remote-screen-header">
                         <span class="remote-label">📺 Remote Screen</span>
-                        <button class="popout-btn" @onclick="OpenFullscreenViewer" title="Open in fullscreen">
-                            <span>⛶</span> Fullscreen
+                        <button class="popout-btn" @onclick="OpenViewerWindow" title="Open in separate window">
+                            <span>⛶</span> Open Window
                         </button>
                     </div>
                     <div class="remote-screen">
@@ -279,6 +254,9 @@
         SessionManager.FileTransferProgress += OnFileTransferProgress;
         SessionManager.FileTransferCompleted += OnFileTransferCompleted;
         SessionManager.FileTransferFailed += OnFileTransferFailed;
+
+        // Subscribe to viewer window input events
+        ViewerService.OnInputEvent += OnViewerInputEvent;
     }
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
@@ -331,6 +309,13 @@
 
     private void OnVideoFrameDecoded(object? sender, DecodedFrame frame)
     {
+        // Forward frame to viewer window if open
+        if (ViewerService.IsViewerOpen)
+        {
+            ViewerService.SendVideoFrame(frame);
+        }
+
+        // Also render in main window if canvas is ready
         if (!_canvasInitialized || _isRendering)
         {
             return;
@@ -531,74 +516,51 @@
 
     #endregion
 
-    #region Fullscreen Viewer
+    #region Separate Window Viewer
 
-    private async Task OpenFullscreenViewer()
+    private void OpenViewerWindow()
     {
-        _isFullscreenViewer = true;
-        _canvasInitialized = false; // Reset to reinitialize on fullscreen canvas
-        StateHasChanged();
-
-        // Wait for render, then initialize fullscreen canvas
-        await Task.Delay(50);
-        try
-        {
-            await CanvasRenderer.InitializeAsync("fullscreenCanvas");
-            _canvasInitialized = true;
-
-            // Reinitialize input capture on fullscreen canvas
-            if (_inputCaptureInitialized)
-            {
-                await JSRuntime.InvokeVoidAsync("SteamViewerInput.stop");
-            }
-            _inputDotNetRef = DotNetObjectReference.Create(this);
-            var success = await JSRuntime.InvokeAsync<bool>(
-                "SteamViewerInput.initialize",
-                "fullscreenCanvas",
-                _inputDotNetRef);
-            _inputCaptureInitialized = success;
-
-            Logger.LogInformation("Fullscreen viewer opened");
-        }
-        catch (Exception ex)
-        {
-            Logger.LogError(ex, "Failed to initialize fullscreen canvas");
-        }
+        // Open the viewer in a separate window
+        ViewerService.OpenViewer(connectedPeerId);
+        Logger.LogInformation("Opened viewer window for peer {PeerId}", connectedPeerId);
     }
 
-    private async Task CloseFullscreenViewer()
+    private void OnViewerInputEvent(InputEventData input)
     {
-        _isFullscreenViewer = false;
-        _canvasInitialized = false; // Reset to reinitialize on regular canvas
-        StateHasChanged();
-
-        // Reinitialize on regular canvas if peer is still sharing
-        if (_peerIsSharingScreen)
+        // Relay input from viewer window to remote peer
+        _ = InvokeAsync(async () =>
         {
-            await Task.Delay(50);
             try
             {
-                await CanvasRenderer.InitializeAsync("remoteCanvas");
-                _canvasInitialized = true;
-
-                if (_inputCaptureInitialized)
+                switch (input.Type)
                 {
-                    await JSRuntime.InvokeVoidAsync("SteamViewerInput.stop");
+                    case InputEventType.MouseMove:
+                        await OnMouseMove(input.X, input.Y);
+                        break;
+                    case InputEventType.MouseDown:
+                        await OnMouseDown(input.Button.ToString(), input.X, input.Y);
+                        break;
+                    case InputEventType.MouseUp:
+                        await OnMouseUp(input.Button.ToString(), input.X, input.Y);
+                        break;
+                    case InputEventType.Wheel:
+                        await OnMouseWheel(input.DeltaX, input.DeltaY);
+                        break;
+                    case InputEventType.KeyDown:
+                        var downMods = JsonSerializer.SerializeToElement(new { ctrl = input.Ctrl, shift = input.Shift, alt = input.Alt });
+                        await OnKeyDown(input.Key!, downMods);
+                        break;
+                    case InputEventType.KeyUp:
+                        var upMods = JsonSerializer.SerializeToElement(new { ctrl = input.Ctrl, shift = input.Shift, alt = input.Alt });
+                        await OnKeyUp(input.Key!, upMods);
+                        break;
                 }
-                _inputDotNetRef = DotNetObjectReference.Create(this);
-                var success = await JSRuntime.InvokeAsync<bool>(
-                    "SteamViewerInput.initialize",
-                    "remoteCanvas",
-                    _inputDotNetRef);
-                _inputCaptureInitialized = success;
-
-                Logger.LogInformation("Returned to normal view");
             }
             catch (Exception ex)
             {
-                Logger.LogError(ex, "Failed to reinitialize canvas after exiting fullscreen");
+                Logger.LogWarning(ex, "Failed to relay input from viewer window");
             }
-        }
+        });
     }
 
     #endregion
@@ -979,8 +941,8 @@
                         await InvokeAsync(() =>
                         {
                             _peerIsSharingScreen = false;
-                            _isFullscreenViewer = false; // Exit fullscreen when peer stops
                             _canvasInitialized = false; // Reset canvas for next share
+                            ViewerService.CloseViewer(); // Close viewer window if open
                             StateHasChanged();
                         });
                         return;
