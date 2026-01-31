@@ -144,7 +144,7 @@
 </div>
 
 @code {
-    private const string Version = "0.0.4";
+    private const string Version = "0.0.5";
 
     private enum AppMode { Select, StartConnection, JoinConnection }
 
@@ -680,6 +680,13 @@
             await HandleDataChannelMessageAsync(json);
         };
 
+        // Subscribe to renegotiation (triggered when screen capture track is added)
+        _webrtc.OnRenegotiationNeeded += async (offerJson) =>
+        {
+            Logger.LogInformation("Renegotiation: sending new offer to {PeerId}", connectedPeerId);
+            await SignalingClient.SendSdpOfferAsync(connectedPeerId, offerJson);
+        };
+
         await _webrtc.InitializeAsync();
         await _webrtc.CreateDataChannelAsync("data");
 
@@ -1038,6 +1045,13 @@
         _webrtc.OnDataChannelMessage += async (json) =>
         {
             await HandleDataChannelMessageAsync(json);
+        };
+
+        // Subscribe to renegotiation (triggered when screen capture track is added)
+        _webrtc.OnRenegotiationNeeded += async (offerJson) =>
+        {
+            Logger.LogInformation("Renegotiation: sending new offer to {PeerId}", connectedPeerId);
+            await SignalingClient.SendSdpOfferAsync(connectedPeerId, offerJson);
         };
 
         await _webrtc.InitializeAsync();

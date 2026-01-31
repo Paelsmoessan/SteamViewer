@@ -49,6 +49,12 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
     /// </summary>
     public event Func<byte[], Task>? OnDataChannelBinaryMessage;
 
+    /// <summary>
+    /// Raised when renegotiation is needed (e.g., after adding video track).
+    /// The string parameter is the SDP offer JSON.
+    /// </summary>
+    public event Func<string, Task>? OnRenegotiationNeeded;
+
     // IWebRTCManager events
     event EventHandler<string>? IWebRTCManager.ConnectionStateChanged
     {
@@ -448,6 +454,16 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
         if (OnDataChannelBinaryMessage != null)
         {
             await OnDataChannelBinaryMessage.Invoke(data);
+        }
+    }
+
+    [JSInvokable]
+    public async Task OnRenegotiationNeededCallback(string offerJson)
+    {
+        _logger.LogInformation("Renegotiation needed - new offer created after track added");
+        if (OnRenegotiationNeeded != null)
+        {
+            await OnRenegotiationNeeded.Invoke(offerJson);
         }
     }
 

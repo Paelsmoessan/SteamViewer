@@ -213,6 +213,25 @@ window.SteamViewerWebRTC = {
                 console.error('ICE candidate error:', event.errorCode, event.errorText, event.url);
             };
 
+            // Handle renegotiation needed (when tracks are added after connection)
+            this.peerConnection.onnegotiationneeded = async () => {
+                console.log('=== NEGOTIATION NEEDED (track added post-connection) ===');
+                try {
+                    // Only renegotiate if we're in a stable state
+                    if (this.peerConnection.signalingState === 'stable') {
+                        const offer = await this.peerConnection.createOffer();
+                        offer.sdp = this.modifySdpForLowLatency(offer.sdp);
+                        await this.peerConnection.setLocalDescription(offer);
+                        console.log('Renegotiation offer created, sending to peer...');
+                        await this.dotNetRef.invokeMethodAsync('OnRenegotiationNeededCallback', JSON.stringify(offer));
+                    } else {
+                        console.log('Skipping renegotiation, signaling state:', this.peerConnection.signalingState);
+                    }
+                } catch (err) {
+                    console.error('Renegotiation failed:', err);
+                }
+            };
+
             // Handle incoming data channels
             this.peerConnection.ondatachannel = (event) => {
                 this.setupDataChannel(event.channel);
@@ -528,6 +547,14 @@ window.SteamViewerWebRTC = {
         console.log('=== Starting screen capture ===');
         console.log('navigator.mediaDevices:', !!navigator.mediaDevices);
         console.log('getDisplayMedia:', !!navigator.mediaDevices?.getDisplayMedia);
+        console.log('peerConnection:', !!this.peerConnection);
+        console.log('peerConnection state:', this.peerConnection?.connectionState);
+        console.log('signalingState:', this.peerConnection?.signalingState);
+
+        if (!this.peerConnection) {
+            console.error('Cannot start screen capture - no peer connection!');
+            return false;
+        }
 
         try {
             this.localStream = await navigator.mediaDevices.getDisplayMedia({
@@ -595,7 +622,14 @@ window.SteamViewerWebRTC = {
             console.log('Screen capture started');
             return true;
         } catch (err) {
-            console.error('Screen capture failed:', err);
+            console.error('Screen capture failed:', err.name, err.message);
+            if (err.name === 'NotAllowedError') {
+                console.error('User denied screen capture permission or cancelled dialog');
+            } else if (err.name === 'NotFoundError') {
+                console.error('No screen available for capture');
+            } else if (err.name === 'NotSupportedError') {
+                console.error('Screen capture not supported in this browser/context');
+            }
             return false;
         }
     },
