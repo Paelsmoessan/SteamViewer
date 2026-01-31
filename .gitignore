@@ -32,3 +32,6 @@ nul
 # Local development helpers
 SteamViewerMainSession.cmd
 *.lnk
+
+# Local config (use appsettings.local.json or appsettings.remote.json as templates)
+src/SteamViewer.App/appsettings.json
