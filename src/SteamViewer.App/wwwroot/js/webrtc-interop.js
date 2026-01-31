@@ -744,6 +744,11 @@ window.SteamViewerInput = {
     isLocked: false,  // Capture lock - only send inputs when locked
 
     initialize(canvasId, dotNetReference) {
+        // Clean up any previous instance
+        if (this.canvas) {
+            this.stop();
+        }
+
         this.canvas = document.getElementById(canvasId);
         this.dotNetRef = dotNetReference;
 
@@ -755,26 +760,36 @@ window.SteamViewerInput = {
         // Create lock indicator overlay
         this.createLockIndicator();
 
+        // Bind event handlers (store references for removal)
+        this._boundMouseMove = (e) => this.handleMouseMove(e);
+        this._boundMouseDown = (e) => this.handleMouseDown(e);
+        this._boundMouseUp = (e) => this.handleMouseUp(e);
+        this._boundWheel = (e) => this.handleWheel(e);
+        this._boundKeyDown = (e) => this.handleKeyDown(e);
+        this._boundKeyUp = (e) => this.handleKeyUp(e);
+        this._boundDblClick = (e) => {
+            e.preventDefault();
+            this.toggleLock();
+        };
+
         // Mouse events
-        this.canvas.addEventListener('mousemove', (e) => this.handleMouseMove(e));
-        this.canvas.addEventListener('mousedown', (e) => this.handleMouseDown(e));
-        this.canvas.addEventListener('mouseup', (e) => this.handleMouseUp(e));
-        this.canvas.addEventListener('wheel', (e) => this.handleWheel(e), { passive: false });
+        this.canvas.addEventListener('mousemove', this._boundMouseMove);
+        this.canvas.addEventListener('mousedown', this._boundMouseDown);
+        this.canvas.addEventListener('mouseup', this._boundMouseUp);
+        this.canvas.addEventListener('wheel', this._boundWheel, { passive: false });
         this.canvas.addEventListener('contextmenu', (e) => e.preventDefault());
 
         // Make canvas focusable for keyboard events
         this.canvas.tabIndex = 0;
         this.canvas.style.outline = 'none';
-        this.canvas.addEventListener('keydown', (e) => this.handleKeyDown(e));
-        this.canvas.addEventListener('keyup', (e) => this.handleKeyUp(e));
+        this.canvas.addEventListener('keydown', this._boundKeyDown);
+        this.canvas.addEventListener('keyup', this._boundKeyUp);
 
         // Double-click to lock/capture
-        this.canvas.addEventListener('dblclick', (e) => {
-            e.preventDefault();
-            this.toggleLock();
-        });
+        this.canvas.addEventListener('dblclick', this._boundDblClick);
 
         this.isCapturing = true;
+        this.isLocked = false;
         console.log('Input capture initialized (double-click to lock, Escape to release)');
         return true;
     },
@@ -901,6 +916,27 @@ window.SteamViewerInput = {
 
     stop() {
         this.isCapturing = false;
+        this.isLocked = false;
+
+        // Remove lock indicator
+        if (this.lockIndicator) {
+            this.lockIndicator.remove();
+            this.lockIndicator = null;
+        }
+
+        // Remove event listeners from canvas
+        if (this.canvas) {
+            this.canvas.removeEventListener('mousemove', this._boundMouseMove);
+            this.canvas.removeEventListener('mousedown', this._boundMouseDown);
+            this.canvas.removeEventListener('mouseup', this._boundMouseUp);
+            this.canvas.removeEventListener('wheel', this._boundWheel);
+            this.canvas.removeEventListener('keydown', this._boundKeyDown);
+            this.canvas.removeEventListener('keyup', this._boundKeyUp);
+            this.canvas.removeEventListener('dblclick', this._boundDblClick);
+        }
+
+        this.canvas = null;
+        this.dotNetRef = null;
         console.log('Input capture stopped');
     }
 };

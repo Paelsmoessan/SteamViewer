@@ -143,8 +143,34 @@
         OnCancel="@CancelFileTransfer" />
 </div>
 
+@* Fullscreen viewer overlay *@
+@if (_isFullscreenViewer && _peerIsSharingScreen)
+{
+    <div class="fullscreen-viewer">
+        <div class="fullscreen-toolbar">
+            <div class="toolbar-left">
+                <span class="connection-indicator">🟢 Connected</span>
+            </div>
+            <div class="toolbar-center">
+                <span class="peer-info">Remote Desktop</span>
+            </div>
+            <div class="toolbar-right">
+                <button class="fs-toolbar-btn" @onclick="ShowTransfersDialog" title="File Transfers">
+                    📁
+                </button>
+                <button class="fs-toolbar-btn" @onclick="CloseFullscreenViewer" title="Exit Fullscreen">
+                    ✕
+                </button>
+            </div>
+        </div>
+        <div class="fullscreen-canvas-container">
+            <canvas id="fullscreenCanvas" width="1920" height="1080"></canvas>
+        </div>
+    </div>
+}
+
 @code {
-    private const string Version = "0.0.5";
+    private const string Version = "0.0.7";
 
     private enum AppMode { Select, StartConnection, JoinConnection }
 
@@ -180,6 +206,7 @@
     // Screen sharing state
     private bool _isSharingScreen;       // Am I sharing my screen?
     private bool _peerIsSharingScreen;   // Is my peer sharing their screen?
+    private bool _isFullscreenViewer;    // Is the viewer in fullscreen mode?
 
     // Pending SDP offer (buffered if received before WebRTC init)
     private SignalingMessage.SdpOffer? _pendingSdpOffer;
@@ -217,8 +244,16 @@
             @* Remote screen display (when peer is sharing) *@
             @if (_peerIsSharingScreen)
             {
-                <div class="remote-screen">
-                    <canvas id="remoteCanvas" width="1920" height="1080"></canvas>
+                <div class="remote-screen-container">
+                    <div class="remote-screen-header">
+                        <span class="remote-label">📺 Remote Screen</span>
+                        <button class="popout-btn" @onclick="OpenFullscreenViewer" title="Open in fullscreen">
+                            <span>⛶</span> Fullscreen
+                        </button>
+                    </div>
+                    <div class="remote-screen">
+                        <canvas id="remoteCanvas" width="1920" height="1080"></canvas>
+                    </div>
                 </div>
             }
             else if (!_isSharingScreen)
@@ -492,6 +527,78 @@
             Logger.LogError(ex, "Failed to stop screen sharing");
         }
         StateHasChanged();
+    }
+
+    #endregion
+
+    #region Fullscreen Viewer
+
+    private async Task OpenFullscreenViewer()
+    {
+        _isFullscreenViewer = true;
+        _canvasInitialized = false; // Reset to reinitialize on fullscreen canvas
+        StateHasChanged();
+
+        // Wait for render, then initialize fullscreen canvas
+        await Task.Delay(50);
+        try
+        {
+            await CanvasRenderer.InitializeAsync("fullscreenCanvas");
+            _canvasInitialized = true;
+
+            // Reinitialize input capture on fullscreen canvas
+            if (_inputCaptureInitialized)
+            {
+                await JSRuntime.InvokeVoidAsync("SteamViewerInput.stop");
+            }
+            _inputDotNetRef = DotNetObjectReference.Create(this);
+            var success = await JSRuntime.InvokeAsync<bool>(
+                "SteamViewerInput.initialize",
+                "fullscreenCanvas",
+                _inputDotNetRef);
+            _inputCaptureInitialized = success;
+
+            Logger.LogInformation("Fullscreen viewer opened");
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Failed to initialize fullscreen canvas");
+        }
+    }
+
+    private async Task CloseFullscreenViewer()
+    {
+        _isFullscreenViewer = false;
+        _canvasInitialized = false; // Reset to reinitialize on regular canvas
+        StateHasChanged();
+
+        // Reinitialize on regular canvas if peer is still sharing
+        if (_peerIsSharingScreen)
+        {
+            await Task.Delay(50);
+            try
+            {
+                await CanvasRenderer.InitializeAsync("remoteCanvas");
+                _canvasInitialized = true;
+
+                if (_inputCaptureInitialized)
+                {
+                    await JSRuntime.InvokeVoidAsync("SteamViewerInput.stop");
+                }
+                _inputDotNetRef = DotNetObjectReference.Create(this);
+                var success = await JSRuntime.InvokeAsync<bool>(
+                    "SteamViewerInput.initialize",
+                    "remoteCanvas",
+                    _inputDotNetRef);
+                _inputCaptureInitialized = success;
+
+                Logger.LogInformation("Returned to normal view");
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError(ex, "Failed to reinitialize canvas after exiting fullscreen");
+            }
+        }
     }
 
     #endregion
@@ -872,6 +979,7 @@
                         await InvokeAsync(() =>
                         {
                             _peerIsSharingScreen = false;
+                            _isFullscreenViewer = false; // Exit fullscreen when peer stops
                             _canvasInitialized = false; // Reset canvas for next share
                             StateHasChanged();
                         });
@@ -1503,5 +1611,144 @@
 
     .session-toolbar .toolbar-btn.disconnect:hover {
         background: rgba(243, 139, 168, 0.15);
+    }
+
+    /* Remote screen container with header */
+    .remote-screen-container {
+        background: #1e1e2e;
+        border-radius: 12px;
+        overflow: hidden;
+        border: 1px solid #45475a;
+        margin: 1rem 0;
+    }
+
+    .remote-screen-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 0.75rem 1rem;
+        background: #313244;
+        border-bottom: 1px solid #45475a;
+    }
+
+    .remote-label {
+        color: #a6e3a1;
+        font-weight: 500;
+    }
+
+    .popout-btn {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.5rem;
+        padding: 0.5rem 1rem;
+        background: #45475a;
+        border: 1px solid #585b70;
+        border-radius: 6px;
+        color: #cdd6f4;
+        font-size: 0.875rem;
+        cursor: pointer;
+        transition: all 0.2s;
+    }
+
+    .popout-btn:hover {
+        background: #585b70;
+        border-color: #89b4fa;
+        color: #89b4fa;
+    }
+
+    /* Fullscreen viewer overlay */
+    .fullscreen-viewer {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: #000;
+        z-index: 9999;
+        display: flex;
+        flex-direction: column;
+    }
+
+    .fullscreen-toolbar {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 0.5rem 1rem;
+        background: rgba(30, 30, 46, 0.95);
+        border-bottom: 1px solid #45475a;
+        opacity: 0.3;
+        transition: opacity 0.3s;
+    }
+
+    .fullscreen-toolbar:hover {
+        opacity: 1;
+    }
+
+    .toolbar-left,
+    .toolbar-center,
+    .toolbar-right {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+    }
+
+    .toolbar-left {
+        flex: 1;
+    }
+
+    .toolbar-center {
+        flex: 2;
+        justify-content: center;
+    }
+
+    .toolbar-right {
+        flex: 1;
+        justify-content: flex-end;
+    }
+
+    .connection-indicator {
+        font-size: 0.875rem;
+        color: #a6e3a1;
+    }
+
+    .peer-info {
+        font-size: 1rem;
+        color: #cdd6f4;
+        font-weight: 500;
+    }
+
+    .fs-toolbar-btn {
+        width: 36px;
+        height: 36px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: #45475a;
+        border: 1px solid #585b70;
+        border-radius: 6px;
+        color: #cdd6f4;
+        font-size: 1.1rem;
+        cursor: pointer;
+        transition: all 0.2s;
+    }
+
+    .fs-toolbar-btn:hover {
+        background: #585b70;
+        border-color: #89b4fa;
+    }
+
+    .fullscreen-canvas-container {
+        flex: 1;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        overflow: hidden;
+        background: #11111b;
+    }
+
+    .fullscreen-canvas-container canvas {
+        max-width: 100%;
+        max-height: 100%;
+        object-fit: contain;
     }
 </style>
