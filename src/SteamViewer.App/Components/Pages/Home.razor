@@ -26,7 +26,7 @@
     @if (currentMode == AppMode.Select)
     {
         <div class="mode-select">
-            <h1>SteamViewer</h1>
+            <img src="images/logo.png" alt="SteamViewer" class="app-logo" />
             <p class="subtitle">Secure Remote Desktop</p>
 
             <div class="mode-buttons">
@@ -144,7 +144,7 @@
 </div>
 
 @code {
-    private const string Version = "0.0.0";
+    private const string Version = "0.0.1";
 
     private enum AppMode { Select, StartConnection, JoinConnection }
 
@@ -1097,6 +1097,12 @@
         color: #6c7086;
         font-family: monospace;
         z-index: 1000;
+    }
+
+    .app-logo {
+        max-width: 280px;
+        height: auto;
+        margin-bottom: 1rem;
     }
 
     .container {
