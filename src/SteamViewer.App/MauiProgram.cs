@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using SteamViewer.Client.Core.Capture;
 using SteamViewer.Client.Core.Network;
@@ -27,10 +28,9 @@ public static class MauiProgram
         builder.Logging.SetMinimumLevel(LogLevel.Debug);
 #endif
 
-        // Get signaling server URL from environment variable or use default
-        // Set STEAMVIEWER_SERVER env var to override (e.g., "wss://steamviewer-signaling.onrender.com/ws")
-        var serverUrl = Environment.GetEnvironmentVariable("STEAMVIEWER_SERVER")
-                        ?? "ws://localhost:8080/ws";
+        // Load server URL from appsettings.json
+        // Edit appsettings.json to change the signaling server
+        var serverUrl = GetSignalingServerUrl();
 
 #if DEBUG
         Console.WriteLine($"Signaling server URL: {serverUrl}");
@@ -71,5 +71,38 @@ public static class MauiProgram
 #endif
 
         return builder.Build();
+    }
+
+    private static string GetSignalingServerUrl()
+    {
+        // Try to load from appsettings.json
+        try
+        {
+            var appDir = AppContext.BaseDirectory;
+            var configPath = Path.Combine(appDir, "appsettings.json");
+
+            if (File.Exists(configPath))
+            {
+                var config = new ConfigurationBuilder()
+                    .AddJsonFile(configPath, optional: true)
+                    .Build();
+
+                var serverUrl = config["SignalingServer"];
+                if (!string.IsNullOrEmpty(serverUrl))
+                {
+                    return serverUrl;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+#if DEBUG
+            Console.WriteLine($"Warning: Could not load appsettings.json: {ex.Message}");
+#endif
+        }
+
+        // Fallback to environment variable or default
+        return Environment.GetEnvironmentVariable("STEAMVIEWER_SERVER")
+               ?? "ws://localhost:8080/ws";
     }
 }
