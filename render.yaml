@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: steamviewer-signaling
+    runtime: docker
+    repo: https://github.com/Paelsmoessan/SteamViewer.NET.git
+    region: frankfurt
+    plan: free
+    branch: main
+    dockerfilePath: ./src/SteamViewer.Server/Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    envVars:
+      - key: ASPNETCORE_ENVIRONMENT
+        value: Production

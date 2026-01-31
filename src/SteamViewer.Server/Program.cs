@@ -3,8 +3,9 @@ using SteamViewer.Server.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// Configure to listen on port 8080
-builder.WebHost.UseUrls("http://0.0.0.0:8080");
+// Configure port - use PORT env var (for Render/Railway) or default to 8080
+var port = Environment.GetEnvironmentVariable("PORT") ?? "8080";
+builder.WebHost.UseUrls($"http://0.0.0.0:{port}");
 
 // Add services
 builder.Services.AddSingleton<ClientRegistry>();
@@ -40,7 +41,6 @@ app.Map("/ws", async (HttpContext context, SignalingHandler handler) =>
 
 // Log startup
 var logger = app.Services.GetRequiredService<ILogger<Program>>();
-var urls = builder.Configuration["ASPNETCORE_URLS"] ?? "http://0.0.0.0:8080";
-logger.LogInformation("SteamViewer Signaling Server starting on {Urls}", urls);
+logger.LogInformation("SteamViewer Signaling Server starting on port {Port}", port);
 
 app.Run();

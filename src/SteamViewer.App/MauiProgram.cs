@@ -27,11 +27,20 @@ public static class MauiProgram
         builder.Logging.SetMinimumLevel(LogLevel.Debug);
 #endif
 
+        // Get signaling server URL from environment variable or use default
+        // Set STEAMVIEWER_SERVER env var to override (e.g., "wss://steamviewer-signaling.onrender.com/ws")
+        var serverUrl = Environment.GetEnvironmentVariable("STEAMVIEWER_SERVER")
+                        ?? "ws://localhost:8080/ws";
+
+#if DEBUG
+        Console.WriteLine($"Signaling server URL: {serverUrl}");
+#endif
+
         // Register platform-agnostic services
         builder.Services.AddSingleton(sp =>
         {
             var logger = sp.GetRequiredService<ILogger<SignalingClient>>();
-            return new SignalingClient("ws://Media-PC:8080/ws", logger);
+            return new SignalingClient(serverUrl, logger);
         });
 
         // Register SessionManager
@@ -39,7 +48,7 @@ public static class MauiProgram
         {
             var config = new SessionConfig
             {
-                SignalingServerUrl = "ws://Media-PC:8080/ws",
+                SignalingServerUrl = serverUrl,
                 TargetFps = 30,
                 VideoBitrate = 4_000_000
             };
