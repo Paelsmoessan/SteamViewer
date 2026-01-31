@@ -17,28 +17,47 @@ window.SteamViewerWebRTC = {
                 { urls: 'stun:stun.l.google.com:19302' },
                 { urls: 'stun:stun1.l.google.com:19302' },
                 { urls: 'stun:stun2.l.google.com:19302' },
-                // Free TURN servers from Open Relay Project (metered.ca)
-                // These are needed for symmetric NAT traversal over internet
+                { urls: 'stun:freestun.net:3478' },
+                // Free TURN servers for NAT traversal over internet
+                // FreeTURN - community shared
                 {
-                    urls: 'turn:a.relay.metered.ca:80',
-                    username: 'e8dd65a92c8f3d5a5c6b8e0a',
-                    credential: 'uWdWNmkhvyqTW1hQ'
+                    urls: 'turn:freestun.net:3478',
+                    username: 'free',
+                    credential: 'free'
                 },
                 {
-                    urls: 'turn:a.relay.metered.ca:443',
-                    username: 'e8dd65a92c8f3d5a5c6b8e0a',
-                    credential: 'uWdWNmkhvyqTW1hQ'
+                    urls: 'turns:freestun.net:5350',
+                    username: 'free',
+                    credential: 'free'
+                },
+                // ExpressTURN - free tier (1000GB/month)
+                {
+                    urls: 'turn:relay1.expressturn.com:3478',
+                    username: 'efFW1GXRLY8FD0ZJVQ',
+                    credential: 'yeCQQq8kTi5oTvgm'
+                },
+                // OpenRelay fallback
+                {
+                    urls: 'turn:openrelay.metered.ca:80',
+                    username: 'openrelayproject',
+                    credential: 'openrelayproject'
                 },
                 {
-                    urls: 'turn:a.relay.metered.ca:443?transport=tcp',
-                    username: 'e8dd65a92c8f3d5a5c6b8e0a',
-                    credential: 'uWdWNmkhvyqTW1hQ'
+                    urls: 'turn:openrelay.metered.ca:443',
+                    username: 'openrelayproject',
+                    credential: 'openrelayproject'
+                },
+                {
+                    urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+                    username: 'openrelayproject',
+                    credential: 'openrelayproject'
                 }
             ],
-            // Prefer UDP for lower latency
+            // Aggressive ICE gathering
             iceCandidatePoolSize: 10,
             bundlePolicy: 'max-bundle',
-            rtcpMuxPolicy: 'require'
+            rtcpMuxPolicy: 'require',
+            iceTransportPolicy: 'all'  // Try all candidates including relay
         };
 
         try {

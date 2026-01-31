@@ -25,7 +25,10 @@ public static class MauiProgram
         builder.Services.AddBlazorWebViewDeveloperTools();
         builder.Logging.AddDebug();
         builder.Logging.AddConsole();
-        builder.Logging.SetMinimumLevel(LogLevel.Debug);
+        // Maximum verbosity for debugging - shows EVERYTHING
+        builder.Logging.SetMinimumLevel(LogLevel.Trace);
+        builder.Logging.AddFilter("SteamViewer", LogLevel.Trace);
+        builder.Logging.AddFilter("Microsoft.AspNetCore", LogLevel.Warning); // Reduce noise from Blazor
 #endif
 
         // Load server URL from appsettings.json

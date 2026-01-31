@@ -353,7 +353,28 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
     [JSInvokable]
     public async Task OnIceCandidateCallback(string candidateJson)
     {
-        _logger.LogDebug("ICE candidate gathered");
+        // Parse candidate type for logging (host, srflx, relay)
+        var candidateType = "unknown";
+        try
+        {
+            var json = System.Text.Json.JsonDocument.Parse(candidateJson);
+            if (json.RootElement.TryGetProperty("candidate", out var candidateProp))
+            {
+                var candidate = candidateProp.GetString() ?? "";
+                var match = System.Text.RegularExpressions.Regex.Match(candidate, @"typ (\w+)");
+                if (match.Success)
+                {
+                    candidateType = match.Groups[1].Value;
+                }
+            }
+        }
+        catch { }
+
+        // Log with type - RELAY means TURN server is working!
+        _logger.LogInformation("ICE candidate gathered: {Type} {Preview}",
+            candidateType.ToUpperInvariant(),
+            candidateType == "relay" ? "✓ TURN WORKING" : "");
+
         if (OnIceCandidate != null)
         {
             await OnIceCandidate.Invoke(candidateJson);
