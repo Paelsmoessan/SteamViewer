@@ -16,7 +16,7 @@ public sealed class SignalingClient : IAsyncDisposable
     private ClientWebSocket? _webSocket;
     private CancellationTokenSource? _cts;
     private Task? _receiveTask;
-    private readonly Channel<SignalingMessage> _incomingMessages;
+    private Channel<SignalingMessage> _incomingMessages;
 
     /// <summary>
     /// Event raised when a message is received from the server.
@@ -54,10 +54,19 @@ public sealed class SignalingClient : IAsyncDisposable
     /// </summary>
     public async Task ConnectAsync(CancellationToken cancellationToken = default)
     {
+        // Clean up any existing connection first (allows reconnection)
         if (_webSocket != null)
         {
-            throw new InvalidOperationException("Already connected");
+            _logger.LogInformation("Cleaning up previous connection before reconnecting");
+            await DisposeInternalAsync();
         }
+
+        // Recreate the channel for the new connection (previous channel was completed)
+        _incomingMessages = Channel.CreateUnbounded<SignalingMessage>(new UnboundedChannelOptions
+        {
+            SingleReader = true,
+            SingleWriter = true
+        });
 
         _webSocket = new ClientWebSocket();
         _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
