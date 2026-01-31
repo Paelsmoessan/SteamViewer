@@ -125,12 +125,12 @@
             }
             else if (connectionState == ConnectionState.Connected)
             {
-                <div class="remote-screen">
+                <div class="remote-screen-fullscreen">
                     <canvas id="remoteCanvas" width="1920" height="1080"></canvas>
-                </div>
-                <div class="connected-actions">
-                    <button class="secondary-btn" @onclick="ShowTransfersDialog">Transfers</button>
-                    <button class="secondary-btn" @onclick="Disconnect">Disconnect</button>
+                    <div class="viewer-toolbar">
+                        <button class="toolbar-btn" @onclick="ShowTransfersDialog">📁 Transfers</button>
+                        <button class="toolbar-btn" @onclick="Disconnect">⏏ Disconnect</button>
+                    </div>
                 </div>
             }
 
@@ -618,7 +618,12 @@
         try
         {
             var json = System.Text.Json.JsonSerializer.Serialize(inputEvent);
-            await _webrtc!.SendDataAsync(json);
+            Logger.LogDebug("Sending input: {Json}, DataChannel open: {IsOpen}", json, _webrtc?.IsDataChannelOpen);
+            var sent = await _webrtc!.SendDataAsync(json);
+            if (!sent)
+            {
+                Logger.LogWarning("Failed to send input - data channel not ready");
+            }
         }
         catch (Exception ex)
         {
@@ -636,6 +641,7 @@
 
         try
         {
+            Logger.LogDebug("Received input message: {Json}", json);
             var inputEvent = JsonSerializer.Deserialize<InputEvent>(json);
             if (inputEvent != null)
             {
@@ -643,13 +649,14 @@
                 int screenWidth = 1920;
                 int screenHeight = 1080;
 
+                Logger.LogDebug("Injecting input: {Type} at screen {Width}x{Height}", inputEvent.GetType().Name, screenWidth, screenHeight);
                 // Inject the input
                 InputInjector.InjectInput(inputEvent, screenWidth, screenHeight);
             }
         }
         catch (Exception ex)
         {
-            Logger.LogWarning(ex, "Failed to process input message");
+            Logger.LogWarning(ex, "Failed to process input message: {Json}", json);
         }
 
         await Task.CompletedTask;
@@ -780,6 +787,13 @@
             {
                 await SignalingClient.SendIceCandidateAsync(connectedPeerId, candidate.candidate, candidate.sdpMid, (ushort?)candidate.sdpMLineIndex);
             }
+        };
+
+        // Subscribe to data channel open (for input sending)
+        _webrtc.OnDataChannelOpen += async () =>
+        {
+            Logger.LogInformation("Viewer data channel opened - input can now be sent");
+            await Task.CompletedTask;
         };
 
         await _webrtc.InitializeAsync();
@@ -1067,6 +1081,56 @@
         display: block;
         max-width: 100%;
         height: auto;
+    }
+
+    .remote-screen-fullscreen {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: #000;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 100;
+    }
+
+    .remote-screen-fullscreen canvas {
+        max-width: 100%;
+        max-height: 100%;
+        object-fit: contain;
+    }
+
+    .viewer-toolbar {
+        position: fixed;
+        top: 10px;
+        left: 10px;
+        display: flex;
+        gap: 8px;
+        z-index: 101;
+        opacity: 0.3;
+        transition: opacity 0.2s;
+    }
+
+    .viewer-toolbar:hover {
+        opacity: 1;
+    }
+
+    .toolbar-btn {
+        background: rgba(49, 50, 68, 0.9);
+        color: #cdd6f4;
+        border: 1px solid #45475a;
+        padding: 8px 16px;
+        border-radius: 6px;
+        font-size: 0.875rem;
+        cursor: pointer;
+        backdrop-filter: blur(4px);
+    }
+
+    .toolbar-btn:hover {
+        background: rgba(69, 71, 90, 0.9);
+        border-color: #89b4fa;
     }
 
     .connected-actions {
