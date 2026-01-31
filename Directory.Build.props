@@ -1,0 +1,13 @@
+<Project>
+  <PropertyGroup>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+    <Authors>SteamViewer Team</Authors>
+    <Company>SteamViewer</Company>
+    <Product>SteamViewer</Product>
+    <Copyright>Copyright (c) 2024-2026</Copyright>
+  </PropertyGroup>
+</Project>

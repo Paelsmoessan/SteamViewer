@@ -1,0 +1,30 @@
+# AI assistant context (private)
+.AI.md
+
+# Build outputs
+bin/
+obj/
+out/
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+
+# JetBrains Rider
+.idea/
+
+# NuGet
+packages/
+*.nupkg
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Logs
+*.log
+
+# Temp files
+*.tmp
+nul

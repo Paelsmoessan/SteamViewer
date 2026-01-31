@@ -1,0 +1,807 @@
+@page "/"
+@using SteamViewer.Client.Core.Capture
+@using SteamViewer.Client.Core.FileTransfer
+@using SteamViewer.Client.Core.Network
+@using SteamViewer.Client.Core.Session
+@using SteamViewer.App.Services
+@using SteamViewer.App.Components.FileTransfer
+@using Blake3
+@using System.Text
+@implements IAsyncDisposable
+@inject SignalingClient SignalingClient
+@inject SessionManager SessionManager
+@inject CanvasRenderingService CanvasRenderer
+@inject ILogger<Home> Logger
+
+<div class="container">
+    @if (currentMode == AppMode.Select)
+    {
+        <div class="mode-select">
+            <h1>SteamViewer</h1>
+            <p class="subtitle">Secure Remote Desktop</p>
+
+            <div class="mode-buttons">
+                <button class="mode-btn host-btn" @onclick="SelectHostMode">
+                    <span class="icon">🖥️</span>
+                    <span class="label">Host</span>
+                    <span class="desc">Share your screen</span>
+                </button>
+
+                <button class="mode-btn viewer-btn" @onclick="SelectViewerMode">
+                    <span class="icon">👁️</span>
+                    <span class="label">Viewer</span>
+                    <span class="desc">Connect to a host</span>
+                </button>
+            </div>
+        </div>
+    }
+    else if (currentMode == AppMode.Host)
+    {
+        <div class="host-view">
+            <button class="back-btn" @onclick="GoBack">← Back</button>
+
+            <h2>Host Mode</h2>
+
+            @if (connectionState == ConnectionState.Idle)
+            {
+                <p>Click "Start Hosting" to begin sharing your screen.</p>
+                <button class="primary-btn" @onclick="StartHosting">Start Hosting</button>
+            }
+            else if (connectionState == ConnectionState.Registering)
+            {
+                <p>Connecting to server...</p>
+                <div class="spinner"></div>
+            }
+            else if (connectionState == ConnectionState.Registered)
+            {
+                <div class="credentials">
+                    <div class="credential-item">
+                        <label>Your ID</label>
+                        <div class="value">@clientId</div>
+                    </div>
+                    <div class="credential-item">
+                        <label>Password</label>
+                        <div class="value">@password</div>
+                    </div>
+                </div>
+                <p class="status">Waiting for connections...</p>
+                <button class="secondary-btn" @onclick="StopHosting">Stop Hosting</button>
+            }
+            else if (connectionState == ConnectionState.Connecting)
+            {
+                <p>Incoming connection from @incomingPeerId</p>
+                <div class="connection-prompt">
+                    <button class="primary-btn" @onclick="AcceptConnection">Accept</button>
+                    <button class="secondary-btn" @onclick="RejectConnection">Reject</button>
+                </div>
+            }
+            else if (connectionState == ConnectionState.Connected)
+            {
+                <p class="status connected">Connected to @connectedPeerId</p>
+                <div class="connected-actions">
+                    <button class="secondary-btn" @onclick="ShowTransfersDialog">Transfers</button>
+                    <button class="secondary-btn" @onclick="Disconnect">Disconnect</button>
+                </div>
+            }
+
+            @if (!string.IsNullOrEmpty(errorMessage))
+            {
+                <div class="error">@errorMessage</div>
+            }
+        </div>
+    }
+    else if (currentMode == AppMode.Viewer)
+    {
+        <div class="viewer-view">
+            <button class="back-btn" @onclick="GoBack">← Back</button>
+
+            <h2>Viewer Mode</h2>
+
+            @if (connectionState == ConnectionState.Idle || connectionState == ConnectionState.Registered)
+            {
+                <div class="connect-form">
+                    <div class="input-group">
+                        <label>Host ID</label>
+                        <input type="text" @bind="targetId" placeholder="Enter 9-digit ID" maxlength="9" />
+                    </div>
+                    <div class="input-group">
+                        <label>Password</label>
+                        <input type="password" @bind="targetPassword" placeholder="Enter password" />
+                    </div>
+                    <button class="primary-btn" @onclick="ConnectToHost" disabled="@(string.IsNullOrWhiteSpace(targetId) || string.IsNullOrWhiteSpace(targetPassword))">
+                        Connect
+                    </button>
+                </div>
+            }
+            else if (connectionState == ConnectionState.Connecting)
+            {
+                <p>Connecting to @targetId...</p>
+                <div class="spinner"></div>
+            }
+            else if (connectionState == ConnectionState.Connected)
+            {
+                <div class="remote-screen">
+                    <canvas id="remoteCanvas" width="1920" height="1080"></canvas>
+                </div>
+                <div class="connected-actions">
+                    <button class="secondary-btn" @onclick="ShowTransfersDialog">Transfers</button>
+                    <button class="secondary-btn" @onclick="Disconnect">Disconnect</button>
+                </div>
+            }
+
+            @if (!string.IsNullOrEmpty(errorMessage))
+            {
+                <div class="error">@errorMessage</div>
+            }
+        </div>
+    }
+
+    <FileTransferDialog
+        IsVisible="@_showFileTransferDialog"
+        Mode="@_fileDialogMode"
+        PendingTransfer="@_pendingFileTransfer"
+        Transfers="@SessionManager.ActiveTransfers"
+        OnClose="@CloseFileTransferDialog"
+        OnAccept="@AcceptFileTransfer"
+        OnReject="@RejectFileTransfer"
+        OnCancel="@CancelFileTransfer" />
+</div>
+
+@code {
+    private enum AppMode { Select, Host, Viewer }
+
+    private AppMode currentMode = AppMode.Select;
+    private ConnectionState connectionState = ConnectionState.Idle;
+
+    // Host mode state
+    private string clientId = "";
+    private string password = "";
+    private string incomingPeerId = "";
+    private string connectedPeerId = "";
+
+    // Viewer mode state
+#if DEBUG
+    private string targetId = "123456789";  // Pre-filled for testing
+    private string targetPassword = "TESTPASS";
+#else
+    private string targetId = "";
+    private string targetPassword = "";
+#endif
+
+    private string errorMessage = "";
+    private bool _canvasInitialized;
+    private bool _isRendering;
+
+    // File transfer state
+    private bool _showFileTransferDialog;
+    private FileTransferDialog.DialogMode _fileDialogMode;
+    private FileTransferState? _pendingFileTransfer;
+
+    protected override void OnInitialized()
+    {
+        SignalingClient.OnMessageReceived += HandleMessage;
+        SignalingClient.OnDisconnected += HandleDisconnected;
+        SignalingClient.OnError += HandleError;
+        SessionManager.VideoFrameDecoded += OnVideoFrameDecoded;
+        SessionManager.IncomingFileTransfer += OnIncomingFileTransfer;
+        SessionManager.FileTransferProgress += OnFileTransferProgress;
+        SessionManager.FileTransferCompleted += OnFileTransferCompleted;
+        SessionManager.FileTransferFailed += OnFileTransferFailed;
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        // Initialize canvas when viewer is connected
+        if (currentMode == AppMode.Viewer &&
+            connectionState == ConnectionState.Connected &&
+            !_canvasInitialized)
+        {
+            try
+            {
+                await CanvasRenderer.InitializeAsync("remoteCanvas");
+                _canvasInitialized = true;
+                Logger.LogInformation("Canvas initialized for video rendering");
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError(ex, "Failed to initialize canvas");
+            }
+        }
+    }
+
+    private void OnVideoFrameDecoded(object? sender, DecodedFrame frame)
+    {
+        if (!_canvasInitialized || _isRendering)
+        {
+            return;
+        }
+
+        _ = InvokeAsync(async () =>
+        {
+            try
+            {
+                _isRendering = true;
+                await CanvasRenderer.RenderFrameAsync(frame);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning(ex, "Failed to render video frame");
+            }
+            finally
+            {
+                _isRendering = false;
+            }
+        });
+    }
+
+    #region File Transfer Handlers
+
+    private void OnIncomingFileTransfer(object? sender, FileTransferState state)
+    {
+        InvokeAsync(() =>
+        {
+            _pendingFileTransfer = state;
+            _fileDialogMode = FileTransferDialog.DialogMode.IncomingRequest;
+            _showFileTransferDialog = true;
+            StateHasChanged();
+        });
+    }
+
+    private void OnFileTransferProgress(object? sender, FileTransferState state)
+    {
+        InvokeAsync(StateHasChanged);
+    }
+
+    private void OnFileTransferCompleted(object? sender, FileTransferState state)
+    {
+        InvokeAsync(() =>
+        {
+            Logger.LogInformation("File transfer completed: {Filename}", state.Filename);
+            StateHasChanged();
+        });
+    }
+
+    private void OnFileTransferFailed(object? sender, FileTransferState state)
+    {
+        InvokeAsync(() =>
+        {
+            Logger.LogWarning("File transfer failed: {Filename} - {Error}", state.Filename, state.ErrorMessage);
+            StateHasChanged();
+        });
+    }
+
+    private void ShowTransfersDialog()
+    {
+        _fileDialogMode = FileTransferDialog.DialogMode.ActiveTransfers;
+        _showFileTransferDialog = true;
+        StateHasChanged();
+    }
+
+    private void CloseFileTransferDialog()
+    {
+        _showFileTransferDialog = false;
+        _pendingFileTransfer = null;
+        StateHasChanged();
+    }
+
+    private async Task AcceptFileTransfer((Guid TransferId, string SavePath) args)
+    {
+        try
+        {
+            await SessionManager.AcceptFileTransferAsync(args.TransferId, args.SavePath);
+            _showFileTransferDialog = false;
+            _pendingFileTransfer = null;
+            // Show active transfers dialog
+            _fileDialogMode = FileTransferDialog.DialogMode.ActiveTransfers;
+            _showFileTransferDialog = true;
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Failed to accept file transfer");
+            errorMessage = ex.Message;
+        }
+        StateHasChanged();
+    }
+
+    private async Task RejectFileTransfer(Guid transferId)
+    {
+        try
+        {
+            await SessionManager.RejectFileTransferAsync(transferId);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Failed to reject file transfer");
+        }
+        _showFileTransferDialog = false;
+        _pendingFileTransfer = null;
+        StateHasChanged();
+    }
+
+    private async Task CancelFileTransfer(Guid transferId)
+    {
+        try
+        {
+            await SessionManager.CancelFileTransferAsync(transferId);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Failed to cancel file transfer");
+        }
+        StateHasChanged();
+    }
+
+    #endregion
+
+    private void SelectHostMode()
+    {
+        currentMode = AppMode.Host;
+        StateHasChanged();
+    }
+
+    private void SelectViewerMode()
+    {
+        currentMode = AppMode.Viewer;
+        StateHasChanged();
+    }
+
+    private async Task GoBack()
+    {
+        await StopHosting();
+        _canvasInitialized = false;
+        currentMode = AppMode.Select;
+        connectionState = ConnectionState.Idle;
+        errorMessage = "";
+        StateHasChanged();
+    }
+
+    private async Task StartHosting()
+    {
+        try
+        {
+            connectionState = ConnectionState.Registering;
+            errorMessage = "";
+            StateHasChanged();
+
+            await SignalingClient.ConnectAsync();
+
+#if DEBUG
+            // Use predetermined credentials for testing
+            clientId = "123456789";
+            password = "TESTPASS";
+            Logger.LogInformation("DEBUG MODE: Using test credentials - ID: {Id}, Password: {Pass}", clientId, password);
+#else
+            // Generate 9-digit client ID
+            clientId = new Random().Next(100000000, 999999999).ToString();
+
+            // Generate random password
+            password = Guid.NewGuid().ToString("N")[..8].ToUpperInvariant();
+#endif
+
+            // Hash password for registration
+            var passwordHash = Convert.ToHexString(
+                Hasher.Hash(Encoding.UTF8.GetBytes(password)).AsSpan()
+            ).ToLowerInvariant();
+
+            var success = await SignalingClient.RegisterAsync(clientId, passwordHash);
+
+            if (success)
+            {
+                connectionState = ConnectionState.Registered;
+            }
+            else
+            {
+                connectionState = ConnectionState.Error;
+                errorMessage = "Failed to register with server";
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Failed to start hosting");
+            connectionState = ConnectionState.Error;
+            errorMessage = ex.Message;
+        }
+
+        StateHasChanged();
+    }
+
+    private async Task StopHosting()
+    {
+        try
+        {
+            await SignalingClient.DisconnectAsync();
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Error during disconnect");
+        }
+
+        connectionState = ConnectionState.Idle;
+        clientId = "";
+        password = "";
+        StateHasChanged();
+    }
+
+    private async Task ConnectToHost()
+    {
+        try
+        {
+            connectionState = ConnectionState.Connecting;
+            errorMessage = "";
+            StateHasChanged();
+
+            if (!SignalingClient.IsConnected)
+            {
+                await SignalingClient.ConnectAsync();
+
+                // Register as viewer with a random ID
+                var viewerId = new Random().Next(100000000, 999999999).ToString();
+                var viewerPasswordHash = Convert.ToHexString(
+                    Hasher.Hash(Encoding.UTF8.GetBytes(Guid.NewGuid().ToString())).AsSpan()
+                ).ToLowerInvariant();
+
+                await SignalingClient.RegisterAsync(viewerId, viewerPasswordHash);
+            }
+
+            await SignalingClient.RequestConnectionAsync(targetId, targetPassword);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Failed to connect to host");
+            connectionState = ConnectionState.Error;
+            errorMessage = ex.Message;
+            StateHasChanged();
+        }
+    }
+
+    private async Task AcceptConnection()
+    {
+        await SignalingClient.RespondToConnectionAsync(incomingPeerId, true);
+        connectedPeerId = incomingPeerId;
+        connectionState = ConnectionState.Connected;
+        StateHasChanged();
+    }
+
+    private async Task RejectConnection()
+    {
+        await SignalingClient.RespondToConnectionAsync(incomingPeerId, false);
+        connectionState = ConnectionState.Registered;
+        incomingPeerId = "";
+        StateHasChanged();
+    }
+
+    private async Task Disconnect()
+    {
+        if (!string.IsNullOrEmpty(connectedPeerId))
+        {
+            await SignalingClient.DisconnectFromPeerAsync(connectedPeerId);
+        }
+
+        connectedPeerId = "";
+        _canvasInitialized = false;
+
+        if (currentMode == AppMode.Host)
+        {
+            connectionState = ConnectionState.Registered;
+        }
+        else
+        {
+            connectionState = ConnectionState.Idle;
+        }
+
+        StateHasChanged();
+    }
+
+    private void HandleMessage(SignalingMessage message)
+    {
+        InvokeAsync(() =>
+        {
+            switch (message)
+            {
+                case SignalingMessage.IncomingConnection incoming:
+                    incomingPeerId = incoming.FromId;
+                    connectionState = ConnectionState.Connecting;
+                    break;
+
+                case SignalingMessage.ConnectionResponse response:
+                    if (response.Approved)
+                    {
+                        connectedPeerId = response.TargetId;
+                        connectionState = ConnectionState.Connected;
+                    }
+                    else
+                    {
+                        errorMessage = "Connection rejected";
+                        connectionState = currentMode == AppMode.Host ? ConnectionState.Registered : ConnectionState.Idle;
+                    }
+                    break;
+
+                case SignalingMessage.Disconnected disconnected:
+                    connectedPeerId = "";
+                    connectionState = currentMode == AppMode.Host ? ConnectionState.Registered : ConnectionState.Idle;
+                    break;
+
+                case SignalingMessage.Error error:
+                    errorMessage = error.Message;
+                    break;
+            }
+
+            StateHasChanged();
+        });
+    }
+
+    private void HandleDisconnected(string? reason)
+    {
+        InvokeAsync(() =>
+        {
+            connectionState = ConnectionState.Disconnected;
+            errorMessage = reason ?? "Disconnected from server";
+            StateHasChanged();
+        });
+    }
+
+    private void HandleError(Exception ex)
+    {
+        InvokeAsync(() =>
+        {
+            errorMessage = ex.Message;
+            StateHasChanged();
+        });
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        SignalingClient.OnMessageReceived -= HandleMessage;
+        SignalingClient.OnDisconnected -= HandleDisconnected;
+        SignalingClient.OnError -= HandleError;
+        SessionManager.VideoFrameDecoded -= OnVideoFrameDecoded;
+        SessionManager.IncomingFileTransfer -= OnIncomingFileTransfer;
+        SessionManager.FileTransferProgress -= OnFileTransferProgress;
+        SessionManager.FileTransferCompleted -= OnFileTransferCompleted;
+        SessionManager.FileTransferFailed -= OnFileTransferFailed;
+
+        if (_canvasInitialized)
+        {
+            await CanvasRenderer.DisposeAsync();
+            _canvasInitialized = false;
+        }
+    }
+}
+
+<style>
+    .container {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        min-height: 100vh;
+        padding: 2rem;
+    }
+
+    .mode-select {
+        text-align: center;
+    }
+
+    h1 {
+        font-size: 3rem;
+        margin-bottom: 0.5rem;
+        color: #89b4fa;
+    }
+
+    h2 {
+        font-size: 1.5rem;
+        margin-bottom: 1.5rem;
+        color: #89b4fa;
+    }
+
+    .subtitle {
+        color: #6c7086;
+        margin-bottom: 3rem;
+    }
+
+    .mode-buttons {
+        display: flex;
+        gap: 2rem;
+    }
+
+    .mode-btn {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        padding: 2rem 3rem;
+        border: 2px solid #45475a;
+        border-radius: 12px;
+        background: #313244;
+        cursor: pointer;
+        transition: all 0.2s;
+    }
+
+    .mode-btn:hover {
+        border-color: #89b4fa;
+        transform: translateY(-2px);
+    }
+
+    .mode-btn .icon {
+        font-size: 3rem;
+        margin-bottom: 1rem;
+    }
+
+    .mode-btn .label {
+        font-size: 1.25rem;
+        font-weight: 600;
+        color: #cdd6f4;
+    }
+
+    .mode-btn .desc {
+        font-size: 0.875rem;
+        color: #6c7086;
+        margin-top: 0.5rem;
+    }
+
+    .back-btn {
+        align-self: flex-start;
+        background: none;
+        border: none;
+        color: #6c7086;
+        cursor: pointer;
+        font-size: 1rem;
+        margin-bottom: 1rem;
+    }
+
+    .back-btn:hover {
+        color: #89b4fa;
+    }
+
+    .credentials {
+        background: #313244;
+        border-radius: 8px;
+        padding: 1.5rem;
+        margin: 1.5rem 0;
+    }
+
+    .credential-item {
+        margin-bottom: 1rem;
+    }
+
+    .credential-item:last-child {
+        margin-bottom: 0;
+    }
+
+    .credential-item label {
+        display: block;
+        font-size: 0.875rem;
+        color: #6c7086;
+        margin-bottom: 0.25rem;
+    }
+
+    .credential-item .value {
+        font-size: 1.5rem;
+        font-family: monospace;
+        color: #a6e3a1;
+        letter-spacing: 2px;
+    }
+
+    .connect-form {
+        width: 300px;
+    }
+
+    .input-group {
+        margin-bottom: 1rem;
+    }
+
+    .input-group label {
+        display: block;
+        font-size: 0.875rem;
+        color: #6c7086;
+        margin-bottom: 0.25rem;
+    }
+
+    .input-group input {
+        width: 100%;
+        padding: 0.75rem;
+        border: 2px solid #45475a;
+        border-radius: 6px;
+        background: #313244;
+        color: #cdd6f4;
+        font-size: 1rem;
+    }
+
+    .input-group input:focus {
+        outline: none;
+        border-color: #89b4fa;
+    }
+
+    .primary-btn {
+        background: #89b4fa;
+        color: #1e1e2e;
+        border: none;
+        padding: 0.75rem 2rem;
+        border-radius: 6px;
+        font-size: 1rem;
+        font-weight: 600;
+        cursor: pointer;
+        transition: background 0.2s;
+    }
+
+    .primary-btn:hover {
+        background: #b4befe;
+    }
+
+    .primary-btn:disabled {
+        background: #45475a;
+        cursor: not-allowed;
+    }
+
+    .secondary-btn {
+        background: transparent;
+        color: #cdd6f4;
+        border: 2px solid #45475a;
+        padding: 0.75rem 2rem;
+        border-radius: 6px;
+        font-size: 1rem;
+        cursor: pointer;
+        transition: all 0.2s;
+    }
+
+    .secondary-btn:hover {
+        border-color: #89b4fa;
+        color: #89b4fa;
+    }
+
+    .status {
+        color: #6c7086;
+        margin: 1rem 0;
+    }
+
+    .status.connected {
+        color: #a6e3a1;
+    }
+
+    .error {
+        background: #45475a;
+        border-left: 4px solid #f38ba8;
+        padding: 1rem;
+        margin-top: 1rem;
+        border-radius: 4px;
+        color: #f38ba8;
+    }
+
+    .spinner {
+        width: 40px;
+        height: 40px;
+        border: 3px solid #45475a;
+        border-top-color: #89b4fa;
+        border-radius: 50%;
+        animation: spin 1s linear infinite;
+        margin: 1rem auto;
+    }
+
+    @@keyframes spin {
+        to { transform: rotate(360deg); }
+    }
+
+    .connection-prompt {
+        display: flex;
+        gap: 1rem;
+        margin-top: 1rem;
+    }
+
+    .remote-screen {
+        background: #11111b;
+        border-radius: 8px;
+        overflow: hidden;
+        margin: 1rem 0;
+    }
+
+    .remote-screen canvas {
+        display: block;
+        max-width: 100%;
+        height: auto;
+    }
+
+    .connected-actions {
+        display: flex;
+        gap: 1rem;
+        margin-top: 1rem;
+    }
+</style>

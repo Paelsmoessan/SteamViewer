@@ -1,0 +1,246 @@
+@using SteamViewer.Client.Core.FileTransfer
+
+@if (IsVisible)
+{
+    <div class="file-transfer-overlay" @onclick="Close">
+        <div class="file-transfer-dialog" @onclick:stopPropagation="true">
+            <h3>@Title</h3>
+
+            @if (Mode == DialogMode.IncomingRequest && PendingTransfer != null)
+            {
+                <div class="transfer-info">
+                    <p><strong>File:</strong> @PendingTransfer.Filename</p>
+                    <p><strong>Size:</strong> @FormatSize(PendingTransfer.FileSize)</p>
+                </div>
+                <div class="dialog-actions">
+                    <button class="primary-btn" @onclick="Accept">Accept</button>
+                    <button class="secondary-btn" @onclick="Reject">Reject</button>
+                </div>
+            }
+            else if (Mode == DialogMode.ActiveTransfers)
+            {
+                @if (Transfers.Any())
+                {
+                    @foreach (var transfer in Transfers)
+                    {
+                        <div class="transfer-item">
+                            <div class="transfer-header">
+                                <span class="filename">@transfer.Filename</span>
+                                <span class="direction">@(transfer.Direction == FileTransferDirection.Sending ? "↑" : "↓")</span>
+                            </div>
+                            <div class="progress-bar">
+                                <div class="progress-fill" style="width: @transfer.ProgressPercent.ToString("F0")%"></div>
+                            </div>
+                            <div class="transfer-stats">
+                                <span>@FormatSize(transfer.BytesTransferred) / @FormatSize(transfer.FileSize)</span>
+                                <span>@FormatSpeed(transfer.SpeedBytesPerSecond)</span>
+                                @if (transfer.Status == FileTransferStatus.InProgress)
+                                {
+                                    <button class="cancel-btn" @onclick="() => Cancel(transfer.TransferId)">✕</button>
+                                }
+                            </div>
+                            @if (transfer.Status == FileTransferStatus.Failed)
+                            {
+                                <div class="error-msg">@transfer.ErrorMessage</div>
+                            }
+                        </div>
+                    }
+                }
+                else
+                {
+                    <p class="no-transfers">No active transfers</p>
+                }
+                <div class="dialog-actions">
+                    <button class="secondary-btn" @onclick="Close">Close</button>
+                </div>
+            }
+        </div>
+    </div>
+}
+
+@code {
+    public enum DialogMode { IncomingRequest, ActiveTransfers }
+
+    [Parameter] public bool IsVisible { get; set; }
+    [Parameter] public DialogMode Mode { get; set; }
+    [Parameter] public FileTransferState? PendingTransfer { get; set; }
+    [Parameter] public IEnumerable<FileTransferState> Transfers { get; set; } = [];
+    [Parameter] public EventCallback OnClose { get; set; }
+    [Parameter] public EventCallback<(Guid, string)> OnAccept { get; set; }
+    [Parameter] public EventCallback<Guid> OnReject { get; set; }
+    [Parameter] public EventCallback<Guid> OnCancel { get; set; }
+
+    private string Title => Mode == DialogMode.IncomingRequest
+        ? "Incoming File Transfer"
+        : "File Transfers";
+
+    private async Task Close() => await OnClose.InvokeAsync();
+
+    private async Task Accept()
+    {
+        if (PendingTransfer != null)
+        {
+            var savePath = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.Desktop),
+                PendingTransfer.Filename);
+            await OnAccept.InvokeAsync((PendingTransfer.TransferId, savePath));
+        }
+    }
+
+    private async Task Reject()
+    {
+        if (PendingTransfer != null)
+            await OnReject.InvokeAsync(PendingTransfer.TransferId);
+    }
+
+    private async Task Cancel(Guid transferId) => await OnCancel.InvokeAsync(transferId);
+
+    private static string FormatSize(ulong bytes)
+    {
+        string[] sizes = ["B", "KB", "MB", "GB"];
+        double size = bytes;
+        var order = 0;
+        while (size >= 1024 && order < sizes.Length - 1)
+        {
+            order++;
+            size /= 1024;
+        }
+        return $"{size:F1} {sizes[order]}";
+    }
+
+    private static string FormatSpeed(double bytesPerSecond)
+    {
+        if (bytesPerSecond <= 0) return "--";
+        return $"{FormatSize((ulong)bytesPerSecond)}/s";
+    }
+}
+
+<style>
+    .file-transfer-overlay {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: rgba(0, 0, 0, 0.7);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 1000;
+    }
+
+    .file-transfer-dialog {
+        background: #1e1e2e;
+        border-radius: 12px;
+        padding: 1.5rem;
+        min-width: 350px;
+        max-width: 500px;
+        border: 1px solid #45475a;
+    }
+
+    .file-transfer-dialog h3 {
+        margin: 0 0 1rem 0;
+        color: #89b4fa;
+    }
+
+    .transfer-info {
+        background: #313244;
+        padding: 1rem;
+        border-radius: 8px;
+        margin-bottom: 1rem;
+    }
+
+    .transfer-info p {
+        margin: 0.25rem 0;
+        color: #cdd6f4;
+    }
+
+    .dialog-actions {
+        display: flex;
+        gap: 0.5rem;
+        justify-content: flex-end;
+        margin-top: 1rem;
+    }
+
+    .transfer-item {
+        background: #313244;
+        padding: 0.75rem;
+        border-radius: 8px;
+        margin-bottom: 0.5rem;
+    }
+
+    .transfer-header {
+        display: flex;
+        justify-content: space-between;
+        margin-bottom: 0.5rem;
+    }
+
+    .filename {
+        color: #cdd6f4;
+        font-weight: 500;
+    }
+
+    .direction {
+        color: #89b4fa;
+    }
+
+    .progress-bar {
+        height: 4px;
+        background: #45475a;
+        border-radius: 2px;
+        overflow: hidden;
+    }
+
+    .progress-fill {
+        height: 100%;
+        background: #a6e3a1;
+        transition: width 0.2s;
+    }
+
+    .transfer-stats {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-top: 0.5rem;
+        font-size: 0.8rem;
+        color: #6c7086;
+    }
+
+    .cancel-btn {
+        background: none;
+        border: none;
+        color: #f38ba8;
+        cursor: pointer;
+        padding: 0.25rem;
+    }
+
+    .error-msg {
+        color: #f38ba8;
+        font-size: 0.8rem;
+        margin-top: 0.5rem;
+    }
+
+    .no-transfers {
+        color: #6c7086;
+        text-align: center;
+        padding: 1rem;
+    }
+
+    .primary-btn {
+        background: #89b4fa;
+        color: #1e1e2e;
+        border: none;
+        padding: 0.5rem 1rem;
+        border-radius: 6px;
+        cursor: pointer;
+    }
+
+    .secondary-btn {
+        background: transparent;
+        color: #cdd6f4;
+        border: 1px solid #45475a;
+        padding: 0.5rem 1rem;
+        border-radius: 6px;
+        cursor: pointer;
+    }
+</style>

@@ -1,0 +1,40 @@
+html, body {
+    margin: 0;
+    padding: 0;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+    background-color: #1e1e2e;
+    color: #cdd6f4;
+}
+
+*, *::before, *::after {
+    box-sizing: border-box;
+}
+
+#blazor-error-ui {
+    background: #f38ba8;
+    bottom: 0;
+    box-shadow: 0 -1px 2px rgba(0, 0, 0, 0.2);
+    display: none;
+    left: 0;
+    padding: 0.6rem 1.25rem 0.7rem 1.25rem;
+    position: fixed;
+    width: 100%;
+    z-index: 1000;
+}
+
+#blazor-error-ui .dismiss {
+    cursor: pointer;
+    position: absolute;
+    right: 0.75rem;
+    top: 0.5rem;
+}
+
+.blazor-error-boundary {
+    background: url(data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iNTYiIGhlaWdodD0iNDkiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyIgeG1sbnM6eGxpbms9Imh0dHA6Ly93d3cudzMub3JnLzE5OTkveGxpbmsiIG92ZXJmbG93PSJoaWRkZW4iPjxkZWZzPjxjbGlwUGF0aCBpZD0iY2xpcDAiPjxyZWN0IHg9IjIzNSIgeT0iNTEiIHdpZHRoPSI1NiIgaGVpZ2h0PSI0OSIvPjwvY2xpcFBhdGg+PC9kZWZzPjxnIGNsaXAtcGF0aD0idXJsKCNjbGlwMCkiIHRyYW5zZm9ybT0idHJhbnNsYXRlKC0yMzUgLTUxKSI+PHBhdGggZD0iTTI2My41MDYgNTFDMjY0LjcxNyA1MSAyNjUuODEzIDUxLjQ4MzcgMjY2LjYwNiA1Mi4yNjU4TDI5MC4xOCA3NS44MzkyQzI5MS44NzMgNzcuNTMxOSAyOTEuODczIDgwLjMxMzEgMjkwLjE4IDgyLjAwNThMMjY2LjYwNiA5NS41Nzc0QzI2NS44MTMgOTYuMzU5NSAyNjQuNzE3IDk2LjgzMzEgMjYzLjUwNiA5Ni44MzMxSDI1OC41Nzc0QzI1Ni4wNTk1IDk2LjgzMzEgMjU0LjI5MjkgOTYuMDU5MyAyNTMuMDM0NyA5NS4wMTcyTDI1My4wMzQ3IDk1LjAxNzJMMjc1LjU0MDMgNzUuODM5MkwyNTMuMDM0NyA1Ni42NjExTDI1My4wMzQ3IDU2LjY2MTFDMjU0LjI5MjkgNTUuNjE5IDI1Ni4wNTk1IDU0LjgzMzEgMjU4LjU3NzQgNTQuODMzMUgyNjMuNTA2WiIgZmlsbD0iI0ZGNDcwMCIvPjwvZz48L3N2Zz4=) no-repeat 1rem/1.8rem, #f38ba8;
+    padding: 1rem 1rem 1rem 3.7rem;
+    color: #1e1e2e;
+}
+
+.blazor-error-boundary::after {
+    content: "An error has occurred.";
+}
