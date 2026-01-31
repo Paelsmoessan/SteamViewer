@@ -33,7 +33,13 @@ window.SteamViewerWebRTC = {
 
             // Handle connection state changes
             this.peerConnection.onconnectionstatechange = async () => {
+                console.log('Connection state:', this.peerConnection.connectionState);
                 await this.dotNetRef.invokeMethodAsync('OnConnectionStateChangeCallback', this.peerConnection.connectionState);
+            };
+
+            // Handle ICE connection state for more debugging
+            this.peerConnection.oniceconnectionstatechange = () => {
+                console.log('ICE connection state:', this.peerConnection.iceConnectionState);
             };
 
             // Handle incoming data channels
@@ -110,6 +116,7 @@ window.SteamViewerWebRTC = {
         };
 
         channel.onmessage = async (event) => {
+            console.log('Data channel message received:', typeof event.data, event.data instanceof ArrayBuffer ? 'binary' : event.data?.substring?.(0, 50));
             if (typeof event.data === 'string') {
                 await this.dotNetRef.invokeMethodAsync('OnDataChannelMessageCallback', event.data);
             } else if (event.data instanceof ArrayBuffer) {
@@ -125,11 +132,13 @@ window.SteamViewerWebRTC = {
 
     // Send string data over data channel
     sendData(data) {
+        console.log('sendData called, dataChannel state:', this.dataChannel?.readyState);
         if (this.dataChannel && this.dataChannel.readyState === 'open') {
             this.dataChannel.send(data);
+            console.log('Data sent:', data.substring(0, 100));
             return true;
         }
-        console.warn('Data channel not open');
+        console.warn('Data channel not open, state:', this.dataChannel?.readyState);
         return false;
     },
 
@@ -237,6 +246,10 @@ window.SteamViewerWebRTC = {
 
     // Start screen capture (for host)
     async startScreenCapture() {
+        console.log('=== Starting screen capture ===');
+        console.log('navigator.mediaDevices:', !!navigator.mediaDevices);
+        console.log('getDisplayMedia:', !!navigator.mediaDevices?.getDisplayMedia);
+
         try {
             this.localStream = await navigator.mediaDevices.getDisplayMedia({
                 video: {
