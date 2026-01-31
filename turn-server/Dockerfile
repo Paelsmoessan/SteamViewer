@@ -1,16 +1,15 @@
 # Coturn TURN server for SteamViewer.NET
+# Optimized for Railway deployment (TCP only)
 FROM coturn/coturn:latest
 
 # Copy configuration
 COPY turnserver.conf /etc/turnserver.conf
 
-# Expose TURN ports
-# 3478 - STUN/TURN UDP and TCP
-# 5349 - TURN TLS
-# 49152-65535 - Relay ports (Railway only exposes main port, so we use fewer)
-EXPOSE 3478/udp
-EXPOSE 3478/tcp
-EXPOSE 5349/tcp
+# Railway provides PORT env var, default to 3478
+ENV PORT=3478
 
-# Run coturn with our config
-CMD ["turnserver", "-c", "/etc/turnserver.conf"]
+# Expose TCP port (Railway only supports TCP)
+EXPOSE 3478/tcp
+
+# Start script that uses Railway's PORT
+CMD turnserver -c /etc/turnserver.conf --listening-port=${PORT} --no-udp --no-dtls

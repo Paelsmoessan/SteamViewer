@@ -6,54 +6,55 @@ Self-hosted coturn TURN server for NAT traversal.
 - **Username**: `steamviewer`
 - **Password**: `SteamViewer2026SecureRelay!`
 
-## Deployment Options
+## Deploy to Railway (Recommended)
 
-### Option 1: VPS (Recommended)
-Best performance with full UDP support. ~$5/month from Hetzner, Vultr, or DigitalOcean.
+1. **Create new Railway project:**
+   ```bash
+   cd turn-server
+   railway login
+   railway init
+   railway up
+   ```
+
+2. **Get your Railway URL:**
+   - Go to Railway dashboard → your project → Settings → Networking
+   - Generate a public domain (e.g., `steamviewer-turn-production.up.railway.app`)
+   - Note the port (usually shown as `443` for HTTPS or the mapped port)
+
+3. **Update appsettings.json:**
+   ```json
+   {
+     "TurnServer": {
+       "Enabled": true,
+       "Urls": [
+         "turn:steamviewer-turn-production.up.railway.app:443?transport=tcp"
+       ],
+       "Username": "steamviewer",
+       "Credential": "SteamViewer2026SecureRelay!"
+     }
+   }
+   ```
+
+4. **Test the connection** - you should see `ICE candidate gathered: RELAY` in logs
+
+## Alternative: VPS (Full UDP support)
+
+For best performance with UDP, use a VPS (~$5/month):
 
 ```bash
 # On Ubuntu VPS
-sudo apt update
-sudo apt install coturn -y
-
-# Copy turnserver.conf to /etc/turnserver.conf
-# Edit to set your public IP:
-#   external-ip=YOUR_PUBLIC_IP
-
-# Enable and start
-sudo systemctl enable coturn
-sudo systemctl start coturn
-
-# Open firewall
-sudo ufw allow 3478/udp
-sudo ufw allow 3478/tcp
-sudo ufw allow 5349/tcp
-sudo ufw allow 49152:49252/udp
-```
-
-### Option 2: Docker (Local/VPS)
-```bash
-cd turn-server
-docker-compose up -d
-```
-
-### Option 3: Railway (TCP only)
-Railway doesn't support UDP well. TURN over TCP works but has higher latency.
-
-```bash
-cd turn-server
-railway up
+sudo apt update && sudo apt install coturn -y
+# Edit /etc/turnserver.conf, add: external-ip=YOUR_PUBLIC_IP
+sudo systemctl enable coturn && sudo systemctl start coturn
+sudo ufw allow 3478/udp && sudo ufw allow 3478/tcp
 ```
 
 ## Testing TURN Server
+
 Use https://webrtc.github.io/samples/src/content/peerconnection/trickle-ice/
 
-Enter:
-- TURN URI: `turn:YOUR_SERVER:3478`
+- TURN URI: `turn:YOUR_SERVER:PORT?transport=tcp`
 - Username: `steamviewer`
 - Password: `SteamViewer2026SecureRelay!`
 
 If you see "relay" candidates, it's working!
-
-## Update App Config
-After deploying, update `webrtc-interop.js` with your server URL.
