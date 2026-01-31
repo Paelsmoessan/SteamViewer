@@ -19,7 +19,9 @@
 @inject ILogger<Home> Logger
 @inject IInputInjector InputInjector
 @inject IConfiguration Configuration
+@inject FileLoggerService FileLogger
 
+<div class="version-tag">v@Version</div>
 <div class="container">
     @if (currentMode == AppMode.Select)
     {
@@ -28,42 +30,37 @@
             <p class="subtitle">Secure Remote Desktop</p>
 
             <div class="mode-buttons">
-                <button class="mode-btn host-btn" @onclick="SelectHostMode">
+                <button class="mode-btn host-btn" @onclick="SelectStartMode">
                     <span class="icon">🖥️</span>
-                    <span class="label">Host</span>
-                    <span class="desc">Share your screen</span>
+                    <span class="label">Start Session</span>
+                    <span class="desc">Share your screen with others</span>
                 </button>
 
-                <button class="mode-btn viewer-btn" @onclick="SelectViewerMode">
-                    <span class="icon">👁️</span>
-                    <span class="label">Viewer</span>
-                    <span class="desc">Connect to a host</span>
+                <button class="mode-btn viewer-btn" @onclick="SelectJoinMode">
+                    <span class="icon">🚀</span>
+                    <span class="label">Join Session</span>
+                    <span class="desc">Connect to an existing session</span>
                 </button>
             </div>
         </div>
     }
-    else if (currentMode == AppMode.Host)
+    else if (currentMode == AppMode.StartConnection)
     {
-        <div class="host-view">
+        <div class="session-view">
             <button class="back-btn" @onclick="GoBack">← Back</button>
 
-            <h2>Host Mode</h2>
+            <h2>Start Session</h2>
 
-            @if (connectionState == ConnectionState.Idle)
+            @if (connectionState == ConnectionState.Idle || connectionState == ConnectionState.Registering)
             {
-                <p>Click "Start Hosting" to begin sharing your screen.</p>
-                <button class="primary-btn" @onclick="StartHosting">Start Hosting</button>
-            }
-            else if (connectionState == ConnectionState.Registering)
-            {
-                <p>Connecting to server...</p>
+                <p>Setting up session...</p>
                 <div class="spinner"></div>
             }
             else if (connectionState == ConnectionState.Registered)
             {
                 <div class="credentials">
                     <div class="credential-item">
-                        <label>Your ID</label>
+                        <label>Session ID</label>
                         <div class="value">@clientId</div>
                     </div>
                     <div class="credential-item">
@@ -71,12 +68,12 @@
                         <div class="value">@password</div>
                     </div>
                 </div>
-                <p class="status">Waiting for connections...</p>
-                <button class="secondary-btn" @onclick="StopHosting">Stop Hosting</button>
+                <p class="status">Share these credentials with your partner</p>
+                <button class="secondary-btn" @onclick="StopSession">Cancel</button>
             }
             else if (connectionState == ConnectionState.Connecting)
             {
-                <p>Incoming connection from @incomingPeerId</p>
+                <p>Incoming connection request</p>
                 <div class="connection-prompt">
                     <button class="primary-btn" @onclick="AcceptConnection">Accept</button>
                     <button class="secondary-btn" @onclick="RejectConnection">Reject</button>
@@ -84,11 +81,8 @@
             }
             else if (connectionState == ConnectionState.Connected)
             {
-                <p class="status connected">Connected to @connectedPeerId</p>
-                <div class="connected-actions">
-                    <button class="secondary-btn" @onclick="ShowTransfersDialog">Transfers</button>
-                    <button class="secondary-btn" @onclick="Disconnect">Disconnect</button>
-                </div>
+                @* Render connected view *@
+                @RenderConnectedView()
             }
 
             @if (!string.IsNullOrEmpty(errorMessage))
@@ -97,43 +91,38 @@
             }
         </div>
     }
-    else if (currentMode == AppMode.Viewer)
+    else if (currentMode == AppMode.JoinConnection)
     {
-        <div class="viewer-view">
+        <div class="session-view">
             <button class="back-btn" @onclick="GoBack">← Back</button>
 
-            <h2>Viewer Mode</h2>
+            <h2>Join Session</h2>
 
             @if (connectionState == ConnectionState.Idle || connectionState == ConnectionState.Registered)
             {
                 <div class="connect-form">
                     <div class="input-group">
-                        <label>Host ID</label>
+                        <label>Session ID</label>
                         <input type="text" @bind="targetId" placeholder="Enter 9-digit ID" maxlength="9" />
                     </div>
                     <div class="input-group">
                         <label>Password</label>
                         <input type="password" @bind="targetPassword" placeholder="Enter password" />
                     </div>
-                    <button class="primary-btn" @onclick="ConnectToHost" disabled="@(string.IsNullOrWhiteSpace(targetId) || string.IsNullOrWhiteSpace(targetPassword))">
-                        Connect
+                    <button class="primary-btn" @onclick="JoinSession" disabled="@(string.IsNullOrWhiteSpace(targetId) || string.IsNullOrWhiteSpace(targetPassword))">
+                        Join
                     </button>
                 </div>
             }
             else if (connectionState == ConnectionState.Connecting)
             {
-                <p>Connecting to @targetId...</p>
+                <p>Connecting...</p>
                 <div class="spinner"></div>
             }
             else if (connectionState == ConnectionState.Connected)
             {
-                <div class="remote-screen-fullscreen">
-                    <canvas id="remoteCanvas" width="1920" height="1080"></canvas>
-                    <div class="viewer-toolbar">
-                        <button class="toolbar-btn" @onclick="ShowTransfersDialog">📁 Transfers</button>
-                        <button class="toolbar-btn" @onclick="Disconnect">⏏ Disconnect</button>
-                    </div>
-                </div>
+                @* Render connected view *@
+                @RenderConnectedView()
             }
 
             @if (!string.IsNullOrEmpty(errorMessage))
@@ -155,18 +144,20 @@
 </div>
 
 @code {
-    private enum AppMode { Select, Host, Viewer }
+    private const string Version = "0.0.0";
+
+    private enum AppMode { Select, StartConnection, JoinConnection }
 
     private AppMode currentMode = AppMode.Select;
     private ConnectionState connectionState = ConnectionState.Idle;
 
-    // Host mode state
+    // Session state
     private string clientId = "";
     private string password = "";
     private string incomingPeerId = "";
     private string connectedPeerId = "";
 
-    // Viewer mode state
+    // Join mode state
 #if DEBUG
     private string targetId = "123456789";  // Pre-filled for testing
     private string targetPassword = "TESTPASS";
@@ -180,14 +171,65 @@
     private bool _isRendering;
     private bool _inputCaptureInitialized;
     private DotNetObjectReference<Home>? _inputDotNetRef;
+    private DotNetObjectReference<Home>? _loggerDotNetRef;
+    private bool _jsLoggerInitialized;
 
     // WebRTC state
     private WebRTCManager? _webrtc;
+
+    // Screen sharing state
+    private bool _isSharingScreen;       // Am I sharing my screen?
+    private bool _peerIsSharingScreen;   // Is my peer sharing their screen?
 
     // File transfer state
     private bool _showFileTransferDialog;
     private FileTransferDialog.DialogMode _fileDialogMode;
     private FileTransferState? _pendingFileTransfer;
+
+    // Render the connected view (same for both Start and Join modes)
+    private RenderFragment RenderConnectedView() => __builder =>
+    {
+        <div class="connected-view">
+            <p class="status connected">Connected to peer</p>
+
+            @* Screen sharing controls *@
+            <div class="screen-share-controls">
+                @if (_isSharingScreen)
+                {
+                    <button class="share-btn sharing" @onclick="StopSharingScreen">
+                        <span class="icon">🛑</span>
+                        <span>Stop Sharing</span>
+                    </button>
+                    <p class="share-status">You are sharing your screen</p>
+                }
+                else
+                {
+                    <button class="share-btn" @onclick="StartSharingScreen">
+                        <span class="icon">🖥️</span>
+                        <span>Share My Screen</span>
+                    </button>
+                }
+            </div>
+
+            @* Remote screen display (when peer is sharing) *@
+            @if (_peerIsSharingScreen)
+            {
+                <div class="remote-screen">
+                    <canvas id="remoteCanvas" width="1920" height="1080"></canvas>
+                </div>
+            }
+            else if (!_isSharingScreen)
+            {
+                <p class="waiting-status">Waiting for screen share...</p>
+            }
+
+            @* Toolbar *@
+            <div class="session-toolbar">
+                <button class="toolbar-btn" @onclick="ShowTransfersDialog">📁 Transfers</button>
+                <button class="toolbar-btn disconnect" @onclick="Disconnect">⏏ Disconnect</button>
+            </div>
+        </div>
+    };
 
     protected override void OnInitialized()
     {
@@ -203,8 +245,24 @@
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
-        // Initialize canvas and input capture when viewer is connected
-        if (currentMode == AppMode.Viewer &&
+        // Initialize JS logger on first render
+        if (firstRender && !_jsLoggerInitialized)
+        {
+            try
+            {
+                _loggerDotNetRef = DotNetObjectReference.Create(this);
+                await JSRuntime.InvokeVoidAsync("SteamViewerLogger.initialize", _loggerDotNetRef);
+                _jsLoggerInitialized = true;
+                Logger.LogInformation("JS Logger initialized - log file: {Path}", FileLogger.LogFilePath);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning(ex, "Failed to initialize JS logger");
+            }
+        }
+
+        // Initialize canvas and input capture when peer is sharing screen
+        if (_peerIsSharingScreen &&
             connectionState == ConnectionState.Connected &&
             !_canvasInitialized)
         {
@@ -357,29 +415,85 @@
 
     #endregion
 
-    private void SelectHostMode()
+    private async Task SelectStartMode()
     {
-        currentMode = AppMode.Host;
+        currentMode = AppMode.StartConnection;
         StateHasChanged();
+        // Auto-start session immediately
+        await StartSession();
     }
 
-    private void SelectViewerMode()
+    private void SelectJoinMode()
     {
-        currentMode = AppMode.Viewer;
+        currentMode = AppMode.JoinConnection;
         StateHasChanged();
     }
 
     private async Task GoBack()
     {
-        await StopHosting();
+        await StopSession();
         _canvasInitialized = false;
+        _isSharingScreen = false;
+        _peerIsSharingScreen = false;
         currentMode = AppMode.Select;
         connectionState = ConnectionState.Idle;
         errorMessage = "";
         StateHasChanged();
     }
 
-    private async Task StartHosting()
+    #region Screen Sharing
+
+    private async Task StartSharingScreen()
+    {
+        if (_webrtc == null) return;
+
+        try
+        {
+            Logger.LogInformation("Starting screen share...");
+            var success = await _webrtc.StartScreenCaptureAsync();
+            if (success)
+            {
+                _isSharingScreen = true;
+                // Notify peer that we're sharing (via data channel)
+                await _webrtc.SendDataAsync(JsonSerializer.Serialize(new { type = "screenShareStarted" }));
+                Logger.LogInformation("Screen sharing started");
+            }
+            else
+            {
+                errorMessage = "Failed to start screen capture";
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Failed to start screen sharing");
+            errorMessage = ex.Message;
+        }
+        StateHasChanged();
+    }
+
+    private async Task StopSharingScreen()
+    {
+        if (_webrtc == null) return;
+
+        try
+        {
+            Logger.LogInformation("Stopping screen share...");
+            await _webrtc.StopScreenCaptureAsync();
+            _isSharingScreen = false;
+            // Notify peer that we stopped sharing
+            await _webrtc.SendDataAsync(JsonSerializer.Serialize(new { type = "screenShareStopped" }));
+            Logger.LogInformation("Screen sharing stopped");
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Failed to stop screen sharing");
+        }
+        StateHasChanged();
+    }
+
+    #endregion
+
+    private async Task StartSession()
     {
         try
         {
@@ -429,11 +543,16 @@
         StateHasChanged();
     }
 
-    private async Task StopHosting()
+    private async Task StopSession()
     {
         try
         {
             await SignalingClient.DisconnectAsync();
+            if (_webrtc != null)
+            {
+                await _webrtc.CloseAsync();
+                _webrtc = null;
+            }
         }
         catch (Exception ex)
         {
@@ -443,10 +562,12 @@
         connectionState = ConnectionState.Idle;
         clientId = "";
         password = "";
+        _isSharingScreen = false;
+        _peerIsSharingScreen = false;
         StateHasChanged();
     }
 
-    private async Task ConnectToHost()
+    private async Task JoinSession()
     {
         try
         {
@@ -458,20 +579,20 @@
             {
                 await SignalingClient.ConnectAsync();
 
-                // Register as viewer with a random ID
-                var viewerId = new Random().Next(100000000, 999999999).ToString();
-                var viewerPasswordHash = Convert.ToHexString(
+                // Register with a random ID (joining peer)
+                var joinerId = new Random().Next(100000000, 999999999).ToString();
+                var joinerPasswordHash = Convert.ToHexString(
                     Hasher.Hash(Encoding.UTF8.GetBytes(Guid.NewGuid().ToString())).AsSpan()
                 ).ToLowerInvariant();
 
-                await SignalingClient.RegisterAsync(viewerId, viewerPasswordHash);
+                await SignalingClient.RegisterAsync(joinerId, joinerPasswordHash);
             }
 
             await SignalingClient.RequestConnectionAsync(targetId, targetPassword);
         }
         catch (Exception ex)
         {
-            Logger.LogError(ex, "Failed to connect to host");
+            Logger.LogError(ex, "Failed to join session");
             connectionState = ConnectionState.Error;
             errorMessage = ex.Message;
             StateHasChanged();
@@ -535,6 +656,9 @@
         // Configure TURN server before WebRTC init
         await SetTurnConfigFromSettings();
 
+        // Set logger to host mode (receives logs from viewer)
+        await JSRuntime.InvokeVoidAsync("SteamViewerLogger.setMode", true);
+
         _webrtc = new WebRTCManager(JSRuntime, LoggerFactory.CreateLogger<WebRTCManager>(), clientId, SendSignalingMessage);
 
         // Subscribe to ICE candidates
@@ -547,18 +671,16 @@
             }
         };
 
-        // Subscribe to data channel messages (for receiving input from viewer)
+        // Subscribe to data channel messages (for receiving input and screen share notifications)
         _webrtc.OnDataChannelMessage += async (json) =>
         {
-            await HandleInputMessageAsync(json);
+            await HandleDataChannelMessageAsync(json);
         };
 
         await _webrtc.InitializeAsync();
         await _webrtc.CreateDataChannelAsync("data");
 
-        // Start screen capture
-        var captureStarted = await _webrtc.StartScreenCaptureAsync();
-        Logger.LogInformation("Screen capture started: {Success}", captureStarted);
+        // NOTE: Screen capture is NOT auto-started; user chooses when to share
 
         // Create and send offer
         var offer = await _webrtc.CreateOfferAsync();
@@ -572,6 +694,16 @@
     }
 
     private record IceCandidateData(string candidate, string? sdpMid, int? sdpMLineIndex);
+
+    #region JS Logger
+
+    [JSInvokable]
+    public void OnJSLog(string level, string message)
+    {
+        FileLogger.LogJS(level, message);
+    }
+
+    #endregion
 
     #region Input Event Handlers (Viewer -> Host)
 
@@ -673,7 +805,8 @@
 
     private async Task HandleInputMessageAsync(string json)
     {
-        if (currentMode != AppMode.Host) return;
+        // Only process input if we're sharing our screen (i.e., receiving remote control)
+        if (!_isSharingScreen) return;
 
         try
         {
@@ -700,6 +833,58 @@
 
     #endregion
 
+    #region Data Channel Message Handler
+
+    private async Task HandleDataChannelMessageAsync(string json)
+    {
+        try
+        {
+            // Try to parse as a control message first
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+
+            if (root.TryGetProperty("type", out var typeElement))
+            {
+                var type = typeElement.GetString();
+                switch (type)
+                {
+                    case "screenShareStarted":
+                        Logger.LogInformation("Peer started sharing their screen");
+                        await InvokeAsync(() =>
+                        {
+                            _peerIsSharingScreen = true;
+                            StateHasChanged();
+                        });
+                        return;
+
+                    case "screenShareStopped":
+                        Logger.LogInformation("Peer stopped sharing their screen");
+                        await InvokeAsync(() =>
+                        {
+                            _peerIsSharingScreen = false;
+                            _canvasInitialized = false; // Reset canvas for next share
+                            StateHasChanged();
+                        });
+                        return;
+                }
+            }
+
+            // If not a control message, treat as input event
+            await HandleInputMessageAsync(json);
+        }
+        catch (JsonException)
+        {
+            // Not JSON, might be raw data - try as input
+            await HandleInputMessageAsync(json);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Failed to handle data channel message: {Json}", json);
+        }
+    }
+
+    #endregion
+
     private async Task RejectConnection()
     {
         await SignalingClient.RespondToConnectionAsync(incomingPeerId, false);
@@ -718,7 +903,7 @@
         connectedPeerId = "";
         _canvasInitialized = false;
 
-        if (currentMode == AppMode.Host)
+        if (currentMode == AppMode.StartConnection)
         {
             connectionState = ConnectionState.Registered;
         }
@@ -753,7 +938,7 @@
                     else
                     {
                         errorMessage = "Connection rejected";
-                        connectionState = currentMode == AppMode.Host ? ConnectionState.Registered : ConnectionState.Idle;
+                        connectionState = currentMode == AppMode.StartConnection ? ConnectionState.Registered : ConnectionState.Idle;
                     }
                     break;
 
@@ -792,7 +977,9 @@
 
                 case SignalingMessage.Disconnected disconnected:
                     connectedPeerId = "";
-                    connectionState = currentMode == AppMode.Host ? ConnectionState.Registered : ConnectionState.Idle;
+                    connectionState = currentMode == AppMode.StartConnection ? ConnectionState.Registered : ConnectionState.Idle;
+                    _isSharingScreen = false;
+                    _peerIsSharingScreen = false;
                     if (_webrtc != null)
                     {
                         await _webrtc.CloseAsync();
@@ -816,6 +1003,9 @@
         // Configure TURN server before WebRTC init
         await SetTurnConfigFromSettings();
 
+        // Set logger to viewer mode (sends logs to host)
+        await JSRuntime.InvokeVoidAsync("SteamViewerLogger.setMode", false);
+
         _webrtc = new WebRTCManager(JSRuntime, LoggerFactory.CreateLogger<WebRTCManager>(), "", SendSignalingMessage);
 
         // Subscribe to ICE candidates
@@ -831,12 +1021,18 @@
         // Subscribe to data channel open (for input sending)
         _webrtc.OnDataChannelOpen += async () =>
         {
-            Logger.LogInformation("Viewer data channel opened - input can now be sent");
+            Logger.LogInformation("Data channel opened - ready for communication");
             await Task.CompletedTask;
         };
 
+        // Subscribe to data channel messages (for screen share notifications and input)
+        _webrtc.OnDataChannelMessage += async (json) =>
+        {
+            await HandleDataChannelMessageAsync(json);
+        };
+
         await _webrtc.InitializeAsync();
-        Logger.LogInformation("WebRTC initialized as viewer, waiting for offer");
+        Logger.LogInformation("WebRTC initialized as joiner, waiting for offer");
     }
 
     private void HandleDisconnected(string? reason)
@@ -888,10 +1084,21 @@
         }
 
         _inputDotNetRef?.Dispose();
+        _loggerDotNetRef?.Dispose();
     }
 }
 
 <style>
+    .version-tag {
+        position: fixed;
+        top: 10px;
+        right: 10px;
+        font-size: 0.75rem;
+        color: #6c7086;
+        font-family: monospace;
+        z-index: 1000;
+    }
+
     .container {
         display: flex;
         flex-direction: column;
@@ -1176,5 +1383,83 @@
         display: flex;
         gap: 1rem;
         margin-top: 1rem;
+    }
+
+    /* Connected view styles */
+    .connected-view {
+        text-align: center;
+        width: 100%;
+        max-width: 1200px;
+    }
+
+    .screen-share-controls {
+        margin: 1.5rem 0;
+    }
+
+    .share-btn {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.5rem;
+        padding: 1rem 2rem;
+        border: 2px solid #45475a;
+        border-radius: 8px;
+        background: #313244;
+        color: #cdd6f4;
+        font-size: 1.1rem;
+        cursor: pointer;
+        transition: all 0.2s;
+    }
+
+    .share-btn:hover {
+        border-color: #89b4fa;
+        background: #45475a;
+    }
+
+    .share-btn.sharing {
+        border-color: #f38ba8;
+        background: rgba(243, 139, 168, 0.15);
+        color: #f38ba8;
+    }
+
+    .share-btn.sharing:hover {
+        background: rgba(243, 139, 168, 0.25);
+    }
+
+    .share-btn .icon {
+        font-size: 1.5rem;
+    }
+
+    .share-status {
+        color: #a6e3a1;
+        margin-top: 0.75rem;
+        font-size: 0.875rem;
+    }
+
+    .waiting-status {
+        color: #6c7086;
+        margin: 2rem 0;
+        font-style: italic;
+    }
+
+    .session-toolbar {
+        display: flex;
+        justify-content: center;
+        gap: 1rem;
+        margin-top: 2rem;
+        padding-top: 1.5rem;
+        border-top: 1px solid #45475a;
+    }
+
+    .session-toolbar .toolbar-btn {
+        padding: 0.75rem 1.5rem;
+    }
+
+    .session-toolbar .toolbar-btn.disconnect {
+        border-color: #f38ba8;
+        color: #f38ba8;
+    }
+
+    .session-toolbar .toolbar-btn.disconnect:hover {
+        background: rgba(243, 139, 168, 0.15);
     }
 </style>

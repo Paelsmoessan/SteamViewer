@@ -208,6 +208,16 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
     }
 
     /// <summary>
+    /// Stop screen capture and remove video track.
+    /// </summary>
+    public async Task StopScreenCaptureAsync()
+    {
+        EnsureInitialized();
+        await _jsRuntime.InvokeVoidAsync("SteamViewerWebRTC.stopScreenCapture");
+        _logger.LogInformation("Screen capture stopped");
+    }
+
+    /// <summary>
     /// Send string data over the data channel.
     /// </summary>
     public async Task<bool> SendDataAsync(string data)

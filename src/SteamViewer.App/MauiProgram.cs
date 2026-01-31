@@ -19,7 +19,26 @@ public static class MauiProgram
                 fonts.AddFont("OpenSans-Regular.ttf", "OpenSansRegular");
             });
 
+        // Load configuration from appsettings.json
+        var appDir = AppContext.BaseDirectory;
+        var configPath = Path.Combine(appDir, "appsettings.json");
+
+        var configBuilder = new ConfigurationBuilder();
+        if (File.Exists(configPath))
+        {
+            configBuilder.AddJsonFile(configPath, optional: false, reloadOnChange: false);
+        }
+        var configuration = configBuilder.Build();
+        builder.Services.AddSingleton<IConfiguration>(configuration);
+
         builder.Services.AddMauiBlazorWebView();
+
+        // File logger - writes all logs to %TEMP%\SteamViewer\debug.log
+        var fileLogger = new FileLoggerService();
+        builder.Services.AddSingleton(fileLogger);
+        builder.Logging.AddProvider(new FileLoggerProvider(fileLogger));
+
+        Console.WriteLine($"=== Log file: {fileLogger.LogFilePath} ===");
 
 #if DEBUG
         builder.Services.AddBlazorWebViewDeveloperTools();
@@ -31,12 +50,14 @@ public static class MauiProgram
         builder.Logging.AddFilter("Microsoft.AspNetCore", LogLevel.Warning); // Reduce noise from Blazor
 #endif
 
-        // Load server URL from appsettings.json
-        // Edit appsettings.json to change the signaling server
-        var serverUrl = GetSignalingServerUrl();
+        // Load server URL from configuration
+        var serverUrl = configuration["SignalingServer"]
+                        ?? Environment.GetEnvironmentVariable("STEAMVIEWER_SERVER")
+                        ?? "ws://localhost:8080/ws";
 
 #if DEBUG
         Console.WriteLine($"Signaling server URL: {serverUrl}");
+        Console.WriteLine($"TURN enabled: {configuration.GetValue<bool>("TurnServer:Enabled")}");
 #endif
 
         // Register platform-agnostic services
@@ -74,38 +95,5 @@ public static class MauiProgram
 #endif
 
         return builder.Build();
-    }
-
-    private static string GetSignalingServerUrl()
-    {
-        // Try to load from appsettings.json
-        try
-        {
-            var appDir = AppContext.BaseDirectory;
-            var configPath = Path.Combine(appDir, "appsettings.json");
-
-            if (File.Exists(configPath))
-            {
-                var config = new ConfigurationBuilder()
-                    .AddJsonFile(configPath, optional: true)
-                    .Build();
-
-                var serverUrl = config["SignalingServer"];
-                if (!string.IsNullOrEmpty(serverUrl))
-                {
-                    return serverUrl;
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-#if DEBUG
-            Console.WriteLine($"Warning: Could not load appsettings.json: {ex.Message}");
-#endif
-        }
-
-        // Fallback to environment variable or default
-        return Environment.GetEnvironmentVariable("STEAMVIEWER_SERVER")
-               ?? "ws://localhost:8080/ws";
     }
 }
