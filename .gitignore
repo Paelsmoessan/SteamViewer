@@ -28,3 +28,7 @@ Thumbs.db
 # Temp files
 *.tmp
 nul
+
+# Local development helpers
+SteamViewerMainSession.cmd
+*.lnk
