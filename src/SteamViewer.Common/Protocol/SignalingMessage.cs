@@ -23,6 +23,20 @@ namespace SteamViewer.Common.Protocol;
 [JsonDerivedType(typeof(Error), "error")]
 [JsonDerivedType(typeof(Ping), "ping")]
 [JsonDerivedType(typeof(Pong), "pong")]
+// Collaboration session messages
+[JsonDerivedType(typeof(CreateSession), "create_session")]
+[JsonDerivedType(typeof(SessionCreated), "session_created")]
+[JsonDerivedType(typeof(JoinSession), "join_session")]
+[JsonDerivedType(typeof(JoinedSession), "joined_session")]
+[JsonDerivedType(typeof(JoinSessionFailed), "join_session_failed")]
+[JsonDerivedType(typeof(ParticipantJoined), "participant_joined")]
+[JsonDerivedType(typeof(ParticipantLeft), "participant_left")]
+[JsonDerivedType(typeof(LeaveSession), "leave_session")]
+[JsonDerivedType(typeof(ScreenShareStateChanged), "screen_share_state_changed")]
+// Mesh WebRTC signaling (within session)
+[JsonDerivedType(typeof(MeshSdpOffer), "mesh_sdp_offer")]
+[JsonDerivedType(typeof(MeshSdpAnswer), "mesh_sdp_answer")]
+[JsonDerivedType(typeof(MeshIceCandidate), "mesh_ice_candidate")]
 public abstract record SignalingMessage
 {
     /// <summary>Client registers with signaling server</summary>
@@ -104,6 +118,78 @@ public abstract record SignalingMessage
 
     /// <summary>Heartbeat/keepalive pong</summary>
     public sealed record Pong : SignalingMessage;
+
+    // ==================== Collaboration Session Messages ====================
+
+    /// <summary>Create a new collaboration session</summary>
+    public sealed record CreateSession(
+        [property: JsonPropertyName("display_name")] string DisplayName,
+        [property: JsonPropertyName("session_name")] string? SessionName = null
+    ) : SignalingMessage;
+
+    /// <summary>Session created successfully</summary>
+    public sealed record SessionCreated(
+        [property: JsonPropertyName("session_code")] string SessionCode,
+        [property: JsonPropertyName("session_name")] string? SessionName
+    ) : SignalingMessage;
+
+    /// <summary>Join an existing session</summary>
+    public sealed record JoinSession(
+        [property: JsonPropertyName("session_code")] string SessionCode,
+        [property: JsonPropertyName("display_name")] string DisplayName
+    ) : SignalingMessage;
+
+    /// <summary>Successfully joined session</summary>
+    public sealed record JoinedSession(
+        [property: JsonPropertyName("session_code")] string SessionCode,
+        [property: JsonPropertyName("participants")] List<ParticipantInfo> Participants
+    ) : SignalingMessage;
+
+    /// <summary>Failed to join session</summary>
+    public sealed record JoinSessionFailed(
+        [property: JsonPropertyName("reason")] string Reason
+    ) : SignalingMessage;
+
+    /// <summary>New participant joined the session</summary>
+    public sealed record ParticipantJoined(
+        [property: JsonPropertyName("participant")] ParticipantInfo Participant
+    ) : SignalingMessage;
+
+    /// <summary>Participant left the session</summary>
+    public sealed record ParticipantLeft(
+        [property: JsonPropertyName("participant_id")] string ParticipantId
+    ) : SignalingMessage;
+
+    /// <summary>Leave current session</summary>
+    public sealed record LeaveSession : SignalingMessage;
+
+    /// <summary>Screen share state changed for a participant</summary>
+    public sealed record ScreenShareStateChanged(
+        [property: JsonPropertyName("participant_id")] string ParticipantId,
+        [property: JsonPropertyName("is_sharing")] bool IsSharing
+    ) : SignalingMessage;
+
+    // ==================== Mesh WebRTC Signaling ====================
+
+    /// <summary>SDP offer to specific peer in session (includes sender ID for routing)</summary>
+    public sealed record MeshSdpOffer(
+        [property: JsonPropertyName("target_id")] string TargetId,
+        [property: JsonPropertyName("sdp")] string Sdp
+    ) : SignalingMessage;
+
+    /// <summary>SDP answer to specific peer in session</summary>
+    public sealed record MeshSdpAnswer(
+        [property: JsonPropertyName("target_id")] string TargetId,
+        [property: JsonPropertyName("sdp")] string Sdp
+    ) : SignalingMessage;
+
+    /// <summary>ICE candidate to specific peer in session</summary>
+    public sealed record MeshIceCandidate(
+        [property: JsonPropertyName("target_id")] string TargetId,
+        [property: JsonPropertyName("candidate")] string Candidate,
+        [property: JsonPropertyName("sdp_mid")] string? SdpMid,
+        [property: JsonPropertyName("sdp_m_line_index")] ushort? SdpMLineIndex
+    ) : SignalingMessage;
 }
 
 /// <summary>

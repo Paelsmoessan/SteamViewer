@@ -14,11 +14,13 @@ namespace SteamViewer.Server.Handlers;
 public sealed class SignalingHandler
 {
     private readonly ClientRegistry _registry;
+    private readonly SessionRegistry _sessionRegistry;
     private readonly ILogger<SignalingHandler> _logger;
 
-    public SignalingHandler(ClientRegistry registry, ILogger<SignalingHandler> logger)
+    public SignalingHandler(ClientRegistry registry, SessionRegistry sessionRegistry, ILogger<SignalingHandler> logger)
     {
         _registry = registry;
+        _sessionRegistry = sessionRegistry;
         _logger = logger;
     }
 
@@ -154,6 +156,14 @@ public sealed class SignalingHandler
             SignalingMessage.IceCandidate candidate => HandleIceCandidate(candidate, currentClientId),
             SignalingMessage.Disconnect disconnect => HandleDisconnect(disconnect, currentClientId),
             SignalingMessage.Ping => new SignalingMessage.Pong(),
+            // Collaboration session messages
+            SignalingMessage.CreateSession createSession => HandleCreateSession(createSession, currentClientId),
+            SignalingMessage.JoinSession joinSession => HandleJoinSession(joinSession, currentClientId),
+            SignalingMessage.LeaveSession => HandleLeaveSession(currentClientId),
+            SignalingMessage.ScreenShareStateChanged shareState => HandleScreenShareStateChanged(shareState, currentClientId),
+            SignalingMessage.MeshSdpOffer meshOffer => HandleMeshSdpOffer(meshOffer, currentClientId),
+            SignalingMessage.MeshSdpAnswer meshAnswer => HandleMeshSdpAnswer(meshAnswer, currentClientId),
+            SignalingMessage.MeshIceCandidate meshCandidate => HandleMeshIceCandidate(meshCandidate, currentClientId),
             // Server-only messages that shouldn't be received from clients
             SignalingMessage.RegisterSuccess or
             SignalingMessage.RegisterFailed or
@@ -161,7 +171,12 @@ public sealed class SignalingHandler
             SignalingMessage.Connected or
             SignalingMessage.Disconnected or
             SignalingMessage.Error or
-            SignalingMessage.Pong => new SignalingMessage.Error("Invalid message from client"),
+            SignalingMessage.Pong or
+            SignalingMessage.SessionCreated or
+            SignalingMessage.JoinedSession or
+            SignalingMessage.JoinSessionFailed or
+            SignalingMessage.ParticipantJoined or
+            SignalingMessage.ParticipantLeft => new SignalingMessage.Error("Invalid message from client"),
             _ => new SignalingMessage.Error("Unknown message type")
         };
 
@@ -295,6 +310,137 @@ public sealed class SignalingHandler
         return null;
     }
 
+    // ==================== Collaboration Session Handlers ====================
+
+    private SignalingMessage HandleCreateSession(SignalingMessage.CreateSession createSession, string? fromId)
+    {
+        if (fromId == null)
+        {
+            return new SignalingMessage.Error("Not registered");
+        }
+
+        var (sessionCode, _) = _sessionRegistry.CreateSession(fromId, createSession.DisplayName, createSession.SessionName);
+        _logger.LogInformation("Session {SessionCode} created by {ClientId}", sessionCode, fromId);
+        return new SignalingMessage.SessionCreated(sessionCode, createSession.SessionName);
+    }
+
+    private SignalingMessage HandleJoinSession(SignalingMessage.JoinSession joinSession, string? fromId)
+    {
+        if (fromId == null)
+        {
+            return new SignalingMessage.Error("Not registered");
+        }
+
+        if (!_sessionRegistry.TryJoinSession(joinSession.SessionCode, fromId, joinSession.DisplayName, out var session, out var error))
+        {
+            return new SignalingMessage.JoinSessionFailed(error ?? "Unknown error");
+        }
+
+        // Get current participants (including self)
+        var participants = session!.Participants.Values.ToList();
+
+        // Notify existing participants that someone joined
+        var newParticipant = session.Participants[fromId];
+        foreach (var participantId in session.Participants.Keys.Where(id => id != fromId))
+        {
+            _registry.TrySendToClient(participantId, new SignalingMessage.ParticipantJoined(newParticipant));
+        }
+
+        _logger.LogInformation("Client {ClientId} joined session {SessionCode}", fromId, joinSession.SessionCode);
+        return new SignalingMessage.JoinedSession(joinSession.SessionCode, participants);
+    }
+
+    private SignalingMessage? HandleLeaveSession(string? fromId)
+    {
+        if (fromId == null)
+        {
+            return new SignalingMessage.Error("Not registered");
+        }
+
+        var (session, _) = _sessionRegistry.LeaveSession(fromId);
+        if (session == null)
+        {
+            return new SignalingMessage.Error("Not in a session");
+        }
+
+        // Notify remaining participants
+        foreach (var participantId in session.Participants.Keys)
+        {
+            _registry.TrySendToClient(participantId, new SignalingMessage.ParticipantLeft(fromId));
+        }
+
+        _logger.LogInformation("Client {ClientId} left session {SessionCode}", fromId, session.SessionCode);
+        return null;
+    }
+
+    private SignalingMessage? HandleScreenShareStateChanged(SignalingMessage.ScreenShareStateChanged shareState, string? fromId)
+    {
+        if (fromId == null)
+        {
+            return new SignalingMessage.Error("Not registered");
+        }
+
+        var session = _sessionRegistry.GetSessionByClient(fromId);
+        if (session == null)
+        {
+            return new SignalingMessage.Error("Not in a session");
+        }
+
+        _sessionRegistry.SetParticipantSharing(fromId, shareState.IsSharing);
+
+        // Broadcast to all other participants
+        foreach (var participantId in session.Participants.Keys.Where(id => id != fromId))
+        {
+            _registry.TrySendToClient(participantId, new SignalingMessage.ScreenShareStateChanged(fromId, shareState.IsSharing));
+        }
+
+        _logger.LogInformation("Client {ClientId} screen share: {IsSharing}", fromId, shareState.IsSharing);
+        return null;
+    }
+
+    private SignalingMessage? HandleMeshSdpOffer(SignalingMessage.MeshSdpOffer offer, string? fromId)
+    {
+        if (fromId == null)
+        {
+            return new SignalingMessage.Error("Not registered");
+        }
+
+        // Forward to target with sender ID
+        _registry.TrySendToClient(offer.TargetId, new SignalingMessage.MeshSdpOffer(fromId, offer.Sdp));
+        _logger.LogDebug("Mesh SDP offer from {FromId} to {TargetId}", fromId, offer.TargetId);
+        return null;
+    }
+
+    private SignalingMessage? HandleMeshSdpAnswer(SignalingMessage.MeshSdpAnswer answer, string? fromId)
+    {
+        if (fromId == null)
+        {
+            return new SignalingMessage.Error("Not registered");
+        }
+
+        // Forward to target with sender ID
+        _registry.TrySendToClient(answer.TargetId, new SignalingMessage.MeshSdpAnswer(fromId, answer.Sdp));
+        _logger.LogDebug("Mesh SDP answer from {FromId} to {TargetId}", fromId, answer.TargetId);
+        return null;
+    }
+
+    private SignalingMessage? HandleMeshIceCandidate(SignalingMessage.MeshIceCandidate candidate, string? fromId)
+    {
+        if (fromId == null)
+        {
+            return new SignalingMessage.Error("Not registered");
+        }
+
+        // Forward to target with sender ID
+        _registry.TrySendToClient(candidate.TargetId, new SignalingMessage.MeshIceCandidate(
+            fromId,
+            candidate.Candidate,
+            candidate.SdpMid,
+            candidate.SdpMLineIndex));
+        _logger.LogDebug("Mesh ICE candidate from {FromId} to {TargetId}", fromId, candidate.TargetId);
+        return null;
+    }
+
     private Task CleanupClientAsync(string? clientId, Guid connectionId)
     {
         if (clientId == null)
@@ -306,10 +452,22 @@ public sealed class SignalingHandler
         var client = _registry.GetClient(clientId);
         var peerId = client?.PeerId;
 
+        // Clean up session membership
+        var (session, _) = _sessionRegistry.LeaveSession(clientId);
+        if (session != null)
+        {
+            // Notify remaining session participants
+            foreach (var participantId in session.Participants.Keys)
+            {
+                _registry.TrySendToClient(participantId, new SignalingMessage.ParticipantLeft(clientId));
+            }
+            _logger.LogInformation("Client {ClientId} removed from session {SessionCode} on disconnect", clientId, session.SessionCode);
+        }
+
         // Unregister the client
         _registry.UnregisterByConnection(connectionId);
 
-        // Notify peer if there was one
+        // Notify peer if there was one (1:1 mode)
         if (peerId != null)
         {
             _registry.SetPeer(peerId, null);

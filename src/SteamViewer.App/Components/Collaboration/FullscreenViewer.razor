@@ -1,0 +1,233 @@
+@using SteamViewer.Common.Protocol
+@inject IJSRuntime JS
+@implements IDisposable
+
+<div class="fullscreen-viewer">
+    <div class="viewer-tabs">
+        @foreach (var participant in SharingParticipants)
+        {
+            <button class="tab @(ActivePeerId == participant.Id ? "active" : "")"
+                    @onclick="() => SelectTab(participant.Id)">
+                @participant.DisplayName
+                @if (participant.Id == MyId)
+                {
+                    <span class="you-tag">(You)</span>
+                }
+            </button>
+        }
+        <button class="close-btn" @onclick="Close" title="Close fullscreen">X</button>
+    </div>
+
+    <div class="viewer-content">
+        <canvas id="fullscreen-canvas" @ref="_canvasRef"></canvas>
+    </div>
+
+    <div class="viewer-toolbar">
+        <button class="toolbar-btn @(_inputLocked ? "active" : "")" @onclick="ToggleInputLock">
+            @(_inputLocked ? "Input Locked (Esc to release)" : "Click to Control")
+        </button>
+        <span class="connection-status">@GetConnectionStatus()</span>
+    </div>
+</div>
+
+<style>
+    .fullscreen-viewer {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: #11111b;
+        display: flex;
+        flex-direction: column;
+        z-index: 1000;
+    }
+
+    .viewer-tabs {
+        display: flex;
+        background: #1e1e2e;
+        border-bottom: 1px solid #313244;
+        padding: 0 8px;
+        gap: 4px;
+        align-items: center;
+    }
+
+    .tab {
+        padding: 12px 20px;
+        background: transparent;
+        border: none;
+        color: #9399b2;
+        cursor: pointer;
+        font-size: 14px;
+        border-bottom: 2px solid transparent;
+        transition: all 0.2s;
+    }
+
+    .tab:hover {
+        color: #cdd6f4;
+        background: #313244;
+    }
+
+    .tab.active {
+        color: #89b4fa;
+        border-bottom-color: #89b4fa;
+    }
+
+    .you-tag {
+        color: #a6e3a1;
+        font-size: 11px;
+        margin-left: 4px;
+    }
+
+    .close-btn {
+        margin-left: auto;
+        padding: 8px 16px;
+        background: #f38ba8;
+        border: none;
+        color: #11111b;
+        border-radius: 4px;
+        cursor: pointer;
+        font-weight: bold;
+    }
+
+    .close-btn:hover {
+        background: #eba0ac;
+    }
+
+    .viewer-content {
+        flex: 1;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        overflow: hidden;
+        background: #000;
+    }
+
+    #fullscreen-canvas {
+        max-width: 100%;
+        max-height: 100%;
+        object-fit: contain;
+    }
+
+    .viewer-toolbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 8px 16px;
+        background: #1e1e2e;
+        border-top: 1px solid #313244;
+    }
+
+    .toolbar-btn {
+        padding: 8px 16px;
+        background: #313244;
+        border: 1px solid #45475a;
+        color: #cdd6f4;
+        border-radius: 4px;
+        cursor: pointer;
+    }
+
+    .toolbar-btn:hover {
+        background: #45475a;
+    }
+
+    .toolbar-btn.active {
+        background: #a6e3a1;
+        color: #11111b;
+        border-color: #a6e3a1;
+    }
+
+    .connection-status {
+        color: #9399b2;
+        font-size: 12px;
+    }
+</style>
+
+@code {
+    [Parameter] public IEnumerable<ParticipantInfo> SharingParticipants { get; set; } = Enumerable.Empty<ParticipantInfo>();
+    [Parameter] public string? MyId { get; set; }
+    [Parameter] public string? InitialPeerId { get; set; }
+    [Parameter] public EventCallback OnClose { get; set; }
+    [Parameter] public Func<string, string, Task<bool>>? RenderPeerToCanvas { get; set; }
+    [Parameter] public Func<string, string>? GetPeerConnectionState { get; set; }
+
+    private ElementReference _canvasRef;
+    private string? ActivePeerId;
+    private bool _inputLocked;
+    private System.Timers.Timer? _renderTimer;
+
+    protected override void OnInitialized()
+    {
+        ActivePeerId = InitialPeerId ?? SharingParticipants.FirstOrDefault()?.Id;
+
+        // Full framerate rendering for fullscreen
+        _renderTimer = new System.Timers.Timer(33); // ~30fps
+        _renderTimer.Elapsed += async (_, _) => await RenderActiveAsync();
+        _renderTimer.Start();
+    }
+
+    protected override void OnParametersSet()
+    {
+        // If active peer left, switch to first available
+        if (ActivePeerId != null && !SharingParticipants.Any(p => p.Id == ActivePeerId))
+        {
+            ActivePeerId = SharingParticipants.FirstOrDefault()?.Id;
+        }
+    }
+
+    private async Task RenderActiveAsync()
+    {
+        if (RenderPeerToCanvas == null || ActivePeerId == null) return;
+        if (ActivePeerId == MyId) return; // Don't render our own stream
+
+        try
+        {
+            await RenderPeerToCanvas(ActivePeerId, "fullscreen-canvas");
+        }
+        catch
+        {
+            // Ignore render errors
+        }
+    }
+
+    private void SelectTab(string peerId)
+    {
+        ActivePeerId = peerId;
+        _inputLocked = false; // Reset input lock when switching tabs
+        StateHasChanged();
+    }
+
+    private void ToggleInputLock()
+    {
+        _inputLocked = !_inputLocked;
+        // TODO: Enable/disable input capture to active peer
+    }
+
+    private async Task Close()
+    {
+        _renderTimer?.Stop();
+        await OnClose.InvokeAsync();
+    }
+
+    private string GetConnectionStatus()
+    {
+        if (ActivePeerId == null) return "No active screen";
+        if (ActivePeerId == MyId) return "Your screen";
+
+        var state = GetPeerConnectionState?.Invoke(ActivePeerId) ?? "unknown";
+        return state switch
+        {
+            "connected" => "Connected",
+            "connecting" => "Connecting...",
+            "disconnected" => "Disconnected",
+            "failed" => "Connection failed",
+            _ => state
+        };
+    }
+
+    public void Dispose()
+    {
+        _renderTimer?.Stop();
+        _renderTimer?.Dispose();
+    }
+}

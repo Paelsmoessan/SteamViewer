@@ -1,3 +1,4 @@
+using SteamViewer.Common.Logging;
 using SteamViewer.Server.Handlers;
 using SteamViewer.Server.Services;
 
@@ -9,10 +10,16 @@ builder.WebHost.UseUrls($"http://0.0.0.0:{port}");
 
 // Add services
 builder.Services.AddSingleton<ClientRegistry>();
+builder.Services.AddSingleton<SessionRegistry>();
 builder.Services.AddSingleton<SignalingHandler>();
+
+// Configure file logging for multi-dev debugging
+var fileLogger = new SharedFileLogger("server");
+builder.Services.AddSingleton(fileLogger);
 
 // Configure logging
 builder.Logging.AddConsole();
+builder.Logging.AddProvider(new SharedFileLoggerProvider(fileLogger));
 
 var app = builder.Build();
 

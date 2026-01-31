@@ -32,17 +32,23 @@
 
             <div class="mode-buttons">
                 <button class="mode-btn host-btn" @onclick="SelectStartMode">
-                    <span class="icon">🖥️</span>
+                    <span class="icon">1:1</span>
                     <span class="label">Start Session</span>
                     <span class="desc">Share your screen with others</span>
                 </button>
 
                 <button class="mode-btn viewer-btn" @onclick="SelectJoinMode">
-                    <span class="icon">🚀</span>
+                    <span class="icon">-></span>
                     <span class="label">Join Session</span>
                     <span class="desc">Connect to an existing session</span>
                 </button>
             </div>
+
+            <a href="/collaboration" class="collaboration-link">
+                <span class="collab-icon">N:N</span>
+                <span>Collaboration Mode</span>
+                <span class="collab-desc">Multi-user screen sharing</span>
+            </a>
         </div>
     }
     else if (currentMode == AppMode.StartConnection)
@@ -1280,6 +1286,36 @@
         font-size: 0.875rem;
         color: #6c7086;
         margin-top: 0.5rem;
+    }
+
+    .collaboration-link {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin-top: 2rem;
+        padding: 12px 24px;
+        background: #181825;
+        border: 1px solid #313244;
+        border-radius: 8px;
+        color: #9399b2;
+        text-decoration: none;
+        transition: all 0.2s;
+    }
+
+    .collaboration-link:hover {
+        border-color: #a6e3a1;
+        color: #a6e3a1;
+    }
+
+    .collab-icon {
+        font-family: monospace;
+        font-weight: bold;
+        color: #a6e3a1;
+    }
+
+    .collab-desc {
+        font-size: 12px;
+        color: #6c7086;
     }
 
     .back-btn {

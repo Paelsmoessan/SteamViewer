@@ -1,71 +1,36 @@
 using Microsoft.Extensions.Logging;
-using System.Collections.Concurrent;
+using SteamViewer.Common.Logging;
 
 namespace SteamViewer.App.Services;
 
 /// <summary>
 /// Logger that writes all logs to a file for easy debugging.
-/// Log file location: %TEMP%\SteamViewer\debug.log
+/// Log file location: logs/client-{MachineName}.log in project root
 /// </summary>
 public class FileLoggerService : IDisposable
 {
-    private readonly string _logFilePath;
-    private readonly StreamWriter _writer;
-    private readonly ConcurrentQueue<string> _queue = new();
-    private readonly CancellationTokenSource _cts = new();
-    private readonly Task _writeTask;
+    private readonly SharedFileLogger _sharedLogger;
 
-    public string LogFilePath => _logFilePath;
+    public string LogFilePath => _sharedLogger.LogFilePath;
 
     public FileLoggerService()
     {
-        var logDir = Path.Combine(Path.GetTempPath(), "SteamViewer");
-        Directory.CreateDirectory(logDir);
-        _logFilePath = Path.Combine(logDir, "debug.log");
-
-        // Clear previous log
-        File.WriteAllText(_logFilePath, $"=== SteamViewer Debug Log - {DateTime.Now:yyyy-MM-dd HH:mm:ss} ===\n\n");
-
-        _writer = new StreamWriter(_logFilePath, append: true) { AutoFlush = true };
-        _writeTask = Task.Run(WriteLoop);
-
-        Log("INFO", "FileLogger", $"Logging to: {_logFilePath}");
+        _sharedLogger = new SharedFileLogger("client");
     }
 
     public void Log(string level, string source, string message)
     {
-        var timestamp = DateTime.Now.ToString("HH:mm:ss.fff");
-        var line = $"[{timestamp}] [{level}] [{source}] {message}";
-        _queue.Enqueue(line);
-        Console.WriteLine(line); // Also write to console
+        _sharedLogger.Log(level, source, message);
     }
 
     public void LogJS(string level, string message)
     {
-        Log(level, "JS", message);
-    }
-
-    private async Task WriteLoop()
-    {
-        while (!_cts.IsCancellationRequested)
-        {
-            while (_queue.TryDequeue(out var line))
-            {
-                try
-                {
-                    await _writer.WriteLineAsync(line);
-                }
-                catch { /* ignore write errors */ }
-            }
-            await Task.Delay(50);
-        }
+        _sharedLogger.LogJS(level, message);
     }
 
     public void Dispose()
     {
-        _cts.Cancel();
-        _writeTask.Wait(1000);
-        _writer.Dispose();
+        _sharedLogger.Dispose();
     }
 }
 
