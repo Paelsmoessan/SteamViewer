@@ -472,10 +472,11 @@
     private string? _selectedPeerId;
     private bool _isLoading;
     private string? _errorMessage;
+    private bool _isLeaving; // Track intentional disconnect to suppress error
 
     private void ShowStartSession() => _sessionState = SessionViewState.StartingSession;
     private void ShowJoinSession() => _sessionState = SessionViewState.JoiningSession;
-    private void BackToSelect() => _sessionState = SessionViewState.SelectMode;
+    private void BackToSelect() { _errorMessage = null; _sessionState = SessionViewState.SelectMode; }
 
     private async Task CreateSession()
     {
@@ -531,7 +532,7 @@
         _manager.ParticipantJoined += (_, p) => { UpdateViewerServiceData(); InvokeAsync(StateHasChanged); };
         _manager.ParticipantLeft += (_, _) => { UpdateViewerServiceData(); InvokeAsync(StateHasChanged); };
         _manager.PeerVideoReady += (_, _) => { UpdateViewerServiceData(); InvokeAsync(StateHasChanged); };
-        _manager.Error += (_, msg) => { _errorMessage = msg; InvokeAsync(StateHasChanged); };
+        _manager.Error += (_, msg) => { if (!_isLeaving) { _errorMessage = msg; InvokeAsync(StateHasChanged); } };
 
         await _manager.ConnectAsync();
     }
@@ -559,9 +560,13 @@
     {
         if (_manager == null) return;
 
+        _isLeaving = true;
+        _errorMessage = null;
         await _manager.LeaveSessionAsync();
-        _sessionState = SessionViewState.SelectMode;
+        await _manager.DisposeAsync();
         _manager = null;
+        _sessionState = SessionViewState.SelectMode;
+        _isLeaving = false;
     }
 
     private void OnScreenSelected(string peerId)
@@ -605,6 +610,7 @@
 
     public async ValueTask DisposeAsync()
     {
+        _isLeaving = true;
         if (_manager != null)
         {
             await _manager.DisposeAsync();
