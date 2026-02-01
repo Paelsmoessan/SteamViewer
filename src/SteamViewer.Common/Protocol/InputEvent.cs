@@ -16,19 +16,25 @@ public abstract record InputEvent
 {
     public sealed record MouseMove(
         [property: JsonPropertyName("x")] double X,
-        [property: JsonPropertyName("y")] double Y
+        [property: JsonPropertyName("y")] double Y,
+        [property: JsonPropertyName("captureWidth")] int CaptureWidth = 0,
+        [property: JsonPropertyName("captureHeight")] int CaptureHeight = 0
     ) : InputEvent;
 
     public sealed record MouseDown(
         [property: JsonPropertyName("button")] MouseButton Button,
         [property: JsonPropertyName("x")] double X,
-        [property: JsonPropertyName("y")] double Y
+        [property: JsonPropertyName("y")] double Y,
+        [property: JsonPropertyName("captureWidth")] int CaptureWidth = 0,
+        [property: JsonPropertyName("captureHeight")] int CaptureHeight = 0
     ) : InputEvent;
 
     public sealed record MouseUp(
         [property: JsonPropertyName("button")] MouseButton Button,
         [property: JsonPropertyName("x")] double X,
-        [property: JsonPropertyName("y")] double Y
+        [property: JsonPropertyName("y")] double Y,
+        [property: JsonPropertyName("captureWidth")] int CaptureWidth = 0,
+        [property: JsonPropertyName("captureHeight")] int CaptureHeight = 0
     ) : InputEvent;
 
     public sealed record MouseWheel(

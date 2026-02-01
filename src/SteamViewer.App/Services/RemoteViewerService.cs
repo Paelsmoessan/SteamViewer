@@ -148,6 +148,14 @@ public record InputEventData
     public bool Ctrl { get; init; }
     public bool Shift { get; init; }
     public bool Alt { get; init; }
+    /// <summary>
+    /// Capture width in pixels (canvas dimensions for coordinate scaling).
+    /// </summary>
+    public int CaptureWidth { get; init; }
+    /// <summary>
+    /// Capture height in pixels (canvas dimensions for coordinate scaling).
+    /// </summary>
+    public int CaptureHeight { get; init; }
 }
 
 public enum InputEventType

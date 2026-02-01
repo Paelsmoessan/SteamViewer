@@ -1099,7 +1099,9 @@ window.SteamViewerInput = {
     async handleMouseMove(e) {
         if (!this.isCapturing || !this.isLocked) return;
         const coords = this.getScaledCoords(e);
-        await this.dotNetRef.invokeMethodAsync('OnMouseMove', coords.x, coords.y);
+        // Pass canvas dimensions (capture size) for accurate coordinate mapping on host
+        await this.dotNetRef.invokeMethodAsync('OnMouseMove', coords.x, coords.y,
+            this.canvas.width, this.canvas.height);
     },
 
     async handleMouseDown(e) {
@@ -1107,7 +1109,9 @@ window.SteamViewerInput = {
         e.preventDefault();
         const coords = this.getScaledCoords(e);
         const button = ['left', 'middle', 'right'][e.button] || 'left';
-        await this.dotNetRef.invokeMethodAsync('OnMouseDown', button, coords.x, coords.y);
+        // Pass canvas dimensions (capture size) for accurate coordinate mapping on host
+        await this.dotNetRef.invokeMethodAsync('OnMouseDown', button, coords.x, coords.y,
+            this.canvas.width, this.canvas.height);
     },
 
     async handleMouseUp(e) {
@@ -1115,7 +1119,9 @@ window.SteamViewerInput = {
         e.preventDefault();
         const coords = this.getScaledCoords(e);
         const button = ['left', 'middle', 'right'][e.button] || 'left';
-        await this.dotNetRef.invokeMethodAsync('OnMouseUp', button, coords.x, coords.y);
+        // Pass canvas dimensions (capture size) for accurate coordinate mapping on host
+        await this.dotNetRef.invokeMethodAsync('OnMouseUp', button, coords.x, coords.y,
+            this.canvas.width, this.canvas.height);
     },
 
     async handleWheel(e) {

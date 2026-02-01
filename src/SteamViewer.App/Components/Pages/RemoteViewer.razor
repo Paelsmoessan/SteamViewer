@@ -85,37 +85,43 @@
     #region Input Callbacks (relayed to main window)
 
     [JSInvokable]
-    public void OnMouseMove(double x, double y)
+    public void OnMouseMove(double x, double y, int captureWidth = 0, int captureHeight = 0)
     {
         ViewerService.SendInputEvent(new InputEventData
         {
             Type = InputEventType.MouseMove,
             X = x,
-            Y = y
+            Y = y,
+            CaptureWidth = captureWidth,
+            CaptureHeight = captureHeight
         });
     }
 
     [JSInvokable]
-    public void OnMouseDown(string button, double x, double y)
+    public void OnMouseDown(string button, double x, double y, int captureWidth = 0, int captureHeight = 0)
     {
         ViewerService.SendInputEvent(new InputEventData
         {
             Type = InputEventType.MouseDown,
             X = x,
             Y = y,
-            Button = button == "left" ? 0 : button == "right" ? 2 : 1
+            Button = button == "left" ? 0 : button == "right" ? 2 : 1,
+            CaptureWidth = captureWidth,
+            CaptureHeight = captureHeight
         });
     }
 
     [JSInvokable]
-    public void OnMouseUp(string button, double x, double y)
+    public void OnMouseUp(string button, double x, double y, int captureWidth = 0, int captureHeight = 0)
     {
         ViewerService.SendInputEvent(new InputEventData
         {
             Type = InputEventType.MouseUp,
             X = x,
             Y = y,
-            Button = button == "left" ? 0 : button == "right" ? 2 : 1
+            Button = button == "left" ? 0 : button == "right" ? 2 : 1,
+            CaptureWidth = captureWidth,
+            CaptureHeight = captureHeight
         });
     }
 

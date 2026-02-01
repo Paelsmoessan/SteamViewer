@@ -621,13 +621,13 @@
                 switch (input.Type)
                 {
                     case InputEventType.MouseMove:
-                        await OnMouseMove(input.X, input.Y);
+                        await OnMouseMove(input.X, input.Y, input.CaptureWidth, input.CaptureHeight);
                         break;
                     case InputEventType.MouseDown:
-                        await OnMouseDown(input.Button.ToString(), input.X, input.Y);
+                        await OnMouseDown(input.Button.ToString(), input.X, input.Y, input.CaptureWidth, input.CaptureHeight);
                         break;
                     case InputEventType.MouseUp:
-                        await OnMouseUp(input.Button.ToString(), input.X, input.Y);
+                        await OnMouseUp(input.Button.ToString(), input.X, input.Y, input.CaptureWidth, input.CaptureHeight);
                         break;
                     case InputEventType.Wheel:
                         await OnMouseWheel(input.DeltaX, input.DeltaY);
@@ -882,15 +882,15 @@
     #region Input Event Handlers (Viewer -> Host)
 
     [JSInvokable]
-    public async Task OnMouseMove(double x, double y)
+    public async Task OnMouseMove(double x, double y, int captureWidth = 0, int captureHeight = 0)
     {
         if (_webrtc == null || !_webrtc.IsDataChannelOpen) return;
-        var inputEvent = new InputEvent.MouseMove(x, y);
+        var inputEvent = new InputEvent.MouseMove(x, y, captureWidth, captureHeight);
         await SendInputEventAsync(inputEvent);
     }
 
     [JSInvokable]
-    public async Task OnMouseDown(string button, double x, double y)
+    public async Task OnMouseDown(string button, double x, double y, int captureWidth = 0, int captureHeight = 0)
     {
         if (_webrtc == null || !_webrtc.IsDataChannelOpen) return;
         var mouseButton = button.ToLowerInvariant() switch
@@ -900,12 +900,12 @@
             "middle" => MouseButton.Middle,
             _ => MouseButton.Left
         };
-        var inputEvent = new InputEvent.MouseDown(mouseButton, x, y);
+        var inputEvent = new InputEvent.MouseDown(mouseButton, x, y, captureWidth, captureHeight);
         await SendInputEventAsync(inputEvent);
     }
 
     [JSInvokable]
-    public async Task OnMouseUp(string button, double x, double y)
+    public async Task OnMouseUp(string button, double x, double y, int captureWidth = 0, int captureHeight = 0)
     {
         if (_webrtc == null || !_webrtc.IsDataChannelOpen) return;
         var mouseButton = button.ToLowerInvariant() switch
@@ -915,7 +915,7 @@
             "middle" => MouseButton.Middle,
             _ => MouseButton.Left
         };
-        var inputEvent = new InputEvent.MouseUp(mouseButton, x, y);
+        var inputEvent = new InputEvent.MouseUp(mouseButton, x, y, captureWidth, captureHeight);
         await SendInputEventAsync(inputEvent);
     }
 
@@ -982,12 +982,29 @@
             var inputEvent = JsonSerializer.Deserialize<InputEvent>(json);
             if (inputEvent != null)
             {
-                // Get screen dimensions (use default if not capturing)
-                int screenWidth = 1920;
-                int screenHeight = 1080;
+                // Extract capture dimensions from the event, fallback to 1920x1080
+                int captureWidth = 1920;
+                int captureHeight = 1080;
 
-                // Inject the input
-                InputInjector.InjectInput(inputEvent, screenWidth, screenHeight);
+                // Get dimensions from mouse events (they carry the viewer's canvas size)
+                switch (inputEvent)
+                {
+                    case InputEvent.MouseMove move when move.CaptureWidth > 0 && move.CaptureHeight > 0:
+                        captureWidth = move.CaptureWidth;
+                        captureHeight = move.CaptureHeight;
+                        break;
+                    case InputEvent.MouseDown down when down.CaptureWidth > 0 && down.CaptureHeight > 0:
+                        captureWidth = down.CaptureWidth;
+                        captureHeight = down.CaptureHeight;
+                        break;
+                    case InputEvent.MouseUp up when up.CaptureWidth > 0 && up.CaptureHeight > 0:
+                        captureWidth = up.CaptureWidth;
+                        captureHeight = up.CaptureHeight;
+                        break;
+                }
+
+                // Inject the input using actual capture dimensions
+                InputInjector.InjectInput(inputEvent, captureWidth, captureHeight);
             }
         }
         catch
