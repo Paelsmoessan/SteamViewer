@@ -17,7 +17,12 @@ public partial class App : Application
 
     protected override Window CreateWindow(IActivationState? activationState)
     {
-        var mainWindow = new Window(new MainPage()) { Title = "SteamViewer" };
+        var mainWindow = new Window(new MainPage())
+        {
+            Title = "SteamViewer",
+            Width = 640,
+            Height = 720
+        };
 
         // Subscribe to viewer service after services are available
         if (!_initialized)

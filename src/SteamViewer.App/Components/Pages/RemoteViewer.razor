@@ -21,8 +21,8 @@
             </button>
         </div>
     </div>
-    <div class="canvas-container">
-        <canvas id="viewerCanvas" width="1920" height="1080"></canvas>
+    <div class="canvas-container" id="canvasContainer">
+        <canvas id="viewerCanvas"></canvas>
     </div>
 </div>
 
@@ -35,14 +35,13 @@
     {
         if (firstRender)
         {
-            // Subscribe to video frames
-            ViewerService.OnVideoFrame += HandleVideoFrame;
+            // Subscribe to JPEG frames (from main window's canvas capture)
+            ViewerService.OnJpegFrame += HandleJpegFrame;
 
             // Initialize canvas
             await Task.Delay(100); // Wait for DOM
             try
             {
-                await CanvasRenderer.InitializeAsync("viewerCanvas");
                 _canvasInitialized = true;
 
                 // Initialize input capture
@@ -59,7 +58,7 @@
         }
     }
 
-    private async void HandleVideoFrame(DecodedFrame frame)
+    private async void HandleJpegFrame(JpegFrame frame)
     {
         if (_canvasInitialized)
         {
@@ -67,7 +66,8 @@
             {
                 await InvokeAsync(async () =>
                 {
-                    await CanvasRenderer.RenderFrameAsync(frame);
+                    await JSRuntime.InvokeVoidAsync("SteamViewerViewer.renderJpegFrame",
+                        "viewerCanvas", frame.Base64Data, frame.Width, frame.Height);
                 });
             }
             catch
@@ -96,45 +96,44 @@
     }
 
     [JSInvokable]
-    public void OnMouseDown(double x, double y, int button)
+    public void OnMouseDown(string button, double x, double y)
     {
         ViewerService.SendInputEvent(new InputEventData
         {
             Type = InputEventType.MouseDown,
             X = x,
             Y = y,
-            Button = button
+            Button = button == "left" ? 0 : button == "right" ? 2 : 1
         });
     }
 
     [JSInvokable]
-    public void OnMouseUp(double x, double y, int button)
+    public void OnMouseUp(string button, double x, double y)
     {
         ViewerService.SendInputEvent(new InputEventData
         {
             Type = InputEventType.MouseUp,
             X = x,
             Y = y,
-            Button = button
+            Button = button == "left" ? 0 : button == "right" ? 2 : 1
         });
     }
 
     [JSInvokable]
-    public void OnWheel(double x, double y, double deltaX, double deltaY)
+    public void OnMouseWheel(double deltaX, double deltaY)
     {
         ViewerService.SendInputEvent(new InputEventData
         {
             Type = InputEventType.Wheel,
-            X = x,
-            Y = y,
             DeltaX = deltaX,
             DeltaY = deltaY
         });
     }
 
     [JSInvokable]
-    public void OnKeyDown(string key, bool ctrl, bool shift, bool alt)
+    public void OnKeyDown(string key, System.Text.Json.JsonElement modifiers)
     {
+        var (ctrl, shift, alt) = ParseModifiers(modifiers);
         ViewerService.SendInputEvent(new InputEventData
         {
             Type = InputEventType.KeyDown,
@@ -146,8 +145,9 @@
     }
 
     [JSInvokable]
-    public void OnKeyUp(string key, bool ctrl, bool shift, bool alt)
+    public void OnKeyUp(string key, System.Text.Json.JsonElement modifiers)
     {
+        var (ctrl, shift, alt) = ParseModifiers(modifiers);
         ViewerService.SendInputEvent(new InputEventData
         {
             Type = InputEventType.KeyUp,
@@ -158,11 +158,20 @@
         });
     }
 
+    private (bool ctrl, bool shift, bool alt) ParseModifiers(System.Text.Json.JsonElement modifiers)
+    {
+        bool ctrl = false, shift = false, alt = false;
+        if (modifiers.TryGetProperty("ctrl", out var ctrlProp)) ctrl = ctrlProp.GetBoolean();
+        if (modifiers.TryGetProperty("shift", out var shiftProp)) shift = shiftProp.GetBoolean();
+        if (modifiers.TryGetProperty("alt", out var altProp)) alt = altProp.GetBoolean();
+        return (ctrl, shift, alt);
+    }
+
     #endregion
 
     public void Dispose()
     {
-        ViewerService.OnVideoFrame -= HandleVideoFrame;
+        ViewerService.OnJpegFrame -= HandleJpegFrame;
         _dotNetRef?.Dispose();
 
         // Notify service that window is closing
@@ -253,15 +262,17 @@
     .canvas-container {
         flex: 1;
         display: flex;
-        align-items: center;
-        justify-content: center;
+        align-items: stretch;
+        justify-content: stretch;
         overflow: hidden;
         background: #000;
+        position: relative;
+        min-height: 0;
     }
 
     .canvas-container canvas {
-        max-width: 100%;
-        max-height: 100%;
-        object-fit: contain;
+        width: 100%;
+        height: 100%;
+        object-fit: contain; /* Maintain aspect ratio while filling space */
     }
 </style>

@@ -152,7 +152,7 @@
 
 
 @code {
-    private const string Version = "0.1.0";
+    private const string Version = "0.0.8";
 
     private enum AppMode { Select, StartConnection, JoinConnection }
 
@@ -184,13 +184,16 @@
 
     // WebRTC state
     private WebRTCManager? _webrtc;
+    private bool _webrtcInitialized;
 
     // Screen sharing state
     private bool _isSharingScreen;       // Am I sharing my screen?
     private bool _peerIsSharingScreen;   // Is my peer sharing their screen?
+    private bool _dataChannelReady;      // Is data channel open and ready?
 
-    // Pending SDP offer (buffered if received before WebRTC init)
+    // Pending SDP offer/ICE candidates (buffered if received before WebRTC init)
     private SignalingMessage.SdpOffer? _pendingSdpOffer;
+    private List<SignalingMessage.IceCandidate> _pendingIceCandidates = new();
 
     // File transfer state
     private bool _showFileTransferDialog;
@@ -215,20 +218,25 @@
                 }
                 else
                 {
-                    <button class="share-btn" @onclick="StartSharingScreen">
+                    <button class="share-btn" @onclick="StartSharingScreen" disabled="@(!_dataChannelReady)">
                         <span class="icon">🖥️</span>
                         <span>Share My Screen</span>
                     </button>
+                    @if (!_dataChannelReady)
+                    {
+                        <p class="connecting-status">Establishing connection...</p>
+                    }
                 }
             </div>
 
             @* Remote screen display (when peer is sharing) *@
             @if (_peerIsSharingScreen)
             {
-                <div class="remote-screen-container">
+                @* Hide visually when viewer window is open, but keep canvas for frame capture *@
+                <div class="remote-screen-container @(ViewerService.IsViewerOpen ? "hidden-for-capture" : "")">
                     <div class="remote-screen-header">
                         <span class="remote-label">📺 Remote Screen</span>
-                        <button class="popout-btn" @onclick="OpenViewerWindow" title="Open in separate window">
+                        <button class="popout-btn" @onclick="async () => await OpenViewerWindow()" title="Open in separate window">
                             <span>⛶</span> Open Window
                         </button>
                     </div>
@@ -236,6 +244,10 @@
                         <canvas id="remoteCanvas" width="1920" height="1080"></canvas>
                     </div>
                 </div>
+                @if (ViewerService.IsViewerOpen)
+                {
+                    <p class="viewer-open-status">Viewing in separate window</p>
+                }
             }
             else if (!_isSharingScreen)
             {
@@ -263,6 +275,12 @@
 
         // Subscribe to viewer window input events
         ViewerService.OnInputEvent += OnViewerInputEvent;
+        ViewerService.OnViewerClosed += OnViewerClosed;
+    }
+
+    private async void OnViewerClosed()
+    {
+        await StopFrameCaptureAsync();
     }
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
@@ -483,9 +501,19 @@
             if (success)
             {
                 _isSharingScreen = true;
-                // Notify peer that we're sharing (via data channel)
-                await _webrtc.SendDataAsync(JsonSerializer.Serialize(new { type = "screenShareStarted" }));
-                Logger.LogInformation("Screen sharing started");
+                Logger.LogInformation("Screen sharing started, notifying peer...");
+
+                // Wait a moment for track to be added, then notify peer
+                await Task.Delay(500);
+
+                // Send notification multiple times to ensure delivery
+                for (int i = 0; i < 3; i++)
+                {
+                    var sent = await _webrtc.SendDataAsync(JsonSerializer.Serialize(new { type = "screenShareStarted" }));
+                    Logger.LogInformation("screenShareStarted message sent: {Sent}", sent);
+                    if (sent) break;
+                    await Task.Delay(200);
+                }
             }
             else
             {
@@ -524,11 +552,63 @@
 
     #region Separate Window Viewer
 
-    private void OpenViewerWindow()
+    private DotNetObjectReference<Home>? _frameCaptureRef;
+
+    private async Task OpenViewerWindow()
     {
         // Open the viewer in a separate window
         ViewerService.OpenViewer(connectedPeerId);
         Logger.LogInformation("Opened viewer window for peer {PeerId}", connectedPeerId);
+
+        // Update UI to hide main window canvas
+        StateHasChanged();
+
+        // Start frame capture to relay video to viewer window
+        await Task.Delay(500); // Wait for viewer window to initialize
+        await StartFrameCaptureAsync();
+    }
+
+    private async Task StartFrameCaptureAsync()
+    {
+        try
+        {
+            _frameCaptureRef = DotNetObjectReference.Create(this);
+            await JSRuntime.InvokeVoidAsync("SteamViewerWebRTC.startFrameCapture", _frameCaptureRef);
+            Logger.LogInformation("Frame capture started for viewer window");
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Failed to start frame capture");
+        }
+    }
+
+    private async Task StopFrameCaptureAsync()
+    {
+        try
+        {
+            await JSRuntime.InvokeVoidAsync("SteamViewerWebRTC.stopFrameCapture");
+            _frameCaptureRef?.Dispose();
+            _frameCaptureRef = null;
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Failed to stop frame capture");
+        }
+    }
+
+    [JSInvokable]
+    public void OnFrameCaptured(string base64Data, int width, int height)
+    {
+        if (!ViewerService.IsViewerOpen) return;
+
+        try
+        {
+            ViewerService.SendJpegFrame(base64Data, width, height);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogDebug(ex, "Failed to relay frame to viewer");
+        }
     }
 
     private void OnViewerInputEvent(InputEventData input)
@@ -762,7 +842,16 @@
             await SignalingClient.SendSdpOfferAsync(connectedPeerId, offerJson);
         };
 
+        // Subscribe to data channel open (host needs this too!)
+        _webrtc.OnDataChannelOpen += async () =>
+        {
+            Logger.LogInformation("Host: Data channel opened - ready for communication");
+            _dataChannelReady = true;
+            await InvokeAsync(StateHasChanged);
+        };
+
         await _webrtc.InitializeAsync();
+        _webrtcInitialized = true;
         await _webrtc.CreateDataChannelAsync("data");
 
         // NOTE: Screen capture is NOT auto-started; user chooses when to share
@@ -871,16 +960,11 @@
         try
         {
             var json = System.Text.Json.JsonSerializer.Serialize(inputEvent);
-            Logger.LogDebug("Sending input: {Json}, DataChannel open: {IsOpen}", json, _webrtc?.IsDataChannelOpen);
-            var sent = await _webrtc!.SendDataAsync(json);
-            if (!sent)
-            {
-                Logger.LogWarning("Failed to send input - data channel not ready");
-            }
+            await _webrtc!.SendDataAsync(json);
         }
-        catch (Exception ex)
+        catch
         {
-            Logger.LogWarning(ex, "Failed to send input event");
+            // Silently ignore input send failures to reduce latency
         }
     }
 
@@ -895,7 +979,6 @@
 
         try
         {
-            Logger.LogDebug("Received input message: {Json}", json);
             var inputEvent = JsonSerializer.Deserialize<InputEvent>(json);
             if (inputEvent != null)
             {
@@ -903,14 +986,13 @@
                 int screenWidth = 1920;
                 int screenHeight = 1080;
 
-                Logger.LogDebug("Injecting input: {Type} at screen {Width}x{Height}", inputEvent.GetType().Name, screenWidth, screenHeight);
                 // Inject the input
                 InputInjector.InjectInput(inputEvent, screenWidth, screenHeight);
             }
         }
-        catch (Exception ex)
+        catch
         {
-            Logger.LogWarning(ex, "Failed to process input message: {Json}", json);
+            // Silently ignore parse errors to reduce latency
         }
 
         await Task.CompletedTask;
@@ -935,21 +1017,29 @@
                 {
                     case "screenShareStarted":
                         Logger.LogInformation("Peer started sharing their screen");
-                        await InvokeAsync(() =>
+                        await InvokeAsync(async () =>
                         {
                             _peerIsSharingScreen = true;
                             StateHasChanged();
+
+                            // Give time for track to be received and renegotiation to complete
+                            await Task.Delay(500);
+
+                            // Manually check for video tracks (in case ontrack didn't fire)
+                            await JSRuntime.InvokeVoidAsync("SteamViewerWebRTC.checkForVideoTracks");
+
                             // Auto-open viewer window
-                            OpenViewerWindow();
+                            await OpenViewerWindow();
                         });
                         return;
 
                     case "screenShareStopped":
                         Logger.LogInformation("Peer stopped sharing their screen");
-                        await InvokeAsync(() =>
+                        await InvokeAsync(async () =>
                         {
                             _peerIsSharingScreen = false;
                             _canvasInitialized = false; // Reset canvas for next share
+                            await StopFrameCaptureAsync();
                             ViewerService.CloseViewer(); // Close viewer window if open
                             StateHasChanged();
                         });
@@ -990,6 +1080,12 @@
 
         connectedPeerId = "";
         _canvasInitialized = false;
+        _dataChannelReady = false;
+        _webrtcInitialized = false;
+        _isSharingScreen = false;
+        _peerIsSharingScreen = false;
+        _pendingSdpOffer = null;
+        _pendingIceCandidates.Clear();
 
         if (currentMode == AppMode.StartConnection)
         {
@@ -1032,7 +1128,7 @@
 
                 case SignalingMessage.SdpOffer offer:
                     Logger.LogInformation("Received SDP offer from {PeerId}", offer.TargetId);
-                    if (_webrtc != null)
+                    if (_webrtc != null && _webrtcInitialized)
                     {
                         await _webrtc.SetRemoteDescriptionAsync(offer.Sdp);
                         var answer = await _webrtc.CreateAnswerAsync();
@@ -1057,7 +1153,7 @@
 
                 case SignalingMessage.IceCandidate ice:
                     Logger.LogDebug("Received ICE candidate from {PeerId}", ice.TargetId);
-                    if (_webrtc != null)
+                    if (_webrtc != null && _webrtcInitialized)
                     {
                         var candidateJson = System.Text.Json.JsonSerializer.Serialize(new
                         {
@@ -1066,6 +1162,12 @@
                             sdpMLineIndex = ice.SdpMLineIndex
                         });
                         await _webrtc.AddIceCandidateAsync(candidateJson);
+                    }
+                    else
+                    {
+                        // Buffer ICE candidate - WebRTC not yet initialized
+                        Logger.LogDebug("WebRTC not ready, buffering ICE candidate");
+                        _pendingIceCandidates.Add(ice);
                     }
                     break;
 
@@ -1116,7 +1218,8 @@
         _webrtc.OnDataChannelOpen += async () =>
         {
             Logger.LogInformation("Data channel opened - ready for communication");
-            await Task.CompletedTask;
+            _dataChannelReady = true;
+            await InvokeAsync(StateHasChanged);
         };
 
         // Subscribe to data channel messages (for screen share notifications and input)
@@ -1133,6 +1236,7 @@
         };
 
         await _webrtc.InitializeAsync();
+        _webrtcInitialized = true;
         Logger.LogInformation("WebRTC initialized as joiner, waiting for offer");
 
         // Process any buffered SDP offer (race condition fix)
@@ -1144,6 +1248,23 @@
             await SignalingClient.SendSdpAnswerAsync(_pendingSdpOffer.TargetId, answer);
             Logger.LogInformation("SDP answer sent for buffered offer");
             _pendingSdpOffer = null;
+        }
+
+        // Process any buffered ICE candidates
+        if (_pendingIceCandidates.Count > 0)
+        {
+            Logger.LogInformation("Processing {Count} buffered ICE candidates", _pendingIceCandidates.Count);
+            foreach (var ice in _pendingIceCandidates)
+            {
+                var candidateJson = System.Text.Json.JsonSerializer.Serialize(new
+                {
+                    candidate = ice.Candidate,
+                    sdpMid = ice.SdpMid,
+                    sdpMLineIndex = ice.SdpMLineIndex
+                });
+                await _webrtc.AddIceCandidateAsync(candidateJson);
+            }
+            _pendingIceCandidates.Clear();
         }
     }
 
@@ -1176,6 +1297,9 @@
         SessionManager.FileTransferProgress -= OnFileTransferProgress;
         SessionManager.FileTransferCompleted -= OnFileTransferCompleted;
         SessionManager.FileTransferFailed -= OnFileTransferFailed;
+        ViewerService.OnViewerClosed -= OnViewerClosed;
+
+        await StopFrameCaptureAsync();
 
         if (_webrtc != null)
         {
@@ -1197,6 +1321,7 @@
 
         _inputDotNetRef?.Dispose();
         _loggerDotNetRef?.Dispose();
+        _frameCaptureRef?.Dispose();
     }
 }
 
@@ -1591,6 +1716,18 @@
         font-style: italic;
     }
 
+    .connecting-status {
+        color: #f9e2af;
+        margin-top: 0.5rem;
+        font-size: 0.875rem;
+        font-style: italic;
+    }
+
+    .share-btn:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+    }
+
     .session-toolbar {
         display: flex;
         justify-content: center;
@@ -1750,5 +1887,23 @@
         max-width: 100%;
         max-height: 100%;
         object-fit: contain;
+    }
+
+    /* Hide remote screen visually when viewer window is open, but keep renderable for frame capture */
+    .remote-screen-container.hidden-for-capture {
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 1px;
+        height: 1px;
+        opacity: 0;
+        pointer-events: none;
+        z-index: -1;
+    }
+
+    .viewer-open-status {
+        color: #a6e3a1;
+        margin: 1rem 0;
+        font-style: italic;
     }
 </style>

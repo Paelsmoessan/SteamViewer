@@ -436,7 +436,6 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
     [JSInvokable]
     public async Task OnDataChannelMessageCallback(string data)
     {
-        _logger.LogDebug("Data channel message received: {Length} chars", data.Length);
         if (OnDataChannelMessage != null)
         {
             await OnDataChannelMessage.Invoke(data);
@@ -446,7 +445,6 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
     [JSInvokable]
     public async Task OnDataChannelBinaryMessageCallback(byte[] data)
     {
-        _logger.LogDebug("Data channel binary message received: {Length} bytes", data.Length);
 
         // Fire interface event for video data
         _videoDataReceivedEvent?.Invoke(this, data);

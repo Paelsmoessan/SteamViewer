@@ -112,9 +112,12 @@ window.SteamViewerWebRTC = {
     // Build ICE servers list
     buildIceServers() {
         const servers = [
-            // STUN servers for NAT discovery (always included)
+            // Multiple STUN servers for reliability
             { urls: 'stun:stun.l.google.com:19302' },
             { urls: 'stun:stun1.l.google.com:19302' },
+            { urls: 'stun:stun2.l.google.com:19302' },
+            { urls: 'stun:stun3.l.google.com:19302' },
+            { urls: 'stun:stun4.l.google.com:19302' },
         ];
 
         // Use custom TURN server if configured
@@ -144,7 +147,7 @@ window.SteamViewerWebRTC = {
 
         const config = {
             iceServers,
-            iceCandidatePoolSize: 10,
+            iceCandidatePoolSize: 25,
             bundlePolicy: 'max-bundle',
             rtcpMuxPolicy: 'require',
             iceTransportPolicy: 'all'
@@ -208,8 +211,13 @@ window.SteamViewerWebRTC = {
                 }
             };
 
-            // Handle ICE candidate errors
+            // Handle ICE candidate errors (ignore STUN timeouts on TURN servers - expected)
             this.peerConnection.onicecandidateerror = (event) => {
+                // Error 701 = STUN timeout, often happens on TURN servers - not critical
+                if (event.errorCode === 701 && event.url?.includes('relay.metered.ca')) {
+                    // Silently ignore - Google STUN servers will handle NAT traversal
+                    return;
+                }
                 console.error('ICE candidate error:', event.errorCode, event.errorText, event.url);
             };
 
@@ -420,13 +428,10 @@ window.SteamViewerWebRTC = {
 
     // Send string data over data channel
     sendData(data) {
-        console.log('sendData called, dataChannel state:', this.dataChannel?.readyState);
         if (this.dataChannel && this.dataChannel.readyState === 'open') {
             this.dataChannel.send(data);
-            console.log('Data sent:', data.substring(0, 100));
             return true;
         }
-        console.warn('Data channel not open, state:', this.dataChannel?.readyState);
         return false;
     },
 
@@ -560,9 +565,9 @@ window.SteamViewerWebRTC = {
             this.localStream = await navigator.mediaDevices.getDisplayMedia({
                 video: {
                     cursor: 'always',
-                    width: { ideal: 1280, max: 1920 },
-                    height: { ideal: 720, max: 1080 },
-                    frameRate: { ideal: 24, max: 30 }
+                    width: { ideal: 1920, max: 3840 },
+                    height: { ideal: 1080, max: 2160 },
+                    frameRate: { ideal: 30, max: 60 }
                 },
                 audio: false,
                 preferCurrentTab: false,
@@ -643,6 +648,95 @@ window.SteamViewerWebRTC = {
         }
     },
 
+    // Manually check for and setup any video tracks (call after renegotiation)
+    checkForVideoTracks() {
+        if (!this.peerConnection) return false;
+
+        const receivers = this.peerConnection.getReceivers();
+        const videoReceiver = receivers.find(r => r.track?.kind === 'video');
+
+        if (videoReceiver && videoReceiver.track) {
+            console.log('=== MANUAL TRACK CHECK: Found video track ===');
+            const track = videoReceiver.track;
+
+            // If we already have this track set up, skip
+            if (this.remoteVideo?.srcObject?.getVideoTracks().includes(track)) {
+                console.log('Track already set up');
+                return true;
+            }
+
+            // Set up the video track (same logic as ontrack)
+            console.log('Setting up video track manually');
+            const stream = new MediaStream([track]);
+
+            const video = document.createElement('video');
+            video.srcObject = stream;
+            video.autoplay = true;
+            video.muted = true;
+            video.playsInline = true;
+            this.remoteVideo = video;
+
+            const setupCanvas = (retryCount = 0) => {
+                const canvas = document.getElementById('remoteCanvas');
+                if (!canvas) {
+                    if (retryCount < 50) {
+                        setTimeout(() => setupCanvas(retryCount + 1), 100);
+                        return;
+                    }
+                    console.error('Canvas not found for manual track setup');
+                    return;
+                }
+
+                const ctx = canvas.getContext('2d');
+                this.remoteCanvas = canvas;
+                this.remoteCtx = ctx;
+
+                video.onloadedmetadata = () => {
+                    const width = video.videoWidth;
+                    const height = video.videoHeight;
+                    console.log(`Manual setup: Video ${width}x${height}`);
+
+                    if (width === 0 || height === 0) return;
+
+                    canvas.width = width;
+                    canvas.height = height;
+
+                    let frameCount = 0;
+                    let lastFrameTime = performance.now();
+
+                    const renderFrame = () => {
+                        if (video.paused || video.ended) return;
+                        if (video.readyState >= 2) {
+                            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                            frameCount++;
+                            const now = performance.now();
+                            if (now - lastFrameTime > 2000) {
+                                frameCount = 0;
+                                lastFrameTime = now;
+                            }
+                        }
+                        requestAnimationFrame(renderFrame);
+                    };
+
+                    video.play().then(() => {
+                        console.log('Manual setup: Video playback started');
+                        renderFrame();
+                    }).catch(err => console.error('Manual setup play failed:', err));
+                };
+
+                if (video.readyState >= 1) {
+                    video.onloadedmetadata();
+                }
+            };
+
+            setupCanvas();
+            return true;
+        }
+
+        console.log('No video track found');
+        return false;
+    },
+
     // Get video pipeline diagnostic info
     getVideoDiagnostics() {
         const info = {
@@ -708,8 +802,119 @@ window.SteamViewerWebRTC = {
         return result;
     },
 
+    // Frame capture for external viewer window
+    frameCaptureDotNetRef: null,
+    frameCaptureEnabled: false,
+    frameCaptureAnimationId: null,
+    lastFrameTime: 0,
+    frameInterval: 50, // ~20fps (less CPU than 30fps)
+    captureCanvas: null, // Downscaled canvas for encoding
+    captureCtx: null,
+
+    // Check if video is ready for capture
+    isVideoReady() {
+        return this.remoteCanvas &&
+               this.remoteCanvas.width > 0 &&
+               this.remoteCanvas.height > 0 &&
+               this.remoteVideo &&
+               this.remoteVideo.readyState >= 2;
+    },
+
+    // Enable frame capture to relay to viewer window
+    async startFrameCapture(dotNetRef) {
+        console.log('Starting frame capture for viewer window');
+        this.frameCaptureDotNetRef = dotNetRef;
+        this.frameCaptureEnabled = true;
+        this.lastFrameTime = 0;
+
+        // Wait for video to be ready (up to 5 seconds)
+        let attempts = 0;
+        while (!this.isVideoReady() && attempts < 50) {
+            await new Promise(r => setTimeout(r, 100));
+            attempts++;
+        }
+
+        if (!this.isVideoReady()) {
+            console.warn('Video not ready after 5s, starting capture anyway');
+        } else {
+            console.log('Video ready, starting frame capture');
+        }
+
+        // Use requestAnimationFrame for better performance
+        const captureLoop = (timestamp) => {
+            if (!this.frameCaptureEnabled) return;
+
+            // Throttle to target frame rate
+            if (timestamp - this.lastFrameTime >= this.frameInterval) {
+                this.captureAndSendFrame();
+                this.lastFrameTime = timestamp;
+            }
+
+            this.frameCaptureAnimationId = requestAnimationFrame(captureLoop);
+        };
+
+        this.frameCaptureAnimationId = requestAnimationFrame(captureLoop);
+        return true;
+    },
+
+    stopFrameCapture() {
+        console.log('Stopping frame capture');
+        this.frameCaptureEnabled = false;
+        if (this.frameCaptureAnimationId) {
+            cancelAnimationFrame(this.frameCaptureAnimationId);
+            this.frameCaptureAnimationId = null;
+        }
+        this.frameCaptureDotNetRef = null;
+        this.captureCanvas = null;
+        this.captureCtx = null;
+    },
+
+    captureAndSendFrame() {
+        if (!this.frameCaptureEnabled || !this.remoteCanvas || !this.frameCaptureDotNetRef) return;
+
+        try {
+            const srcWidth = this.remoteCanvas.width;
+            const srcHeight = this.remoteCanvas.height;
+
+            if (srcWidth === 0 || srcHeight === 0) return;
+
+            // Downscale large resolutions for encoding (max 1920x1080 for capture)
+            const maxWidth = 1920;
+            const maxHeight = 1080;
+            let destWidth = srcWidth;
+            let destHeight = srcHeight;
+
+            if (srcWidth > maxWidth || srcHeight > maxHeight) {
+                const scale = Math.min(maxWidth / srcWidth, maxHeight / srcHeight);
+                destWidth = Math.round(srcWidth * scale);
+                destHeight = Math.round(srcHeight * scale);
+            }
+
+            // Create/reuse downscale canvas
+            if (!this.captureCanvas || this.captureCanvas.width !== destWidth || this.captureCanvas.height !== destHeight) {
+                this.captureCanvas = document.createElement('canvas');
+                this.captureCanvas.width = destWidth;
+                this.captureCanvas.height = destHeight;
+                this.captureCtx = this.captureCanvas.getContext('2d');
+            }
+
+            // Draw downscaled frame
+            this.captureCtx.drawImage(this.remoteCanvas, 0, 0, destWidth, destHeight);
+
+            // Convert to JPEG (0.85 quality balances size/quality/CPU)
+            const dataUrl = this.captureCanvas.toDataURL('image/jpeg', 0.85);
+
+            // Send to C# - use original dimensions for coordinate scaling
+            const base64Data = dataUrl.replace(/^data:image\/jpeg;base64,/, '');
+            this.frameCaptureDotNetRef.invokeMethodAsync('OnFrameCaptured', base64Data, srcWidth, srcHeight);
+        } catch (e) {
+            // Ignore capture errors
+        }
+    },
+
     // Close connection
     close() {
+        this.stopFrameCapture();
         this.stopScreenCapture();
 
         if (this.remoteVideo) {
@@ -846,11 +1051,39 @@ window.SteamViewerInput = {
 
     getScaledCoords(e) {
         const rect = this.canvas.getBoundingClientRect();
-        const scaleX = this.canvas.width / rect.width;
-        const scaleY = this.canvas.height / rect.height;
+
+        // Account for object-fit: contain letterboxing
+        // Calculate the actual rendered size of the canvas content
+        const canvasAspect = this.canvas.width / this.canvas.height;
+        const rectAspect = rect.width / rect.height;
+
+        let renderWidth, renderHeight, offsetX, offsetY;
+
+        if (rectAspect > canvasAspect) {
+            // Container is wider than canvas - letterbox on sides
+            renderHeight = rect.height;
+            renderWidth = rect.height * canvasAspect;
+            offsetX = (rect.width - renderWidth) / 2;
+            offsetY = 0;
+        } else {
+            // Container is taller than canvas - letterbox on top/bottom
+            renderWidth = rect.width;
+            renderHeight = rect.width / canvasAspect;
+            offsetX = 0;
+            offsetY = (rect.height - renderHeight) / 2;
+        }
+
+        // Calculate position relative to actual content area
+        const relX = e.clientX - rect.left - offsetX;
+        const relY = e.clientY - rect.top - offsetY;
+
+        // Scale to canvas internal coordinates
+        const scaleX = this.canvas.width / renderWidth;
+        const scaleY = this.canvas.height / renderHeight;
+
         return {
-            x: (e.clientX - rect.left) * scaleX,
-            y: (e.clientY - rect.top) * scaleY
+            x: Math.max(0, Math.min(this.canvas.width, relX * scaleX)),
+            y: Math.max(0, Math.min(this.canvas.height, relY * scaleY))
         };
     },
 
@@ -938,6 +1171,44 @@ window.SteamViewerInput = {
         this.canvas = null;
         this.dotNetRef = null;
         console.log('Input capture stopped');
+    }
+};
+
+// JPEG frame rendering for remote viewer window
+window.SteamViewerViewer = {
+    canvas: null,
+    ctx: null,
+    img: null,
+
+    // Render a JPEG frame to the viewer canvas
+    renderJpegFrame(canvasId, base64Data, width, height) {
+        // Get or create canvas context
+        if (!this.canvas || this.canvas.id !== canvasId) {
+            this.canvas = document.getElementById(canvasId);
+            if (!this.canvas) {
+                console.error(`Canvas '${canvasId}' not found`);
+                return;
+            }
+            this.ctx = this.canvas.getContext('2d');
+        }
+
+        // Update canvas size if needed
+        if (this.canvas.width !== width || this.canvas.height !== height) {
+            this.canvas.width = width;
+            this.canvas.height = height;
+        }
+
+        // Create image and draw to canvas
+        if (!this.img) {
+            this.img = new Image();
+            this.img.onload = () => {
+                if (this.ctx) {
+                    this.ctx.drawImage(this.img, 0, 0, this.canvas.width, this.canvas.height);
+                }
+            };
+        }
+
+        this.img.src = 'data:image/jpeg;base64,' + base64Data;
     }
 };
 

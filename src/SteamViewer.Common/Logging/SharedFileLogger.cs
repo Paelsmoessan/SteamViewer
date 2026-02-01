@@ -70,7 +70,12 @@ public class SharedFileLogger : IDisposable
         var timestamp = DateTime.Now.ToString("HH:mm:ss.fff");
         var line = $"[{timestamp}] [{level}] [{source}] {message}";
         _queue.Enqueue(line);
-        Console.WriteLine(line);
+
+        // Only write errors/warnings to console to reduce noise
+        if (level == "ERROR" || level == "WARN" || level == "CRIT")
+        {
+            Console.WriteLine(line);
+        }
     }
 
     public void LogJS(string level, string message)

@@ -18,6 +18,11 @@ public sealed class RemoteViewerService
     public event Action<DecodedFrame>? OnVideoFrame;
 
     /// <summary>
+    /// Raised when a JPEG frame is received (for viewer window to render).
+    /// </summary>
+    public event Action<JpegFrame>? OnJpegFrame;
+
+    /// <summary>
     /// Raised when an input event is received from the viewer window.
     /// </summary>
     public event Action<InputEventData>? OnInputEvent;
@@ -112,6 +117,14 @@ public sealed class RemoteViewerService
     }
 
     /// <summary>
+    /// Send a JPEG frame to the viewer window.
+    /// </summary>
+    public void SendJpegFrame(string base64Data, int width, int height)
+    {
+        OnJpegFrame?.Invoke(new JpegFrame(base64Data, width, height));
+    }
+
+    /// <summary>
     /// Send an input event from the viewer window to the main window.
     /// </summary>
     public void SendInputEvent(InputEventData inputEvent)
@@ -146,3 +159,8 @@ public enum InputEventType
     KeyDown,
     KeyUp
 }
+
+/// <summary>
+/// JPEG frame data for cross-window video relay.
+/// </summary>
+public record JpegFrame(string Base64Data, int Width, int Height);
