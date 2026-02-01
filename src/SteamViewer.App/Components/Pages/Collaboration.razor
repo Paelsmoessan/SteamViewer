@@ -4,9 +4,11 @@
 @using SteamViewer.Client.Core.Session
 @using SteamViewer.Common.Protocol
 @using SteamViewer.App.Components.Collaboration
+@using SteamViewer.App.Services
 @inject IJSRuntime JS
 @inject IConfiguration Configuration
 @inject ILoggerFactory LoggerFactory
+@inject CollaborationViewerService ViewerService
 @implements IAsyncDisposable
 
 <div class="collaboration-page">
@@ -137,17 +139,6 @@
                 </div>
             </div>
         </div>
-    }
-
-    @if (_showFullscreen && _fullscreenPeerId != null)
-    {
-        <FullscreenViewer
-            SharingParticipants="@(_manager?.State.SharingParticipants ?? Enumerable.Empty<ParticipantInfo>())"
-            MyId="@_manager?.State.MyClientId"
-            InitialPeerId="@_fullscreenPeerId"
-            OnClose="CloseFullscreen"
-            RenderPeerToCanvas="RenderPeerToCanvas"
-            GetPeerConnectionState="GetPeerConnectionState" />
     }
 
     @if (!string.IsNullOrEmpty(_errorMessage))
@@ -479,8 +470,6 @@
     private string _sessionName = "";
     private string _sessionCode = "";
     private string? _selectedPeerId;
-    private string? _fullscreenPeerId;
-    private bool _showFullscreen;
     private bool _isLoading;
     private string? _errorMessage;
 
@@ -539,9 +528,9 @@
         var serverUrl = Configuration["SignalingServer:Url"] ?? "ws://localhost:8080/ws";
         _manager = new CollaborationSessionManager(serverUrl, JS, LoggerFactory);
 
-        _manager.ParticipantJoined += (_, p) => InvokeAsync(StateHasChanged);
-        _manager.ParticipantLeft += (_, _) => InvokeAsync(StateHasChanged);
-        _manager.PeerVideoReady += (_, _) => InvokeAsync(StateHasChanged);
+        _manager.ParticipantJoined += (_, p) => { UpdateViewerServiceData(); InvokeAsync(StateHasChanged); };
+        _manager.ParticipantLeft += (_, _) => { UpdateViewerServiceData(); InvokeAsync(StateHasChanged); };
+        _manager.PeerVideoReady += (_, _) => { UpdateViewerServiceData(); InvokeAsync(StateHasChanged); };
         _manager.Error += (_, msg) => { _errorMessage = msg; InvokeAsync(StateHasChanged); };
 
         await _manager.ConnectAsync();
@@ -582,14 +571,18 @@
 
     private void OnScreenFullscreen(string peerId)
     {
-        _fullscreenPeerId = peerId;
-        _showFullscreen = true;
+        // Update service with current data so FullscreenViewer in separate window can access it
+        UpdateViewerServiceData();
+        // Open in separate window
+        ViewerService.OpenViewer(peerId);
     }
 
-    private void CloseFullscreen()
+    private void UpdateViewerServiceData()
     {
-        _showFullscreen = false;
-        _fullscreenPeerId = null;
+        if (_manager == null) return;
+        ViewerService.SharingParticipants = _manager.State.SharingParticipants;
+        ViewerService.MyClientId = _manager.State.MyClientId;
+        ViewerService.RenderPeerToCanvas = RenderPeerToCanvas;
     }
 
     private async Task<bool> RenderPeerToCanvas(string peerId, string canvasId)

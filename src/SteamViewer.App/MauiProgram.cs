@@ -86,6 +86,9 @@ public static class MauiProgram
         // Register RemoteViewerService for multi-window support
         builder.Services.AddSingleton<RemoteViewerService>();
 
+        // Register CollaborationViewerService for multi-user viewer window
+        builder.Services.AddSingleton<CollaborationViewerService>();
+
         // Register platform-specific services
 #if WINDOWS
         builder.Services.AddSingleton<IMonitorEnumerator, SteamViewer.Platform.Windows.WindowsMonitorEnumerator>();

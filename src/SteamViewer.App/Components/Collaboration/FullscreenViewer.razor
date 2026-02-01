@@ -1,21 +1,23 @@
 @using SteamViewer.Common.Protocol
+@using SteamViewer.App.Services
 @inject IJSRuntime JS
+@inject CollaborationViewerService ViewerService
 @implements IDisposable
 
 <div class="fullscreen-viewer">
     <div class="viewer-tabs">
-        @foreach (var participant in SharingParticipants)
+        @foreach (var participant in ViewerService.SharingParticipants)
         {
             <button class="tab @(ActivePeerId == participant.Id ? "active" : "")"
                     @onclick="() => SelectTab(participant.Id)">
                 @participant.DisplayName
-                @if (participant.Id == MyId)
+                @if (participant.Id == ViewerService.MyClientId)
                 {
                     <span class="you-tag">(You)</span>
                 }
             </button>
         }
-        <button class="close-btn" @onclick="Close" title="Close fullscreen">X</button>
+        <button class="close-btn" @onclick="Close" title="Close viewer window">X</button>
     </div>
 
     <div class="viewer-content">
@@ -32,15 +34,11 @@
 
 <style>
     .fullscreen-viewer {
-        position: fixed;
-        top: 0;
-        left: 0;
-        right: 0;
-        bottom: 0;
+        width: 100%;
+        height: 100vh;
         background: #11111b;
         display: flex;
         flex-direction: column;
-        z-index: 1000;
     }
 
     .viewer-tabs {
@@ -144,13 +142,6 @@
 </style>
 
 @code {
-    [Parameter] public IEnumerable<ParticipantInfo> SharingParticipants { get; set; } = Enumerable.Empty<ParticipantInfo>();
-    [Parameter] public string? MyId { get; set; }
-    [Parameter] public string? InitialPeerId { get; set; }
-    [Parameter] public EventCallback OnClose { get; set; }
-    [Parameter] public Func<string, string, Task<bool>>? RenderPeerToCanvas { get; set; }
-    [Parameter] public Func<string, string>? GetPeerConnectionState { get; set; }
-
     private ElementReference _canvasRef;
     private string? ActivePeerId;
     private bool _inputLocked;
@@ -158,7 +149,10 @@
 
     protected override void OnInitialized()
     {
-        ActivePeerId = InitialPeerId ?? SharingParticipants.FirstOrDefault()?.Id;
+        ActivePeerId = ViewerService.InitialPeerId ?? ViewerService.SharingParticipants.FirstOrDefault()?.Id;
+
+        // Subscribe to tab changes from the service
+        ViewerService.OnActiveTabChanged += OnActiveTabChanged;
 
         // Full framerate rendering for fullscreen
         _renderTimer = new System.Timers.Timer(33); // ~30fps
@@ -166,23 +160,21 @@
         _renderTimer.Start();
     }
 
-    protected override void OnParametersSet()
+    private void OnActiveTabChanged(string peerId)
     {
-        // If active peer left, switch to first available
-        if (ActivePeerId != null && !SharingParticipants.Any(p => p.Id == ActivePeerId))
-        {
-            ActivePeerId = SharingParticipants.FirstOrDefault()?.Id;
-        }
+        ActivePeerId = peerId;
+        _inputLocked = false;
+        InvokeAsync(StateHasChanged);
     }
 
     private async Task RenderActiveAsync()
     {
-        if (RenderPeerToCanvas == null || ActivePeerId == null) return;
-        if (ActivePeerId == MyId) return; // Don't render our own stream
+        if (ViewerService.RenderPeerToCanvas == null || ActivePeerId == null) return;
+        if (ActivePeerId == ViewerService.MyClientId) return; // Don't render our own stream
 
         try
         {
-            await RenderPeerToCanvas(ActivePeerId, "fullscreen-canvas");
+            await ViewerService.RenderPeerToCanvas(ActivePeerId, "fullscreen-canvas");
         }
         catch
         {
@@ -193,6 +185,7 @@
     private void SelectTab(string peerId)
     {
         ActivePeerId = peerId;
+        ViewerService.SwitchTab(peerId);
         _inputLocked = false; // Reset input lock when switching tabs
         StateHasChanged();
     }
@@ -203,30 +196,22 @@
         // TODO: Enable/disable input capture to active peer
     }
 
-    private async Task Close()
+    private void Close()
     {
         _renderTimer?.Stop();
-        await OnClose.InvokeAsync();
+        ViewerService.CloseViewer();
     }
 
     private string GetConnectionStatus()
     {
         if (ActivePeerId == null) return "No active screen";
-        if (ActivePeerId == MyId) return "Your screen";
-
-        var state = GetPeerConnectionState?.Invoke(ActivePeerId) ?? "unknown";
-        return state switch
-        {
-            "connected" => "Connected",
-            "connecting" => "Connecting...",
-            "disconnected" => "Disconnected",
-            "failed" => "Connection failed",
-            _ => state
-        };
+        if (ActivePeerId == ViewerService.MyClientId) return "Your screen";
+        return "Connected";
     }
 
     public void Dispose()
     {
+        ViewerService.OnActiveTabChanged -= OnActiveTabChanged;
         _renderTimer?.Stop();
         _renderTimer?.Dispose();
     }
