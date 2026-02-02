@@ -1,8 +1,12 @@
 @page "/viewer"
 @using Microsoft.JSInterop
 @using SteamViewer.App.Services
+@using SteamViewer.App.Services.Models
+@using SteamViewer.App.Components.Shared
 @using SteamViewer.Client.Core.Capture
 @inject RemoteViewerService ViewerService
+@inject ViewerSessionManager SessionManager
+@inject ViewerTabManager TabManager
 @inject CanvasRenderingService CanvasRenderer
 @inject IJSRuntime JSRuntime
 @implements IDisposable
@@ -19,44 +23,93 @@
                 @(_inputLocked ? "🔒" : "🔓")
             </button>
             <button class="icon-btn" title="Fullscreen">⛶</button>
-            <button class="icon-btn close-btn" @onclick="CloseWindow" title="Disconnect">×</button>
+            <button class="icon-btn close-btn" @onclick="CloseWindow" title="Close window">×</button>
         </div>
     </div>
     <div class="canvas-wrapper">
-        <div class="tab-bar">
+        <div class="tab-bar" data-window-id="@_windowId">
             <div class="tabs">
-                <div class="tab active" title="Current session">
-                    <span class="tab-icon">🖥️</span>
-                    <span class="tab-title">@(ViewerService.PeerId ?? "Remote")</span>
-                    <button class="tab-close" title="Close tab">×</button>
-                </div>
-                <div class="tab" title="Example tab (placeholder)">
-                    <span class="tab-icon">🖥️</span>
-                    <span class="tab-title">Server-02</span>
-                    <button class="tab-close" title="Close tab">×</button>
-                </div>
+                @foreach (var tab in _tabs)
+                {
+                    <div class="tab @(tab.IsActive ? "active" : "") @(tab.IsConnected ? "" : "disconnected")"
+                         title="@tab.Title"
+                         @onclick="() => SwitchTab(tab.SessionId)"
+                         @onclick:stopPropagation="true"
+                         data-session-id="@tab.SessionId">
+                        <span class="tab-icon">@GetTabIcon(tab)</span>
+                        <span class="tab-title">@tab.Title</span>
+                        <button class="tab-close"
+                                title="Close tab"
+                                @onclick="() => CloseTab(tab.SessionId)"
+                                @onclick:stopPropagation="true">×</button>
+                    </div>
+                }
             </div>
-            <button class="tab-add" title="New connection">+</button>
+            <button class="tab-add" title="New connection" @onclick="OpenConnectionDialog">+</button>
         </div>
         <div class="canvas-container" id="canvasContainer">
             <canvas id="viewerCanvas"></canvas>
+            @if (_tabs.Count == 0)
+            {
+                <div class="no-tabs-message">
+                    <p>No active sessions</p>
+                    <button class="add-connection-btn" @onclick="OpenConnectionDialog">+ Add Connection</button>
+                </div>
+            }
         </div>
     </div>
 </div>
 
+<ConnectionDialog
+    IsVisible="@_showConnectionDialog"
+    WindowId="@_windowId"
+    OnClose="CloseConnectionDialog"
+    OnConnected="HandleConnected" />
+
 @code {
     private DotNetObjectReference<RemoteViewer>? _dotNetRef;
+    private DotNetObjectReference<RemoteViewer>? _tabDragRef;
     private bool _canvasInitialized;
     private bool _inputInitialized;
+    private bool _tabDragInitialized;
     private bool _inputLocked;
+    private string? _windowId;
+    private List<TabState> _tabs = new();
+    private bool _showConnectionDialog;
+
+    protected override void OnInitialized()
+    {
+        // Get or create window ID for this viewer
+        _windowId = TabManager.CreateWindow();
+
+        // Subscribe to tab manager events
+        TabManager.OnTabsChanged += HandleTabsChanged;
+        TabManager.OnActiveTabChanged += HandleActiveTabChanged;
+
+        // Subscribe to legacy single-session service for backward compatibility
+        ViewerService.OnJpegFrame += HandleJpegFrame;
+
+        // If legacy service has a peer, create a tab for it
+        if (!string.IsNullOrEmpty(ViewerService.PeerId))
+        {
+            // For now, use legacy mode - create a pseudo-tab for the existing connection
+            _tabs.Add(new TabState
+            {
+                SessionId = "legacy",
+                Title = ViewerService.PeerId,
+                IsActive = true,
+                IsConnected = true,
+                IsPeerSharing = true
+            });
+        }
+
+        RefreshTabs();
+    }
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
         if (firstRender)
         {
-            // Subscribe to JPEG frames (from main window's canvas capture)
-            ViewerService.OnJpegFrame += HandleJpegFrame;
-
             // Initialize canvas
             await Task.Delay(100); // Wait for DOM
             try
@@ -70,12 +123,148 @@
                     "viewerCanvas",
                     _dotNetRef,
                     new { showLockIndicator = false });
+
+                // Initialize tab drag functionality
+                _tabDragRef = DotNetObjectReference.Create(this);
+                _tabDragInitialized = await JSRuntime.InvokeAsync<bool>(
+                    "SteamViewerTabDrag.initialize",
+                    _tabDragRef);
+
+                // Set window ID on tab bar for cross-window drops
+                if (_windowId != null)
+                {
+                    await JSRuntime.InvokeVoidAsync("SteamViewerTabDrag.setTabBarWindowId", _windowId);
+                }
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"Failed to initialize viewer canvas: {ex.Message}");
             }
         }
+    }
+
+    #region Tab Drag Callbacks
+
+    [JSInvokable]
+    public void OnTabDragStart(string sessionId)
+    {
+        // Tab drag started - could update UI state if needed
+        Console.WriteLine($"Tab drag started: {sessionId}");
+    }
+
+    [JSInvokable]
+    public async Task OnTabDetached(string sessionId, int screenX, int screenY)
+    {
+        // Tab dragged outside window - create new window
+        if (_windowId == null) return;
+
+        Console.WriteLine($"Tab detached: {sessionId} at ({screenX}, {screenY})");
+        TabManager.DetachTab(_windowId, sessionId, screenX, screenY);
+        await Task.CompletedTask;
+    }
+
+    [JSInvokable]
+    public async Task OnTabDroppedOnWindow(string sessionId, string targetWindowId)
+    {
+        // Tab dropped on another window's tab bar
+        if (_windowId == null) return;
+
+        Console.WriteLine($"Tab dropped: {sessionId} from {_windowId} to {targetWindowId}");
+        TabManager.MoveTab(_windowId, targetWindowId, sessionId);
+        await Task.CompletedTask;
+    }
+
+    #endregion
+
+    private void RefreshTabs()
+    {
+        if (_windowId == null) return;
+
+        var newTabs = TabManager.GetTabs(_windowId).ToList();
+
+        // Keep legacy tab if it exists and no other tabs
+        if (newTabs.Count == 0 && _tabs.Any(t => t.SessionId == "legacy"))
+        {
+            // Keep legacy tab
+            return;
+        }
+
+        _tabs = newTabs;
+    }
+
+    private void HandleTabsChanged(string windowId)
+    {
+        if (windowId != _windowId) return;
+        InvokeAsync(() =>
+        {
+            RefreshTabs();
+            StateHasChanged();
+        });
+    }
+
+    private void HandleActiveTabChanged(string windowId, string? sessionId)
+    {
+        if (windowId != _windowId) return;
+        InvokeAsync(StateHasChanged);
+    }
+
+    private void SwitchTab(string sessionId)
+    {
+        if (_windowId == null) return;
+
+        if (sessionId == "legacy")
+        {
+            // Legacy mode - already showing the only session
+            return;
+        }
+
+        TabManager.SetActiveTab(_windowId, sessionId);
+    }
+
+    private async Task CloseTab(string sessionId)
+    {
+        if (_windowId == null) return;
+
+        if (sessionId == "legacy")
+        {
+            // Legacy mode - close the window
+            CloseWindow();
+            return;
+        }
+
+        await TabManager.RemoveTabAsync(_windowId, sessionId);
+
+        // If no tabs left, close window
+        if (_tabs.Count == 0)
+        {
+            CloseWindow();
+        }
+    }
+
+    private string GetTabIcon(TabState tab)
+    {
+        if (!tab.IsConnected) return "⚠️";
+        if (tab.IsPeerSharing) return "🖥️";
+        return "🔗";
+    }
+
+    private void OpenConnectionDialog()
+    {
+        _showConnectionDialog = true;
+        StateHasChanged();
+    }
+
+    private void CloseConnectionDialog()
+    {
+        _showConnectionDialog = false;
+        StateHasChanged();
+    }
+
+    private void HandleConnected(string sessionId)
+    {
+        _showConnectionDialog = false;
+        RefreshTabs();
+        StateHasChanged();
     }
 
     private async Task ToggleInputLock()
@@ -123,11 +312,12 @@
         ViewerService.CloseViewer();
     }
 
-    #region Input Callbacks (relayed to main window)
+    #region Input Callbacks (relayed to main window or active session)
 
     [JSInvokable]
     public void OnMouseMove(double x, double y, int captureWidth = 0, int captureHeight = 0)
     {
+        // For now, relay to legacy service
         ViewerService.SendInputEvent(new InputEventData
         {
             Type = InputEventType.MouseMove,
@@ -218,8 +408,27 @@
 
     public void Dispose()
     {
+        TabManager.OnTabsChanged -= HandleTabsChanged;
+        TabManager.OnActiveTabChanged -= HandleActiveTabChanged;
         ViewerService.OnJpegFrame -= HandleJpegFrame;
         _dotNetRef?.Dispose();
+        _tabDragRef?.Dispose();
+
+        // Dispose tab drag JS
+        if (_tabDragInitialized)
+        {
+            try
+            {
+                _ = JSRuntime.InvokeVoidAsync("SteamViewerTabDrag.dispose");
+            }
+            catch { }
+        }
+
+        // Remove window from tab manager
+        if (_windowId != null)
+        {
+            _ = TabManager.RemoveWindowAsync(_windowId);
+        }
 
         // Notify service that window is closing
         ViewerService.NotifyViewerClosed();
@@ -321,30 +530,30 @@
         right: 0;
         z-index: 10;
         display: flex;
-        align-items: flex-start; /* Align to top to connect with toolbar */
+        align-items: flex-start;
         height: 36px;
         padding: 0 8px;
-        background: transparent; /* Canvas shows through! */
+        background: transparent;
         transition: opacity 0.2s;
     }
 
     /* Auto-fade: tabs faded by default, light up on tab-bar hover */
     .tab-bar {
         opacity: 0.3;
-        transition: opacity 0.3s ease 0.25s; /* 0.25s delay before fading */
+        transition: opacity 0.3s ease 0.25s;
     }
 
     .tab-bar:hover {
         opacity: 1;
-        transition: opacity 0.15s ease; /* Instant appear */
+        transition: opacity 0.15s ease;
     }
 
     .tabs {
         display: flex;
-        align-items: flex-start; /* Align to top */
+        align-items: flex-start;
     }
 
-    /* Chrome-style slanted tab with frosted glass - wider at top, connects to toolbar */
+    /* Chrome-style slanted tab with frosted glass */
     .tab {
         display: flex;
         align-items: center;
@@ -357,17 +566,17 @@
         cursor: pointer;
         min-width: 120px;
         max-width: 200px;
-        margin-top: -1px; /* Overlap toolbar to prevent shimmering line */
-        /* Slanted trapezoid with beveled bottom corners */
+        margin-top: -1px;
         clip-path: polygon(
-            0 0,                          /* top-left */
-            100% 0,                       /* top-right */
-            calc(100% - 4px) calc(100% - 6px),  /* right bevel start */
-            calc(100% - 10px) 100%,       /* bottom-right */
-            10px 100%,                    /* bottom-left */
-            4px calc(100% - 6px)          /* left bevel start */
+            0 0,
+            100% 0,
+            calc(100% - 4px) calc(100% - 6px),
+            calc(100% - 10px) 100%,
+            10px 100%,
+            4px calc(100% - 6px)
         );
         transition: all 0.15s;
+        position: relative;
     }
 
     .tab:hover {
@@ -387,6 +596,14 @@
         right: 0;
         height: 2px;
         background: #89b4fa;
+    }
+
+    .tab.disconnected {
+        opacity: 0.6;
+    }
+
+    .tab.disconnected .tab-title {
+        color: #f38ba8;
     }
 
     .tab-icon {
@@ -440,7 +657,7 @@
         backdrop-filter: blur(8px);
         -webkit-backdrop-filter: blur(8px);
         border: none;
-        border-radius: 0 0 6px 6px; /* Rounded at bottom only */
+        border-radius: 0 0 6px 6px;
         color: #6c7086;
         font-size: 16px;
         margin-left: 8px;
@@ -475,5 +692,37 @@
         width: 100%;
         height: 100%;
         object-fit: contain;
+    }
+
+    /* No tabs message */
+    .no-tabs-message {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        text-align: center;
+        color: #6c7086;
+    }
+
+    .no-tabs-message p {
+        margin-bottom: 16px;
+        font-size: 14px;
+    }
+
+    .add-connection-btn {
+        padding: 12px 24px;
+        background: #313244;
+        border: 1px solid #45475a;
+        border-radius: 8px;
+        color: #cdd6f4;
+        font-size: 14px;
+        cursor: pointer;
+        transition: all 0.15s;
+    }
+
+    .add-connection-btn:hover {
+        background: #45475a;
+        border-color: #89b4fa;
+        color: #89b4fa;
     }
 </style>

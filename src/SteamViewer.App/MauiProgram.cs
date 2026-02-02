@@ -89,6 +89,12 @@ public static class MauiProgram
         // Register CollaborationViewerService for multi-user viewer window
         builder.Services.AddSingleton<CollaborationViewerService>();
 
+        // Register ViewerSessionManager for multi-tab viewer sessions
+        builder.Services.AddSingleton<ViewerSessionManager>();
+
+        // Register ViewerTabManager for multi-tab/multi-window coordination
+        builder.Services.AddSingleton<ViewerTabManager>();
+
         // Register platform-specific services
 #if WINDOWS
         builder.Services.AddSingleton<IMonitorEnumerator, SteamViewer.Platform.Windows.WindowsMonitorEnumerator>();
