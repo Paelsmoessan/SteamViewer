@@ -10,16 +10,16 @@
 <div class="viewer-container">
     <div class="viewer-toolbar">
         <div class="toolbar-menus">
-            <button class="menu-btn">Actions ▾</button>
-            <button class="menu-btn">View ▾</button>
-            <button class="menu-btn">Files ▾</button>
+            <button class="menu-btn" title="Session actions">Actions ▾</button>
+            <button class="menu-btn" title="Display options">View ▾</button>
+            <button class="menu-btn" title="File transfer">Files ▾</button>
         </div>
         <div class="toolbar-icons">
-            <button class="icon-btn @(_inputLocked ? "locked" : "")" @onclick="ToggleInputLock" title="@(_inputLocked ? "Unlock Input (Esc)" : "Lock Input (double-click canvas)")">
+            <button class="icon-btn @(_inputLocked ? "locked" : "")" @onclick="ToggleInputLock" title="@(_inputLocked ? "Unlock (Esc)" : "Lock input")">
                 @(_inputLocked ? "🔒" : "🔓")
             </button>
-            <button class="icon-btn" title="Fullscreen (not implemented)">⛶</button>
-            <button class="icon-btn close-btn" @onclick="CloseWindow" title="Close">×</button>
+            <button class="icon-btn" title="Fullscreen">⛶</button>
+            <button class="icon-btn close-btn" @onclick="CloseWindow" title="Disconnect">×</button>
         </div>
     </div>
     <div class="canvas-container" id="canvasContainer">
@@ -223,8 +223,8 @@
         display: flex;
         align-items: center;
         justify-content: space-between;
-        height: 36px;
-        padding: 0 8px;
+        height: 28px;
+        padding: 0 6px;
         background: #1e1e2e;
         border-bottom: 1px solid #313244;
         flex-shrink: 0;
@@ -232,17 +232,17 @@
 
     .toolbar-menus {
         display: flex;
-        gap: 4px;
+        gap: 2px;
     }
 
     .menu-btn {
         background: transparent;
         border: none;
         color: #a6adc8;
-        padding: 6px 12px;
-        font-size: 13px;
+        padding: 4px 10px;
+        font-size: 12px;
         cursor: pointer;
-        border-radius: 4px;
+        border-radius: 3px;
         transition: all 0.15s;
     }
 
@@ -253,18 +253,18 @@
 
     .toolbar-icons {
         display: flex;
-        gap: 4px;
+        gap: 2px;
     }
 
     .icon-btn {
-        width: 28px;
-        height: 28px;
+        width: 24px;
+        height: 24px;
         background: transparent;
         border: none;
         color: #a6adc8;
-        font-size: 14px;
+        font-size: 12px;
         cursor: pointer;
-        border-radius: 4px;
+        border-radius: 3px;
         display: flex;
         align-items: center;
         justify-content: center;
