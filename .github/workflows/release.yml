@@ -1,0 +1,211 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g., v1.0.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-server:
+    name: Build Server (${{ matrix.rid }})
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            rid: win-x64
+            ext: .exe
+          - os: macos-latest
+            rid: osx-x64
+            ext: ""
+          - os: macos-latest
+            rid: osx-arm64
+            ext: ""
+          - os: ubuntu-latest
+            rid: linux-x64
+            ext: ""
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore dependencies
+        run: dotnet restore src/SteamViewer.Server
+
+      - name: Publish Server
+        run: |
+          dotnet publish src/SteamViewer.Server \
+            -c Release \
+            -r ${{ matrix.rid }} \
+            --self-contained true \
+            -p:PublishSingleFile=true \
+            -p:PublishTrimmed=true \
+            -p:TrimMode=full \
+            -p:SuppressTrimAnalysisWarnings=true \
+            -o publish
+
+      - name: Rename artifact
+        shell: bash
+        run: |
+          if [ "${{ matrix.ext }}" = ".exe" ]; then
+            mv publish/SteamViewer.Server.exe "publish/SteamViewer.Server-${{ matrix.rid }}.exe"
+          else
+            mv publish/SteamViewer.Server "publish/SteamViewer.Server-${{ matrix.rid }}"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-${{ matrix.rid }}
+          path: publish/SteamViewer.Server-${{ matrix.rid }}${{ matrix.ext }}
+          retention-days: 1
+
+  build-launcher:
+    name: Build Windows Launcher
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install ps2exe
+        shell: pwsh
+        run: |
+          Install-Module ps2exe -Scope CurrentUser -Force
+
+      - name: Get version
+        id: version
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build launcher
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}".TrimStart('v')
+          Invoke-ps2exe `
+            -InputFile "tools/launcher/Launcher.ps1" `
+            -OutputFile "tools/launcher/SteamViewer.Launcher.exe" `
+            -NoConsole `
+            -Title "SteamViewer Launcher" `
+            -Description "Downloads and runs SteamViewer Server" `
+            -Company "SteamViewer" `
+            -Product "SteamViewer Launcher" `
+            -Version $version `
+            -Copyright "(c) 2026 SteamViewer" `
+            -RequireAdmin:$false
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: launcher-windows
+          path: tools/launcher/SteamViewer.Launcher.exe
+          retention-days: 1
+
+  release:
+    name: Create Release
+    needs: [build-server, build-launcher]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release
+
+          # Move server binaries
+          find artifacts -name "SteamViewer.Server-*" -exec mv {} release/ \;
+
+          # Move launcher
+          mv artifacts/launcher-windows/SteamViewer.Launcher.exe release/
+
+          # Copy shell launcher
+          cp tools/launcher/steamviewer-launcher.sh release/
+          chmod +x release/steamviewer-launcher.sh
+
+          # List release files
+          echo "Release files:"
+          ls -la release/
+
+      - name: Generate checksums
+        run: |
+          cd release
+          sha256sum * > checksums.txt
+          cat checksums.txt
+
+      - name: Get version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: SteamViewer ${{ steps.version.outputs.version }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            release/SteamViewer.Launcher.exe
+            release/steamviewer-launcher.sh
+            release/SteamViewer.Server-win-x64.exe
+            release/SteamViewer.Server-osx-x64
+            release/SteamViewer.Server-osx-arm64
+            release/SteamViewer.Server-linux-x64
+            release/checksums.txt
+          body: |
+            ## Downloads
+
+            ### Quick Start (Recommended)
+
+            | Platform | Download | Size |
+            |----------|----------|------|
+            | **Windows** | [SteamViewer.Launcher.exe](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/SteamViewer.Launcher.exe) | ~50KB |
+            | **macOS/Linux** | [steamviewer-launcher.sh](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/steamviewer-launcher.sh) | ~3KB |
+
+            The launcher automatically downloads and updates the server (~13-15MB) on first run.
+
+            ### Direct Downloads (Advanced)
+
+            If you prefer to download the server directly:
+
+            | Platform | Download |
+            |----------|----------|
+            | Windows x64 | [SteamViewer.Server-win-x64.exe](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/SteamViewer.Server-win-x64.exe) |
+            | macOS Intel | [SteamViewer.Server-osx-x64](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/SteamViewer.Server-osx-x64) |
+            | macOS ARM (M1/M2/M3) | [SteamViewer.Server-osx-arm64](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/SteamViewer.Server-osx-arm64) |
+            | Linux x64 | [SteamViewer.Server-linux-x64](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/SteamViewer.Server-linux-x64) |
+
+            ### Verification
+
+            SHA256 checksums: [checksums.txt](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/checksums.txt)
