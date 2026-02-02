@@ -29,4 +29,4 @@ COPY --from=publish /app/publish .
 # Expose port (Render provides PORT env var)
 EXPOSE 8080
 
-ENTRYPOINT ["dotnet", "SteamViewer.Server.dll"]
+ENTRYPOINT ["./SteamViewer.Server"]
