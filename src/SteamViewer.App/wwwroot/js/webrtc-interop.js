@@ -256,11 +256,32 @@ window.SteamViewerWebRTC = {
                 if (event.track.kind === 'video') {
                     console.log('Setting up video track...');
 
+                    // Configure receiver for ultra-low latency (reduces jitter buffer)
+                    const receiver = event.receiver;
+                    if (receiver) {
+                        if ('playoutDelayHint' in receiver) {
+                            receiver.playoutDelayHint = 0;  // Minimum delay (browser enforces floor)
+                            console.log('Set playoutDelayHint to 0 (ultra-low latency)');
+                        }
+                        if ('jitterBufferTarget' in receiver) {
+                            receiver.jitterBufferTarget = 0;  // Request minimal jitter buffer
+                            console.log('Set jitterBufferTarget to 0');
+                        }
+                    }
+
                     const video = document.createElement('video');
                     video.srcObject = event.streams[0];
                     video.autoplay = true;
                     video.muted = true;
                     video.playsInline = true;
+
+                    // Low-latency hints to reduce video element buffering
+                    video.disableRemotePlayback = true;  // No casting
+                    video.preload = 'none';              // Don't pre-buffer
+                    video.playbackRate = 1.0;            // Prevent adaptive playback adjustments
+                    if ('preservesPitch' in video) {
+                        video.preservesPitch = false;    // Skip audio pitch correction
+                    }
 
                     // Store reference for debugging
                     this.remoteVideo = video;
@@ -281,12 +302,12 @@ window.SteamViewerWebRTC = {
                     const setupCanvas = (retryCount = 0) => {
                         const canvas = document.getElementById('remoteCanvas');
                         if (!canvas) {
-                            if (retryCount < 50) { // Retry for up to 5 seconds
-                                console.log(`Canvas not found, retry ${retryCount + 1}/50...`);
+                            if (retryCount < 10) { // Retry for up to 1 second (reduced from 5s)
+                                console.log(`Canvas not found, retry ${retryCount + 1}/10...`);
                                 setTimeout(() => setupCanvas(retryCount + 1), 100);
                                 return;
                             }
-                            console.error('Canvas not found after 5 seconds!');
+                            console.error('Canvas not found after 1 second!');
                             return;
                         }
 
@@ -309,7 +330,39 @@ window.SteamViewerWebRTC = {
                             canvas.width = width;
                             canvas.height = height;
 
-                            const renderFrame = () => {
+                            // Use requestVideoFrameCallback for lower latency (renders when frame arrives, not on monitor refresh)
+                            const renderFrameRVFC = (now, metadata) => {
+                                if (video.paused || video.ended) {
+                                    console.log('Video paused/ended, stopping render');
+                                    return;
+                                }
+
+                                // Skip drawing if video not ready yet (avoids errors during startup)
+                                if (video.readyState < 2) {
+                                    video.requestVideoFrameCallback(renderFrameRVFC);
+                                    return;
+                                }
+
+                                try {
+                                    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                                    frameCount++;
+
+                                    // Log frame rate every 2 seconds
+                                    if (now - lastFrameTime > 2000) {
+                                        const fps = frameCount / ((now - lastFrameTime) / 1000);
+                                        console.log(`Video rendering (RVFC): ${fps.toFixed(1)} FPS, ${frameCount} frames`);
+                                        frameCount = 0;
+                                        lastFrameTime = now;
+                                    }
+                                } catch (e) {
+                                    console.error('Error drawing frame:', e);
+                                }
+
+                                video.requestVideoFrameCallback(renderFrameRVFC);
+                            };
+
+                            // Fallback for browsers without requestVideoFrameCallback
+                            const renderFrameRAF = () => {
                                 if (video.paused || video.ended) {
                                     console.log('Video paused/ended, stopping render');
                                     return;
@@ -324,7 +377,7 @@ window.SteamViewerWebRTC = {
                                         const now = performance.now();
                                         if (now - lastFrameTime > 2000) {
                                             const fps = frameCount / ((now - lastFrameTime) / 1000);
-                                            console.log(`Video rendering: ${fps.toFixed(1)} FPS, ${frameCount} frames`);
+                                            console.log(`Video rendering (RAF): ${fps.toFixed(1)} FPS, ${frameCount} frames`);
                                             frameCount = 0;
                                             lastFrameTime = now;
                                         }
@@ -332,15 +385,25 @@ window.SteamViewerWebRTC = {
                                         console.error('Error drawing frame:', e);
                                     }
                                 }
-                                requestAnimationFrame(renderFrame);
+                                requestAnimationFrame(renderFrameRAF);
                             };
 
                             lastFrameTime = performance.now();
 
+                            // Start rendering IMMEDIATELY (don't wait for play() promise)
+                            // This eliminates 200-500ms latency from waiting for play() to resolve
+                            if ('requestVideoFrameCallback' in HTMLVideoElement.prototype) {
+                                console.log('Using requestVideoFrameCallback (low-latency mode)');
+                                video.requestVideoFrameCallback(renderFrameRVFC);
+                            } else {
+                                console.log('Using requestAnimationFrame fallback');
+                                renderFrameRAF();
+                            }
+
+                            // Play in background (don't block rendering)
                             video.play()
                                 .then(() => {
                                     console.log('=== VIDEO PLAYBACK STARTED ===');
-                                    renderFrame();
                                 })
                                 .catch(err => {
                                     console.error('Video play() FAILED:', err);
@@ -564,7 +627,7 @@ window.SteamViewerWebRTC = {
         try {
             this.localStream = await navigator.mediaDevices.getDisplayMedia({
                 video: {
-                    cursor: 'always',
+                    cursor: 'motion',  // Only redraw cursor when moving (reduces capture overhead)
                     width: { ideal: 1920, max: 3840 },
                     height: { ideal: 1080, max: 2160 },
                     frameRate: { ideal: 30, max: 60 }
@@ -611,11 +674,13 @@ window.SteamViewerWebRTC = {
                     params.encodings = [{}];
                 }
                 params.encodings[0].maxBitrate = 3000000; // 3 Mbps (lower = less latency)
-                params.encodings[0].maxFramerate = 24;
+                params.encodings[0].maxFramerate = 30;  // Match getDisplayMedia ideal (24 causes stuttering)
                 params.encodings[0].priority = 'high';
                 params.encodings[0].networkPriority = 'high';
                 // Disable scalability for lower latency
                 params.encodings[0].scalabilityMode = 'L1T1';
+                // Maintain frame rate even if quality has to drop (better for responsiveness)
+                params.encodings[0].degradationPreference = 'maintain-framerate';
                 sender.setParameters(params).catch(e => console.warn('Could not set encoding params:', e));
 
                 // Handle track ending (user stops sharing)
@@ -665,6 +730,16 @@ window.SteamViewerWebRTC = {
                 return true;
             }
 
+            // Configure receiver for ultra-low latency (reduces jitter buffer)
+            if ('playoutDelayHint' in videoReceiver) {
+                videoReceiver.playoutDelayHint = 0;
+                console.log('Manual setup: Set playoutDelayHint to 0');
+            }
+            if ('jitterBufferTarget' in videoReceiver) {
+                videoReceiver.jitterBufferTarget = 0;
+                console.log('Manual setup: Set jitterBufferTarget to 0');
+            }
+
             // Set up the video track (same logic as ontrack)
             console.log('Setting up video track manually');
             const stream = new MediaStream([track]);
@@ -674,12 +749,21 @@ window.SteamViewerWebRTC = {
             video.autoplay = true;
             video.muted = true;
             video.playsInline = true;
+
+            // Low-latency hints
+            video.disableRemotePlayback = true;
+            video.preload = 'none';
+            video.playbackRate = 1.0;  // Prevent adaptive playback adjustments
+            if ('preservesPitch' in video) {
+                video.preservesPitch = false;
+            }
+
             this.remoteVideo = video;
 
             const setupCanvas = (retryCount = 0) => {
                 const canvas = document.getElementById('remoteCanvas');
                 if (!canvas) {
-                    if (retryCount < 50) {
+                    if (retryCount < 10) { // Reduced from 50 (5s) to 10 (1s)
                         setTimeout(() => setupCanvas(retryCount + 1), 100);
                         return;
                     }
@@ -704,7 +788,24 @@ window.SteamViewerWebRTC = {
                     let frameCount = 0;
                     let lastFrameTime = performance.now();
 
-                    const renderFrame = () => {
+                    // Low-latency render using requestVideoFrameCallback
+                    const renderFrameRVFC = (now, metadata) => {
+                        if (video.paused || video.ended) return;
+                        if (video.readyState < 2) {
+                            video.requestVideoFrameCallback(renderFrameRVFC);
+                            return;
+                        }
+                        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                        frameCount++;
+                        if (now - lastFrameTime > 2000) {
+                            frameCount = 0;
+                            lastFrameTime = now;
+                        }
+                        video.requestVideoFrameCallback(renderFrameRVFC);
+                    };
+
+                    // Fallback render using requestAnimationFrame
+                    const renderFrameRAF = () => {
                         if (video.paused || video.ended) return;
                         if (video.readyState >= 2) {
                             ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
@@ -715,12 +816,16 @@ window.SteamViewerWebRTC = {
                                 lastFrameTime = now;
                             }
                         }
-                        requestAnimationFrame(renderFrame);
+                        requestAnimationFrame(renderFrameRAF);
                     };
 
                     video.play().then(() => {
                         console.log('Manual setup: Video playback started');
-                        renderFrame();
+                        if ('requestVideoFrameCallback' in HTMLVideoElement.prototype) {
+                            video.requestVideoFrameCallback(renderFrameRVFC);
+                        } else {
+                            renderFrameRAF();
+                        }
                     }).catch(err => console.error('Manual setup play failed:', err));
                 };
 
@@ -800,6 +905,26 @@ window.SteamViewerWebRTC = {
         });
 
         return result;
+    },
+
+    // Log latency stats for debugging - call from browser console: SteamViewerWebRTC.logLatencyStats()
+    async logLatencyStats() {
+        if (!this.peerConnection) {
+            console.log('[LATENCY] No peer connection');
+            return;
+        }
+        const stats = await this.peerConnection.getStats();
+        stats.forEach(report => {
+            if (report.type === 'inbound-rtp' && report.kind === 'video') {
+                console.log(`[LATENCY] jitterBufferDelay: ${report.jitterBufferDelay?.toFixed(3) ?? 'N/A'}s, ` +
+                            `jitter: ${report.jitter?.toFixed(3) ?? 'N/A'}s, ` +
+                            `framesDecoded: ${report.framesDecoded ?? 'N/A'}, ` +
+                            `FPS: ${report.framesPerSecond?.toFixed(1) ?? 'N/A'}`);
+            }
+            if (report.type === 'candidate-pair' && report.state === 'succeeded') {
+                console.log(`[LATENCY] RTT: ${((report.currentRoundTripTime ?? 0) * 1000).toFixed(1)}ms`);
+            }
+        });
     },
 
     // Frame capture for external viewer window
