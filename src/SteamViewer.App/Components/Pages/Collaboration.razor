@@ -526,7 +526,8 @@
 
     private async Task InitializeManagerAsync()
     {
-        var serverUrl = Configuration["SignalingServer:Url"] ?? "ws://localhost:8080/ws";
+        var serverUrl = Configuration["SignalingServer"]
+            ?? throw new InvalidOperationException("SignalingServer not configured in appsettings.json");
         _manager = new CollaborationSessionManager(serverUrl, JS, LoggerFactory);
 
         _manager.ParticipantJoined += (_, p) => { UpdateViewerServiceData(); InvokeAsync(StateHasChanged); };

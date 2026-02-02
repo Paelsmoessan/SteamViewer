@@ -6,9 +6,9 @@ namespace SteamViewer.Client.Core.Session;
 public sealed class SessionConfig
 {
     /// <summary>
-    /// Signaling server WebSocket URL.
+    /// Signaling server WebSocket URL (required).
     /// </summary>
-    public string SignalingServerUrl { get; set; } = "ws://localhost:8080/ws";
+    public required string SignalingServerUrl { get; set; }
 
     /// <summary>
     /// STUN servers for NAT traversal.

@@ -50,10 +50,10 @@ public static class MauiProgram
         builder.Logging.AddFilter("Microsoft.AspNetCore", LogLevel.Warning); // Reduce noise from Blazor
 #endif
 
-        // Load server URL from configuration
+        // Load server URL from configuration (required)
         var serverUrl = configuration["SignalingServer"]
                         ?? Environment.GetEnvironmentVariable("STEAMVIEWER_SERVER")
-                        ?? "ws://localhost:8080/ws";
+                        ?? throw new InvalidOperationException("SignalingServer not configured in appsettings.json. Run 'git pull' and rebuild.");
 
 #if DEBUG
         Console.WriteLine($"Signaling server URL: {serverUrl}");
