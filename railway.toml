@@ -1,6 +1,7 @@
 [build]
 builder = "dockerfile"
 dockerfilePath = "src/SteamViewer.Server/Dockerfile"
+watchPatterns = ["src/SteamViewer.Server/**"]
 
 [deploy]
 restartPolicyType = "ON_FAILURE"
