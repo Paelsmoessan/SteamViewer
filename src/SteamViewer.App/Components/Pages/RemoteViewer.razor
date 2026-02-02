@@ -9,16 +9,17 @@
 
 <div class="viewer-container">
     <div class="viewer-toolbar">
-        <div class="toolbar-left">
-            <span class="connection-indicator">Connected</span>
+        <div class="toolbar-menus">
+            <button class="menu-btn">Actions ▾</button>
+            <button class="menu-btn">View ▾</button>
+            <button class="menu-btn">Files ▾</button>
         </div>
-        <div class="toolbar-center">
-            <span class="peer-info">Remote Desktop - @(ViewerService.PeerId ?? "Unknown")</span>
-        </div>
-        <div class="toolbar-right">
-            <button class="toolbar-btn" @onclick="CloseWindow" title="Close">
-                Close
+        <div class="toolbar-icons">
+            <button class="icon-btn @(_inputLocked ? "locked" : "")" @onclick="ToggleInputLock" title="@(_inputLocked ? "Unlock Input (Esc)" : "Lock Input (double-click canvas)")">
+                @(_inputLocked ? "🔒" : "🔓")
             </button>
+            <button class="icon-btn" title="Fullscreen (not implemented)">⛶</button>
+            <button class="icon-btn close-btn" @onclick="CloseWindow" title="Close">×</button>
         </div>
     </div>
     <div class="canvas-container" id="canvasContainer">
@@ -30,6 +31,7 @@
     private DotNetObjectReference<RemoteViewer>? _dotNetRef;
     private bool _canvasInitialized;
     private bool _inputInitialized;
+    private bool _inputLocked;
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
@@ -44,18 +46,40 @@
             {
                 _canvasInitialized = true;
 
-                // Initialize input capture
+                // Initialize input capture (without floating lock indicator - we have toolbar button)
                 _dotNetRef = DotNetObjectReference.Create(this);
                 _inputInitialized = await JSRuntime.InvokeAsync<bool>(
                     "SteamViewerInput.initialize",
                     "viewerCanvas",
-                    _dotNetRef);
+                    _dotNetRef,
+                    new { showLockIndicator = false });
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"Failed to initialize viewer canvas: {ex.Message}");
             }
         }
+    }
+
+    private async Task ToggleInputLock()
+    {
+        _inputLocked = !_inputLocked;
+        if (_inputLocked)
+        {
+            await JSRuntime.InvokeVoidAsync("SteamViewerInput.lock");
+        }
+        else
+        {
+            await JSRuntime.InvokeVoidAsync("SteamViewerInput.unlock");
+        }
+        StateHasChanged();
+    }
+
+    [JSInvokable]
+    public void OnInputLockChanged(bool locked)
+    {
+        _inputLocked = locked;
+        InvokeAsync(StateHasChanged);
     }
 
     private async void HandleJpegFrame(JpegFrame frame)
@@ -197,72 +221,73 @@
 
     .viewer-toolbar {
         display: flex;
-        justify-content: space-between;
         align-items: center;
-        padding: 0.5rem 1rem;
+        justify-content: space-between;
+        height: 36px;
+        padding: 0 8px;
         background: #1e1e2e;
-        border-bottom: 1px solid #45475a;
-        min-height: 48px;
+        border-bottom: 1px solid #313244;
+        flex-shrink: 0;
     }
 
-    .toolbar-left,
-    .toolbar-center,
-    .toolbar-right {
+    .toolbar-menus {
+        display: flex;
+        gap: 4px;
+    }
+
+    .menu-btn {
+        background: transparent;
+        border: none;
+        color: #a6adc8;
+        padding: 6px 12px;
+        font-size: 13px;
+        cursor: pointer;
+        border-radius: 4px;
+        transition: all 0.15s;
+    }
+
+    .menu-btn:hover {
+        background: #313244;
+        color: #cdd6f4;
+    }
+
+    .toolbar-icons {
+        display: flex;
+        gap: 4px;
+    }
+
+    .icon-btn {
+        width: 28px;
+        height: 28px;
+        background: transparent;
+        border: none;
+        color: #a6adc8;
+        font-size: 14px;
+        cursor: pointer;
+        border-radius: 4px;
         display: flex;
         align-items: center;
-        gap: 0.75rem;
-    }
-
-    .toolbar-left {
-        flex: 1;
-    }
-
-    .toolbar-center {
-        flex: 2;
         justify-content: center;
+        transition: all 0.15s;
     }
 
-    .toolbar-right {
-        flex: 1;
-        justify-content: flex-end;
-    }
-
-    .connection-indicator {
-        display: inline-flex;
-        align-items: center;
-        gap: 0.5rem;
-        font-size: 0.875rem;
-        color: #a6e3a1;
-    }
-
-    .connection-indicator::before {
-        content: '';
-        width: 8px;
-        height: 8px;
-        background: #a6e3a1;
-        border-radius: 50%;
-    }
-
-    .peer-info {
-        font-size: 1rem;
-        font-weight: 500;
-    }
-
-    .toolbar-btn {
-        padding: 0.5rem 1rem;
-        background: #45475a;
-        border: 1px solid #585b70;
-        border-radius: 6px;
+    .icon-btn:hover {
+        background: #313244;
         color: #cdd6f4;
-        font-size: 0.875rem;
-        cursor: pointer;
-        transition: all 0.2s;
     }
 
-    .toolbar-btn:hover {
-        background: #585b70;
-        border-color: #f38ba8;
-        color: #f38ba8;
+    .icon-btn.locked {
+        background: #a6e3a1;
+        color: #1e1e2e;
+    }
+
+    .icon-btn.locked:hover {
+        background: #94e2d5;
+    }
+
+    .close-btn:hover {
+        background: #f38ba8;
+        color: #1e1e2e;
     }
 
     .canvas-container {
@@ -279,6 +304,6 @@
     .canvas-container canvas {
         width: 100%;
         height: 100%;
-        object-fit: contain; /* Maintain aspect ratio while filling space */
+        object-fit: contain;
     }
 </style>

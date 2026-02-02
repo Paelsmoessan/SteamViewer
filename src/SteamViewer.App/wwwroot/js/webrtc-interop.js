@@ -1073,7 +1073,9 @@ window.SteamViewerInput = {
     isCapturing: false,
     isLocked: false,  // Capture lock - only send inputs when locked
 
-    initialize(canvasId, dotNetReference) {
+    initialize(canvasId, dotNetReference, options = {}) {
+        const { showLockIndicator = true } = options;
+
         // Clean up any previous instance
         if (this.canvas) {
             this.stop();
@@ -1081,14 +1083,17 @@ window.SteamViewerInput = {
 
         this.canvas = document.getElementById(canvasId);
         this.dotNetRef = dotNetReference;
+        this.showLockIndicator = showLockIndicator;
 
         if (!this.canvas) {
             console.error(`Canvas '${canvasId}' not found`);
             return false;
         }
 
-        // Create lock indicator overlay
-        this.createLockIndicator();
+        // Create lock indicator overlay (optional)
+        if (showLockIndicator) {
+            this.createLockIndicator();
+        }
 
         // Bind event handlers (store references for removal)
         this._boundMouseMove = (e) => this.handleMouseMove(e);
@@ -1145,7 +1150,7 @@ window.SteamViewerInput = {
     },
 
     updateLockIndicator() {
-        if (!this.lockIndicator) return;
+        if (!this.lockIndicator || !this.showLockIndicator) return;
         if (this.isLocked) {
             this.lockIndicator.textContent = '🔒 Input Locked (Esc to release)';
             this.lockIndicator.style.background = '#a6e3a1';
@@ -1160,6 +1165,7 @@ window.SteamViewerInput = {
     toggleLock() {
         this.isLocked = !this.isLocked;
         this.updateLockIndicator();
+        this.notifyLockChange();
         if (this.isLocked) {
             this.canvas.focus();
             console.log('Input LOCKED - sending inputs to host');
@@ -1168,10 +1174,30 @@ window.SteamViewerInput = {
         }
     },
 
+    lock() {
+        this.isLocked = true;
+        this.updateLockIndicator();
+        this.notifyLockChange();
+        this.canvas.focus();
+        console.log('Input LOCKED - sending inputs to host');
+    },
+
     unlock() {
         this.isLocked = false;
         this.updateLockIndicator();
+        this.notifyLockChange();
         console.log('Input UNLOCKED');
+    },
+
+    notifyLockChange() {
+        // Notify C# of lock state change (for toolbar sync)
+        if (this.dotNetRef) {
+            try {
+                this.dotNetRef.invokeMethodAsync('OnInputLockChanged', this.isLocked);
+            } catch (e) {
+                // Ignore if C# callback not available
+            }
+        }
     },
 
     getScaledCoords(e) {
