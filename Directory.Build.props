@@ -10,4 +10,9 @@
     <Product>SteamViewer</Product>
     <Copyright>Copyright (c) 2024-2026</Copyright>
   </PropertyGroup>
+
+  <!-- Git-based versioning from version.json -->
+  <ItemGroup>
+    <PackageReference Include="Nerdbank.GitVersioning" Version="3.6.143" PrivateAssets="All" />
+  </ItemGroup>
 </Project>
