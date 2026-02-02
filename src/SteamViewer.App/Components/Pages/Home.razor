@@ -317,14 +317,15 @@
                 _canvasInitialized = true;
                 Logger.LogInformation("Canvas initialized for video rendering");
 
-                // Initialize input capture on canvas
+                // Initialize input capture on canvas (no lock indicator - viewer window handles that)
                 if (!_inputCaptureInitialized)
                 {
                     _inputDotNetRef = DotNetObjectReference.Create(this);
                     var success = await JSRuntime.InvokeAsync<bool>(
                         "SteamViewerInput.initialize",
                         "remoteCanvas",
-                        _inputDotNetRef);
+                        _inputDotNetRef,
+                        new { showLockIndicator = false });
                     _inputCaptureInitialized = success;
                     Logger.LogInformation("Input capture initialized: {Success}", success);
                 }
