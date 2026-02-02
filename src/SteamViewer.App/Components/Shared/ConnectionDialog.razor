@@ -1,0 +1,386 @@
+@using SteamViewer.App.Services
+@using SteamViewer.App.Services.Models
+@inject ViewerSessionManager SessionManager
+@inject ViewerTabManager TabManager
+
+<div class="dialog-overlay @(IsVisible ? "visible" : "")" @onclick="HandleOverlayClick">
+    <div class="dialog" @onclick:stopPropagation="true">
+        <div class="dialog-header">
+            <h3>New Connection</h3>
+            <button class="close-btn" @onclick="Close">×</button>
+        </div>
+
+        <div class="dialog-content">
+            @if (_isConnecting)
+            {
+                <div class="connecting-state">
+                    <div class="spinner"></div>
+                    <p>Connecting to @_peerId...</p>
+                    <button class="cancel-btn" @onclick="CancelConnect">Cancel</button>
+                </div>
+            }
+            else
+            {
+                <div class="input-group">
+                    <label>Session ID</label>
+                    <input type="text"
+                           @bind="_peerId"
+                           @bind:event="oninput"
+                           placeholder="Enter 9-digit ID"
+                           maxlength="9"
+                           disabled="@_isConnecting" />
+                </div>
+
+                <div class="input-group">
+                    <label>Password</label>
+                    <input type="password"
+                           @bind="_password"
+                           @bind:event="oninput"
+                           placeholder="Enter password"
+                           disabled="@_isConnecting" />
+                </div>
+
+                @if (!string.IsNullOrEmpty(_errorMessage))
+                {
+                    <div class="error-message">@_errorMessage</div>
+                }
+
+                <div class="dialog-actions">
+                    <button class="secondary-btn" @onclick="Close">Cancel</button>
+                    <button class="primary-btn"
+                            @onclick="Connect"
+                            disabled="@(!CanConnect)">
+                        Connect
+                    </button>
+                </div>
+            }
+        </div>
+    </div>
+</div>
+
+@code {
+    /// <summary>
+    /// Whether the dialog is visible.
+    /// </summary>
+    [Parameter]
+    public bool IsVisible { get; set; }
+
+    /// <summary>
+    /// The window ID to add the new tab to.
+    /// </summary>
+    [Parameter]
+    public string? WindowId { get; set; }
+
+    /// <summary>
+    /// Callback when dialog is closed.
+    /// </summary>
+    [Parameter]
+    public EventCallback OnClose { get; set; }
+
+    /// <summary>
+    /// Callback when connection succeeds, provides the session ID.
+    /// </summary>
+    [Parameter]
+    public EventCallback<string> OnConnected { get; set; }
+
+    private string _peerId = "";
+    private string _password = "";
+    private string _errorMessage = "";
+    private bool _isConnecting;
+
+    private bool CanConnect => !string.IsNullOrWhiteSpace(_peerId) &&
+                               !string.IsNullOrWhiteSpace(_password) &&
+                               !_isConnecting;
+
+    protected override void OnInitialized()
+    {
+        SessionManager.OnConnectionFailed += HandleConnectionFailed;
+    }
+
+    protected override void OnParametersSet()
+    {
+        // Reset state when dialog becomes visible
+        if (IsVisible && !_isConnecting)
+        {
+            _errorMessage = "";
+        }
+    }
+
+    private async Task Connect()
+    {
+        if (!CanConnect) return;
+
+        _isConnecting = true;
+        _errorMessage = "";
+        StateHasChanged();
+
+        try
+        {
+            var session = await SessionManager.CreateSessionAsync(_peerId, _password);
+            if (session != null)
+            {
+                // Add tab to window
+                if (!string.IsNullOrEmpty(WindowId))
+                {
+                    TabManager.AddTab(WindowId, session.SessionId);
+                }
+
+                await OnConnected.InvokeAsync(session.SessionId);
+                await Close();
+            }
+            else
+            {
+                // Error should have been set by OnConnectionFailed
+                if (string.IsNullOrEmpty(_errorMessage))
+                {
+                    _errorMessage = "Failed to create session";
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _errorMessage = ex.Message;
+        }
+        finally
+        {
+            _isConnecting = false;
+            StateHasChanged();
+        }
+    }
+
+    private void CancelConnect()
+    {
+        _isConnecting = false;
+        StateHasChanged();
+    }
+
+    private void HandleConnectionFailed(string peerId, string message)
+    {
+        if (peerId == _peerId)
+        {
+            _errorMessage = message;
+            _isConnecting = false;
+            InvokeAsync(StateHasChanged);
+        }
+    }
+
+    private void HandleOverlayClick()
+    {
+        if (!_isConnecting)
+        {
+            _ = Close();
+        }
+    }
+
+    private async Task Close()
+    {
+        _peerId = "";
+        _password = "";
+        _errorMessage = "";
+        _isConnecting = false;
+        await OnClose.InvokeAsync();
+    }
+
+    public void Dispose()
+    {
+        SessionManager.OnConnectionFailed -= HandleConnectionFailed;
+    }
+}
+
+<style>
+    .dialog-overlay {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: rgba(0, 0, 0, 0.6);
+        backdrop-filter: blur(2px);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 1000;
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 0.2s;
+    }
+
+    .dialog-overlay.visible {
+        opacity: 1;
+        pointer-events: auto;
+    }
+
+    .dialog {
+        background: #1e1e2e;
+        border: 1px solid #45475a;
+        border-radius: 12px;
+        width: 320px;
+        max-width: 90vw;
+        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+    }
+
+    .dialog-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 16px;
+        border-bottom: 1px solid #313244;
+    }
+
+    .dialog-header h3 {
+        margin: 0;
+        font-size: 16px;
+        font-weight: 600;
+        color: #cdd6f4;
+    }
+
+    .close-btn {
+        width: 28px;
+        height: 28px;
+        background: transparent;
+        border: none;
+        color: #6c7086;
+        font-size: 18px;
+        cursor: pointer;
+        border-radius: 4px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        transition: all 0.15s;
+    }
+
+    .close-btn:hover {
+        background: #f38ba8;
+        color: #1e1e2e;
+    }
+
+    .dialog-content {
+        padding: 16px;
+    }
+
+    .input-group {
+        margin-bottom: 16px;
+    }
+
+    .input-group label {
+        display: block;
+        font-size: 12px;
+        color: #a6adc8;
+        margin-bottom: 6px;
+    }
+
+    .input-group input {
+        width: 100%;
+        padding: 10px 12px;
+        background: #313244;
+        border: 1px solid #45475a;
+        border-radius: 6px;
+        color: #cdd6f4;
+        font-size: 14px;
+        transition: border-color 0.15s;
+    }
+
+    .input-group input:focus {
+        outline: none;
+        border-color: #89b4fa;
+    }
+
+    .input-group input:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+    }
+
+    .error-message {
+        background: rgba(243, 139, 168, 0.1);
+        border: 1px solid #f38ba8;
+        border-radius: 6px;
+        padding: 10px 12px;
+        margin-bottom: 16px;
+        color: #f38ba8;
+        font-size: 13px;
+    }
+
+    .dialog-actions {
+        display: flex;
+        gap: 8px;
+        justify-content: flex-end;
+    }
+
+    .primary-btn {
+        padding: 10px 20px;
+        background: #89b4fa;
+        border: none;
+        border-radius: 6px;
+        color: #1e1e2e;
+        font-size: 14px;
+        font-weight: 500;
+        cursor: pointer;
+        transition: all 0.15s;
+    }
+
+    .primary-btn:hover {
+        background: #b4befe;
+    }
+
+    .primary-btn:disabled {
+        background: #45475a;
+        color: #6c7086;
+        cursor: not-allowed;
+    }
+
+    .secondary-btn {
+        padding: 10px 20px;
+        background: transparent;
+        border: 1px solid #45475a;
+        border-radius: 6px;
+        color: #cdd6f4;
+        font-size: 14px;
+        cursor: pointer;
+        transition: all 0.15s;
+    }
+
+    .secondary-btn:hover {
+        border-color: #89b4fa;
+        color: #89b4fa;
+    }
+
+    .connecting-state {
+        text-align: center;
+        padding: 20px 0;
+    }
+
+    .connecting-state p {
+        color: #a6adc8;
+        margin: 16px 0;
+    }
+
+    .cancel-btn {
+        padding: 8px 16px;
+        background: transparent;
+        border: 1px solid #45475a;
+        border-radius: 6px;
+        color: #f38ba8;
+        font-size: 13px;
+        cursor: pointer;
+        transition: all 0.15s;
+    }
+
+    .cancel-btn:hover {
+        background: rgba(243, 139, 168, 0.1);
+        border-color: #f38ba8;
+    }
+
+    .spinner {
+        width: 32px;
+        height: 32px;
+        border: 3px solid #45475a;
+        border-top-color: #89b4fa;
+        border-radius: 50%;
+        animation: spin 1s linear infinite;
+        margin: 0 auto;
+    }
+
+    @@keyframes spin {
+        to { transform: rotate(360deg); }
+    }
+</style>
