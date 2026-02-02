@@ -152,7 +152,8 @@
 
 
 @code {
-    private const string Version = "0.0.8";
+    private static readonly string Version = System.Reflection.CustomAttributeExtensions
+        .GetCustomAttribute<System.Reflection.AssemblyInformationalVersionAttribute>(typeof(Home).Assembly)?.InformationalVersion?.Split('+')[0] ?? "0.0.0";
 
     private enum AppMode { Select, StartConnection, JoinConnection }
 
@@ -190,6 +191,10 @@
     private bool _isSharingScreen;       // Am I sharing my screen?
     private bool _peerIsSharingScreen;   // Is my peer sharing their screen?
     private bool _dataChannelReady;      // Is data channel open and ready?
+
+    // Track last known capture dimensions from mouse events (for keyboard events)
+    private int _lastCaptureWidth = 1920;
+    private int _lastCaptureHeight = 1080;
 
     // Pending SDP offer/ICE candidates (buffered if received before WebRTC init)
     private SignalingMessage.SdpOffer? _pendingSdpOffer;
@@ -982,29 +987,26 @@
             var inputEvent = JsonSerializer.Deserialize<InputEvent>(json);
             if (inputEvent != null)
             {
-                // Extract capture dimensions from the event, fallback to 1920x1080
-                int captureWidth = 1920;
-                int captureHeight = 1080;
-
-                // Get dimensions from mouse events (they carry the viewer's canvas size)
+                // Track dimensions from mouse events (they carry the viewer's canvas size)
+                // Keyboard events will reuse the last known dimensions
                 switch (inputEvent)
                 {
                     case InputEvent.MouseMove move when move.CaptureWidth > 0 && move.CaptureHeight > 0:
-                        captureWidth = move.CaptureWidth;
-                        captureHeight = move.CaptureHeight;
+                        _lastCaptureWidth = move.CaptureWidth;
+                        _lastCaptureHeight = move.CaptureHeight;
                         break;
                     case InputEvent.MouseDown down when down.CaptureWidth > 0 && down.CaptureHeight > 0:
-                        captureWidth = down.CaptureWidth;
-                        captureHeight = down.CaptureHeight;
+                        _lastCaptureWidth = down.CaptureWidth;
+                        _lastCaptureHeight = down.CaptureHeight;
                         break;
                     case InputEvent.MouseUp up when up.CaptureWidth > 0 && up.CaptureHeight > 0:
-                        captureWidth = up.CaptureWidth;
-                        captureHeight = up.CaptureHeight;
+                        _lastCaptureWidth = up.CaptureWidth;
+                        _lastCaptureHeight = up.CaptureHeight;
                         break;
                 }
 
-                // Inject the input using actual capture dimensions
-                InputInjector.InjectInput(inputEvent, captureWidth, captureHeight);
+                // Inject the input using tracked capture dimensions
+                InputInjector.InjectInput(inputEvent, _lastCaptureWidth, _lastCaptureHeight);
             }
         }
         catch
