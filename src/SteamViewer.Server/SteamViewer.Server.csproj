@@ -26,8 +26,8 @@
     <DebugSymbols>false</DebugSymbols>
     <CopyOutputSymbolsToPublishDirectory>false</CopyOutputSymbolsToPublishDirectory>
 
-    <!-- No admin required (uses port 8080, not privileged) -->
-    <ApplicationManifest Condition="'$(RuntimeIdentifier)' == 'win-x64' Or '$(RuntimeIdentifier)' == ''">app.manifest</ApplicationManifest>
+    <!-- No admin required (uses port 8080, not privileged) - Windows only -->
+    <ApplicationManifest Condition="$([MSBuild]::IsOSPlatform('Windows'))">app.manifest</ApplicationManifest>
   </PropertyGroup>
 
   <ItemGroup>
