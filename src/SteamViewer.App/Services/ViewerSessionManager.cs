@@ -20,7 +20,6 @@ public sealed class ViewerSessionManager : IAsyncDisposable
     private readonly ILoggerFactory _loggerFactory;
     private readonly IConfiguration _configuration;
     private readonly SignalingClient _signalingClient;
-    private readonly IJSRuntime _jsRuntime;
 
     private readonly ConcurrentDictionary<string, ViewerSession> _sessions = new();
     private readonly ConcurrentDictionary<string, string> _peerToSession = new(); // peerId -> sessionId
@@ -61,14 +60,12 @@ public sealed class ViewerSessionManager : IAsyncDisposable
         ILogger<ViewerSessionManager> logger,
         ILoggerFactory loggerFactory,
         IConfiguration configuration,
-        SignalingClient signalingClient,
-        IJSRuntime jsRuntime)
+        SignalingClient signalingClient)
     {
         _logger = logger;
         _loggerFactory = loggerFactory;
         _configuration = configuration;
         _signalingClient = signalingClient;
-        _jsRuntime = jsRuntime;
     }
 
     /// <summary>
@@ -76,8 +73,9 @@ public sealed class ViewerSessionManager : IAsyncDisposable
     /// </summary>
     /// <param name="peerId">The peer ID to connect to.</param>
     /// <param name="password">The password for the peer.</param>
+    /// <param name="jsRuntime">The JS runtime from the calling Blazor context.</param>
     /// <returns>The created session, or null if max sessions reached or connection failed.</returns>
-    public async Task<ViewerSession?> CreateSessionAsync(string peerId, string password)
+    public async Task<ViewerSession?> CreateSessionAsync(string peerId, string password, IJSRuntime jsRuntime)
     {
         if (_sessions.Count >= MaxSessions)
         {
@@ -115,7 +113,7 @@ public sealed class ViewerSessionManager : IAsyncDisposable
         var session = new ViewerSession(
             sessionId,
             peerId,
-            _jsRuntime,
+            jsRuntime,
             _loggerFactory,
             SendSignalingMessage);
 
@@ -136,7 +134,7 @@ public sealed class ViewerSessionManager : IAsyncDisposable
         await session.InitializeAsync();
 
         // Configure TURN server
-        await ConfigureTurnServerAsync();
+        await ConfigureTurnServerAsync(jsRuntime);
 
         // Request connection via signaling
         await _signalingClient.RequestConnectionAsync(peerId, password);
@@ -323,7 +321,7 @@ public sealed class ViewerSessionManager : IAsyncDisposable
         await _signalingClient.SendAsync(message);
     }
 
-    private async Task ConfigureTurnServerAsync()
+    private async Task ConfigureTurnServerAsync(IJSRuntime jsRuntime)
     {
         var turnEnabled = _configuration.GetValue<bool>("TurnServer:Enabled");
         if (!turnEnabled) return;
@@ -343,7 +341,7 @@ public sealed class ViewerSessionManager : IAsyncDisposable
         }
 
         _logger.LogInformation("Configuring TURN server for session manager");
-        await _jsRuntime.InvokeVoidAsync("SteamViewerWebRTC.setTurnConfig", urls, username, credential);
+        await jsRuntime.InvokeVoidAsync("SteamViewerWebRTC.setTurnConfig", urls, username, credential);
     }
 
     public async ValueTask DisposeAsync()

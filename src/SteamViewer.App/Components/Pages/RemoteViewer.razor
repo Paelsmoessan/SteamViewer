@@ -4,6 +4,7 @@
 @using SteamViewer.App.Services.Models
 @using SteamViewer.App.Components.Shared
 @using SteamViewer.Client.Core.Capture
+@using SteamViewer.Common.Protocol
 @inject RemoteViewerService ViewerService
 @inject ViewerSessionManager SessionManager
 @inject ViewerTabManager TabManager
@@ -76,6 +77,8 @@
     private string? _windowId;
     private List<TabState> _tabs = new();
     private bool _showConnectionDialog;
+    private string? _activeSessionId;
+    private ViewerSession? _activeSession;
 
     protected override void OnInitialized()
     {
@@ -101,6 +104,7 @@
                 IsConnected = true,
                 IsPeerSharing = true
             });
+            _activeSessionId = "legacy";
         }
 
         RefreshTabs();
@@ -205,7 +209,50 @@
     private void HandleActiveTabChanged(string windowId, string? sessionId)
     {
         if (windowId != _windowId) return;
+
+        // Unsubscribe from previous session
+        if (_activeSession != null)
+        {
+            _activeSession.OnFrame -= HandleSessionFrame;
+        }
+
+        _activeSessionId = sessionId;
+
+        // Subscribe to new active session's frames
+        if (sessionId != null && sessionId != "legacy")
+        {
+            _activeSession = SessionManager.GetSession(sessionId);
+            if (_activeSession != null)
+            {
+                _activeSession.OnFrame += HandleSessionFrame;
+            }
+        }
+        else
+        {
+            _activeSession = null;
+        }
+
         InvokeAsync(StateHasChanged);
+    }
+
+    private void HandleSessionFrame(JpegFrame frame)
+    {
+        // Frames from multi-session manager
+        if (_canvasInitialized)
+        {
+            _ = InvokeAsync(async () =>
+            {
+                try
+                {
+                    await JSRuntime.InvokeVoidAsync("SteamViewerViewer.renderJpegFrame",
+                        "viewerCanvas", frame.Base64Data, frame.Width, frame.Height);
+                }
+                catch
+                {
+                    // Ignore rendering errors during shutdown
+                }
+            });
+        }
     }
 
     private void SwitchTab(string sessionId)
@@ -314,85 +361,122 @@
 
     #region Input Callbacks (relayed to main window or active session)
 
+    private void SendInputToActiveSession(InputEvent inputEvent)
+    {
+        // Route input to active session (multi-tab) or legacy service
+        if (_activeSession != null && _activeSessionId != "legacy")
+        {
+            _ = _activeSession.SendInputAsync(inputEvent);
+        }
+        else if (_activeSessionId == "legacy")
+        {
+            // Legacy mode - relay through ViewerService
+            var data = inputEvent switch
+            {
+                InputEvent.MouseMove m => new InputEventData
+                {
+                    Type = InputEventType.MouseMove,
+                    X = m.X,
+                    Y = m.Y,
+                    CaptureWidth = m.CaptureWidth,
+                    CaptureHeight = m.CaptureHeight
+                },
+                InputEvent.MouseDown m => new InputEventData
+                {
+                    Type = InputEventType.MouseDown,
+                    X = m.X,
+                    Y = m.Y,
+                    Button = (int)m.Button,
+                    CaptureWidth = m.CaptureWidth,
+                    CaptureHeight = m.CaptureHeight
+                },
+                InputEvent.MouseUp m => new InputEventData
+                {
+                    Type = InputEventType.MouseUp,
+                    X = m.X,
+                    Y = m.Y,
+                    Button = (int)m.Button,
+                    CaptureWidth = m.CaptureWidth,
+                    CaptureHeight = m.CaptureHeight
+                },
+                InputEvent.MouseWheel m => new InputEventData
+                {
+                    Type = InputEventType.Wheel,
+                    DeltaX = m.DeltaX,
+                    DeltaY = m.DeltaY
+                },
+                InputEvent.KeyDown k => new InputEventData
+                {
+                    Type = InputEventType.KeyDown,
+                    Key = k.Key,
+                    Ctrl = k.Modifiers.Ctrl,
+                    Shift = k.Modifiers.Shift,
+                    Alt = k.Modifiers.Alt
+                },
+                InputEvent.KeyUp k => new InputEventData
+                {
+                    Type = InputEventType.KeyUp,
+                    Key = k.Key,
+                    Ctrl = k.Modifiers.Ctrl,
+                    Shift = k.Modifiers.Shift,
+                    Alt = k.Modifiers.Alt
+                },
+                _ => null
+            };
+            if (data != null) ViewerService.SendInputEvent(data);
+        }
+    }
+
     [JSInvokable]
     public void OnMouseMove(double x, double y, int captureWidth = 0, int captureHeight = 0)
     {
-        // For now, relay to legacy service
-        ViewerService.SendInputEvent(new InputEventData
-        {
-            Type = InputEventType.MouseMove,
-            X = x,
-            Y = y,
-            CaptureWidth = captureWidth,
-            CaptureHeight = captureHeight
-        });
+        SendInputToActiveSession(new InputEvent.MouseMove(x, y, captureWidth, captureHeight));
     }
 
     [JSInvokable]
     public void OnMouseDown(string button, double x, double y, int captureWidth = 0, int captureHeight = 0)
     {
-        ViewerService.SendInputEvent(new InputEventData
+        var mouseButton = button.ToLowerInvariant() switch
         {
-            Type = InputEventType.MouseDown,
-            X = x,
-            Y = y,
-            Button = button == "left" ? 0 : button == "right" ? 2 : 1,
-            CaptureWidth = captureWidth,
-            CaptureHeight = captureHeight
-        });
+            "left" => MouseButton.Left,
+            "right" => MouseButton.Right,
+            "middle" => MouseButton.Middle,
+            _ => MouseButton.Left
+        };
+        SendInputToActiveSession(new InputEvent.MouseDown(mouseButton, x, y, captureWidth, captureHeight));
     }
 
     [JSInvokable]
     public void OnMouseUp(string button, double x, double y, int captureWidth = 0, int captureHeight = 0)
     {
-        ViewerService.SendInputEvent(new InputEventData
+        var mouseButton = button.ToLowerInvariant() switch
         {
-            Type = InputEventType.MouseUp,
-            X = x,
-            Y = y,
-            Button = button == "left" ? 0 : button == "right" ? 2 : 1,
-            CaptureWidth = captureWidth,
-            CaptureHeight = captureHeight
-        });
+            "left" => MouseButton.Left,
+            "right" => MouseButton.Right,
+            "middle" => MouseButton.Middle,
+            _ => MouseButton.Left
+        };
+        SendInputToActiveSession(new InputEvent.MouseUp(mouseButton, x, y, captureWidth, captureHeight));
     }
 
     [JSInvokable]
     public void OnMouseWheel(double deltaX, double deltaY)
     {
-        ViewerService.SendInputEvent(new InputEventData
-        {
-            Type = InputEventType.Wheel,
-            DeltaX = deltaX,
-            DeltaY = deltaY
-        });
+        SendInputToActiveSession(new InputEvent.MouseWheel(deltaX, deltaY));
     }
 
     [JSInvokable]
     public void OnKeyDown(string key, System.Text.Json.JsonElement modifiers)
     {
         var (ctrl, shift, alt) = ParseModifiers(modifiers);
-        ViewerService.SendInputEvent(new InputEventData
-        {
-            Type = InputEventType.KeyDown,
-            Key = key,
-            Ctrl = ctrl,
-            Shift = shift,
-            Alt = alt
-        });
+        SendInputToActiveSession(new InputEvent.KeyDown(key, new KeyModifiers(ctrl, shift, alt, false)));
     }
 
     [JSInvokable]
     public void OnKeyUp(string key, System.Text.Json.JsonElement modifiers)
     {
         var (ctrl, shift, alt) = ParseModifiers(modifiers);
-        ViewerService.SendInputEvent(new InputEventData
-        {
-            Type = InputEventType.KeyUp,
-            Key = key,
-            Ctrl = ctrl,
-            Shift = shift,
-            Alt = alt
-        });
+        SendInputToActiveSession(new InputEvent.KeyUp(key, new KeyModifiers(ctrl, shift, alt, false)));
     }
 
     private (bool ctrl, bool shift, bool alt) ParseModifiers(System.Text.Json.JsonElement modifiers)
@@ -411,6 +495,13 @@
         TabManager.OnTabsChanged -= HandleTabsChanged;
         TabManager.OnActiveTabChanged -= HandleActiveTabChanged;
         ViewerService.OnJpegFrame -= HandleJpegFrame;
+
+        // Unsubscribe from active session
+        if (_activeSession != null)
+        {
+            _activeSession.OnFrame -= HandleSessionFrame;
+        }
+
         _dotNetRef?.Dispose();
         _tabDragRef?.Dispose();
 

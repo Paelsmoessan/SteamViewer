@@ -1,7 +1,9 @@
 @using SteamViewer.App.Services
 @using SteamViewer.App.Services.Models
+@using Microsoft.JSInterop
 @inject ViewerSessionManager SessionManager
 @inject ViewerTabManager TabManager
+@inject IJSRuntime JSRuntime
 
 <div class="dialog-overlay @(IsVisible ? "visible" : "")" @onclick="HandleOverlayClick">
     <div class="dialog" @onclick:stopPropagation="true">
@@ -116,7 +118,7 @@
 
         try
         {
-            var session = await SessionManager.CreateSessionAsync(_peerId, _password);
+            var session = await SessionManager.CreateSessionAsync(_peerId, _password, JSRuntime);
             if (session != null)
             {
                 // Add tab to window
