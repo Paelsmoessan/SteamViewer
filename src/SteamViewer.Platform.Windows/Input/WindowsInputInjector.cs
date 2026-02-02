@@ -19,6 +19,14 @@ public sealed class WindowsInputInjector : IInputInjector
     private readonly int _virtualScreenWidth;
     private readonly int _virtualScreenHeight;
 
+    // Debug log file for cursor diagnostics (in app folder for easy access via network share)
+    private static readonly string DebugLogPath = Path.Combine(
+        AppContext.BaseDirectory,
+        "SteamViewer_InputDebug.log");
+    private static readonly object LogLock = new();
+    private int _logCount;
+    private const int MaxLogEntries = 100; // Limit to avoid huge log files
+
     public WindowsInputInjector(ILogger<WindowsInputInjector> logger)
     {
         _logger = logger;
@@ -31,6 +39,21 @@ public sealed class WindowsInputInjector : IInputInjector
 
         _logger.LogInformation("Virtual screen: ({Left},{Top}) {Width}x{Height}",
             _virtualScreenLeft, _virtualScreenTop, _virtualScreenWidth, _virtualScreenHeight);
+
+        // Initialize debug log file
+        try
+        {
+            File.WriteAllText(DebugLogPath,
+                $"=== SteamViewer Input Debug Log - {DateTime.Now:yyyy-MM-dd HH:mm:ss} ===\n" +
+                $"Virtual Screen: left={_virtualScreenLeft}, top={_virtualScreenTop}, " +
+                $"width={_virtualScreenWidth}, height={_virtualScreenHeight}\n" +
+                $"Log file: {DebugLogPath}\n\n");
+            _logger.LogInformation("Debug log file created at: {Path}", DebugLogPath);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Could not create debug log file at {Path}", DebugLogPath);
+        }
     }
 
     public bool IsAvailable => !_disposed;
@@ -247,7 +270,9 @@ public sealed class WindowsInputInjector : IInputInjector
 
     private (int AbsX, int AbsY) ConvertToAbsoluteCoordinates(double x, double y, int screenWidth, int screenHeight)
     {
-        // Scale coordinates from remote screen to local screen
+        // Scale coordinates from remote screen (capture size) to local screen (virtual screen)
+        // x, y are in capture pixel space (0 to screenWidth/screenHeight)
+        // We need to map them to the local virtual screen coordinates
         var localX = x * _virtualScreenWidth / screenWidth + _virtualScreenLeft;
         var localY = y * _virtualScreenHeight / screenHeight + _virtualScreenTop;
 
@@ -255,7 +280,38 @@ public sealed class WindowsInputInjector : IInputInjector
         var absX = (int)((localX - _virtualScreenLeft) * 65535 / _virtualScreenWidth);
         var absY = (int)((localY - _virtualScreenTop) * 65535 / _virtualScreenHeight);
 
-        return (absX, absY);
+        // Debug logging to file
+        if (_logCount < MaxLogEntries)
+        {
+            try
+            {
+                lock (LogLock)
+                {
+                    if (_logCount < MaxLogEntries)
+                    {
+                        var logLine = $"[{DateTime.Now:HH:mm:ss.fff}] " +
+                            $"INPUT: x={x:F1}, y={y:F1}, captureSize={screenWidth}x{screenHeight} | " +
+                            $"VIRTUAL: {_virtualScreenWidth}x{_virtualScreenHeight} | " +
+                            $"LOCAL: x={localX:F1}, y={localY:F1} | " +
+                            $"ABS: x={absX}, y={absY} (0-65535 range)\n";
+                        File.AppendAllText(DebugLogPath, logLine);
+                        _logCount++;
+
+                        if (_logCount == MaxLogEntries)
+                        {
+                            File.AppendAllText(DebugLogPath,
+                                $"\n=== Max log entries ({MaxLogEntries}) reached, logging stopped ===\n");
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                // Ignore logging errors to not disrupt input
+            }
+        }
+
+        return (Math.Clamp(absX, 0, 65535), Math.Clamp(absY, 0, 65535));
     }
 
     private static ushort KeyToVirtualKey(string key)
