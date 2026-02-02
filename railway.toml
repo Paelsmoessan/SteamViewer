@@ -1,8 +1,7 @@
 [build]
-builder = "nixpacks"
-buildCommand = "cd src/SteamViewer.Server && dotnet publish -c Release -o ../../out"
+builder = "dockerfile"
+dockerfilePath = "src/SteamViewer.Server/Dockerfile"
 
 [deploy]
-startCommand = "cd out && dotnet SteamViewer.Server.dll"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
