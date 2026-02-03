@@ -67,11 +67,21 @@
                 <div class="credentials">
                     <div class="credential-item">
                         <label>Session ID</label>
-                        <div class="value">@clientId</div>
+                        <div class="value-row">
+                            <div class="value">@clientId</div>
+                            <button class="copy-btn" @onclick="CopySessionId" title="@(_copiedId ? "Copied!" : "Copy to clipboard")">
+                                @(_copiedId ? "✓" : "📋")
+                            </button>
+                        </div>
                     </div>
                     <div class="credential-item">
                         <label>Password</label>
-                        <div class="value">@password</div>
+                        <div class="value-row">
+                            <div class="value">@password</div>
+                            <button class="copy-btn" @onclick="CopyPassword" title="@(_copiedPassword ? "Copied!" : "Copy to clipboard")">
+                                @(_copiedPassword ? "✓" : "📋")
+                            </button>
+                        </div>
                     </div>
                 </div>
                 <p class="status">Share these credentials with your partner</p>
@@ -181,6 +191,8 @@
 #endif
 
     private string errorMessage = "";
+    private bool _copiedId;
+    private bool _copiedPassword;
     private bool _canvasInitialized;
     private bool _isRendering;
     private bool _inputCaptureInitialized;
@@ -536,6 +548,49 @@
         StateHasChanged();
     }
 
+    private async Task CopySessionId()
+    {
+        await CopyToClipboard(clientId);
+        _copiedId = true;
+        StateHasChanged();
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(2000);
+            await InvokeAsync(() =>
+            {
+                _copiedId = false;
+                StateHasChanged();
+            });
+        });
+    }
+
+    private async Task CopyPassword()
+    {
+        await CopyToClipboard(password);
+        _copiedPassword = true;
+        StateHasChanged();
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(2000);
+            await InvokeAsync(() =>
+            {
+                _copiedPassword = false;
+                StateHasChanged();
+            });
+        });
+    }
+
+    private async Task CopyToClipboard(string text)
+    {
+        try
+        {
+            await JSRuntime.InvokeVoidAsync("navigator.clipboard.writeText", text);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Failed to copy to clipboard");
+        }
+    }
 
     #region Screen Sharing
 
@@ -1559,6 +1614,29 @@
         font-family: monospace;
         color: #a6e3a1;
         letter-spacing: 2px;
+    }
+
+    .value-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+    }
+
+    .copy-btn {
+        background: transparent;
+        border: 1px solid #45475a;
+        border-radius: 4px;
+        color: #6c7086;
+        cursor: pointer;
+        padding: 4px 8px;
+        font-size: 14px;
+        transition: all 0.15s;
+    }
+
+    .copy-btn:hover {
+        background: #45475a;
+        color: #cdd6f4;
+        border-color: #89b4fa;
     }
 
     .connect-form {
