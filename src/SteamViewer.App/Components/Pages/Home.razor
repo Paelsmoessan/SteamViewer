@@ -166,6 +166,11 @@
     private static readonly string Version = System.Reflection.CustomAttributeExtensions
         .GetCustomAttribute<System.Reflection.AssemblyInformationalVersionAttribute>(typeof(Home).Assembly)?.InformationalVersion?.Split('+')[0] ?? "0.0.0";
 
+#if DEBUG
+    // Counter for generating short test IDs (TEST1, TEST2, etc.)
+    private static int _debugIdCounter = 1;
+#endif
+
     private enum AppMode { Select, StartConnection, JoinConnection }
 
     private AppMode currentMode = AppMode.Select;
@@ -179,7 +184,7 @@
 
     // Join mode state
 #if DEBUG
-    private string targetId = "";  // User types short machine name
+    private string targetId = "TEST1";  // Pre-filled for testing (matches first host)
     private string targetPassword = "TESTPASS";
     private string _idPlaceholder = "Enter machine name";
     private string _idMaxLength = "50";
@@ -766,8 +771,8 @@
             await SignalingClient.ConnectAsync();
 
 #if DEBUG
-            // Use machine name as ID for unique, memorable debug credentials
-            clientId = Environment.MachineName;
+            // Use short IDs for easier testing (TEST1, TEST2, etc.)
+            clientId = $"TEST{_debugIdCounter++}";
             password = "TESTPASS";
             Logger.LogInformation("DEBUG MODE: Using test credentials - ID: {Id}, Password: {Pass}", clientId, password);
 #else
