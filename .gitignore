@@ -1,5 +1,6 @@
 # AI assistant context (private)
 .AI.md
+.claude/settings.local.json
 
 # Build outputs
 bin/
