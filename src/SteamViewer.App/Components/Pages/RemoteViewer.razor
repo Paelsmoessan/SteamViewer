@@ -105,7 +105,7 @@
                 @(_inputLocked ? "🔒" : "🔓")
             </button>
             <button class="icon-btn @(_statsVisible ? "active-toggle" : "")" @onclick="ToggleStatsOverlay" title="Toggle stats overlay">📊</button>
-            <button class="icon-btn" title="Fullscreen">⛶</button>
+            <button class="icon-btn" @onclick="ToggleFullscreen" title="Fullscreen (F11)">⛶</button>
             <button class="icon-btn close-btn" @onclick="CloseWindow" title="Close window">×</button>
         </div>
     </div>
@@ -605,7 +605,14 @@
 
     private async Task ToggleFullscreen()
     {
-        await JSRuntime.InvokeVoidAsync("eval", "document.documentElement.requestFullscreen()");
+        // Check if currently in fullscreen and toggle
+        await JSRuntime.InvokeVoidAsync("eval", @"
+            if (document.fullscreenElement) {
+                document.exitFullscreen();
+            } else {
+                document.documentElement.requestFullscreen();
+            }
+        ");
         CloseMenus();
     }
 
