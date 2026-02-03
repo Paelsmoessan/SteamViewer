@@ -193,14 +193,27 @@ window.SteamViewerWebRTC = {
 
             // Handle connection state changes
             this.peerConnection.onconnectionstatechange = async () => {
-                console.log('=== CONNECTION STATE:', this.peerConnection.connectionState, '===');
-                if (this.peerConnection.connectionState === 'failed') {
+                const state = this.peerConnection.connectionState;
+                console.log('=== CONNECTION STATE:', state, '===');
+
+                if (state === 'failed') {
                     console.error('CONNECTION FAILED - Possible causes:');
                     console.error('1. No relay candidates (TURN not working)');
                     console.error('2. Firewall blocking');
                     console.error('3. NAT traversal failed');
                 }
-                await this.dotNetRef.invokeMethodAsync('OnConnectionStateChangeCallback', this.peerConnection.connectionState);
+
+                // Reset input lock on disconnect/failure (fix: input lock persists after disconnect)
+                if (state === 'disconnected' || state === 'failed' || state === 'closed') {
+                    if (window.SteamViewerInput && window.SteamViewerInput.isLocked) {
+                        window.SteamViewerInput.unlock();
+                        console.log('Input lock released due to connection state:', state);
+                    }
+                    // Stop frame capture to prevent lingering animations
+                    this.stopFrameCapture();
+                }
+
+                await this.dotNetRef.invokeMethodAsync('OnConnectionStateChangeCallback', state);
             };
 
             // Handle ICE connection state for more debugging
@@ -1061,8 +1074,35 @@ window.SteamViewerWebRTC = {
             this.peerConnection = null;
         }
 
+        // Reset input lock state on disconnect (fix: input lock persists after disconnect)
+        if (window.SteamViewerInput && window.SteamViewerInput.isLocked) {
+            window.SteamViewerInput.unlock();
+            console.log('Input lock released due to connection close');
+        }
+
         this.dotNetRef = null;
         console.log('WebRTC connection closed');
+    },
+
+    // Reset capture state for reconnection (fix: mouse coords stale after reconnect)
+    resetForReconnect() {
+        this.stopFrameCapture();
+        this.stopScreenCapture();
+
+        if (this.remoteVideo) {
+            this.remoteVideo.pause();
+            this.remoteVideo.srcObject = null;
+        }
+
+        this.remoteCanvas = null;
+        this.remoteCtx = null;
+
+        // Reset input state
+        if (window.SteamViewerInput) {
+            window.SteamViewerInput.unlock();
+        }
+
+        console.log('WebRTC state reset for reconnection');
     }
 };
 
