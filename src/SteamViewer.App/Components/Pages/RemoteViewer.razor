@@ -13,12 +13,92 @@
 @inject FileLoggerService FileLogger
 @implements IDisposable
 
-<div class="viewer-container">
+<div class="viewer-container" @onclick="CloseMenus" @onclick:stopPropagation="false">
     <div class="viewer-toolbar">
         <div class="toolbar-menus">
-            <button class="menu-btn" title="Session actions">Actions ▾</button>
-            <button class="menu-btn" title="Display options">View ▾</button>
-            <button class="menu-btn" title="File transfer">Files ▾</button>
+            <div class="menu-wrapper">
+                <button class="menu-btn @(_activeMenu == "actions" ? "active" : "")"
+                        @onclick='() => ToggleMenu("actions")'
+                        @onclick:stopPropagation="true"
+                        title="Session actions">Actions ▾</button>
+                @if (_activeMenu == "actions")
+                {
+                    <div class="menu-dropdown" @onclick:stopPropagation="true">
+                        <div class="menu-section">
+                            <span class="menu-section-title">Special Keys</span>
+                            <button class="menu-item" @onclick="SendCtrlShiftEsc" title="Open Task Manager">
+                                <span class="menu-icon">📋</span>
+                                <span>Task Manager</span>
+                                <span class="menu-shortcut">Ctrl+Shift+Esc</span>
+                            </button>
+                            <button class="menu-item" @onclick="SendWinD" title="Show Desktop">
+                                <span class="menu-icon">🖥️</span>
+                                <span>Show Desktop</span>
+                                <span class="menu-shortcut">Win+D</span>
+                            </button>
+                            <button class="menu-item" @onclick="SendWinL" title="Lock Screen">
+                                <span class="menu-icon">🔒</span>
+                                <span>Lock Screen</span>
+                                <span class="menu-shortcut">Win+L</span>
+                            </button>
+                            <button class="menu-item" @onclick="SendAltTab" title="Switch Windows">
+                                <span class="menu-icon">🔄</span>
+                                <span>Switch Windows</span>
+                                <span class="menu-shortcut">Alt+Tab</span>
+                            </button>
+                            <button class="menu-item" @onclick="SendAltF4" title="Close Active Window">
+                                <span class="menu-icon">❌</span>
+                                <span>Close Window</span>
+                                <span class="menu-shortcut">Alt+F4</span>
+                            </button>
+                        </div>
+                        <div class="menu-divider"></div>
+                        <div class="menu-section">
+                            <span class="menu-section-title">System</span>
+                            <button class="menu-item disabled" title="Requires direct access to host">
+                                <span class="menu-icon">🛡️</span>
+                                <span>Ctrl+Alt+Del</span>
+                                <span class="menu-note">N/A</span>
+                            </button>
+                        </div>
+                    </div>
+                }
+            </div>
+            <div class="menu-wrapper">
+                <button class="menu-btn @(_activeMenu == "view" ? "active" : "")"
+                        @onclick='() => ToggleMenu("view")'
+                        @onclick:stopPropagation="true"
+                        title="Display options">View ▾</button>
+                @if (_activeMenu == "view")
+                {
+                    <div class="menu-dropdown" @onclick:stopPropagation="true">
+                        <button class="menu-item" @onclick="ToggleFullscreen">
+                            <span class="menu-icon">⛶</span>
+                            <span>Fullscreen</span>
+                            <span class="menu-shortcut">F11</span>
+                        </button>
+                    </div>
+                }
+            </div>
+            <div class="menu-wrapper">
+                <button class="menu-btn @(_activeMenu == "files" ? "active" : "")"
+                        @onclick='() => ToggleMenu("files")'
+                        @onclick:stopPropagation="true"
+                        title="File transfer">Files ▾</button>
+                @if (_activeMenu == "files")
+                {
+                    <div class="menu-dropdown" @onclick:stopPropagation="true">
+                        <button class="menu-item disabled">
+                            <span class="menu-icon">📤</span>
+                            <span>Send File...</span>
+                        </button>
+                        <button class="menu-item disabled">
+                            <span class="menu-icon">📥</span>
+                            <span>Receive File...</span>
+                        </button>
+                    </div>
+                }
+            </div>
         </div>
         <div class="toolbar-icons">
             <button class="icon-btn @(_inputLocked ? "locked" : "")" @onclick="ToggleInputLock" title="@(_inputLocked ? "Unlock (Esc)" : "Lock input")">
@@ -108,6 +188,7 @@
     private string? _windowId;
     private List<TabState> _tabs = new();
     private bool _showConnectionDialog;
+    private string? _activeMenu;
     private string? _activeSessionId;
     private ViewerSession? _activeSession;
     private bool _showReconnectOverlay;
@@ -450,6 +531,85 @@
     {
         FileLogger.LogJS(level, message);
     }
+
+    #region Menu Handling
+
+    private void ToggleMenu(string menuName)
+    {
+        _activeMenu = _activeMenu == menuName ? null : menuName;
+        StateHasChanged();
+    }
+
+    private void CloseMenus()
+    {
+        if (_activeMenu != null)
+        {
+            _activeMenu = null;
+            StateHasChanged();
+        }
+    }
+
+    #endregion
+
+    #region Hard Key Actions
+
+    private void SendCtrlShiftEsc()
+    {
+        // Send Ctrl+Shift+Esc to open Task Manager
+        SendKeyCombo("Escape", ctrl: true, shift: true);
+        CloseMenus();
+    }
+
+    private void SendWinD()
+    {
+        // Send Win+D to show desktop
+        SendKeyCombo("d", meta: true);
+        CloseMenus();
+    }
+
+    private void SendWinL()
+    {
+        // Send Win+L to lock screen
+        SendKeyCombo("l", meta: true);
+        CloseMenus();
+    }
+
+    private void SendAltTab()
+    {
+        // Send Alt+Tab to switch windows
+        SendKeyCombo("Tab", alt: true);
+        CloseMenus();
+    }
+
+    private void SendAltF4()
+    {
+        // Send Alt+F4 to close active window
+        SendKeyCombo("F4", alt: true);
+        CloseMenus();
+    }
+
+    private void SendKeyCombo(string key, bool ctrl = false, bool shift = false, bool alt = false, bool meta = false)
+    {
+        var modifiers = new KeyModifiers(ctrl, shift, alt, meta);
+
+        // Send key down
+        SendInputToActiveSession(new InputEvent.KeyDown(key, modifiers));
+
+        // Small delay then key up (handled asynchronously)
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(50);
+            await InvokeAsync(() => SendInputToActiveSession(new InputEvent.KeyUp(key, modifiers)));
+        });
+    }
+
+    private async Task ToggleFullscreen()
+    {
+        await JSRuntime.InvokeVoidAsync("eval", "document.documentElement.requestFullscreen()");
+        CloseMenus();
+    }
+
+    #endregion
 
     private async void HandleJpegFrame(JpegFrame frame)
     {
@@ -821,9 +981,94 @@
         transition: all 0.15s;
     }
 
-    .menu-btn:hover {
+    .menu-btn:hover,
+    .menu-btn.active {
         background: #313244;
         color: #cdd6f4;
+    }
+
+    .menu-wrapper {
+        position: relative;
+    }
+
+    .menu-dropdown {
+        position: absolute;
+        top: 100%;
+        left: 0;
+        min-width: 220px;
+        background: #1e1e2e;
+        border: 1px solid #313244;
+        border-radius: 6px;
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+        z-index: 1000;
+        padding: 4px 0;
+        margin-top: 2px;
+    }
+
+    .menu-section {
+        padding: 4px 0;
+    }
+
+    .menu-section-title {
+        display: block;
+        padding: 4px 12px;
+        font-size: 10px;
+        font-weight: 600;
+        text-transform: uppercase;
+        color: #6c7086;
+        letter-spacing: 0.5px;
+    }
+
+    .menu-divider {
+        height: 1px;
+        background: #313244;
+        margin: 4px 8px;
+    }
+
+    .menu-item {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        width: 100%;
+        padding: 8px 12px;
+        background: transparent;
+        border: none;
+        color: #cdd6f4;
+        font-size: 13px;
+        cursor: pointer;
+        text-align: left;
+        transition: all 0.1s;
+    }
+
+    .menu-item:hover:not(.disabled) {
+        background: #313244;
+    }
+
+    .menu-item.disabled {
+        color: #6c7086;
+        cursor: not-allowed;
+    }
+
+    .menu-icon {
+        width: 16px;
+        text-align: center;
+        font-size: 14px;
+    }
+
+    .menu-item span:nth-child(2) {
+        flex: 1;
+    }
+
+    .menu-shortcut {
+        font-size: 11px;
+        color: #6c7086;
+        font-family: monospace;
+    }
+
+    .menu-note {
+        font-size: 10px;
+        color: #f38ba8;
+        font-style: italic;
     }
 
     .toolbar-icons {
