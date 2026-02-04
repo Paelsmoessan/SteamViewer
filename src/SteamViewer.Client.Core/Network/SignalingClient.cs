@@ -287,6 +287,38 @@ public sealed class SignalingClient : IAsyncDisposable
 
     private async Task DisposeInternalAsync()
     {
+        // Attempt graceful close if WebSocket is in a closeable state
+        if (_webSocket != null)
+        {
+            var state = _webSocket.State;
+            if (state == WebSocketState.Open || state == WebSocketState.CloseReceived)
+            {
+                try
+                {
+                    // Use a short timeout for the close handshake
+                    using var closeCts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                    await _webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Closing", closeCts.Token);
+                }
+                catch (OperationCanceledException)
+                {
+                    _logger.LogDebug("WebSocket close handshake timed out");
+                }
+                catch (WebSocketException ex)
+                {
+                    _logger.LogDebug(ex, "WebSocket close handshake failed (expected during cancel)");
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Unexpected error during WebSocket close");
+                }
+            }
+            else if (state == WebSocketState.Connecting)
+            {
+                _logger.LogDebug("Aborting WebSocket connection in progress");
+                _webSocket.Abort();
+            }
+        }
+
         _cts?.Cancel();
 
         if (_receiveTask != null)
