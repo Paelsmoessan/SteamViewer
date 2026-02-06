@@ -270,24 +270,33 @@ public sealed class SignalingClient : IAsyncDisposable
     /// </summary>
     public async Task DisconnectAsync()
     {
-        if (_webSocket != null && _webSocket.State == WebSocketState.Open)
-        {
-            try
-            {
-                await _webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Disconnecting", CancellationToken.None);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Error during graceful disconnect");
-            }
-        }
-
         await DisposeInternalAsync();
     }
 
     private async Task DisposeInternalAsync()
     {
-        // Attempt graceful close if WebSocket is in a closeable state
+        // First, cancel the receive loop so it exits cleanly
+        // This prevents WebSocketException from being raised as an error
+        _cts?.Cancel();
+
+        // Wait for receive loop to exit
+        if (_receiveTask != null)
+        {
+            try
+            {
+                await _receiveTask.WaitAsync(TimeSpan.FromSeconds(2));
+            }
+            catch (TimeoutException)
+            {
+                _logger.LogDebug("Receive loop did not exit in time");
+            }
+            catch
+            {
+                // Ignore other exceptions during cleanup
+            }
+        }
+
+        // Now close the WebSocket (receive loop is already stopped)
         if (_webSocket != null)
         {
             var state = _webSocket.State;
@@ -316,20 +325,6 @@ public sealed class SignalingClient : IAsyncDisposable
             {
                 _logger.LogDebug("Aborting WebSocket connection in progress");
                 _webSocket.Abort();
-            }
-        }
-
-        _cts?.Cancel();
-
-        if (_receiveTask != null)
-        {
-            try
-            {
-                await _receiveTask;
-            }
-            catch
-            {
-                // Ignore exceptions during cleanup
             }
         }
 

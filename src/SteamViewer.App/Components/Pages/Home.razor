@@ -54,14 +54,13 @@
     else if (currentMode == AppMode.StartConnection)
     {
         <div class="session-view">
-            <button class="back-btn" @onclick="GoBack">← Back</button>
-
             <h2>Start Session</h2>
 
             @if (connectionState == ConnectionState.Idle || connectionState == ConnectionState.Registering)
             {
                 <p>Setting up session...</p>
                 <div class="spinner"></div>
+                <button class="secondary-btn" @onclick="GoBack">Cancel</button>
             }
             else if (connectionState == ConnectionState.Registered)
             {
@@ -101,8 +100,6 @@
     else if (currentMode == AppMode.JoinConnection)
     {
         <div class="session-view">
-            <button class="back-btn" @onclick="GoBack">← Back</button>
-
             <h2>Join Session</h2>
 
             @if (connectionState == ConnectionState.Idle || connectionState == ConnectionState.Registered)
@@ -116,15 +113,19 @@
                         <label>Password</label>
                         <input type="password" @bind="targetPassword" placeholder="Enter password" />
                     </div>
-                    <button class="primary-btn" @onclick="JoinSession" disabled="@(string.IsNullOrWhiteSpace(targetId) || string.IsNullOrWhiteSpace(targetPassword))">
-                        Join
-                    </button>
+                    <div class="form-buttons">
+                        <button class="secondary-btn" @onclick="GoBack">Back</button>
+                        <button class="primary-btn" @onclick="JoinSession" disabled="@(string.IsNullOrWhiteSpace(targetId) || string.IsNullOrWhiteSpace(targetPassword))">
+                            Join
+                        </button>
+                    </div>
                 </div>
             }
             else if (connectionState == ConnectionState.Connecting)
             {
                 <p>Connecting...</p>
                 <div class="spinner"></div>
+                <button class="secondary-btn" @onclick="GoBack">Cancel</button>
             }
             else if (connectionState == ConnectionState.Connected)
             {
@@ -1508,6 +1509,20 @@
 
     .connect-form {
         width: 300px;
+    }
+
+    .form-buttons {
+        display: flex;
+        gap: 1rem;
+        margin-top: 1rem;
+    }
+
+    .form-buttons .secondary-btn {
+        flex: 1;
+    }
+
+    .form-buttons .primary-btn {
+        flex: 2;
     }
 
     .input-group {
