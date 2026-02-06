@@ -73,7 +73,7 @@ download-run.cmd
 
 **"HTTP 404" on download**
 - The dev machine hasn't uploaded a build yet
-- Ask dev to run `upload-full.cmd` first
+- Ask dev to run `scripts/upload-full.cmd` first
 
 **"unauthorized"**
 - Run `gh auth login` again to refresh token
