@@ -1,5 +1,5 @@
 # AI assistant context (private)
-.AI.md
+misc/.AI.md
 .claude/settings.local.json
 
 # Build outputs
@@ -32,6 +32,6 @@ logs/
 nul
 
 # Local development helpers
-SteamViewerMainSession.cmd
-*.lnk
+misc/SteamViewerMainSession.cmd
+misc/*.lnk
 
