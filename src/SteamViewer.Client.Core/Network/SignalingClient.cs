@@ -270,34 +270,61 @@ public sealed class SignalingClient : IAsyncDisposable
     /// </summary>
     public async Task DisconnectAsync()
     {
-        if (_webSocket != null && _webSocket.State == WebSocketState.Open)
-        {
-            try
-            {
-                await _webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Disconnecting", CancellationToken.None);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Error during graceful disconnect");
-            }
-        }
-
         await DisposeInternalAsync();
     }
 
     private async Task DisposeInternalAsync()
     {
+        // First, cancel the receive loop so it exits cleanly
+        // This prevents WebSocketException from being raised as an error
         _cts?.Cancel();
 
+        // Wait for receive loop to exit
         if (_receiveTask != null)
         {
             try
             {
-                await _receiveTask;
+                await _receiveTask.WaitAsync(TimeSpan.FromSeconds(2));
+            }
+            catch (TimeoutException)
+            {
+                _logger.LogDebug("Receive loop did not exit in time");
             }
             catch
             {
-                // Ignore exceptions during cleanup
+                // Ignore other exceptions during cleanup
+            }
+        }
+
+        // Now close the WebSocket (receive loop is already stopped)
+        if (_webSocket != null)
+        {
+            var state = _webSocket.State;
+            if (state == WebSocketState.Open || state == WebSocketState.CloseReceived)
+            {
+                try
+                {
+                    // Use a short timeout for the close handshake
+                    using var closeCts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                    await _webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Closing", closeCts.Token);
+                }
+                catch (OperationCanceledException)
+                {
+                    _logger.LogDebug("WebSocket close handshake timed out");
+                }
+                catch (WebSocketException ex)
+                {
+                    _logger.LogDebug(ex, "WebSocket close handshake failed (expected during cancel)");
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Unexpected error during WebSocket close");
+                }
+            }
+            else if (state == WebSocketState.Connecting)
+            {
+                _logger.LogDebug("Aborting WebSocket connection in progress");
+                _webSocket.Abort();
             }
         }
 
