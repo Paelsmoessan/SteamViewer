@@ -115,6 +115,7 @@ public sealed class ViewerSession : IAsyncDisposable
         // Subscribe to WebRTC events
         _webrtc.OnIceCandidate += HandleIceCandidate;
         _webrtc.OnDataChannelOpen += HandleDataChannelOpen;
+        _webrtc.OnDataChannelClose += HandleDataChannelClose;
         _webrtc.OnDataChannelMessage += HandleDataChannelMessage;
         _webrtc.OnRenegotiationNeeded += HandleRenegotiationNeeded;
         _webrtc.OnConnectionStateChange += HandleConnectionStateChange;
@@ -223,6 +224,18 @@ public sealed class ViewerSession : IAsyncDisposable
         await Task.CompletedTask;
     }
 
+    private async Task HandleDataChannelClose()
+    {
+        _logger.LogWarning("Session {SessionId}: Data channel closed unexpectedly", SessionId);
+        // Treat data channel close as disconnect (fix: OnDataChannelClose handler)
+        if (State == ViewerSessionState.Connected)
+        {
+            SetState(ViewerSessionState.Disconnected);
+            OnDisconnected?.Invoke("Data channel closed");
+        }
+        await Task.CompletedTask;
+    }
+
     private async Task HandleDataChannelMessage(string json)
     {
         try
@@ -311,6 +324,7 @@ public sealed class ViewerSession : IAsyncDisposable
         {
             _webrtc.OnIceCandidate -= HandleIceCandidate;
             _webrtc.OnDataChannelOpen -= HandleDataChannelOpen;
+            _webrtc.OnDataChannelClose -= HandleDataChannelClose;
             _webrtc.OnDataChannelMessage -= HandleDataChannelMessage;
             _webrtc.OnRenegotiationNeeded -= HandleRenegotiationNeeded;
             _webrtc.OnConnectionStateChange -= HandleConnectionStateChange;

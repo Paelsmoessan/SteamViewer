@@ -57,6 +57,28 @@
                     <button class="add-connection-btn" @onclick="OpenConnectionDialog">+ Add Connection</button>
                 </div>
             }
+            @if (_showReconnectOverlay)
+            {
+                <div class="reconnect-overlay">
+                    <div class="reconnect-dialog">
+                        <h3>Host Disconnected</h3>
+                        @if (_reconnectCountdown > 0)
+                        {
+                            <p>Reconnecting in @_reconnectCountdown seconds...</p>
+                        }
+                        else
+                        {
+                            <p>Attempting to reconnect...</p>
+                        }
+                        <div class="reconnect-buttons">
+                            <button class="btn-primary" @onclick="ReconnectNow">Reconnect Now</button>
+                            <button class="btn-secondary" @onclick="CancelReconnect">Cancel</button>
+                            <button class="btn-danger" @onclick="CloseDisconnectedTab">Close Tab</button>
+                        </div>
+                        <p class="reconnect-attempts">Attempt @(_reconnectAttempts + 1)</p>
+                    </div>
+                </div>
+            }
         </div>
     </div>
 </div>
@@ -79,6 +101,10 @@
     private bool _showConnectionDialog;
     private string? _activeSessionId;
     private ViewerSession? _activeSession;
+    private bool _showReconnectOverlay;
+    private int _reconnectCountdown;
+    private System.Threading.Timer? _reconnectTimer;
+    private int _reconnectAttempts;
 
     protected override void OnInitialized()
     {
@@ -214,9 +240,13 @@
         if (_activeSession != null)
         {
             _activeSession.OnFrame -= HandleSessionFrame;
+            _activeSession.OnDisconnected -= HandleSessionDisconnected;
         }
 
         _activeSessionId = sessionId;
+        _showReconnectOverlay = false;
+        _reconnectTimer?.Dispose();
+        _reconnectTimer = null;
 
         // Subscribe to new active session's frames
         if (sessionId != null && sessionId != "legacy")
@@ -225,6 +255,13 @@
             if (_activeSession != null)
             {
                 _activeSession.OnFrame += HandleSessionFrame;
+                _activeSession.OnDisconnected += HandleSessionDisconnected;
+
+                // Show reconnect overlay if session is already disconnected
+                if (_activeSession.State == ViewerSessionState.Disconnected)
+                {
+                    ShowReconnectOverlay("Session disconnected");
+                }
             }
         }
         else
@@ -233,6 +270,12 @@
         }
 
         InvokeAsync(StateHasChanged);
+    }
+
+    private void HandleSessionDisconnected(string? reason)
+    {
+        Console.WriteLine($"Session disconnected: {reason}");
+        ShowReconnectOverlay(reason);
     }
 
     private void HandleSessionFrame(JpegFrame frame)
@@ -490,8 +533,96 @@
 
     #endregion
 
+    #region Reconnect Logic
+
+    private void ShowReconnectOverlay(string? reason)
+    {
+        _showReconnectOverlay = true;
+        _reconnectAttempts = 0;
+        StartReconnectCountdown();
+        InvokeAsync(StateHasChanged);
+    }
+
+    private void StartReconnectCountdown()
+    {
+        // Exponential backoff: 10s, 20s, 40s, ... max 300s (5 min)
+        var baseDelay = 10;
+        var delay = Math.Min(baseDelay * (int)Math.Pow(2, _reconnectAttempts), 300);
+        _reconnectCountdown = delay;
+
+        _reconnectTimer?.Dispose();
+        _reconnectTimer = new System.Threading.Timer(
+            async _ => await OnReconnectTimerTick(),
+            null,
+            TimeSpan.FromSeconds(1),
+            TimeSpan.FromSeconds(1));
+    }
+
+    private async Task OnReconnectTimerTick()
+    {
+        _reconnectCountdown--;
+
+        if (_reconnectCountdown <= 0)
+        {
+            _reconnectTimer?.Dispose();
+            _reconnectTimer = null;
+            await TryReconnect();
+        }
+
+        await InvokeAsync(StateHasChanged);
+    }
+
+    private async Task TryReconnect()
+    {
+        if (_activeSession == null || _activeSessionId == null) return;
+
+        _reconnectAttempts++;
+        Console.WriteLine($"Reconnect attempt {_reconnectAttempts} for session {_activeSessionId}");
+
+        // TODO: Implement actual reconnection via SessionManager
+        // For now, just restart the countdown
+        // await SessionManager.ReconnectSessionAsync(_activeSessionId);
+
+        // If reconnect fails, start countdown again
+        StartReconnectCountdown();
+    }
+
+    private async Task ReconnectNow()
+    {
+        _reconnectTimer?.Dispose();
+        _reconnectTimer = null;
+        _reconnectCountdown = 0;
+        await TryReconnect();
+    }
+
+    private void CancelReconnect()
+    {
+        _reconnectTimer?.Dispose();
+        _reconnectTimer = null;
+        _showReconnectOverlay = false;
+        StateHasChanged();
+    }
+
+    private async Task CloseDisconnectedTab()
+    {
+        _reconnectTimer?.Dispose();
+        _reconnectTimer = null;
+        _showReconnectOverlay = false;
+
+        if (_activeSessionId != null)
+        {
+            await CloseTab(_activeSessionId);
+        }
+    }
+
+    #endregion
+
     public void Dispose()
     {
+        // Clean up reconnect timer
+        _reconnectTimer?.Dispose();
+        _reconnectTimer = null;
+
         TabManager.OnTabsChanged -= HandleTabsChanged;
         TabManager.OnActiveTabChanged -= HandleActiveTabChanged;
         ViewerService.OnJpegFrame -= HandleJpegFrame;
@@ -500,6 +631,7 @@
         if (_activeSession != null)
         {
             _activeSession.OnFrame -= HandleSessionFrame;
+            _activeSession.OnDisconnected -= HandleSessionDisconnected;
         }
 
         _dotNetRef?.Dispose();
@@ -815,5 +947,90 @@
         background: #45475a;
         border-color: #89b4fa;
         color: #89b4fa;
+    }
+
+    /* Reconnect overlay */
+    .reconnect-overlay {
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: rgba(17, 17, 27, 0.9);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 100;
+    }
+
+    .reconnect-dialog {
+        background: #1e1e2e;
+        border: 1px solid #313244;
+        border-radius: 12px;
+        padding: 32px 48px;
+        text-align: center;
+        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+    }
+
+    .reconnect-dialog h3 {
+        margin: 0 0 16px 0;
+        color: #f38ba8;
+        font-size: 18px;
+        font-weight: 500;
+    }
+
+    .reconnect-dialog p {
+        margin: 0 0 20px 0;
+        color: #a6adc8;
+        font-size: 14px;
+    }
+
+    .reconnect-buttons {
+        display: flex;
+        gap: 12px;
+        justify-content: center;
+        margin-bottom: 16px;
+    }
+
+    .reconnect-buttons button {
+        padding: 10px 20px;
+        border: none;
+        border-radius: 6px;
+        font-size: 13px;
+        cursor: pointer;
+        transition: all 0.15s;
+    }
+
+    .btn-primary {
+        background: #89b4fa;
+        color: #1e1e2e;
+    }
+
+    .btn-primary:hover {
+        background: #b4befe;
+    }
+
+    .btn-secondary {
+        background: #313244;
+        color: #cdd6f4;
+    }
+
+    .btn-secondary:hover {
+        background: #45475a;
+    }
+
+    .btn-danger {
+        background: #f38ba8;
+        color: #1e1e2e;
+    }
+
+    .btn-danger:hover {
+        background: #eba0ac;
+    }
+
+    .reconnect-attempts {
+        color: #6c7086;
+        font-size: 12px;
+        margin: 0;
     }
 </style>
