@@ -149,7 +149,7 @@ public sealed class ViewerTabManager
     /// <summary>
     /// Add a tab to a window for an existing session.
     /// </summary>
-    public void AddTab(string windowId, string sessionId)
+    public void AddTab(string windowId, string sessionId, string? title = null)
     {
         if (!_windows.TryGetValue(windowId, out var window))
         {
@@ -163,23 +163,21 @@ public sealed class ViewerTabManager
             return;
         }
 
-        var session = _sessionManager.GetSession(sessionId);
-        if (session == null)
-        {
-            _logger.LogWarning("Cannot add tab: session {SessionId} not found", sessionId);
-            return;
-        }
-
         // Create tab state if it doesn't exist
         if (!_tabs.ContainsKey(sessionId))
         {
+            var session = _sessionManager.GetSession(sessionId);
             _tabs[sessionId] = new TabState
             {
                 SessionId = sessionId,
-                Title = session.Title,
-                IsConnected = session.State == ViewerSessionState.Connected,
-                IsPeerSharing = session.IsPeerSharing
+                Title = title ?? session?.Title ?? sessionId,
+                IsConnected = session?.State == ViewerSessionState.Connected || session == null,
+                IsPeerSharing = session?.IsPeerSharing ?? true
             };
+        }
+        else if (title != null)
+        {
+            _tabs[sessionId].Title = title;
         }
 
         window.TabIds.Add(sessionId);

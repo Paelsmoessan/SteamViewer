@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Logging;
 using Microsoft.JSInterop;
+using SteamViewer.App.Services;
 using SteamViewer.Client.Core.Network;
 using SteamViewer.Common.Protocol;
 using System.Text.Json;
@@ -17,6 +18,8 @@ public sealed class ViewerSession : IAsyncDisposable
     private readonly ILoggerFactory _loggerFactory;
     private readonly Func<SignalingMessage, Task> _sendSignaling;
     private WebRTCManager? _webrtc;
+    private DotNetObjectReference<ViewerSession>? _dotNetRef;
+    private bool _frameCaptureStarted;
     private bool _disposed;
 
     /// <summary>
@@ -223,7 +226,7 @@ public sealed class ViewerSession : IAsyncDisposable
         _logger.LogInformation("Session {SessionId}: Data channel opened", SessionId);
         SetState(ViewerSessionState.Connected);
         OnReady?.Invoke();
-        await Task.CompletedTask;
+        await StartFrameCaptureAsync();
     }
 
     private async Task HandleDataChannelClose()
@@ -317,10 +320,53 @@ public sealed class ViewerSession : IAsyncDisposable
         OnFrame?.Invoke(frame);
     }
 
+    /// <summary>
+    /// Called from JS when a video frame is captured.
+    /// </summary>
+    [JSInvokable]
+    public void OnFrameCaptured(string base64Data, int width, int height)
+    {
+        OnFrame?.Invoke(new JpegFrame(base64Data, width, height));
+    }
+
+    /// <summary>
+    /// Start capturing frames from the JS WebRTC video track.
+    /// </summary>
+    private async Task StartFrameCaptureAsync()
+    {
+        if (_frameCaptureStarted || _disposed) return;
+        _frameCaptureStarted = true;
+
+        try
+        {
+            _dotNetRef = DotNetObjectReference.Create(this);
+            await _jsRuntime.InvokeVoidAsync("SteamViewerWebRTC.startFrameCapture", SessionId, _dotNetRef);
+            _logger.LogInformation("Session {SessionId}: Frame capture started", SessionId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Session {SessionId}: Failed to start frame capture", SessionId);
+            _frameCaptureStarted = false;
+        }
+    }
+
     public async ValueTask DisposeAsync()
     {
         if (_disposed) return;
         _disposed = true;
+
+        // Stop frame capture
+        try
+        {
+            await _jsRuntime.InvokeVoidAsync("SteamViewerWebRTC.stopFrameCapture", SessionId);
+        }
+        catch
+        {
+            // Ignore if JS not available during shutdown
+        }
+
+        _dotNetRef?.Dispose();
+        _dotNetRef = null;
 
         if (_webrtc != null)
         {

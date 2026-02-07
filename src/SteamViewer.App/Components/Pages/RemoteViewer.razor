@@ -120,18 +120,10 @@
         // Subscribe to legacy single-session service for backward compatibility
         ViewerService.OnJpegFrame += HandleJpegFrame;
 
-        // If legacy service has a peer, create a tab for it
+        // If legacy service has a peer, register the tab with TabManager
         if (!string.IsNullOrEmpty(ViewerService.PeerId))
         {
-            // For now, use legacy mode - create a pseudo-tab for the existing connection
-            _tabs.Add(new TabState
-            {
-                SessionId = "legacy",
-                Title = ViewerService.PeerId,
-                IsActive = true,
-                IsConnected = true,
-                IsPeerSharing = true
-            });
+            TabManager.AddTab(_windowId, "legacy", ViewerService.PeerId);
             _activeSessionId = "legacy";
         }
 
@@ -211,17 +203,7 @@
     private void RefreshTabs()
     {
         if (_windowId == null) return;
-
-        var newTabs = TabManager.GetTabs(_windowId).ToList();
-
-        // Keep legacy tab if it exists and no other tabs
-        if (newTabs.Count == 0 && _tabs.Any(t => t.SessionId == "legacy"))
-        {
-            // Keep legacy tab
-            return;
-        }
-
-        _tabs = newTabs;
+        _tabs = TabManager.GetTabs(_windowId).ToList();
     }
 
     private void HandleTabsChanged(string windowId)

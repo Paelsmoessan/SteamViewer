@@ -348,20 +348,10 @@ window.SteamViewerWebRTC = {
                     let frameCount = 0;
                     let lastFrameTime = 0;
 
-                    // Wait for canvas with retry logic (Blazor may not have rendered yet)
-                    const setupCanvas = (retryCount = 0) => {
-                        const canvas = document.getElementById('remoteCanvas');
-                        if (!canvas) {
-                            if (retryCount < 10) { // Retry for up to 1 second (reduced from 5s)
-                                console.log(`Canvas not found, retry ${retryCount + 1}/10...`);
-                                setTimeout(() => setupCanvas(retryCount + 1), 100);
-                                return;
-                            }
-                            console.error('Canvas not found after 1 second!');
-                            return;
-                        }
-
-                        console.log('Canvas found, setting up renderer');
+                    // Create offscreen canvas per session (no DOM dependency)
+                    const setupCanvas = () => {
+                        const canvas = document.createElement('canvas');
+                        console.log(`[${sessionId}] Created offscreen canvas for video rendering`);
                         const ctx = canvas.getContext('2d');
                         session.remoteCanvas = canvas;
                         session.remoteCtx = ctx;
@@ -824,17 +814,9 @@ window.SteamViewerWebRTC = {
 
             session.remoteVideo = video;
 
-            const setupCanvas = (retryCount = 0) => {
-                const canvas = document.getElementById('remoteCanvas');
-                if (!canvas) {
-                    if (retryCount < 10) { // Reduced from 50 (5s) to 10 (1s)
-                        setTimeout(() => setupCanvas(retryCount + 1), 100);
-                        return;
-                    }
-                    console.error('Canvas not found for manual track setup');
-                    return;
-                }
-
+            const setupCanvas = () => {
+                const canvas = document.createElement('canvas');
+                console.log(`[${sessionId}] Created offscreen canvas for manual track setup`);
                 const ctx = canvas.getContext('2d');
                 session.remoteCanvas = canvas;
                 session.remoteCtx = ctx;
