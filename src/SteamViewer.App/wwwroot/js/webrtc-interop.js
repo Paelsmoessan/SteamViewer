@@ -233,21 +233,34 @@ window.SteamViewerWebRTC = {
                 const state = session.peerConnection.connectionState;
                 console.log(`=== CONNECTION STATE [${sessionId}]:`, state, '===');
 
-                if (state === 'failed') {
+                if (state === 'connected') {
+                    // Recovery from temporary disconnect — resume capture if it was paused
+                    this.resumeFrameCapture(sessionId);
+                } else if (state === 'failed') {
                     console.error('CONNECTION FAILED - Possible causes:');
                     console.error('1. No relay candidates (TURN not working)');
                     console.error('2. Firewall blocking');
                     console.error('3. NAT traversal failed');
                 }
 
-                // Reset input lock on disconnect/failure (fix: input lock persists after disconnect)
-                if (state === 'disconnected' || state === 'failed' || state === 'closed') {
-                    if (window.SteamViewerInput && window.SteamViewerInput.isLocked) {
+                // Handle disconnect/failure
+                if (state === 'disconnected') {
+                    // Temporary disconnect — pause capture (preserves dotNetRef for recovery)
+                    this.pauseFrameCapture(sessionId);
+                    // Only unlock input if THIS session is the active input session
+                    if (window.SteamViewerInput && window.SteamViewerInput.isLocked
+                        && window.SteamViewerInput._activeSessionId === sessionId) {
                         window.SteamViewerInput.unlock();
                         console.log('Input lock released due to connection state:', state);
                     }
-                    // Stop frame capture to prevent lingering animations
+                } else if (state === 'failed' || state === 'closed') {
+                    // Permanent failure — full cleanup
                     this.stopFrameCapture(sessionId);
+                    if (window.SteamViewerInput && window.SteamViewerInput.isLocked
+                        && window.SteamViewerInput._activeSessionId === sessionId) {
+                        window.SteamViewerInput.unlock();
+                        console.log('Input lock released due to connection state:', state);
+                    }
                 }
 
                 await session.dotNetRef.invokeMethodAsync('OnConnectionStateChangeCallback', state);
@@ -1037,6 +1050,37 @@ window.SteamViewerWebRTC = {
         session.frameCaptureDotNetRef = null;
         session.captureCanvas = null;
         session.captureCtx = null;
+    },
+
+    // Pause frame capture (keeps dotNetRef for resume)
+    pauseFrameCapture(sessionId) {
+        const session = this.sessions.get(sessionId);
+        if (!session || !session.frameCaptureEnabled) return;
+        console.log(`[${sessionId}] Pausing frame capture`);
+        session.frameCaptureEnabled = false;
+        if (session.frameCaptureAnimationId) {
+            cancelAnimationFrame(session.frameCaptureAnimationId);
+            session.frameCaptureAnimationId = null;
+        }
+    },
+
+    // Resume frame capture (restarts rAF loop if dotNetRef is still set)
+    resumeFrameCapture(sessionId) {
+        const session = this.sessions.get(sessionId);
+        if (!session || !session.frameCaptureDotNetRef || session.frameCaptureEnabled) return;
+        console.log(`[${sessionId}] Resuming frame capture`);
+        session.frameCaptureEnabled = true;
+        session.lastFrameTime = 0;
+
+        const captureLoop = (timestamp) => {
+            if (!session.frameCaptureEnabled) return;
+            if (timestamp - session.lastFrameTime >= session.frameInterval) {
+                this._captureAndSendFrame(sessionId);
+                session.lastFrameTime = timestamp;
+            }
+            session.frameCaptureAnimationId = requestAnimationFrame(captureLoop);
+        };
+        session.frameCaptureAnimationId = requestAnimationFrame(captureLoop);
     },
 
     _captureAndSendFrame(sessionId) {

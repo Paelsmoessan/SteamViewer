@@ -290,6 +290,13 @@ public sealed class ViewerSession : IAsyncDisposable
         {
             case "connected":
                 SetState(ViewerSessionState.Connected);
+                // Restart frame capture if it was stopped by a previous disconnect
+                if (_frameCaptureStarted)
+                {
+                    _logger.LogInformation("Session {SessionId}: Connection recovered, restarting frame capture", SessionId);
+                    _frameCaptureStarted = false;
+                    await StartFrameCaptureAsync();
+                }
                 break;
             case "disconnected":
             case "failed":
@@ -298,8 +305,6 @@ public sealed class ViewerSession : IAsyncDisposable
                 OnDisconnected?.Invoke(state);
                 break;
         }
-
-        await Task.CompletedTask;
     }
 
     private void SetState(ViewerSessionState newState)

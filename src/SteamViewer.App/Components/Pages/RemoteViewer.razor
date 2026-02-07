@@ -220,11 +220,13 @@
     {
         if (windowId != _windowId) return;
 
-        // Unsubscribe from previous session
+        // Pause frame capture and unsubscribe from previous session
         if (_activeSession != null)
         {
+            var oldSessionId = _activeSession.SessionId;
             _activeSession.OnFrame -= HandleSessionFrame;
             _activeSession.OnDisconnected -= HandleSessionDisconnected;
+            _ = JSRuntime.InvokeVoidAsync("SteamViewerWebRTC.pauseFrameCapture", oldSessionId);
         }
 
         _activeSessionId = sessionId;
@@ -239,7 +241,7 @@
             _ = JSRuntime.InvokeVoidAsync("SteamViewerInput.setActiveSession", inputSessionId);
         }
 
-        // Subscribe to new active session's frames
+        // Subscribe to new active session's frames and resume capture
         if (sessionId != null && sessionId != "legacy")
         {
             _activeSession = SessionManager.GetSession(sessionId);
@@ -247,6 +249,8 @@
             {
                 _activeSession.OnFrame += HandleSessionFrame;
                 _activeSession.OnDisconnected += HandleSessionDisconnected;
+
+                _ = JSRuntime.InvokeVoidAsync("SteamViewerWebRTC.resumeFrameCapture", sessionId);
 
                 // Show reconnect overlay if session is already disconnected
                 if (_activeSession.State == ViewerSessionState.Disconnected)
