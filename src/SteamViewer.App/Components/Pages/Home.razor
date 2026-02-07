@@ -187,6 +187,7 @@
     // WebRTC state
     private WebRTCManager? _webrtc;
     private bool _webrtcInitialized;
+    private string _sessionId = "host"; // Session ID for JS interop (host uses constant "host")
 
     // Screen sharing state
     private bool _isSharingScreen;       // Am I sharing my screen?
@@ -262,7 +263,6 @@
 
             @* Toolbar *@
             <div class="session-toolbar">
-                <button class="toolbar-btn" @onclick="ToggleStatsOverlay">📊 Stats</button>
                 <button class="toolbar-btn" @onclick="ShowTransfersDialog">📁 Transfers</button>
                 <button class="toolbar-btn disconnect" @onclick="Disconnect">⏏ Disconnect</button>
             </div>
@@ -329,6 +329,10 @@
                         _inputDotNetRef,
                         new { showLockIndicator = false });
                     _inputCaptureInitialized = success;
+                    if (success)
+                    {
+                        await JSRuntime.InvokeVoidAsync("SteamViewerInput.setActiveSession", _sessionId);
+                    }
                     Logger.LogInformation("Input capture initialized: {Success}", success);
                 }
             }
@@ -496,17 +500,6 @@
         StateHasChanged();
     }
 
-    private async Task ToggleStatsOverlay()
-    {
-        try
-        {
-            await JSRuntime.InvokeVoidAsync("SteamViewerWebRTC.toggleStatsOverlay");
-        }
-        catch (Exception ex)
-        {
-            Logger.LogWarning(ex, "Failed to toggle stats overlay");
-        }
-    }
 
     #region Screen Sharing
 
@@ -593,7 +586,7 @@
         try
         {
             _frameCaptureRef = DotNetObjectReference.Create(this);
-            await JSRuntime.InvokeVoidAsync("SteamViewerWebRTC.startFrameCapture", _frameCaptureRef);
+            await JSRuntime.InvokeVoidAsync("SteamViewerWebRTC.startFrameCapture", _sessionId, _frameCaptureRef);
             Logger.LogInformation("Frame capture started for viewer window");
         }
         catch (Exception ex)
@@ -606,7 +599,7 @@
     {
         try
         {
-            await JSRuntime.InvokeVoidAsync("SteamViewerWebRTC.stopFrameCapture");
+            await JSRuntime.InvokeVoidAsync("SteamViewerWebRTC.stopFrameCapture", _sessionId);
             _frameCaptureRef?.Dispose();
             _frameCaptureRef = null;
         }
@@ -837,7 +830,7 @@
         // Set logger to host mode (receives logs from viewer)
         await JSRuntime.InvokeVoidAsync("SteamViewerLogger.setMode", true);
 
-        _webrtc = new WebRTCManager(JSRuntime, LoggerFactory.CreateLogger<WebRTCManager>(), clientId, SendSignalingMessage);
+        _webrtc = new WebRTCManager(JSRuntime, LoggerFactory.CreateLogger<WebRTCManager>(), _sessionId, clientId, SendSignalingMessage);
 
         // Subscribe to ICE candidates
         _webrtc.OnIceCandidate += async (candidateJson) =>
@@ -1060,7 +1053,7 @@
                             await Task.Delay(500);
 
                             // Manually check for video tracks (in case ontrack didn't fire)
-                            await JSRuntime.InvokeVoidAsync("SteamViewerWebRTC.checkForVideoTracks");
+                            await JSRuntime.InvokeVoidAsync("SteamViewerWebRTC.checkForVideoTracks", _sessionId);
 
                             // Auto-open viewer window
                             await OpenViewerWindow();
@@ -1236,7 +1229,7 @@
         // Set logger to viewer mode (sends logs to host)
         await JSRuntime.InvokeVoidAsync("SteamViewerLogger.setMode", false);
 
-        _webrtc = new WebRTCManager(JSRuntime, LoggerFactory.CreateLogger<WebRTCManager>(), "", SendSignalingMessage);
+        _webrtc = new WebRTCManager(JSRuntime, LoggerFactory.CreateLogger<WebRTCManager>(), _sessionId, "", SendSignalingMessage);
 
         // Subscribe to ICE candidates
         _webrtc.OnIceCandidate += async (candidateJson) =>

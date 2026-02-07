@@ -13,6 +13,7 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
     private readonly IJSRuntime _jsRuntime;
     private readonly ILogger<WebRTCManager> _logger;
     private readonly Func<SignalingMessage, Task>? _sendSignaling;
+    private readonly string _sessionId;
     private DotNetObjectReference<WebRTCManager>? _dotNetRef;
     private bool _isInitialized;
     private bool _disposed;
@@ -101,10 +102,11 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
     /// </summary>
     public bool IsDataChannelOpen { get; private set; }
 
-    public WebRTCManager(IJSRuntime jsRuntime, ILogger<WebRTCManager> logger, string clientId = "", Func<SignalingMessage, Task>? sendSignaling = null)
+    public WebRTCManager(IJSRuntime jsRuntime, ILogger<WebRTCManager> logger, string sessionId, string clientId = "", Func<SignalingMessage, Task>? sendSignaling = null)
     {
         _jsRuntime = jsRuntime;
         _logger = logger;
+        _sessionId = sessionId;
         _clientId = clientId;
         _sendSignaling = sendSignaling;
     }
@@ -139,7 +141,7 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
 
         var success = await _jsRuntime.InvokeAsync<bool>(
             "SteamViewerWebRTC.initialize",
-            _dotNetRef);
+            _sessionId, _dotNetRef);
 
         if (!success)
         {
@@ -156,7 +158,7 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
     public async Task CreateDataChannelAsync(string name = "data")
     {
         EnsureInitialized();
-        await _jsRuntime.InvokeVoidAsync("SteamViewerWebRTC.createDataChannel", name);
+        await _jsRuntime.InvokeVoidAsync("SteamViewerWebRTC.createDataChannel", _sessionId, name);
         _logger.LogDebug("Data channel '{Name}' created", name);
     }
 
@@ -166,7 +168,7 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
     public async Task<string> CreateOfferAsync()
     {
         EnsureInitialized();
-        var offer = await _jsRuntime.InvokeAsync<string>("SteamViewerWebRTC.createOffer");
+        var offer = await _jsRuntime.InvokeAsync<string>("SteamViewerWebRTC.createOffer", _sessionId);
         _logger.LogDebug("SDP offer created");
         return offer;
     }
@@ -177,7 +179,7 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
     public async Task<string> CreateAnswerAsync()
     {
         EnsureInitialized();
-        var answer = await _jsRuntime.InvokeAsync<string>("SteamViewerWebRTC.createAnswer");
+        var answer = await _jsRuntime.InvokeAsync<string>("SteamViewerWebRTC.createAnswer", _sessionId);
         _logger.LogDebug("SDP answer created");
         return answer;
     }
@@ -188,7 +190,7 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
     public async Task SetRemoteDescriptionAsync(string sdpJson)
     {
         EnsureInitialized();
-        await _jsRuntime.InvokeVoidAsync("SteamViewerWebRTC.setRemoteDescription", sdpJson);
+        await _jsRuntime.InvokeVoidAsync("SteamViewerWebRTC.setRemoteDescription", _sessionId, sdpJson);
         _logger.LogDebug("Remote description set");
     }
 
@@ -198,7 +200,7 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
     public async Task AddIceCandidateAsync(string candidateJson)
     {
         EnsureInitialized();
-        await _jsRuntime.InvokeVoidAsync("SteamViewerWebRTC.addIceCandidate", candidateJson);
+        await _jsRuntime.InvokeVoidAsync("SteamViewerWebRTC.addIceCandidate", _sessionId, candidateJson);
         _logger.LogDebug("ICE candidate added");
     }
 
@@ -208,7 +210,7 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
     public async Task<bool> StartScreenCaptureAsync()
     {
         EnsureInitialized();
-        var success = await _jsRuntime.InvokeAsync<bool>("SteamViewerWebRTC.startScreenCapture");
+        var success = await _jsRuntime.InvokeAsync<bool>("SteamViewerWebRTC.startScreenCapture", _sessionId);
         _logger.LogInformation("Screen capture started: {Success}", success);
         return success;
     }
@@ -219,7 +221,7 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
     public async Task StopScreenCaptureAsync()
     {
         EnsureInitialized();
-        await _jsRuntime.InvokeVoidAsync("SteamViewerWebRTC.stopScreenCapture");
+        await _jsRuntime.InvokeVoidAsync("SteamViewerWebRTC.stopScreenCapture", _sessionId);
         _logger.LogInformation("Screen capture stopped");
     }
 
@@ -229,7 +231,7 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
     public async Task<bool> SendDataAsync(string data)
     {
         EnsureInitialized();
-        return await _jsRuntime.InvokeAsync<bool>("SteamViewerWebRTC.sendData", data);
+        return await _jsRuntime.InvokeAsync<bool>("SteamViewerWebRTC.sendData", _sessionId, data);
     }
 
     /// <summary>
@@ -238,7 +240,7 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
     public async Task<bool> SendBinaryDataAsync(byte[] data)
     {
         EnsureInitialized();
-        return await _jsRuntime.InvokeAsync<bool>("SteamViewerWebRTC.sendBinaryData", data);
+        return await _jsRuntime.InvokeAsync<bool>("SteamViewerWebRTC.sendBinaryData", _sessionId, data);
     }
 
     #region IWebRTCManager Implementation
@@ -357,7 +359,7 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
             return;
         }
 
-        await _jsRuntime.InvokeVoidAsync("SteamViewerWebRTC.close");
+        await _jsRuntime.InvokeVoidAsync("SteamViewerWebRTC.close", _sessionId);
         _isInitialized = false;
         IsDataChannelOpen = false;
         ConnectionState = "closed";

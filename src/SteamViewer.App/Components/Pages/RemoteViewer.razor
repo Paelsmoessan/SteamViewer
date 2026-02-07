@@ -23,6 +23,7 @@
             <button class="icon-btn @(_inputLocked ? "locked" : "")" @onclick="ToggleInputLock" title="@(_inputLocked ? "Unlock (Esc)" : "Lock input")">
                 @(_inputLocked ? "🔒" : "🔓")
             </button>
+            <button class="icon-btn @(_statsVisible ? "active-toggle" : "")" @onclick="ToggleStatsOverlay" title="Toggle stats overlay">📊</button>
             <button class="icon-btn" title="Fullscreen">⛶</button>
             <button class="icon-btn close-btn" @onclick="CloseWindow" title="Close window">×</button>
         </div>
@@ -105,6 +106,7 @@
     private int _reconnectCountdown;
     private System.Threading.Timer? _reconnectTimer;
     private int _reconnectAttempts;
+    private bool _statsVisible;
 
     protected override void OnInitialized()
     {
@@ -248,6 +250,13 @@
         _reconnectTimer?.Dispose();
         _reconnectTimer = null;
 
+        // Update input's active session for stats tracking
+        var inputSessionId = sessionId == "legacy" ? "host" : sessionId;
+        if (!string.IsNullOrEmpty(inputSessionId))
+        {
+            _ = JSRuntime.InvokeVoidAsync("SteamViewerInput.setActiveSession", inputSessionId);
+        }
+
         // Subscribe to new active session's frames
         if (sessionId != null && sessionId != "legacy")
         {
@@ -354,6 +363,17 @@
     {
         _showConnectionDialog = false;
         RefreshTabs();
+        StateHasChanged();
+    }
+
+    private async Task ToggleStatsOverlay()
+    {
+        // Use active session ID for stats, or "host" for legacy single-session mode
+        var statsSessionId = _activeSessionId == "legacy" ? "host" : _activeSessionId;
+        if (string.IsNullOrEmpty(statsSessionId)) return;
+
+        _statsVisible = !_statsVisible;
+        await JSRuntime.InvokeVoidAsync("SteamViewerWebRTC.toggleStatsOverlay", statsSessionId);
         StateHasChanged();
     }
 
@@ -732,6 +752,15 @@
 
     .icon-btn.locked:hover {
         background: #94e2d5;
+    }
+
+    .icon-btn.active-toggle {
+        background: #89b4fa;
+        color: #1e1e2e;
+    }
+
+    .icon-btn.active-toggle:hover {
+        background: #b4befe;
     }
 
     .close-btn:hover {

@@ -110,7 +110,7 @@ public sealed class ViewerSession : IAsyncDisposable
 
         _logger.LogInformation("Initializing viewer session {SessionId} for peer {PeerId}", SessionId, PeerId);
 
-        _webrtc = new WebRTCManager(_jsRuntime, (ILogger<WebRTCManager>)_logger, "", _sendSignaling);
+        _webrtc = new WebRTCManager(_jsRuntime, (ILogger<WebRTCManager>)_logger, SessionId, "", _sendSignaling);
 
         // Subscribe to WebRTC events
         _webrtc.OnIceCandidate += HandleIceCandidate;

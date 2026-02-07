@@ -1,5 +1,6 @@
 // WebRTC Interop for SteamViewer
 // Provides browser WebRTC API access to Blazor via JS interop
+// Multi-session architecture: each connection identified by sessionId
 
 // Console interceptor - forwards all console output to C# for file logging
 (function() {
@@ -60,8 +61,8 @@ window.SteamViewerLogger = {
             }
         }
 
-        // Relay to peer (bidirectional - both host and viewer send)
-        if (this.relayEnabled && window.SteamViewerWebRTC?.dataChannel?.readyState === 'open') {
+        // Relay to all active sessions (bidirectional - both host and viewer send)
+        if (this.relayEnabled) {
             try {
                 const logMsg = JSON.stringify({
                     _logRelay: true,
@@ -70,7 +71,12 @@ window.SteamViewerLogger = {
                     from: this.peerName,
                     timestamp: Date.now()
                 });
-                window.SteamViewerWebRTC.dataChannel.send(logMsg);
+                // Send through all sessions' data channels
+                for (const [, session] of window.SteamViewerWebRTC.sessions) {
+                    if (session.dataChannel?.readyState === 'open') {
+                        try { session.dataChannel.send(logMsg); } catch (e) { /* ignore */ }
+                    }
+                }
             } catch (e) {
                 // Ignore relay errors
             }
@@ -91,34 +97,56 @@ window.SteamViewerLogger = {
 };
 
 window.SteamViewerWebRTC = {
-    peerConnection: null,
-    dataChannel: null,
-    dotNetRef: null,
-    localStream: null,
-    remoteVideo: null,      // Video element for incoming stream
-    remoteCanvas: null,     // Canvas for rendering
-    remoteCtx: null,        // Canvas 2D context
+    // Session-keyed Map: sessionId → session state object
+    sessions: new Map(),
 
-    // Custom TURN server config (set from C# via setTurnConfig)
+    // Custom TURN server config (shared across all sessions)
     customTurnServer: null,
 
-    // Stats overlay state
-    _statsInterval: null,
-    _statsOverlayEl: null,
-    _statsVisible: false,
-    _statsPrev: null,       // Previous poll snapshot for delta calculations
-    _inputEventsCount: 0,   // Incremented by input handlers, reset each poll
-    _inputThrottledCount: 0, // Throttled input events count
-    _qualityMode: 'HQ',    // Current quality mode: 'HQ' or 'Fast'
+    // Get session by ID (throws if not found)
+    _getSession(sessionId) {
+        const s = this.sessions.get(sessionId);
+        if (!s) throw new Error(`No session: ${sessionId}`);
+        return s;
+    },
 
-    // Set custom TURN server configuration
+    // Create a new session state object with all per-session fields
+    _createSessionState(dotNetRef) {
+        return {
+            peerConnection: null,
+            dataChannel: null,
+            dotNetRef: dotNetRef,
+            localStream: null,
+            remoteVideo: null,
+            remoteCanvas: null,
+            remoteCtx: null,
+            // Frame capture
+            frameCaptureDotNetRef: null,
+            frameCaptureEnabled: false,
+            frameCaptureAnimationId: null,
+            lastFrameTime: 0,
+            frameInterval: 50, // ~20fps
+            captureCanvas: null,
+            captureCtx: null,
+            // Stats overlay
+            _statsInterval: null,
+            _statsOverlayEl: null,
+            _statsVisible: false,
+            _statsPrev: null,
+            _inputEventsCount: 0,
+            _inputThrottledCount: 0,
+            _qualityMode: 'HQ'
+        };
+    },
+
+    // Set custom TURN server configuration (shared, no sessionId needed)
     // Call this before initialize() to use your own TURN server
     setTurnConfig(urls, username, credential) {
         console.log('Setting custom TURN server:', urls);
         this.customTurnServer = { urls, username, credential };
     },
 
-    // Build ICE servers list
+    // Build ICE servers list (shared helper)
     buildIceServers() {
         const servers = [
             // Multiple STUN servers for reliability
@@ -146,12 +174,12 @@ window.SteamViewerWebRTC = {
         return servers;
     },
 
-    // Initialize WebRTC with STUN/TURN servers
-    async initialize(dotNetReference) {
-        this.dotNetRef = dotNetReference;
+    // Initialize WebRTC with STUN/TURN servers for a specific session
+    async initialize(sessionId, dotNetReference) {
+        const session = this._createSessionState(dotNetReference);
 
         const iceServers = this.buildIceServers();
-        console.log('=== WebRTC INIT ===');
+        console.log(`=== WebRTC INIT [${sessionId}] ===`);
         console.log('ICE servers configured:', JSON.stringify(iceServers, null, 2));
 
         const config = {
@@ -163,20 +191,20 @@ window.SteamViewerWebRTC = {
         };
 
         try {
-            this.peerConnection = new RTCPeerConnection(config);
-            console.log('RTCPeerConnection created');
+            session.peerConnection = new RTCPeerConnection(config);
+            console.log(`[${sessionId}] RTCPeerConnection created`);
 
             // Track candidate types found
             const candidateTypes = { host: 0, srflx: 0, relay: 0, prflx: 0 };
 
             // Handle ICE candidates
-            this.peerConnection.onicecandidate = async (event) => {
+            session.peerConnection.onicecandidate = async (event) => {
                 if (event.candidate) {
                     const candidateType = event.candidate.candidate.match(/typ (\w+)/)?.[1] || 'unknown';
                     candidateTypes[candidateType] = (candidateTypes[candidateType] || 0) + 1;
 
                     // Full candidate logging for debugging
-                    console.log(`=== ICE CANDIDATE: ${candidateType.toUpperCase()} ===`);
+                    console.log(`=== ICE CANDIDATE [${sessionId}]: ${candidateType.toUpperCase()} ===`);
                     console.log('Full candidate:', event.candidate.candidate);
                     console.log('Candidate counts so far:', candidateTypes);
 
@@ -184,9 +212,9 @@ window.SteamViewerWebRTC = {
                         console.log('*** RELAY CANDIDATE FOUND - TURN SERVER WORKING! ***');
                     }
 
-                    await this.dotNetRef.invokeMethodAsync('OnIceCandidateCallback', JSON.stringify(event.candidate));
+                    await session.dotNetRef.invokeMethodAsync('OnIceCandidateCallback', JSON.stringify(event.candidate));
                 } else {
-                    console.log('=== ICE GATHERING COMPLETE ===');
+                    console.log(`=== ICE GATHERING COMPLETE [${sessionId}] ===`);
                     console.log('Final candidate counts:', candidateTypes);
                     if (candidateTypes.relay === 0) {
                         console.error('!!! NO RELAY CANDIDATES - TURN SERVER NOT WORKING !!!');
@@ -196,14 +224,14 @@ window.SteamViewerWebRTC = {
             };
 
             // Handle ICE gathering state
-            this.peerConnection.onicegatheringstatechange = () => {
-                console.log('ICE gathering state:', this.peerConnection.iceGatheringState);
+            session.peerConnection.onicegatheringstatechange = () => {
+                console.log(`[${sessionId}] ICE gathering state:`, session.peerConnection.iceGatheringState);
             };
 
             // Handle connection state changes
-            this.peerConnection.onconnectionstatechange = async () => {
-                const state = this.peerConnection.connectionState;
-                console.log('=== CONNECTION STATE:', state, '===');
+            session.peerConnection.onconnectionstatechange = async () => {
+                const state = session.peerConnection.connectionState;
+                console.log(`=== CONNECTION STATE [${sessionId}]:`, state, '===');
 
                 if (state === 'failed') {
                     console.error('CONNECTION FAILED - Possible causes:');
@@ -219,22 +247,22 @@ window.SteamViewerWebRTC = {
                         console.log('Input lock released due to connection state:', state);
                     }
                     // Stop frame capture to prevent lingering animations
-                    this.stopFrameCapture();
+                    this.stopFrameCapture(sessionId);
                 }
 
-                await this.dotNetRef.invokeMethodAsync('OnConnectionStateChangeCallback', state);
+                await session.dotNetRef.invokeMethodAsync('OnConnectionStateChangeCallback', state);
             };
 
             // Handle ICE connection state for more debugging
-            this.peerConnection.oniceconnectionstatechange = () => {
-                console.log('ICE connection state:', this.peerConnection.iceConnectionState);
-                if (this.peerConnection.iceConnectionState === 'failed') {
+            session.peerConnection.oniceconnectionstatechange = () => {
+                console.log(`[${sessionId}] ICE connection state:`, session.peerConnection.iceConnectionState);
+                if (session.peerConnection.iceConnectionState === 'failed') {
                     console.error('ICE CONNECTION FAILED');
                 }
             };
 
             // Handle ICE candidate errors (ignore STUN timeouts on TURN servers - expected)
-            this.peerConnection.onicecandidateerror = (event) => {
+            session.peerConnection.onicecandidateerror = (event) => {
                 // Error 701 = STUN timeout, often happens on TURN servers - not critical
                 if (event.errorCode === 701 && event.url?.includes('relay.metered.ca')) {
                     // Silently ignore - Google STUN servers will handle NAT traversal
@@ -244,18 +272,18 @@ window.SteamViewerWebRTC = {
             };
 
             // Handle renegotiation needed (when tracks are added after connection)
-            this.peerConnection.onnegotiationneeded = async () => {
-                console.log('=== NEGOTIATION NEEDED (track added post-connection) ===');
+            session.peerConnection.onnegotiationneeded = async () => {
+                console.log(`=== NEGOTIATION NEEDED [${sessionId}] (track added post-connection) ===`);
                 try {
                     // Only renegotiate if we're in a stable state
-                    if (this.peerConnection.signalingState === 'stable') {
-                        const offer = await this.peerConnection.createOffer();
+                    if (session.peerConnection.signalingState === 'stable') {
+                        const offer = await session.peerConnection.createOffer();
                         offer.sdp = this.modifySdpForLowLatency(offer.sdp);
-                        await this.peerConnection.setLocalDescription(offer);
+                        await session.peerConnection.setLocalDescription(offer);
                         console.log('Renegotiation offer created, sending to peer...');
-                        await this.dotNetRef.invokeMethodAsync('OnRenegotiationNeededCallback', JSON.stringify(offer));
+                        await session.dotNetRef.invokeMethodAsync('OnRenegotiationNeededCallback', JSON.stringify(offer));
                     } else {
-                        console.log('Skipping renegotiation, signaling state:', this.peerConnection.signalingState);
+                        console.log('Skipping renegotiation, signaling state:', session.peerConnection.signalingState);
                     }
                 } catch (err) {
                     console.error('Renegotiation failed:', err);
@@ -263,13 +291,13 @@ window.SteamViewerWebRTC = {
             };
 
             // Handle incoming data channels
-            this.peerConnection.ondatachannel = (event) => {
-                this.setupDataChannel(event.channel);
+            session.peerConnection.ondatachannel = (event) => {
+                this._setupDataChannel(sessionId, event.channel);
             };
 
             // Handle incoming video track
-            this.peerConnection.ontrack = (event) => {
-                console.log('=== ONTRACK EVENT ===');
+            session.peerConnection.ontrack = (event) => {
+                console.log(`=== ONTRACK EVENT [${sessionId}] ===`);
                 console.log('Track kind:', event.track.kind);
                 console.log('Track id:', event.track.id);
                 console.log('Track readyState:', event.track.readyState);
@@ -306,15 +334,15 @@ window.SteamViewerWebRTC = {
                     }
 
                     // Store reference for debugging
-                    this.remoteVideo = video;
+                    session.remoteVideo = video;
 
                     // Log video events
-                    video.onloadstart = () => console.log('Video: loadstart');
-                    video.onloadeddata = () => console.log('Video: loadeddata');
-                    video.oncanplay = () => console.log('Video: canplay');
-                    video.onplaying = () => console.log('Video: playing');
-                    video.onstalled = () => console.warn('Video: STALLED');
-                    video.onerror = (e) => console.error('Video ERROR:', video.error);
+                    video.onloadstart = () => console.log(`[${sessionId}] Video: loadstart`);
+                    video.onloadeddata = () => console.log(`[${sessionId}] Video: loadeddata`);
+                    video.oncanplay = () => console.log(`[${sessionId}] Video: canplay`);
+                    video.onplaying = () => console.log(`[${sessionId}] Video: playing`);
+                    video.onstalled = () => console.warn(`[${sessionId}] Video: STALLED`);
+                    video.onerror = (e) => console.error(`[${sessionId}] Video ERROR:`, video.error);
 
                     // Track if we got any frames
                     let frameCount = 0;
@@ -335,13 +363,13 @@ window.SteamViewerWebRTC = {
 
                         console.log('Canvas found, setting up renderer');
                         const ctx = canvas.getContext('2d');
-                        this.remoteCanvas = canvas;
-                        this.remoteCtx = ctx;
+                        session.remoteCanvas = canvas;
+                        session.remoteCtx = ctx;
 
                         video.onloadedmetadata = () => {
                             const width = video.videoWidth;
                             const height = video.videoHeight;
-                            console.log(`=== VIDEO METADATA LOADED ===`);
+                            console.log(`=== VIDEO METADATA LOADED [${sessionId}] ===`);
                             console.log(`Dimensions: ${width}x${height}`);
 
                             if (width === 0 || height === 0) {
@@ -447,40 +475,45 @@ window.SteamViewerWebRTC = {
                 }
             };
 
-            console.log('WebRTC initialized successfully');
+            // Store session in map
+            this.sessions.set(sessionId, session);
+
+            console.log(`[${sessionId}] WebRTC initialized successfully`);
             return true;
         } catch (err) {
-            console.error('Failed to initialize WebRTC:', err);
+            console.error(`[${sessionId}] Failed to initialize WebRTC:`, err);
             return false;
         }
     },
 
     // Create data channel (for host)
-    createDataChannel(name) {
-        if (!this.peerConnection) {
+    createDataChannel(sessionId, name) {
+        const session = this._getSession(sessionId);
+        if (!session.peerConnection) {
             console.error('PeerConnection not initialized');
             return;
         }
 
-        this.dataChannel = this.peerConnection.createDataChannel(name, {
+        session.dataChannel = session.peerConnection.createDataChannel(name, {
             ordered: true
         });
-        this.setupDataChannel(this.dataChannel);
-        console.log(`Data channel '${name}' created`);
+        this._setupDataChannel(sessionId, session.dataChannel);
+        console.log(`[${sessionId}] Data channel '${name}' created`);
     },
 
-    setupDataChannel(channel) {
-        this.dataChannel = channel;
+    _setupDataChannel(sessionId, channel) {
+        const session = this._getSession(sessionId);
+        session.dataChannel = channel;
         channel.binaryType = 'arraybuffer';
 
         channel.onopen = async () => {
-            console.log('Data channel opened');
-            await this.dotNetRef.invokeMethodAsync('OnDataChannelOpenCallback');
+            console.log(`[${sessionId}] Data channel opened`);
+            await session.dotNetRef.invokeMethodAsync('OnDataChannelOpenCallback');
         };
 
         channel.onclose = async () => {
-            console.log('Data channel closed');
-            await this.dotNetRef.invokeMethodAsync('OnDataChannelCloseCallback');
+            console.log(`[${sessionId}] Data channel closed`);
+            await session.dotNetRef.invokeMethodAsync('OnDataChannelCloseCallback');
         };
 
         channel.onmessage = async (event) => {
@@ -497,41 +530,43 @@ window.SteamViewerWebRTC = {
                     // Not JSON or not a log relay - continue normally
                 }
 
-                console.log('Data channel message received:', event.data?.substring?.(0, 50));
-                await this.dotNetRef.invokeMethodAsync('OnDataChannelMessageCallback', event.data);
+                console.log(`[${sessionId}] Data channel message received:`, event.data?.substring?.(0, 50));
+                await session.dotNetRef.invokeMethodAsync('OnDataChannelMessageCallback', event.data);
             } else if (event.data instanceof ArrayBuffer) {
-                console.log('Data channel binary message received:', event.data.byteLength, 'bytes');
+                console.log(`[${sessionId}] Data channel binary message received:`, event.data.byteLength, 'bytes');
                 const uint8Array = new Uint8Array(event.data);
-                await this.dotNetRef.invokeMethodAsync('OnDataChannelBinaryMessageCallback', Array.from(uint8Array));
+                await session.dotNetRef.invokeMethodAsync('OnDataChannelBinaryMessageCallback', Array.from(uint8Array));
             }
         };
 
         channel.onerror = (error) => {
-            console.error('Data channel error:', error);
+            console.error(`[${sessionId}] Data channel error:`, error);
         };
     },
 
     // Send string data over data channel
-    sendData(data) {
-        if (this.dataChannel && this.dataChannel.readyState === 'open') {
-            this.dataChannel.send(data);
+    sendData(sessionId, data) {
+        const session = this._getSession(sessionId);
+        if (session.dataChannel && session.dataChannel.readyState === 'open') {
+            session.dataChannel.send(data);
             return true;
         }
         return false;
     },
 
     // Send binary data over data channel
-    sendBinaryData(data) {
-        if (this.dataChannel && this.dataChannel.readyState === 'open') {
+    sendBinaryData(sessionId, data) {
+        const session = this._getSession(sessionId);
+        if (session.dataChannel && session.dataChannel.readyState === 'open') {
             const uint8Array = new Uint8Array(data);
-            this.dataChannel.send(uint8Array.buffer);
+            session.dataChannel.send(uint8Array.buffer);
             return true;
         }
-        console.warn('Data channel not open');
+        console.warn(`[${sessionId}] Data channel not open`);
         return false;
     },
 
-    // Modify SDP for lower latency
+    // Modify SDP for lower latency (pure function, no session state)
     modifySdpForLowLatency(sdp) {
         let modified = sdp;
 
@@ -566,12 +601,13 @@ window.SteamViewerWebRTC = {
     },
 
     // Create SDP offer (for viewer initiating connection)
-    async createOffer() {
-        if (!this.peerConnection) {
+    async createOffer(sessionId) {
+        const session = this._getSession(sessionId);
+        if (!session.peerConnection) {
             throw new Error('PeerConnection not initialized');
         }
 
-        const offer = await this.peerConnection.createOffer({
+        const offer = await session.peerConnection.createOffer({
             offerToReceiveVideo: true,
             offerToReceiveAudio: false
         });
@@ -579,8 +615,8 @@ window.SteamViewerWebRTC = {
         // Modify SDP for lower latency
         offer.sdp = this.modifySdpForLowLatency(offer.sdp);
 
-        await this.peerConnection.setLocalDescription(offer);
-        console.log('=== SDP OFFER CREATED ===');
+        await session.peerConnection.setLocalDescription(offer);
+        console.log(`=== SDP OFFER CREATED [${sessionId}] ===`);
         console.log('Has video:', offer.sdp.includes('m=video'));
         console.log('Has H264:', offer.sdp.toLowerCase().includes('h264'));
         console.log('Has VP8:', offer.sdp.toLowerCase().includes('vp8'));
@@ -589,65 +625,69 @@ window.SteamViewerWebRTC = {
     },
 
     // Create SDP answer (for host responding to connection)
-    async createAnswer() {
-        if (!this.peerConnection) {
+    async createAnswer(sessionId) {
+        const session = this._getSession(sessionId);
+        if (!session.peerConnection) {
             throw new Error('PeerConnection not initialized');
         }
 
-        const answer = await this.peerConnection.createAnswer();
+        const answer = await session.peerConnection.createAnswer();
 
         // Modify SDP for lower latency
         answer.sdp = this.modifySdpForLowLatency(answer.sdp);
 
-        await this.peerConnection.setLocalDescription(answer);
-        console.log('SDP answer created');
+        await session.peerConnection.setLocalDescription(answer);
+        console.log(`[${sessionId}] SDP answer created`);
         return JSON.stringify(answer);
     },
 
     // Set remote SDP description
-    async setRemoteDescription(sdpJson) {
-        if (!this.peerConnection) {
+    async setRemoteDescription(sessionId, sdpJson) {
+        const session = this._getSession(sessionId);
+        if (!session.peerConnection) {
             throw new Error('PeerConnection not initialized');
         }
 
         const sdp = JSON.parse(sdpJson);
-        console.log('=== SETTING REMOTE DESCRIPTION ===');
+        console.log(`=== SETTING REMOTE DESCRIPTION [${sessionId}] ===`);
         console.log('Type:', sdp.type);
         console.log('Has video:', sdp.sdp?.includes('m=video'));
         console.log('Has H264:', sdp.sdp?.toLowerCase().includes('h264'));
 
-        await this.peerConnection.setRemoteDescription(new RTCSessionDescription(sdp));
+        await session.peerConnection.setRemoteDescription(new RTCSessionDescription(sdp));
         console.log('Remote description set successfully');
-        console.log('Signaing state:', this.peerConnection.signalingState);
+        console.log('Signaling state:', session.peerConnection.signalingState);
     },
 
     // Add ICE candidate
-    async addIceCandidate(candidateJson) {
-        if (!this.peerConnection) {
+    async addIceCandidate(sessionId, candidateJson) {
+        const session = this._getSession(sessionId);
+        if (!session.peerConnection) {
             throw new Error('PeerConnection not initialized');
         }
 
         const candidate = JSON.parse(candidateJson);
-        await this.peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
-        console.log('ICE candidate added');
+        await session.peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+        console.log(`[${sessionId}] ICE candidate added`);
     },
 
     // Start screen capture (for host)
-    async startScreenCapture() {
-        console.log('=== Starting screen capture ===');
+    async startScreenCapture(sessionId) {
+        const session = this._getSession(sessionId);
+        console.log(`=== Starting screen capture [${sessionId}] ===`);
         console.log('navigator.mediaDevices:', !!navigator.mediaDevices);
         console.log('getDisplayMedia:', !!navigator.mediaDevices?.getDisplayMedia);
-        console.log('peerConnection:', !!this.peerConnection);
-        console.log('peerConnection state:', this.peerConnection?.connectionState);
-        console.log('signalingState:', this.peerConnection?.signalingState);
+        console.log('peerConnection:', !!session.peerConnection);
+        console.log('peerConnection state:', session.peerConnection?.connectionState);
+        console.log('signalingState:', session.peerConnection?.signalingState);
 
-        if (!this.peerConnection) {
+        if (!session.peerConnection) {
             console.error('Cannot start screen capture - no peer connection!');
             return false;
         }
 
         try {
-            this.localStream = await navigator.mediaDevices.getDisplayMedia({
+            session.localStream = await navigator.mediaDevices.getDisplayMedia({
                 video: {
                     cursor: 'motion',  // Only redraw cursor when moving (reduces capture overhead)
                     width: { ideal: 1920, max: 3840 },
@@ -661,7 +701,7 @@ window.SteamViewerWebRTC = {
             });
 
             // Add video track to peer connection with encoding parameters
-            const videoTracks = this.localStream.getVideoTracks();
+            const videoTracks = session.localStream.getVideoTracks();
             console.log(`=== SCREEN CAPTURE: Found ${videoTracks.length} video track(s) ===`);
 
             videoTracks.forEach((track, index) => {
@@ -687,7 +727,7 @@ window.SteamViewerWebRTC = {
                     track.contentHint = 'detail'; // Optimizes for sharp text/UI
                 }
 
-                const sender = this.peerConnection.addTrack(track, this.localStream);
+                const sender = session.peerConnection.addTrack(track, session.localStream);
                 console.log('Track added to peer connection, sender:', !!sender);
 
                 // Configure encoding for lower latency
@@ -727,27 +767,29 @@ window.SteamViewerWebRTC = {
     },
 
     // Stop screen capture
-    stopScreenCapture() {
-        if (this.localStream) {
-            this.localStream.getTracks().forEach(track => track.stop());
-            this.localStream = null;
-            console.log('Screen capture stopped');
+    stopScreenCapture(sessionId) {
+        const session = this._getSession(sessionId);
+        if (session.localStream) {
+            session.localStream.getTracks().forEach(track => track.stop());
+            session.localStream = null;
+            console.log(`[${sessionId}] Screen capture stopped`);
         }
     },
 
     // Manually check for and setup any video tracks (call after renegotiation)
-    checkForVideoTracks() {
-        if (!this.peerConnection) return false;
+    checkForVideoTracks(sessionId) {
+        const session = this._getSession(sessionId);
+        if (!session.peerConnection) return false;
 
-        const receivers = this.peerConnection.getReceivers();
+        const receivers = session.peerConnection.getReceivers();
         const videoReceiver = receivers.find(r => r.track?.kind === 'video');
 
         if (videoReceiver && videoReceiver.track) {
-            console.log('=== MANUAL TRACK CHECK: Found video track ===');
+            console.log(`=== MANUAL TRACK CHECK [${sessionId}]: Found video track ===`);
             const track = videoReceiver.track;
 
             // If we already have this track set up, skip
-            if (this.remoteVideo?.srcObject?.getVideoTracks().includes(track)) {
+            if (session.remoteVideo?.srcObject?.getVideoTracks().includes(track)) {
                 console.log('Track already set up');
                 return true;
             }
@@ -780,7 +822,7 @@ window.SteamViewerWebRTC = {
                 video.preservesPitch = false;
             }
 
-            this.remoteVideo = video;
+            session.remoteVideo = video;
 
             const setupCanvas = (retryCount = 0) => {
                 const canvas = document.getElementById('remoteCanvas');
@@ -794,8 +836,8 @@ window.SteamViewerWebRTC = {
                 }
 
                 const ctx = canvas.getContext('2d');
-                this.remoteCanvas = canvas;
-                this.remoteCtx = ctx;
+                session.remoteCanvas = canvas;
+                session.remoteCtx = ctx;
 
                 video.onloadedmetadata = () => {
                     const width = video.videoWidth;
@@ -865,25 +907,26 @@ window.SteamViewerWebRTC = {
     },
 
     // Get video pipeline diagnostic info
-    getVideoDiagnostics() {
+    getVideoDiagnostics(sessionId) {
+        const session = this._getSession(sessionId);
         const info = {
-            peerConnection: this.peerConnection?.connectionState || 'none',
-            iceConnection: this.peerConnection?.iceConnectionState || 'none',
-            signalingState: this.peerConnection?.signalingState || 'none',
-            hasRemoteVideo: !!this.remoteVideo,
-            videoReadyState: this.remoteVideo?.readyState || -1,
-            videoPaused: this.remoteVideo?.paused,
-            videoEnded: this.remoteVideo?.ended,
-            videoWidth: this.remoteVideo?.videoWidth || 0,
-            videoHeight: this.remoteVideo?.videoHeight || 0,
-            hasCanvas: !!this.remoteCanvas,
-            canvasWidth: this.remoteCanvas?.width || 0,
-            canvasHeight: this.remoteCanvas?.height || 0,
+            peerConnection: session.peerConnection?.connectionState || 'none',
+            iceConnection: session.peerConnection?.iceConnectionState || 'none',
+            signalingState: session.peerConnection?.signalingState || 'none',
+            hasRemoteVideo: !!session.remoteVideo,
+            videoReadyState: session.remoteVideo?.readyState || -1,
+            videoPaused: session.remoteVideo?.paused,
+            videoEnded: session.remoteVideo?.ended,
+            videoWidth: session.remoteVideo?.videoWidth || 0,
+            videoHeight: session.remoteVideo?.videoHeight || 0,
+            hasCanvas: !!session.remoteCanvas,
+            canvasWidth: session.remoteCanvas?.width || 0,
+            canvasHeight: session.remoteCanvas?.height || 0,
             receivers: []
         };
 
-        if (this.peerConnection) {
-            const receivers = this.peerConnection.getReceivers();
+        if (session.peerConnection) {
+            const receivers = session.peerConnection.getReceivers();
             info.receivers = receivers.map(r => ({
                 kind: r.track?.kind,
                 readyState: r.track?.readyState,
@@ -892,18 +935,19 @@ window.SteamViewerWebRTC = {
             }));
         }
 
-        console.log('=== VIDEO DIAGNOSTICS ===');
+        console.log(`=== VIDEO DIAGNOSTICS [${sessionId}] ===`);
         console.log(JSON.stringify(info, null, 2));
         return info;
     },
 
     // Get connection stats
-    async getStats() {
-        if (!this.peerConnection) {
+    async getStats(sessionId) {
+        const session = this._getSession(sessionId);
+        if (!session.peerConnection) {
             return null;
         }
 
-        const stats = await this.peerConnection.getStats();
+        const stats = await session.peerConnection.getStats();
         const result = {};
 
         stats.forEach(report => {
@@ -929,13 +973,14 @@ window.SteamViewerWebRTC = {
         return result;
     },
 
-    // Log latency stats for debugging - call from browser console: SteamViewerWebRTC.logLatencyStats()
-    async logLatencyStats() {
-        if (!this.peerConnection) {
+    // Log latency stats for debugging - call from browser console: SteamViewerWebRTC.logLatencyStats('sessionId')
+    async logLatencyStats(sessionId) {
+        const session = this._getSession(sessionId);
+        if (!session.peerConnection) {
             console.log('[LATENCY] No peer connection');
             return;
         }
-        const stats = await this.peerConnection.getStats();
+        const stats = await session.peerConnection.getStats();
         stats.forEach(report => {
             if (report.type === 'inbound-rtp' && report.kind === 'video') {
                 console.log(`[LATENCY] jitterBufferDelay: ${report.jitterBufferDelay?.toFixed(3) ?? 'N/A'}s, ` +
@@ -949,39 +994,33 @@ window.SteamViewerWebRTC = {
         });
     },
 
-    // Frame capture for external viewer window
-    frameCaptureDotNetRef: null,
-    frameCaptureEnabled: false,
-    frameCaptureAnimationId: null,
-    lastFrameTime: 0,
-    frameInterval: 50, // ~20fps (less CPU than 30fps)
-    captureCanvas: null, // Downscaled canvas for encoding
-    captureCtx: null,
-
     // Check if video is ready for capture
-    isVideoReady() {
-        return this.remoteCanvas &&
-               this.remoteCanvas.width > 0 &&
-               this.remoteCanvas.height > 0 &&
-               this.remoteVideo &&
-               this.remoteVideo.readyState >= 2;
+    _isVideoReady(sessionId) {
+        const session = this.sessions.get(sessionId);
+        if (!session) return false;
+        return session.remoteCanvas &&
+               session.remoteCanvas.width > 0 &&
+               session.remoteCanvas.height > 0 &&
+               session.remoteVideo &&
+               session.remoteVideo.readyState >= 2;
     },
 
     // Enable frame capture to relay to viewer window
-    async startFrameCapture(dotNetRef) {
-        console.log('Starting frame capture for viewer window');
-        this.frameCaptureDotNetRef = dotNetRef;
-        this.frameCaptureEnabled = true;
-        this.lastFrameTime = 0;
+    async startFrameCapture(sessionId, dotNetRef) {
+        const session = this._getSession(sessionId);
+        console.log(`[${sessionId}] Starting frame capture for viewer window`);
+        session.frameCaptureDotNetRef = dotNetRef;
+        session.frameCaptureEnabled = true;
+        session.lastFrameTime = 0;
 
         // Wait for video to be ready (up to 5 seconds)
         let attempts = 0;
-        while (!this.isVideoReady() && attempts < 50) {
+        while (!this._isVideoReady(sessionId) && attempts < 50) {
             await new Promise(r => setTimeout(r, 100));
             attempts++;
         }
 
-        if (!this.isVideoReady()) {
+        if (!this._isVideoReady(sessionId)) {
             console.warn('Video not ready after 5s, starting capture anyway');
         } else {
             console.log('Video ready, starting frame capture');
@@ -989,39 +1028,42 @@ window.SteamViewerWebRTC = {
 
         // Use requestAnimationFrame for better performance
         const captureLoop = (timestamp) => {
-            if (!this.frameCaptureEnabled) return;
+            if (!session.frameCaptureEnabled) return;
 
             // Throttle to target frame rate
-            if (timestamp - this.lastFrameTime >= this.frameInterval) {
-                this.captureAndSendFrame();
-                this.lastFrameTime = timestamp;
+            if (timestamp - session.lastFrameTime >= session.frameInterval) {
+                this._captureAndSendFrame(sessionId);
+                session.lastFrameTime = timestamp;
             }
 
-            this.frameCaptureAnimationId = requestAnimationFrame(captureLoop);
+            session.frameCaptureAnimationId = requestAnimationFrame(captureLoop);
         };
 
-        this.frameCaptureAnimationId = requestAnimationFrame(captureLoop);
+        session.frameCaptureAnimationId = requestAnimationFrame(captureLoop);
         return true;
     },
 
-    stopFrameCapture() {
-        console.log('Stopping frame capture');
-        this.frameCaptureEnabled = false;
-        if (this.frameCaptureAnimationId) {
-            cancelAnimationFrame(this.frameCaptureAnimationId);
-            this.frameCaptureAnimationId = null;
+    stopFrameCapture(sessionId) {
+        const session = this.sessions.get(sessionId);
+        if (!session) return;
+        console.log(`[${sessionId}] Stopping frame capture`);
+        session.frameCaptureEnabled = false;
+        if (session.frameCaptureAnimationId) {
+            cancelAnimationFrame(session.frameCaptureAnimationId);
+            session.frameCaptureAnimationId = null;
         }
-        this.frameCaptureDotNetRef = null;
-        this.captureCanvas = null;
-        this.captureCtx = null;
+        session.frameCaptureDotNetRef = null;
+        session.captureCanvas = null;
+        session.captureCtx = null;
     },
 
-    captureAndSendFrame() {
-        if (!this.frameCaptureEnabled || !this.remoteCanvas || !this.frameCaptureDotNetRef) return;
+    _captureAndSendFrame(sessionId) {
+        const session = this.sessions.get(sessionId);
+        if (!session || !session.frameCaptureEnabled || !session.remoteCanvas || !session.frameCaptureDotNetRef) return;
 
         try {
-            const srcWidth = this.remoteCanvas.width;
-            const srcHeight = this.remoteCanvas.height;
+            const srcWidth = session.remoteCanvas.width;
+            const srcHeight = session.remoteCanvas.height;
 
             if (srcWidth === 0 || srcHeight === 0) return;
 
@@ -1038,22 +1080,22 @@ window.SteamViewerWebRTC = {
             }
 
             // Create/reuse downscale canvas
-            if (!this.captureCanvas || this.captureCanvas.width !== destWidth || this.captureCanvas.height !== destHeight) {
-                this.captureCanvas = document.createElement('canvas');
-                this.captureCanvas.width = destWidth;
-                this.captureCanvas.height = destHeight;
-                this.captureCtx = this.captureCanvas.getContext('2d');
+            if (!session.captureCanvas || session.captureCanvas.width !== destWidth || session.captureCanvas.height !== destHeight) {
+                session.captureCanvas = document.createElement('canvas');
+                session.captureCanvas.width = destWidth;
+                session.captureCanvas.height = destHeight;
+                session.captureCtx = session.captureCanvas.getContext('2d');
             }
 
             // Draw downscaled frame
-            this.captureCtx.drawImage(this.remoteCanvas, 0, 0, destWidth, destHeight);
+            session.captureCtx.drawImage(session.remoteCanvas, 0, 0, destWidth, destHeight);
 
             // Convert to JPEG (0.85 quality balances size/quality/CPU)
-            const dataUrl = this.captureCanvas.toDataURL('image/jpeg', 0.85);
+            const dataUrl = session.captureCanvas.toDataURL('image/jpeg', 0.85);
 
             // Send to C# - use original dimensions for coordinate scaling
             const base64Data = dataUrl.replace(/^data:image\/jpeg;base64,/, '');
-            this.frameCaptureDotNetRef.invokeMethodAsync('OnFrameCaptured', base64Data, srcWidth, srcHeight);
+            session.frameCaptureDotNetRef.invokeMethodAsync('OnFrameCaptured', base64Data, srcWidth, srcHeight);
         } catch (e) {
             // Ignore capture errors
         }
@@ -1061,23 +1103,25 @@ window.SteamViewerWebRTC = {
 
     // === Stats Overlay ===
 
-    toggleStatsOverlay() {
-        this._statsVisible = !this._statsVisible;
-        if (this._statsVisible) {
-            this._createStatsOverlay();
-            this._startStatsPolling();
+    toggleStatsOverlay(sessionId) {
+        const session = this._getSession(sessionId);
+        session._statsVisible = !session._statsVisible;
+        if (session._statsVisible) {
+            this._createStatsOverlay(sessionId);
+            this._startStatsPolling(sessionId);
         } else {
-            this._stopStatsPolling();
-            this._removeStatsOverlay();
+            this._stopStatsPolling(sessionId);
+            this._removeStatsOverlay(sessionId);
         }
     },
 
-    _createStatsOverlay() {
-        if (this._statsOverlayEl) return;
+    _createStatsOverlay(sessionId) {
+        const session = this._getSession(sessionId);
+        if (session._statsOverlayEl) return;
         const el = document.createElement('div');
-        el.id = 'svStatsOverlay';
+        el.id = `svStatsOverlay-${sessionId}`;
         el.style.cssText = `
-            position: fixed; top: 10px; left: 10px; z-index: 10000;
+            position: fixed; top: 40px; right: 10px; z-index: 10000;
             background: rgba(17,17,27,0.85); color: #a6adc8;
             font-family: 'Consolas','Courier New',monospace; font-size: 12px;
             padding: 8px 12px; border-radius: 6px; border: 1px solid #45475a;
@@ -1086,35 +1130,41 @@ window.SteamViewerWebRTC = {
         `;
         el.textContent = 'Collecting stats...';
         document.body.appendChild(el);
-        this._statsOverlayEl = el;
+        session._statsOverlayEl = el;
     },
 
-    _removeStatsOverlay() {
-        if (this._statsOverlayEl) {
-            this._statsOverlayEl.remove();
-            this._statsOverlayEl = null;
+    _removeStatsOverlay(sessionId) {
+        const session = this.sessions.get(sessionId);
+        if (!session) return;
+        if (session._statsOverlayEl) {
+            session._statsOverlayEl.remove();
+            session._statsOverlayEl = null;
         }
     },
 
-    _startStatsPolling() {
-        this._statsPrev = null;
-        this._inputEventsCount = 0;
-        this._inputThrottledCount = 0;
-        this._statsInterval = setInterval(() => this._pollStats(), 1000);
+    _startStatsPolling(sessionId) {
+        const session = this._getSession(sessionId);
+        session._statsPrev = null;
+        session._inputEventsCount = 0;
+        session._inputThrottledCount = 0;
+        session._statsInterval = setInterval(() => this._pollStats(sessionId), 1000);
     },
 
-    _stopStatsPolling() {
-        if (this._statsInterval) {
-            clearInterval(this._statsInterval);
-            this._statsInterval = null;
+    _stopStatsPolling(sessionId) {
+        const session = this.sessions.get(sessionId);
+        if (!session) return;
+        if (session._statsInterval) {
+            clearInterval(session._statsInterval);
+            session._statsInterval = null;
         }
-        this._statsPrev = null;
+        session._statsPrev = null;
     },
 
-    async _pollStats() {
-        if (!this.peerConnection || !this._statsOverlayEl) return;
+    async _pollStats(sessionId) {
+        const session = this.sessions.get(sessionId);
+        if (!session || !session.peerConnection || !session._statsOverlayEl) return;
 
-        const stats = await this.peerConnection.getStats();
+        const stats = await session.peerConnection.getStats();
         const now = performance.now();
 
         let videoFps = 0, bitrateMbps = 0, resolution = '?';
@@ -1150,14 +1200,14 @@ window.SteamViewerWebRTC = {
         });
 
         // Calculate deltas from previous poll
-        if (this._statsPrev) {
-            const elapsed = (now - this._statsPrev.time) / 1000; // seconds
+        if (session._statsPrev) {
+            const elapsed = (now - session._statsPrev.time) / 1000; // seconds
             if (elapsed > 0) {
-                const deltaBytes = currentBytes - this._statsPrev.bytes;
+                const deltaBytes = currentBytes - session._statsPrev.bytes;
                 bitrateMbps = (deltaBytes * 8) / (elapsed * 1_000_000);
 
                 if (!videoFps) {
-                    const deltaFrames = currentFrames - this._statsPrev.frames;
+                    const deltaFrames = currentFrames - session._statsPrev.frames;
                     videoFps = deltaFrames / elapsed;
                 }
             }
@@ -1169,23 +1219,23 @@ window.SteamViewerWebRTC = {
         }
 
         // Data channel buffer
-        const bufferKB = this.dataChannel ? (this.dataChannel.bufferedAmount / 1024) : 0;
+        const bufferKB = session.dataChannel ? (session.dataChannel.bufferedAmount / 1024) : 0;
 
         // Input events/sec (captured since last poll)
-        const inputPerSec = this._inputEventsCount;
-        const throttledPerSec = this._inputThrottledCount;
-        this._inputEventsCount = 0;
-        this._inputThrottledCount = 0;
+        const inputPerSec = session._inputEventsCount;
+        const throttledPerSec = session._inputThrottledCount;
+        session._inputEventsCount = 0;
+        session._inputThrottledCount = 0;
 
         // Save for next delta
-        this._statsPrev = { time: now, bytes: currentBytes, frames: currentFrames };
+        session._statsPrev = { time: now, bytes: currentBytes, frames: currentFrames };
 
         // If resolution still unknown, try from canvas/video
         if (resolution === '?') {
-            if (this.remoteCanvas && this.remoteCanvas.width > 0) {
-                resolution = `${this.remoteCanvas.width}x${this.remoteCanvas.height}`;
-            } else if (this.remoteVideo && this.remoteVideo.videoWidth > 0) {
-                resolution = `${this.remoteVideo.videoWidth}x${this.remoteVideo.videoHeight}`;
+            if (session.remoteCanvas && session.remoteCanvas.width > 0) {
+                resolution = `${session.remoteCanvas.width}x${session.remoteCanvas.height}`;
+            } else if (session.remoteVideo && session.remoteVideo.videoWidth > 0) {
+                resolution = `${session.remoteVideo.videoWidth}x${session.remoteVideo.videoHeight}`;
             }
         }
 
@@ -1194,37 +1244,44 @@ window.SteamViewerWebRTC = {
             `Video: ${videoFps.toFixed(0)} FPS | ${bitrateMbps.toFixed(1)} Mbps | ${resolution}`,
             `Net:   RTT ${rttMs.toFixed(0)}ms | Loss ${lossPercent.toFixed(1)}%`,
             `Input: ${inputPerSec} evt/s${throttledPerSec > 0 ? ` (${throttledPerSec} throttled)` : ''} | Buf: ${bufferKB.toFixed(0)} KB`,
-            `Mode:  [${this._qualityMode}]`
+            `Mode:  [${session._qualityMode}]`
         ];
 
-        this._statsOverlayEl.textContent = lines.join('\n');
-        this._statsOverlayEl.style.whiteSpace = 'pre';
+        session._statsOverlayEl.textContent = lines.join('\n');
+        session._statsOverlayEl.style.whiteSpace = 'pre';
     },
 
     // Close connection
-    close() {
-        this._stopStatsPolling();
-        this._removeStatsOverlay();
-        this.stopFrameCapture();
-        this.stopScreenCapture();
+    close(sessionId) {
+        const session = this.sessions.get(sessionId);
+        if (!session) return;
 
-        if (this.remoteVideo) {
-            this.remoteVideo.pause();
-            this.remoteVideo.srcObject = null;
-            this.remoteVideo = null;
+        this._stopStatsPolling(sessionId);
+        this._removeStatsOverlay(sessionId);
+        this.stopFrameCapture(sessionId);
+
+        if (session.localStream) {
+            session.localStream.getTracks().forEach(track => track.stop());
+            session.localStream = null;
         }
 
-        this.remoteCanvas = null;
-        this.remoteCtx = null;
-
-        if (this.dataChannel) {
-            this.dataChannel.close();
-            this.dataChannel = null;
+        if (session.remoteVideo) {
+            session.remoteVideo.pause();
+            session.remoteVideo.srcObject = null;
+            session.remoteVideo = null;
         }
 
-        if (this.peerConnection) {
-            this.peerConnection.close();
-            this.peerConnection = null;
+        session.remoteCanvas = null;
+        session.remoteCtx = null;
+
+        if (session.dataChannel) {
+            session.dataChannel.close();
+            session.dataChannel = null;
+        }
+
+        if (session.peerConnection) {
+            session.peerConnection.close();
+            session.peerConnection = null;
         }
 
         // Reset input lock state on disconnect (fix: input lock persists after disconnect)
@@ -1233,29 +1290,45 @@ window.SteamViewerWebRTC = {
             console.log('Input lock released due to connection close');
         }
 
-        this.dotNetRef = null;
-        console.log('WebRTC connection closed');
+        session.dotNetRef = null;
+        this.sessions.delete(sessionId);
+        console.log(`[${sessionId}] WebRTC connection closed`);
     },
 
     // Reset capture state for reconnection (fix: mouse coords stale after reconnect)
-    resetForReconnect() {
-        this.stopFrameCapture();
-        this.stopScreenCapture();
+    resetForReconnect(sessionId) {
+        const session = this.sessions.get(sessionId);
+        if (!session) return;
 
-        if (this.remoteVideo) {
-            this.remoteVideo.pause();
-            this.remoteVideo.srcObject = null;
+        this.stopFrameCapture(sessionId);
+
+        if (session.localStream) {
+            session.localStream.getTracks().forEach(track => track.stop());
+            session.localStream = null;
         }
 
-        this.remoteCanvas = null;
-        this.remoteCtx = null;
+        if (session.remoteVideo) {
+            session.remoteVideo.pause();
+            session.remoteVideo.srcObject = null;
+        }
+
+        session.remoteCanvas = null;
+        session.remoteCtx = null;
 
         // Reset input state
         if (window.SteamViewerInput) {
             window.SteamViewerInput.unlock();
         }
 
-        console.log('WebRTC state reset for reconnection');
+        console.log(`[${sessionId}] WebRTC state reset for reconnection`);
+    },
+
+    // Helper to increment input event count for a session (called from SteamViewerInput)
+    _incrementInputCount(sessionId) {
+        const session = this.sessions.get(sessionId);
+        if (session) {
+            session._inputEventsCount++;
+        }
     }
 };
 
@@ -1265,6 +1338,8 @@ window.SteamViewerInput = {
     dotNetRef: null,
     isCapturing: false,
     isLocked: false,  // Capture lock - only send inputs when locked
+    // Track which session the input is associated with (for stats counting)
+    _activeSessionId: null,
 
     initialize(canvasId, dotNetReference, options = {}) {
         const { showLockIndicator = true } = options;
@@ -1320,6 +1395,11 @@ window.SteamViewerInput = {
         this.isLocked = false;
         console.log('Input capture initialized (double-click to lock, Escape to release)');
         return true;
+    },
+
+    // Set which session input events count toward (for stats overlay)
+    setActiveSession(sessionId) {
+        this._activeSessionId = sessionId;
     },
 
     createLockIndicator() {
@@ -1442,7 +1522,9 @@ window.SteamViewerInput = {
 
     async handleMouseMove(e) {
         if (!this.isCapturing || !this.isLocked) return;
-        window.SteamViewerWebRTC._inputEventsCount++;
+        if (this._activeSessionId) {
+            window.SteamViewerWebRTC._incrementInputCount(this._activeSessionId);
+        }
         const coords = this.getScaledCoords(e);
         // Pass canvas dimensions (capture size) for accurate coordinate mapping on host
         await this.dotNetRef.invokeMethodAsync('OnMouseMove', coords.x, coords.y,
@@ -1451,7 +1533,9 @@ window.SteamViewerInput = {
 
     async handleMouseDown(e) {
         if (!this.isCapturing || !this.isLocked) return;
-        window.SteamViewerWebRTC._inputEventsCount++;
+        if (this._activeSessionId) {
+            window.SteamViewerWebRTC._incrementInputCount(this._activeSessionId);
+        }
         e.preventDefault();
         const coords = this.getScaledCoords(e);
         const button = ['left', 'middle', 'right'][e.button] || 'left';
@@ -1462,7 +1546,9 @@ window.SteamViewerInput = {
 
     async handleMouseUp(e) {
         if (!this.isCapturing || !this.isLocked) return;
-        window.SteamViewerWebRTC._inputEventsCount++;
+        if (this._activeSessionId) {
+            window.SteamViewerWebRTC._incrementInputCount(this._activeSessionId);
+        }
         e.preventDefault();
         const coords = this.getScaledCoords(e);
         const button = ['left', 'middle', 'right'][e.button] || 'left';
@@ -1473,7 +1559,9 @@ window.SteamViewerInput = {
 
     async handleWheel(e) {
         if (!this.isCapturing || !this.isLocked) return;
-        window.SteamViewerWebRTC._inputEventsCount++;
+        if (this._activeSessionId) {
+            window.SteamViewerWebRTC._incrementInputCount(this._activeSessionId);
+        }
         e.preventDefault();
         await this.dotNetRef.invokeMethodAsync('OnMouseWheel', e.deltaX, e.deltaY);
     },
@@ -1524,6 +1612,7 @@ window.SteamViewerInput = {
 
         this.canvas = null;
         this.dotNetRef = null;
+        this._activeSessionId = null;
         console.log('Input capture stopped');
     }
 };
