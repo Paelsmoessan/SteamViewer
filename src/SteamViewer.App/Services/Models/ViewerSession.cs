@@ -14,6 +14,7 @@ public sealed class ViewerSession : IAsyncDisposable
 {
     private readonly IJSRuntime _jsRuntime;
     private readonly ILogger _logger;
+    private readonly ILoggerFactory _loggerFactory;
     private readonly Func<SignalingMessage, Task> _sendSignaling;
     private WebRTCManager? _webrtc;
     private bool _disposed;
@@ -95,6 +96,7 @@ public sealed class ViewerSession : IAsyncDisposable
         Title = peerId;
         _jsRuntime = jsRuntime;
         _logger = loggerFactory.CreateLogger<ViewerSession>();
+        _loggerFactory = loggerFactory;
         _sendSignaling = sendSignaling;
     }
 
@@ -110,7 +112,7 @@ public sealed class ViewerSession : IAsyncDisposable
 
         _logger.LogInformation("Initializing viewer session {SessionId} for peer {PeerId}", SessionId, PeerId);
 
-        _webrtc = new WebRTCManager(_jsRuntime, (ILogger<WebRTCManager>)_logger, SessionId, "", _sendSignaling);
+        _webrtc = new WebRTCManager(_jsRuntime, _loggerFactory.CreateLogger<WebRTCManager>(), SessionId, "", _sendSignaling);
 
         // Subscribe to WebRTC events
         _webrtc.OnIceCandidate += HandleIceCandidate;
