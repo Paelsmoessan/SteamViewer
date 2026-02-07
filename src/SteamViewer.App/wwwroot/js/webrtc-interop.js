@@ -1186,6 +1186,13 @@ window.SteamViewerWebRTC = {
         session._statsPrev = null;
     },
 
+    _formatBytes(bytes) {
+        if (bytes < 1024) return '0 KB';
+        if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+        if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+        return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+    },
+
     async _pollStats(sessionId) {
         const session = this.sessions.get(sessionId);
         if (!session || !session.peerConnection || !session._statsOverlayEl) return;
@@ -1222,6 +1229,14 @@ window.SteamViewerWebRTC = {
             // RTT from candidate pair
             if (report.type === 'candidate-pair' && report.state === 'succeeded') {
                 rttMs = (report.currentRoundTripTime || 0) * 1000;
+            }
+        });
+
+        // Data channel bytes (control/input traffic)
+        let dataChannelBytes = 0;
+        stats.forEach(report => {
+            if (report.type === 'data-channel') {
+                dataChannelBytes += (report.bytesSent || 0) + (report.bytesReceived || 0);
             }
         });
 
@@ -1270,6 +1285,7 @@ window.SteamViewerWebRTC = {
             `Video: ${videoFps.toFixed(0)} FPS | ${bitrateMbps.toFixed(1)} Mbps | ${resolution}`,
             `Net:   RTT ${rttMs.toFixed(0)}ms | Loss ${lossPercent.toFixed(1)}%`,
             `Input: ${inputPerSec} evt/s${throttledPerSec > 0 ? ` (${throttledPerSec} throttled)` : ''} | Buf: ${bufferKB.toFixed(0)} KB`,
+            `Data:  ${this._formatBytes(currentBytes)} video | ${this._formatBytes(dataChannelBytes)} ctrl`,
             `Mode:  [${session._qualityMode}]`
         ];
 
