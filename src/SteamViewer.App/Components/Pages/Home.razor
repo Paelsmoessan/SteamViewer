@@ -1142,6 +1142,7 @@
                     break;
 
                 case SignalingMessage.ConnectionResponse response:
+                    if (response.TargetId != targetId && response.TargetId != incomingPeerId) break;
                     if (response.Approved)
                     {
                         connectedPeerId = response.TargetId;
@@ -1158,6 +1159,7 @@
                     break;
 
                 case SignalingMessage.SdpOffer offer:
+                    if (offer.TargetId != connectedPeerId) break;
                     Logger.LogInformation("Received SDP offer from {PeerId}", offer.TargetId);
                     if (_webrtc != null && _webrtcInitialized)
                     {
@@ -1175,6 +1177,7 @@
                     break;
 
                 case SignalingMessage.SdpAnswer answer:
+                    if (answer.TargetId != connectedPeerId) break;
                     Logger.LogInformation("Received SDP answer from {PeerId}", answer.TargetId);
                     if (_webrtc != null)
                     {
@@ -1183,6 +1186,7 @@
                     break;
 
                 case SignalingMessage.IceCandidate ice:
+                    if (ice.TargetId != connectedPeerId) break;
                     Logger.LogDebug("Received ICE candidate from {PeerId}", ice.TargetId);
                     if (_webrtc != null && _webrtcInitialized)
                     {
@@ -1203,6 +1207,7 @@
                     break;
 
                 case SignalingMessage.Disconnected disconnected:
+                    if (disconnected.PeerId != connectedPeerId) break;
                     connectedPeerId = "";
                     connectionState = currentMode == AppMode.StartConnection ? ConnectionState.Registered : ConnectionState.Idle;
                     _isSharingScreen = false;

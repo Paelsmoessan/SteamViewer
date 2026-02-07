@@ -293,12 +293,6 @@
     {
         if (_windowId == null) return;
 
-        if (sessionId == "legacy")
-        {
-            // Legacy mode - already showing the only session
-            return;
-        }
-
         TabManager.SetActiveTab(_windowId, sessionId);
     }
 
@@ -382,6 +376,7 @@
 
     private async void HandleJpegFrame(JpegFrame frame)
     {
+        if (_activeSessionId != "legacy") return;
         if (_canvasInitialized)
         {
             try

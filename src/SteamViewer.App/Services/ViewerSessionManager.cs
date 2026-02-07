@@ -312,8 +312,9 @@ public sealed class ViewerSessionManager : IAsyncDisposable
 
     private void HandleSessionDisconnected(string sessionId, string? reason)
     {
-        _logger.LogInformation("Session {SessionId} disconnected: {Reason}", sessionId, reason ?? "unknown");
-        _ = RemoveSessionAsync(sessionId);
+        _logger.LogInformation("Session {SessionId} WebRTC disconnected: {Reason}", sessionId, reason ?? "unknown");
+        // Don't remove - WebRTC disconnects can be temporary.
+        // Removal via: HandlePeerDisconnected (signaling) or user closing the tab.
     }
 
     private async Task SendSignalingMessage(SignalingMessage message)
