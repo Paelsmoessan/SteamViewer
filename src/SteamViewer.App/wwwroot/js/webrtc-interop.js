@@ -102,6 +102,15 @@ window.SteamViewerWebRTC = {
     // Custom TURN server config (set from C# via setTurnConfig)
     customTurnServer: null,
 
+    // Stats overlay state
+    _statsInterval: null,
+    _statsOverlayEl: null,
+    _statsVisible: false,
+    _statsPrev: null,       // Previous poll snapshot for delta calculations
+    _inputEventsCount: 0,   // Incremented by input handlers, reset each poll
+    _inputThrottledCount: 0, // Throttled input events count
+    _qualityMode: 'HQ',    // Current quality mode: 'HQ' or 'Fast'
+
     // Set custom TURN server configuration
     // Call this before initialize() to use your own TURN server
     setTurnConfig(urls, username, credential) {
@@ -1050,8 +1059,152 @@ window.SteamViewerWebRTC = {
         }
     },
 
+    // === Stats Overlay ===
+
+    toggleStatsOverlay() {
+        this._statsVisible = !this._statsVisible;
+        if (this._statsVisible) {
+            this._createStatsOverlay();
+            this._startStatsPolling();
+        } else {
+            this._stopStatsPolling();
+            this._removeStatsOverlay();
+        }
+    },
+
+    _createStatsOverlay() {
+        if (this._statsOverlayEl) return;
+        const el = document.createElement('div');
+        el.id = 'svStatsOverlay';
+        el.style.cssText = `
+            position: fixed; top: 10px; left: 10px; z-index: 10000;
+            background: rgba(17,17,27,0.85); color: #a6adc8;
+            font-family: 'Consolas','Courier New',monospace; font-size: 12px;
+            padding: 8px 12px; border-radius: 6px; border: 1px solid #45475a;
+            pointer-events: none; line-height: 1.6; min-width: 260px;
+            backdrop-filter: blur(4px);
+        `;
+        el.textContent = 'Collecting stats...';
+        document.body.appendChild(el);
+        this._statsOverlayEl = el;
+    },
+
+    _removeStatsOverlay() {
+        if (this._statsOverlayEl) {
+            this._statsOverlayEl.remove();
+            this._statsOverlayEl = null;
+        }
+    },
+
+    _startStatsPolling() {
+        this._statsPrev = null;
+        this._inputEventsCount = 0;
+        this._inputThrottledCount = 0;
+        this._statsInterval = setInterval(() => this._pollStats(), 1000);
+    },
+
+    _stopStatsPolling() {
+        if (this._statsInterval) {
+            clearInterval(this._statsInterval);
+            this._statsInterval = null;
+        }
+        this._statsPrev = null;
+    },
+
+    async _pollStats() {
+        if (!this.peerConnection || !this._statsOverlayEl) return;
+
+        const stats = await this.peerConnection.getStats();
+        const now = performance.now();
+
+        let videoFps = 0, bitrateMbps = 0, resolution = '?';
+        let rttMs = 0, lossPercent = 0;
+        let currentBytes = 0, currentFrames = 0;
+        let packetsLost = 0, packetsReceived = 0;
+
+        stats.forEach(report => {
+            // Outbound video (host side)
+            if (report.type === 'outbound-rtp' && report.kind === 'video') {
+                currentBytes = report.bytesSent || 0;
+                currentFrames = report.framesEncoded || 0;
+                videoFps = report.framesPerSecond || 0;
+                if (report.frameWidth && report.frameHeight) {
+                    resolution = `${report.frameWidth}x${report.frameHeight}`;
+                }
+            }
+            // Inbound video (viewer side)
+            if (report.type === 'inbound-rtp' && report.kind === 'video') {
+                currentBytes = report.bytesReceived || 0;
+                currentFrames = report.framesDecoded || 0;
+                videoFps = report.framesPerSecond || 0;
+                packetsLost = report.packetsLost || 0;
+                packetsReceived = report.packetsReceived || 0;
+                if (report.frameWidth && report.frameHeight) {
+                    resolution = `${report.frameWidth}x${report.frameHeight}`;
+                }
+            }
+            // RTT from candidate pair
+            if (report.type === 'candidate-pair' && report.state === 'succeeded') {
+                rttMs = (report.currentRoundTripTime || 0) * 1000;
+            }
+        });
+
+        // Calculate deltas from previous poll
+        if (this._statsPrev) {
+            const elapsed = (now - this._statsPrev.time) / 1000; // seconds
+            if (elapsed > 0) {
+                const deltaBytes = currentBytes - this._statsPrev.bytes;
+                bitrateMbps = (deltaBytes * 8) / (elapsed * 1_000_000);
+
+                if (!videoFps) {
+                    const deltaFrames = currentFrames - this._statsPrev.frames;
+                    videoFps = deltaFrames / elapsed;
+                }
+            }
+        }
+
+        // Loss percentage
+        if (packetsReceived + packetsLost > 0) {
+            lossPercent = (packetsLost / (packetsReceived + packetsLost)) * 100;
+        }
+
+        // Data channel buffer
+        const bufferKB = this.dataChannel ? (this.dataChannel.bufferedAmount / 1024) : 0;
+
+        // Input events/sec (captured since last poll)
+        const inputPerSec = this._inputEventsCount;
+        const throttledPerSec = this._inputThrottledCount;
+        this._inputEventsCount = 0;
+        this._inputThrottledCount = 0;
+
+        // Save for next delta
+        this._statsPrev = { time: now, bytes: currentBytes, frames: currentFrames };
+
+        // If resolution still unknown, try from canvas/video
+        if (resolution === '?') {
+            if (this.remoteCanvas && this.remoteCanvas.width > 0) {
+                resolution = `${this.remoteCanvas.width}x${this.remoteCanvas.height}`;
+            } else if (this.remoteVideo && this.remoteVideo.videoWidth > 0) {
+                resolution = `${this.remoteVideo.videoWidth}x${this.remoteVideo.videoHeight}`;
+            }
+        }
+
+        // Format overlay text
+        const lines = [
+            `Video: ${videoFps.toFixed(0)} FPS | ${bitrateMbps.toFixed(1)} Mbps | ${resolution}`,
+            `Net:   RTT ${rttMs.toFixed(0)}ms | Loss ${lossPercent.toFixed(1)}%`,
+            `Input: ${inputPerSec} evt/s${throttledPerSec > 0 ? ` (${throttledPerSec} throttled)` : ''} | Buf: ${bufferKB.toFixed(0)} KB`,
+            `Mode:  [${this._qualityMode}]`
+        ];
+
+        this._statsOverlayEl.textContent = lines.join('\n');
+        this._statsOverlayEl.style.whiteSpace = 'pre';
+    },
+
     // Close connection
     close() {
+        this._stopStatsPolling();
+        this._removeStatsOverlay();
         this.stopFrameCapture();
         this.stopScreenCapture();
 
@@ -1289,6 +1442,7 @@ window.SteamViewerInput = {
 
     async handleMouseMove(e) {
         if (!this.isCapturing || !this.isLocked) return;
+        window.SteamViewerWebRTC._inputEventsCount++;
         const coords = this.getScaledCoords(e);
         // Pass canvas dimensions (capture size) for accurate coordinate mapping on host
         await this.dotNetRef.invokeMethodAsync('OnMouseMove', coords.x, coords.y,
@@ -1297,6 +1451,7 @@ window.SteamViewerInput = {
 
     async handleMouseDown(e) {
         if (!this.isCapturing || !this.isLocked) return;
+        window.SteamViewerWebRTC._inputEventsCount++;
         e.preventDefault();
         const coords = this.getScaledCoords(e);
         const button = ['left', 'middle', 'right'][e.button] || 'left';
@@ -1307,6 +1462,7 @@ window.SteamViewerInput = {
 
     async handleMouseUp(e) {
         if (!this.isCapturing || !this.isLocked) return;
+        window.SteamViewerWebRTC._inputEventsCount++;
         e.preventDefault();
         const coords = this.getScaledCoords(e);
         const button = ['left', 'middle', 'right'][e.button] || 'left';
@@ -1317,6 +1473,7 @@ window.SteamViewerInput = {
 
     async handleWheel(e) {
         if (!this.isCapturing || !this.isLocked) return;
+        window.SteamViewerWebRTC._inputEventsCount++;
         e.preventDefault();
         await this.dotNetRef.invokeMethodAsync('OnMouseWheel', e.deltaX, e.deltaY);
     },

@@ -262,6 +262,7 @@
 
             @* Toolbar *@
             <div class="session-toolbar">
+                <button class="toolbar-btn" @onclick="ToggleStatsOverlay">📊 Stats</button>
                 <button class="toolbar-btn" @onclick="ShowTransfersDialog">📁 Transfers</button>
                 <button class="toolbar-btn disconnect" @onclick="Disconnect">⏏ Disconnect</button>
             </div>
@@ -493,6 +494,18 @@
         connectionState = ConnectionState.Idle;
         errorMessage = "";
         StateHasChanged();
+    }
+
+    private async Task ToggleStatsOverlay()
+    {
+        try
+        {
+            await JSRuntime.InvokeVoidAsync("SteamViewerWebRTC.toggleStatsOverlay");
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Failed to toggle stats overlay");
+        }
     }
 
     #region Screen Sharing
