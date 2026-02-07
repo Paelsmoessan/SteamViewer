@@ -28,8 +28,8 @@
                     <input type="text"
                            @bind="_peerId"
                            @bind:event="oninput"
-                           placeholder="Enter 9-digit ID"
-                           maxlength="9"
+                           placeholder="@_idPlaceholder"
+                           maxlength="@_idMaxLength"
                            disabled="@_isConnecting" />
                 </div>
 
@@ -86,7 +86,15 @@
     public EventCallback<string> OnConnected { get; set; }
 
     private string _peerId = "";
+#if DEBUG
+    private string _password = "TESTPASS";
+    private string _idPlaceholder = "Enter machine name";
+    private string _idMaxLength = "50";
+#else
     private string _password = "";
+    private string _idPlaceholder = "Enter 9-digit ID";
+    private string _idMaxLength = "9";
+#endif
     private string _errorMessage = "";
     private bool _isConnecting;
 
@@ -177,7 +185,11 @@
     private async Task Close()
     {
         _peerId = "";
+#if DEBUG
+        _password = "TESTPASS";
+#else
         _password = "";
+#endif
         _errorMessage = "";
         _isConnecting = false;
         await OnClose.InvokeAsync();
