@@ -756,7 +756,6 @@
         position: absolute;
         top: 0;
         left: 0;
-        right: 0;
         z-index: 10;
         display: flex;
         align-items: flex-start;
@@ -764,6 +763,7 @@
         padding: 0 8px;
         background: transparent;
         transition: opacity 0.2s;
+        pointer-events: none;
     }
 
     /* Auto-fade: tabs faded by default, light up on tab-bar hover */
@@ -780,6 +780,7 @@
     .tabs {
         display: flex;
         align-items: flex-start;
+        pointer-events: auto;
     }
 
     /* Chrome-style slanted tab with frosted glass */
@@ -880,6 +881,7 @@
     }
 
     .tab-add {
+        pointer-events: auto;
         width: 28px;
         height: 28px;
         background: rgba(30, 30, 46, 0.7);
