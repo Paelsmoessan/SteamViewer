@@ -107,7 +107,7 @@
                 <div class="connect-form">
                     <div class="input-group">
                         <label>Session ID</label>
-                        <input type="text" @bind="targetId" placeholder="Enter 9-digit ID" maxlength="9" />
+                        <input type="text" @bind="targetId" placeholder="@_idPlaceholder" maxlength="@_idMaxLength" />
                     </div>
                     <div class="input-group">
                         <label>Password</label>
@@ -169,11 +169,15 @@
 
     // Join mode state
 #if DEBUG
-    private string targetId = "123456789";  // Pre-filled for testing
+    private string targetId = "";  // User types short machine name
     private string targetPassword = "TESTPASS";
+    private string _idPlaceholder = "Enter machine name";
+    private string _idMaxLength = "50";
 #else
     private string targetId = "";
     private string targetPassword = "";
+    private string _idPlaceholder = "Enter 9-digit ID";
+    private string _idMaxLength = "9";
 #endif
 
     private string errorMessage = "";
@@ -675,8 +679,8 @@
             await SignalingClient.ConnectAsync();
 
 #if DEBUG
-            // Use predetermined credentials for testing
-            clientId = "123456789";
+            // Use machine name as ID for unique, memorable debug credentials
+            clientId = Environment.MachineName;
             password = "TESTPASS";
             Logger.LogInformation("DEBUG MODE: Using test credentials - ID: {Id}, Password: {Pass}", clientId, password);
 #else
