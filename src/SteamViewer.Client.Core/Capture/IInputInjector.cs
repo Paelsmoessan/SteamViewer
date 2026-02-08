@@ -19,4 +19,16 @@ public interface IInputInjector : IDisposable
     /// Check if input injection is available/permitted.
     /// </summary>
     bool IsAvailable { get; }
+
+    /// <summary>
+    /// Send the Secure Attention Sequence (Ctrl+Alt+Del).
+    /// Returns true if successful, false if elevated privileges are required.
+    /// </summary>
+    bool SendSecureAttentionSequence() => false;
+
+    /// <summary>
+    /// Initiate a system reboot with auto-restart of the application.
+    /// Returns true if reboot was initiated, false if elevated privileges are required.
+    /// </summary>
+    bool RebootWithAutoRestart() => false;
 }

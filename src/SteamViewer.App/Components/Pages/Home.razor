@@ -20,7 +20,8 @@
 @inject IInputInjector InputInjector
 @inject IConfiguration Configuration
 @inject FileLoggerService FileLogger
-@inject RemoteViewerService ViewerService
+@inject ViewerSessionManager ViewerSessionManager
+@inject ViewerTabManager TabManager
 
 <div class="version-tag">v@(Version)</div>
 <div class="container">
@@ -67,11 +68,21 @@
                 <div class="credentials">
                     <div class="credential-item">
                         <label>Session ID</label>
-                        <div class="value">@clientId</div>
+                        <div class="value-row">
+                            <div class="value">@clientId</div>
+                            <button class="copy-btn" @onclick="CopySessionId" title="@(_copiedId ? "Copied!" : "Copy to clipboard")">
+                                @(_copiedId ? "✓" : "📋")
+                            </button>
+                        </div>
                     </div>
                     <div class="credential-item">
                         <label>Password</label>
-                        <div class="value">@password</div>
+                        <div class="value-row">
+                            <div class="value">@password</div>
+                            <button class="copy-btn" @onclick="CopyPassword" title="@(_copiedPassword ? "Copied!" : "Copy to clipboard")">
+                                @(_copiedPassword ? "✓" : "📋")
+                            </button>
+                        </div>
                     </div>
                 </div>
                 <p class="status">Share these credentials with your partner</p>
@@ -156,6 +167,9 @@
     private static readonly string Version = System.Reflection.CustomAttributeExtensions
         .GetCustomAttribute<System.Reflection.AssemblyInformationalVersionAttribute>(typeof(Home).Assembly)?.InformationalVersion?.Split('+')[0] ?? "0.0.0";
 
+#if DEBUG
+#endif
+
     private enum AppMode { Select, StartConnection, JoinConnection }
 
     private AppMode currentMode = AppMode.Select;
@@ -169,7 +183,7 @@
 
     // Join mode state
 #if DEBUG
-    private string targetId = "";  // User types short machine name
+    private string targetId = "";
     private string targetPassword = "TESTPASS";
     private string _idPlaceholder = "Enter machine name";
     private string _idMaxLength = "50";
@@ -181,6 +195,8 @@
 #endif
 
     private string errorMessage = "";
+    private bool _copiedId;
+    private bool _copiedPassword;
     private bool _canvasInitialized;
     private bool _isRendering;
     private bool _inputCaptureInitialized;
@@ -243,22 +259,14 @@
             @* Remote screen display (when peer is sharing) *@
             @if (_peerIsSharingScreen)
             {
-                @* Hide visually when viewer window is open, but keep canvas for frame capture *@
-                <div class="remote-screen-container @(ViewerService.IsViewerOpen ? "hidden-for-capture" : "")">
+                <div class="remote-screen-container">
                     <div class="remote-screen-header">
                         <span class="remote-label">📺 Remote Screen</span>
-                        <button class="popout-btn" @onclick="async () => await OpenViewerWindow()" title="Open in separate window">
-                            <span>⛶</span> Open Window
-                        </button>
                     </div>
                     <div class="remote-screen">
                         <canvas id="remoteCanvas" width="1920" height="1080"></canvas>
                     </div>
                 </div>
-                @if (ViewerService.IsViewerOpen)
-                {
-                    <p class="viewer-open-status">Viewing in separate window</p>
-                }
             }
             else if (!_isSharingScreen)
             {
@@ -283,47 +291,6 @@
         SessionManager.FileTransferProgress += OnFileTransferProgress;
         SessionManager.FileTransferCompleted += OnFileTransferCompleted;
         SessionManager.FileTransferFailed += OnFileTransferFailed;
-
-        // Subscribe to viewer window events
-        ViewerService.OnInputEvent += OnViewerInputEvent;
-        ViewerService.OnViewerClosed += OnViewerClosed;
-        ViewerService.OnStatsToggleRequested += OnViewerStatsToggle;
-    }
-
-    private async void OnViewerClosed()
-    {
-        // Stop stats relay when viewer closes
-        if (_statsRelayEnabled)
-        {
-            OnViewerStatsToggle(false);
-        }
-        await StopFrameCaptureAsync();
-    }
-
-    private bool _statsRelayEnabled;
-
-    private async void OnViewerStatsToggle(bool enable)
-    {
-        _statsRelayEnabled = enable;
-        try
-        {
-            if (enable)
-                await JSRuntime.InvokeVoidAsync("SteamViewerWebRTC.enableStatsRelay", _sessionId);
-            else
-                await JSRuntime.InvokeVoidAsync("SteamViewerWebRTC.disableStatsRelay", _sessionId);
-        }
-        catch (Exception ex)
-        {
-            Logger.LogWarning(ex, "Failed to toggle stats relay");
-        }
-    }
-
-    private void OnWebRTCStatsUpdate(string json)
-    {
-        if (_statsRelayEnabled && ViewerService.IsViewerOpen)
-        {
-            ViewerService.SendStatsUpdate(json);
-        }
     }
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
@@ -381,13 +348,7 @@
 
     private void OnVideoFrameDecoded(object? sender, DecodedFrame frame)
     {
-        // Forward frame to viewer window if open
-        if (ViewerService.IsViewerOpen)
-        {
-            ViewerService.SendVideoFrame(frame);
-        }
-
-        // Also render in main window if canvas is ready
+        // Render in main window if canvas is ready
         if (!_canvasInitialized || _isRendering)
         {
             return;
@@ -536,6 +497,49 @@
         StateHasChanged();
     }
 
+    private async Task CopySessionId()
+    {
+        await CopyToClipboard(clientId);
+        _copiedId = true;
+        StateHasChanged();
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(2000);
+            await InvokeAsync(() =>
+            {
+                _copiedId = false;
+                StateHasChanged();
+            });
+        });
+    }
+
+    private async Task CopyPassword()
+    {
+        await CopyToClipboard(password);
+        _copiedPassword = true;
+        StateHasChanged();
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(2000);
+            await InvokeAsync(() =>
+            {
+                _copiedPassword = false;
+                StateHasChanged();
+            });
+        });
+    }
+
+    private async Task CopyToClipboard(string text)
+    {
+        try
+        {
+            await JSRuntime.InvokeVoidAsync("navigator.clipboard.writeText", text);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Failed to copy to clipboard");
+        }
+    }
 
     #region Screen Sharing
 
@@ -599,106 +603,7 @@
 
     #endregion
 
-    #region Separate Window Viewer
-
-    private DotNetObjectReference<Home>? _frameCaptureRef;
-
-    private async Task OpenViewerWindow()
-    {
-        // Open the viewer in a separate window
-        ViewerService.OpenViewer(connectedPeerId);
-        Logger.LogInformation("Opened viewer window for peer {PeerId}", connectedPeerId);
-
-        // Update UI to hide main window canvas
-        StateHasChanged();
-
-        // Start frame capture to relay video to viewer window
-        await Task.Delay(500); // Wait for viewer window to initialize
-        await StartFrameCaptureAsync();
-    }
-
-    private async Task StartFrameCaptureAsync()
-    {
-        try
-        {
-            _frameCaptureRef = DotNetObjectReference.Create(this);
-            await JSRuntime.InvokeVoidAsync("SteamViewerWebRTC.startFrameCapture", _sessionId, _frameCaptureRef);
-            Logger.LogInformation("Frame capture started for viewer window");
-        }
-        catch (Exception ex)
-        {
-            Logger.LogWarning(ex, "Failed to start frame capture");
-        }
-    }
-
-    private async Task StopFrameCaptureAsync()
-    {
-        try
-        {
-            await JSRuntime.InvokeVoidAsync("SteamViewerWebRTC.stopFrameCapture", _sessionId);
-            _frameCaptureRef?.Dispose();
-            _frameCaptureRef = null;
-        }
-        catch (Exception ex)
-        {
-            Logger.LogWarning(ex, "Failed to stop frame capture");
-        }
-    }
-
-    [JSInvokable]
-    public void OnFrameCaptured(string base64Data, int width, int height)
-    {
-        if (!ViewerService.IsViewerOpen) return;
-
-        try
-        {
-            ViewerService.SendJpegFrame(base64Data, width, height);
-        }
-        catch (Exception ex)
-        {
-            Logger.LogDebug(ex, "Failed to relay frame to viewer");
-        }
-    }
-
-    private void OnViewerInputEvent(InputEventData input)
-    {
-        // Relay input from viewer window to remote peer
-        _ = InvokeAsync(async () =>
-        {
-            try
-            {
-                switch (input.Type)
-                {
-                    case InputEventType.MouseMove:
-                        await OnMouseMove(input.X, input.Y, input.CaptureWidth, input.CaptureHeight);
-                        break;
-                    case InputEventType.MouseDown:
-                        await OnMouseDown(input.Button.ToString(), input.X, input.Y, input.CaptureWidth, input.CaptureHeight);
-                        break;
-                    case InputEventType.MouseUp:
-                        await OnMouseUp(input.Button.ToString(), input.X, input.Y, input.CaptureWidth, input.CaptureHeight);
-                        break;
-                    case InputEventType.Wheel:
-                        await OnMouseWheel(input.DeltaX, input.DeltaY);
-                        break;
-                    case InputEventType.KeyDown:
-                        var downMods = JsonSerializer.SerializeToElement(new { ctrl = input.Ctrl, shift = input.Shift, alt = input.Alt });
-                        await OnKeyDown(input.Key!, downMods);
-                        break;
-                    case InputEventType.KeyUp:
-                        var upMods = JsonSerializer.SerializeToElement(new { ctrl = input.Ctrl, shift = input.Shift, alt = input.Alt });
-                        await OnKeyUp(input.Key!, upMods);
-                        break;
-                }
-            }
-            catch (Exception ex)
-            {
-                Logger.LogWarning(ex, "Failed to relay input from viewer window");
-            }
-        });
-    }
-
-    #endregion
+    // Viewer window relay removed - ViewerSessionManager handles viewer connections directly
 
     private async Task StartSession()
     {
@@ -711,7 +616,7 @@
             await SignalingClient.ConnectAsync();
 
 #if DEBUG
-            // Use machine name as ID for unique, memorable debug credentials
+            // Use machine name for easier testing across multiple machines
             clientId = Environment.MachineName;
             password = "TESTPASS";
             Logger.LogInformation("DEBUG MODE: Using test credentials - ID: {Id}, Password: {Pass}", clientId, password);
@@ -782,28 +687,32 @@
             errorMessage = "";
             StateHasChanged();
 
-            if (!SignalingClient.IsConnected)
+            // Delegate entirely to ViewerSessionManager (handles signaling, WebRTC, etc.)
+            var session = await ViewerSessionManager.CreateSessionAsync(
+                targetId, targetPassword, JSRuntime);
+
+            if (session != null)
             {
-                await SignalingClient.ConnectAsync();
-
-                // Register with a random ID (joining peer)
-                var joinerId = new Random().Next(100000000, 999999999).ToString();
-                var joinerPasswordHash = Convert.ToHexString(
-                    Hasher.Hash(Encoding.UTF8.GetBytes(Guid.NewGuid().ToString())).AsSpan()
-                ).ToLowerInvariant();
-
-                await SignalingClient.RegisterAsync(joinerId, joinerPasswordHash);
+                // Open viewer window with this session as a tab
+                TabManager.OpenViewerForSession(session.SessionId, targetId);
+                Logger.LogInformation("Opened viewer for peer {PeerId} via ViewerSessionManager", targetId);
+            }
+            else
+            {
+                errorMessage = "Failed to create session";
             }
 
-            await SignalingClient.RequestConnectionAsync(targetId, targetPassword);
+            // Return to select mode - viewer window handles everything from here
+            currentMode = AppMode.Select;
+            connectionState = ConnectionState.Idle;
         }
         catch (Exception ex)
         {
             Logger.LogError(ex, "Failed to join session");
             connectionState = ConnectionState.Error;
             errorMessage = ex.Message;
-            StateHasChanged();
         }
+        StateHasChanged();
     }
 
     private async Task AcceptConnection()
@@ -898,9 +807,6 @@
             _dataChannelReady = true;
             await InvokeAsync(StateHasChanged);
         };
-
-        // Subscribe to stats relay (for cross-window overlay)
-        _webrtc.OnStatsUpdated += OnWebRTCStatsUpdate;
 
         await _webrtc.InitializeAsync();
         _webrtcInitialized = true;
@@ -1081,32 +987,47 @@
                 var type = typeElement.GetString();
                 switch (type)
                 {
+                    case "rebootHost":
+                        Logger.LogInformation("Received reboot request from viewer");
+                        var rebootResult = InputInjector.RebootWithAutoRestart();
+                        if (!rebootResult && _webrtc != null)
+                        {
+                            await _webrtc.SendDataAsync(JsonSerializer.Serialize(new
+                            {
+                                type = "rebootError",
+                                message = "Host needs to run as administrator to reboot"
+                            }));
+                        }
+                        return;
+
+                    case "ctrlAltDel":
+                        Logger.LogInformation("Received Ctrl+Alt+Del request from viewer");
+                        var sasResult = InputInjector.SendSecureAttentionSequence();
+                        if (!sasResult && _webrtc != null)
+                        {
+                            await _webrtc.SendDataAsync(JsonSerializer.Serialize(new
+                            {
+                                type = "ctrlAltDelError",
+                                message = "Host needs to run as administrator"
+                            }));
+                        }
+                        return;
+
                     case "screenShareStarted":
                         Logger.LogInformation("Peer started sharing their screen");
-                        await InvokeAsync(async () =>
+                        await InvokeAsync(() =>
                         {
                             _peerIsSharingScreen = true;
                             StateHasChanged();
-
-                            // Give time for track to be received and renegotiation to complete
-                            await Task.Delay(500);
-
-                            // Manually check for video tracks (in case ontrack didn't fire)
-                            await JSRuntime.InvokeVoidAsync("SteamViewerWebRTC.checkForVideoTracks", _sessionId);
-
-                            // Auto-open viewer window
-                            await OpenViewerWindow();
                         });
                         return;
 
                     case "screenShareStopped":
                         Logger.LogInformation("Peer stopped sharing their screen");
-                        await InvokeAsync(async () =>
+                        await InvokeAsync(() =>
                         {
                             _peerIsSharingScreen = false;
-                            _canvasInitialized = false; // Reset canvas for next share
-                            await StopFrameCaptureAsync();
-                            ViewerService.CloseViewer(); // Close viewer window if open
+                            _canvasInitialized = false;
                             StateHasChanged();
                         });
                         return;
@@ -1167,6 +1088,10 @@
 
     private void HandleMessage(SignalingMessage message)
     {
+        // Home.razor only handles HOST-side signaling.
+        // Viewer-side signaling is handled by ViewerSessionManager (subscribed to same event).
+        if (currentMode != AppMode.StartConnection) return;
+
         InvokeAsync(async () =>
         {
             switch (message)
@@ -1177,19 +1102,12 @@
                     break;
 
                 case SignalingMessage.ConnectionResponse response:
-                    if (response.TargetId != targetId && response.TargetId != incomingPeerId) break;
-                    if (response.Approved)
-                    {
-                        connectedPeerId = response.TargetId;
-                        connectionState = ConnectionState.Connected;
-
-                        // Initialize WebRTC as viewer
-                        await InitializeWebRTCAsViewer();
-                    }
-                    else
+                    // Host only receives rejections here (approvals come via AcceptConnection)
+                    if (response.TargetId != incomingPeerId) break;
+                    if (!response.Approved)
                     {
                         errorMessage = "Connection rejected";
-                        connectionState = currentMode == AppMode.StartConnection ? ConnectionState.Registered : ConnectionState.Idle;
+                        connectionState = ConnectionState.Registered;
                     }
                     break;
 
@@ -1205,7 +1123,6 @@
                     }
                     else
                     {
-                        // Buffer offer - WebRTC not yet initialized (race condition)
                         Logger.LogWarning("WebRTC not ready, buffering SDP offer");
                         _pendingSdpOffer = offer;
                     }
@@ -1235,7 +1152,6 @@
                     }
                     else
                     {
-                        // Buffer ICE candidate - WebRTC not yet initialized
                         Logger.LogDebug("WebRTC not ready, buffering ICE candidate");
                         _pendingIceCandidates.Add(ice);
                     }
@@ -1244,7 +1160,7 @@
                 case SignalingMessage.Disconnected disconnected:
                     if (disconnected.PeerId != connectedPeerId) break;
                     connectedPeerId = "";
-                    connectionState = currentMode == AppMode.StartConnection ? ConnectionState.Registered : ConnectionState.Idle;
+                    connectionState = ConnectionState.Registered;
                     _isSharingScreen = false;
                     _peerIsSharingScreen = false;
                     if (_webrtc != null)
@@ -1263,84 +1179,7 @@
         });
     }
 
-    private async Task InitializeWebRTCAsViewer()
-    {
-        Logger.LogInformation("Initializing WebRTC as viewer");
-
-        // Configure TURN server before WebRTC init
-        await SetTurnConfigFromSettings();
-
-        // Set logger to viewer mode (sends logs to host)
-        await JSRuntime.InvokeVoidAsync("SteamViewerLogger.setMode", false);
-
-        _webrtc = new WebRTCManager(JSRuntime, LoggerFactory.CreateLogger<WebRTCManager>(), _sessionId, "", SendSignalingMessage);
-
-        // Subscribe to ICE candidates
-        _webrtc.OnIceCandidate += async (candidateJson) =>
-        {
-            var candidate = System.Text.Json.JsonSerializer.Deserialize<IceCandidateData>(candidateJson);
-            if (candidate != null)
-            {
-                await SignalingClient.SendIceCandidateAsync(connectedPeerId, candidate.candidate, candidate.sdpMid, (ushort?)candidate.sdpMLineIndex);
-            }
-        };
-
-        // Subscribe to data channel open (for input sending)
-        _webrtc.OnDataChannelOpen += async () =>
-        {
-            Logger.LogInformation("Data channel opened - ready for communication");
-            _dataChannelReady = true;
-            await InvokeAsync(StateHasChanged);
-        };
-
-        // Subscribe to data channel messages (for screen share notifications and input)
-        _webrtc.OnDataChannelMessage += async (json) =>
-        {
-            await HandleDataChannelMessageAsync(json);
-        };
-
-        // Subscribe to renegotiation (triggered when screen capture track is added)
-        _webrtc.OnRenegotiationNeeded += async (offerJson) =>
-        {
-            Logger.LogInformation("Renegotiation: sending new offer to {PeerId}", connectedPeerId);
-            await SignalingClient.SendSdpOfferAsync(connectedPeerId, offerJson);
-        };
-
-        // Subscribe to stats relay (for cross-window overlay)
-        _webrtc.OnStatsUpdated += OnWebRTCStatsUpdate;
-
-        await _webrtc.InitializeAsync();
-        _webrtcInitialized = true;
-        Logger.LogInformation("WebRTC initialized as joiner, waiting for offer");
-
-        // Process any buffered SDP offer (race condition fix)
-        if (_pendingSdpOffer != null)
-        {
-            Logger.LogInformation("Processing buffered SDP offer from {PeerId}", _pendingSdpOffer.TargetId);
-            await _webrtc.SetRemoteDescriptionAsync(_pendingSdpOffer.Sdp);
-            var answer = await _webrtc.CreateAnswerAsync();
-            await SignalingClient.SendSdpAnswerAsync(_pendingSdpOffer.TargetId, answer);
-            Logger.LogInformation("SDP answer sent for buffered offer");
-            _pendingSdpOffer = null;
-        }
-
-        // Process any buffered ICE candidates
-        if (_pendingIceCandidates.Count > 0)
-        {
-            Logger.LogInformation("Processing {Count} buffered ICE candidates", _pendingIceCandidates.Count);
-            foreach (var ice in _pendingIceCandidates)
-            {
-                var candidateJson = System.Text.Json.JsonSerializer.Serialize(new
-                {
-                    candidate = ice.Candidate,
-                    sdpMid = ice.SdpMid,
-                    sdpMLineIndex = ice.SdpMLineIndex
-                });
-                await _webrtc.AddIceCandidateAsync(candidateJson);
-            }
-            _pendingIceCandidates.Clear();
-        }
-    }
+    // InitializeWebRTCAsViewer removed - ViewerSessionManager handles viewer-side WebRTC
 
     private void HandleDisconnected(string? reason)
     {
@@ -1371,10 +1210,6 @@
         SessionManager.FileTransferProgress -= OnFileTransferProgress;
         SessionManager.FileTransferCompleted -= OnFileTransferCompleted;
         SessionManager.FileTransferFailed -= OnFileTransferFailed;
-        ViewerService.OnViewerClosed -= OnViewerClosed;
-        ViewerService.OnStatsToggleRequested -= OnViewerStatsToggle;
-
-        await StopFrameCaptureAsync();
 
         if (_webrtc != null)
         {
@@ -1396,7 +1231,6 @@
 
         _inputDotNetRef?.Dispose();
         _loggerDotNetRef?.Dispose();
-        _frameCaptureRef?.Dispose();
     }
 }
 
@@ -1559,6 +1393,29 @@
         font-family: monospace;
         color: #a6e3a1;
         letter-spacing: 2px;
+    }
+
+    .value-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+    }
+
+    .copy-btn {
+        background: transparent;
+        border: 1px solid #45475a;
+        border-radius: 4px;
+        color: #6c7086;
+        cursor: pointer;
+        padding: 4px 8px;
+        font-size: 14px;
+        transition: all 0.15s;
+    }
+
+    .copy-btn:hover {
+        background: #45475a;
+        color: #cdd6f4;
+        border-color: #89b4fa;
     }
 
     .connect-form {
@@ -1862,26 +1719,6 @@
         font-weight: 500;
     }
 
-    .popout-btn {
-        display: inline-flex;
-        align-items: center;
-        gap: 0.5rem;
-        padding: 0.5rem 1rem;
-        background: #45475a;
-        border: 1px solid #585b70;
-        border-radius: 6px;
-        color: #cdd6f4;
-        font-size: 0.875rem;
-        cursor: pointer;
-        transition: all 0.2s;
-    }
-
-    .popout-btn:hover {
-        background: #585b70;
-        border-color: #89b4fa;
-        color: #89b4fa;
-    }
-
     /* Fullscreen viewer overlay */
     .fullscreen-viewer {
         position: fixed;
@@ -1978,21 +1815,4 @@
         object-fit: contain;
     }
 
-    /* Hide remote screen visually when viewer window is open, but keep renderable for frame capture */
-    .remote-screen-container.hidden-for-capture {
-        position: fixed;
-        top: 0;
-        left: 0;
-        width: 1px;
-        height: 1px;
-        opacity: 0;
-        pointer-events: none;
-        z-index: -1;
-    }
-
-    .viewer-open-status {
-        color: #a6e3a1;
-        margin: 1rem 0;
-        font-style: italic;
-    }
 </style>

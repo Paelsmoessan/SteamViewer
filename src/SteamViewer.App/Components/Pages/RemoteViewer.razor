@@ -3,9 +3,7 @@
 @using SteamViewer.App.Services
 @using SteamViewer.App.Services.Models
 @using SteamViewer.App.Components.Shared
-@using SteamViewer.Client.Core.Capture
 @using SteamViewer.Common.Protocol
-@inject RemoteViewerService ViewerService
 @inject ViewerSessionManager SessionManager
 @inject ViewerTabManager TabManager
 @inject CanvasRenderingService CanvasRenderer
@@ -13,19 +11,99 @@
 @inject FileLoggerService FileLogger
 @implements IDisposable
 
-<div class="viewer-container">
+<div class="viewer-container" @onclick="CloseMenus" @onclick:stopPropagation="false">
     <div class="viewer-toolbar">
         <div class="toolbar-menus">
-            <button class="menu-btn" title="Session actions">Actions ▾</button>
-            <button class="menu-btn" title="Display options">View ▾</button>
-            <button class="menu-btn" title="File transfer">Files ▾</button>
+            <div class="menu-wrapper">
+                <button class="menu-btn @(_activeMenu == "actions" ? "active" : "")"
+                        @onclick='() => ToggleMenu("actions")'
+                        @onclick:stopPropagation="true"
+                        title="Session actions">Actions ▾</button>
+                @if (_activeMenu == "actions")
+                {
+                    <div class="menu-dropdown" @onclick:stopPropagation="true">
+                        <div class="menu-section">
+                            <span class="menu-section-title">Special Keys</span>
+                            <button class="menu-item" @onclick="SendCtrlShiftEsc" title="Open Task Manager">
+                                <span class="menu-icon">📋</span>
+                                <span>Task Manager</span>
+                                <span class="menu-shortcut">Ctrl+Shift+Esc</span>
+                            </button>
+                            <button class="menu-item" @onclick="SendWinD" title="Show Desktop">
+                                <span class="menu-icon">🖥️</span>
+                                <span>Show Desktop</span>
+                                <span class="menu-shortcut">Win+D</span>
+                            </button>
+                            <button class="menu-item" @onclick="SendWinL" title="Lock Screen">
+                                <span class="menu-icon">🔒</span>
+                                <span>Lock Screen</span>
+                                <span class="menu-shortcut">Win+L</span>
+                            </button>
+                            <button class="menu-item" @onclick="SendAltTab" title="Switch Windows">
+                                <span class="menu-icon">🔄</span>
+                                <span>Switch Windows</span>
+                                <span class="menu-shortcut">Alt+Tab</span>
+                            </button>
+                            <button class="menu-item" @onclick="SendAltF4" title="Close Active Window">
+                                <span class="menu-icon">❌</span>
+                                <span>Close Window</span>
+                                <span class="menu-shortcut">Alt+F4</span>
+                            </button>
+                        </div>
+                        <div class="menu-divider"></div>
+                        <div class="menu-section">
+                            <span class="menu-section-title">System</span>
+                            <button class="menu-item disabled" title="Requires direct access to host">
+                                <span class="menu-icon">🛡️</span>
+                                <span>Ctrl+Alt+Del</span>
+                                <span class="menu-note">N/A</span>
+                            </button>
+                        </div>
+                    </div>
+                }
+            </div>
+            <div class="menu-wrapper">
+                <button class="menu-btn @(_activeMenu == "view" ? "active" : "")"
+                        @onclick='() => ToggleMenu("view")'
+                        @onclick:stopPropagation="true"
+                        title="Display options">View ▾</button>
+                @if (_activeMenu == "view")
+                {
+                    <div class="menu-dropdown" @onclick:stopPropagation="true">
+                        <button class="menu-item" @onclick="ToggleFullscreen">
+                            <span class="menu-icon">⛶</span>
+                            <span>Fullscreen</span>
+                            <span class="menu-shortcut">F11</span>
+                        </button>
+                    </div>
+                }
+            </div>
+            <div class="menu-wrapper">
+                <button class="menu-btn @(_activeMenu == "files" ? "active" : "")"
+                        @onclick='() => ToggleMenu("files")'
+                        @onclick:stopPropagation="true"
+                        title="File transfer">Files ▾</button>
+                @if (_activeMenu == "files")
+                {
+                    <div class="menu-dropdown" @onclick:stopPropagation="true">
+                        <button class="menu-item disabled">
+                            <span class="menu-icon">📤</span>
+                            <span>Send File...</span>
+                        </button>
+                        <button class="menu-item disabled">
+                            <span class="menu-icon">📥</span>
+                            <span>Receive File...</span>
+                        </button>
+                    </div>
+                }
+            </div>
         </div>
         <div class="toolbar-icons">
             <button class="icon-btn @(_inputLocked ? "locked" : "")" @onclick="ToggleInputLock" title="@(_inputLocked ? "Unlock (Esc)" : "Lock input")">
                 @(_inputLocked ? "🔒" : "🔓")
             </button>
             <button class="icon-btn @(_statsVisible ? "active-toggle" : "")" @onclick="ToggleStatsOverlay" title="Toggle stats overlay">📊</button>
-            <button class="icon-btn" title="Fullscreen">⛶</button>
+            <button class="icon-btn" @onclick="ToggleFullscreen" title="Fullscreen (F11)">⛶</button>
             <button class="icon-btn close-btn" @onclick="CloseWindow" title="Close window">×</button>
         </div>
     </div>
@@ -59,11 +137,23 @@
                     <button class="add-connection-btn" @onclick="OpenConnectionDialog">+ Add Connection</button>
                 </div>
             }
+            @if (_activeSessionId != null && !_hasReceivedFrame && !_showReconnectOverlay)
+            {
+                <div class="connecting-overlay">
+                    <div class="connecting-spinner"></div>
+                    <p class="connecting-text">Waiting for host screen...</p>
+                    <p class="connecting-subtext">Establishing connection to @(_activeSession?.PeerId ?? "peer")</p>
+                </div>
+            }
             @if (_statsVisible && _statsText != null)
             {
                 <div class="stats-overlay">
                     <pre>@_statsText</pre>
                 </div>
+            }
+            @if (_toastMessage != null)
+            {
+                <div class="toast-notification">@_toastMessage</div>
             }
             @if (_showReconnectOverlay)
             {
@@ -108,6 +198,7 @@
     private string? _windowId;
     private List<TabState> _tabs = new();
     private bool _showConnectionDialog;
+    private string? _activeMenu;
     private string? _activeSessionId;
     private ViewerSession? _activeSession;
     private bool _showReconnectOverlay;
@@ -116,28 +207,28 @@
     private int _reconnectAttempts;
     private bool _statsVisible;
     private string? _statsText;
+    private string? _toastMessage;
+    private bool? _hostElevated;
+    private bool _hasReceivedFrame;
 
     protected override void OnInitialized()
     {
-        // Get or create window ID for this viewer
-        _windowId = TabManager.CreateWindow();
+        // Claim a pre-created window (from OpenViewerForSession/DetachTab) or create a new one
+        _windowId = TabManager.ClaimOrCreateWindow();
 
         // Subscribe to tab manager events
         TabManager.OnTabsChanged += HandleTabsChanged;
         TabManager.OnActiveTabChanged += HandleActiveTabChanged;
 
-        // Subscribe to legacy single-session service for backward compatibility
-        ViewerService.OnJpegFrame += HandleJpegFrame;
-        ViewerService.OnStatsUpdate += HandleStatsUpdate;
-
-        // If legacy service has a peer, register the tab with TabManager
-        if (!string.IsNullOrEmpty(ViewerService.PeerId))
-        {
-            TabManager.AddTab(_windowId, "legacy", ViewerService.PeerId);
-            _activeSessionId = "legacy";
-        }
-
         RefreshTabs();
+
+        // If the window already has an active tab (OpenViewerForSession added it before we subscribed),
+        // manually activate it now since we missed the OnActiveTabChanged event.
+        var activeTab = TabManager.GetActiveTab(_windowId);
+        if (activeTab != null && _activeSessionId == null)
+        {
+            HandleActiveTabChanged(_windowId, activeTab.SessionId);
+        }
     }
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
@@ -244,12 +335,6 @@
             oldTab.InputLocked = _inputLocked;
         }
 
-        // Disable legacy stats relay when switching away from legacy tab
-        if (_activeSessionId == "legacy" && _statsVisible)
-        {
-            ViewerService.RequestStatsToggle(false);
-        }
-
         // Pause frame capture and unsubscribe from previous session
         if (_activeSession != null)
         {
@@ -257,24 +342,25 @@
             _activeSession.OnFrame -= HandleSessionFrame;
             _activeSession.OnDisconnected -= HandleSessionDisconnected;
             _activeSession.OnStatsUpdated -= HandleStatsUpdate;
+            _activeSession.OnControlMessage -= HandleControlMessage;
             if (_statsVisible) _ = _activeSession.DisableStatsRelayAsync();
             _ = JSRuntime.InvokeVoidAsync("SteamViewerWebRTC.pauseFrameCapture", oldSessionId);
         }
 
         _activeSessionId = sessionId;
+        _hasReceivedFrame = false;
         _showReconnectOverlay = false;
         _reconnectTimer?.Dispose();
         _reconnectTimer = null;
 
         // Update input's active session for stats tracking
-        var inputSessionId = sessionId == "legacy" ? "host" : sessionId;
-        if (!string.IsNullOrEmpty(inputSessionId))
+        if (!string.IsNullOrEmpty(sessionId))
         {
-            _ = JSRuntime.InvokeVoidAsync("SteamViewerInput.setActiveSession", inputSessionId);
+            _ = JSRuntime.InvokeVoidAsync("SteamViewerInput.setActiveSession", sessionId);
         }
 
         // Subscribe to new active session's frames and resume capture
-        if (sessionId != null && sessionId != "legacy")
+        if (sessionId != null)
         {
             _activeSession = SessionManager.GetSession(sessionId);
             if (_activeSession != null)
@@ -282,6 +368,7 @@
                 _activeSession.OnFrame += HandleSessionFrame;
                 _activeSession.OnDisconnected += HandleSessionDisconnected;
                 _activeSession.OnStatsUpdated += HandleStatsUpdate;
+                _activeSession.OnControlMessage += HandleControlMessage;
 
                 _ = JSRuntime.InvokeVoidAsync("SteamViewerWebRTC.resumeFrameCapture", sessionId);
 
@@ -301,15 +388,13 @@
         var newTab = _tabs.FirstOrDefault(t => t.SessionId == sessionId);
         _statsVisible = newTab?.StatsVisible ?? false;
         _inputLocked = newTab?.InputLocked ?? false;
+        _hostElevated = _activeSession?.IsHostElevated;
         if (!_statsVisible) _statsText = null;
 
         // Enable stats relay on new tab if it had stats on
-        if (_statsVisible)
+        if (_statsVisible && _activeSession != null)
         {
-            if (sessionId == "legacy")
-                ViewerService.RequestStatsToggle(true);
-            else if (_activeSession != null)
-                _ = _activeSession.EnableStatsRelayAsync();
+            _ = _activeSession.EnableStatsRelayAsync();
         }
 
         // Apply restored input lock state to JS
@@ -327,8 +412,34 @@
         ShowReconnectOverlay(reason);
     }
 
+    private void HandleControlMessage(string type, string? message)
+    {
+        InvokeAsync(() =>
+        {
+            switch (type)
+            {
+                case "hostStatus":
+                    _hostElevated = bool.TryParse(message, out var e) && e;
+                    StateHasChanged();
+                    break;
+                case "ctrlAltDelError":
+                    ShowToast(message ?? "Host needs to run as administrator");
+                    break;
+                case "rebootError":
+                    ShowToast(message ?? "Host needs to run as administrator to reboot");
+                    break;
+            }
+        });
+    }
+
     private void HandleSessionFrame(JpegFrame frame)
     {
+        if (!_hasReceivedFrame)
+        {
+            _hasReceivedFrame = true;
+            _ = InvokeAsync(StateHasChanged);
+        }
+
         // Frames from multi-session manager
         if (_canvasInitialized)
         {
@@ -347,6 +458,21 @@
         }
     }
 
+    private void ShowToast(string message)
+    {
+        _toastMessage = message;
+        StateHasChanged();
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(4000);
+            await InvokeAsync(() =>
+            {
+                _toastMessage = null;
+                StateHasChanged();
+            });
+        });
+    }
+
     private void SwitchTab(string sessionId)
     {
         if (_windowId == null) return;
@@ -357,13 +483,6 @@
     private async Task CloseTab(string sessionId)
     {
         if (_windowId == null) return;
-
-        if (sessionId == "legacy")
-        {
-            // Legacy mode - close the window
-            CloseWindow();
-            return;
-        }
 
         await TabManager.RemoveTabAsync(_windowId, sessionId);
 
@@ -404,14 +523,8 @@
     {
         _statsVisible = !_statsVisible;
 
-        if (_activeSessionId == "legacy" || _activeSessionId == null)
+        if (_activeSession != null)
         {
-            // Legacy mode: relay through Home.razor's JS context
-            ViewerService.RequestStatsToggle(_statsVisible);
-        }
-        else if (_activeSession != null)
-        {
-            // Multi-session: enable/disable relay in viewer's own JS
             if (_statsVisible)
                 await _activeSession.EnableStatsRelayAsync();
             else
@@ -451,25 +564,91 @@
         FileLogger.LogJS(level, message);
     }
 
-    private async void HandleJpegFrame(JpegFrame frame)
+    #region Menu Handling
+
+    private void ToggleMenu(string menuName)
     {
-        if (_activeSessionId != "legacy") return;
-        if (_canvasInitialized)
+        _activeMenu = _activeMenu == menuName ? null : menuName;
+        StateHasChanged();
+    }
+
+    private void CloseMenus()
+    {
+        if (_activeMenu != null)
         {
-            try
-            {
-                await InvokeAsync(async () =>
-                {
-                    await JSRuntime.InvokeVoidAsync("SteamViewerViewer.renderJpegFrame",
-                        "viewerCanvas", frame.Base64Data, frame.Width, frame.Height);
-                });
-            }
-            catch
-            {
-                // Ignore rendering errors during shutdown
-            }
+            _activeMenu = null;
+            StateHasChanged();
         }
     }
+
+    #endregion
+
+    #region Hard Key Actions
+
+    private void SendCtrlShiftEsc()
+    {
+        // Send Ctrl+Shift+Esc to open Task Manager
+        SendKeyCombo("Escape", ctrl: true, shift: true);
+        CloseMenus();
+    }
+
+    private void SendWinD()
+    {
+        // Send Win+D to show desktop
+        SendKeyCombo("d", meta: true);
+        CloseMenus();
+    }
+
+    private void SendWinL()
+    {
+        // Send Win+L to lock screen
+        SendKeyCombo("l", meta: true);
+        CloseMenus();
+    }
+
+    private void SendAltTab()
+    {
+        // Send Alt+Tab to switch windows
+        SendKeyCombo("Tab", alt: true);
+        CloseMenus();
+    }
+
+    private void SendAltF4()
+    {
+        // Send Alt+F4 to close active window
+        SendKeyCombo("F4", alt: true);
+        CloseMenus();
+    }
+
+    private void SendKeyCombo(string key, bool ctrl = false, bool shift = false, bool alt = false, bool meta = false)
+    {
+        var modifiers = new KeyModifiers(ctrl, shift, alt, meta);
+
+        // Send key down
+        SendInputToActiveSession(new InputEvent.KeyDown(key, modifiers));
+
+        // Small delay then key up (handled asynchronously)
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(50);
+            await InvokeAsync(() => SendInputToActiveSession(new InputEvent.KeyUp(key, modifiers)));
+        });
+    }
+
+    private async Task ToggleFullscreen()
+    {
+        // Check if currently in fullscreen and toggle
+        await JSRuntime.InvokeVoidAsync("eval", @"
+            if (document.fullscreenElement) {
+                document.exitFullscreen();
+            } else {
+                document.documentElement.requestFullscreen();
+            }
+        ");
+        CloseMenus();
+    }
+
+    #endregion
 
     private void HandleStatsUpdate(string json)
     {
@@ -522,74 +701,20 @@
 
     private void CloseWindow()
     {
-        ViewerService.CloseViewer();
+        if (_windowId != null)
+        {
+            // Remove all tabs (disconnects sessions) then triggers window close
+            _ = TabManager.RemoveWindowAsync(_windowId);
+        }
     }
 
     #region Input Callbacks (relayed to main window or active session)
 
     private void SendInputToActiveSession(InputEvent inputEvent)
     {
-        // Route input to active session (multi-tab) or legacy service
-        if (_activeSession != null && _activeSessionId != "legacy")
+        if (_activeSession != null)
         {
             _ = _activeSession.SendInputAsync(inputEvent);
-        }
-        else if (_activeSessionId == "legacy")
-        {
-            // Legacy mode - relay through ViewerService
-            var data = inputEvent switch
-            {
-                InputEvent.MouseMove m => new InputEventData
-                {
-                    Type = InputEventType.MouseMove,
-                    X = m.X,
-                    Y = m.Y,
-                    CaptureWidth = m.CaptureWidth,
-                    CaptureHeight = m.CaptureHeight
-                },
-                InputEvent.MouseDown m => new InputEventData
-                {
-                    Type = InputEventType.MouseDown,
-                    X = m.X,
-                    Y = m.Y,
-                    Button = (int)m.Button,
-                    CaptureWidth = m.CaptureWidth,
-                    CaptureHeight = m.CaptureHeight
-                },
-                InputEvent.MouseUp m => new InputEventData
-                {
-                    Type = InputEventType.MouseUp,
-                    X = m.X,
-                    Y = m.Y,
-                    Button = (int)m.Button,
-                    CaptureWidth = m.CaptureWidth,
-                    CaptureHeight = m.CaptureHeight
-                },
-                InputEvent.MouseWheel m => new InputEventData
-                {
-                    Type = InputEventType.Wheel,
-                    DeltaX = m.DeltaX,
-                    DeltaY = m.DeltaY
-                },
-                InputEvent.KeyDown k => new InputEventData
-                {
-                    Type = InputEventType.KeyDown,
-                    Key = k.Key,
-                    Ctrl = k.Modifiers.Ctrl,
-                    Shift = k.Modifiers.Shift,
-                    Alt = k.Modifiers.Alt
-                },
-                InputEvent.KeyUp k => new InputEventData
-                {
-                    Type = InputEventType.KeyUp,
-                    Key = k.Key,
-                    Ctrl = k.Modifiers.Ctrl,
-                    Shift = k.Modifiers.Shift,
-                    Alt = k.Modifiers.Alt
-                },
-                _ => null
-            };
-            if (data != null) ViewerService.SendInputEvent(data);
         }
     }
 
@@ -748,8 +873,6 @@
 
         TabManager.OnTabsChanged -= HandleTabsChanged;
         TabManager.OnActiveTabChanged -= HandleActiveTabChanged;
-        ViewerService.OnJpegFrame -= HandleJpegFrame;
-        ViewerService.OnStatsUpdate -= HandleStatsUpdate;
 
         // Unsubscribe from active session
         if (_activeSession != null)
@@ -757,6 +880,7 @@
             _activeSession.OnFrame -= HandleSessionFrame;
             _activeSession.OnDisconnected -= HandleSessionDisconnected;
             _activeSession.OnStatsUpdated -= HandleStatsUpdate;
+            _activeSession.OnControlMessage -= HandleControlMessage;
         }
 
         _dotNetRef?.Dispose();
@@ -778,9 +902,6 @@
         {
             _ = TabManager.RemoveWindowAsync(_windowId);
         }
-
-        // Notify service that window is closing
-        ViewerService.NotifyViewerClosed();
     }
 }
 
@@ -821,9 +942,94 @@
         transition: all 0.15s;
     }
 
-    .menu-btn:hover {
+    .menu-btn:hover,
+    .menu-btn.active {
         background: #313244;
         color: #cdd6f4;
+    }
+
+    .menu-wrapper {
+        position: relative;
+    }
+
+    .menu-dropdown {
+        position: absolute;
+        top: 100%;
+        left: 0;
+        min-width: 220px;
+        background: #1e1e2e;
+        border: 1px solid #313244;
+        border-radius: 6px;
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+        z-index: 1000;
+        padding: 4px 0;
+        margin-top: 2px;
+    }
+
+    .menu-section {
+        padding: 4px 0;
+    }
+
+    .menu-section-title {
+        display: block;
+        padding: 4px 12px;
+        font-size: 10px;
+        font-weight: 600;
+        text-transform: uppercase;
+        color: #6c7086;
+        letter-spacing: 0.5px;
+    }
+
+    .menu-divider {
+        height: 1px;
+        background: #313244;
+        margin: 4px 8px;
+    }
+
+    .menu-item {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        width: 100%;
+        padding: 8px 12px;
+        background: transparent;
+        border: none;
+        color: #cdd6f4;
+        font-size: 13px;
+        cursor: pointer;
+        text-align: left;
+        transition: all 0.1s;
+    }
+
+    .menu-item:hover:not(.disabled) {
+        background: #313244;
+    }
+
+    .menu-item.disabled {
+        color: #6c7086;
+        cursor: not-allowed;
+    }
+
+    .menu-icon {
+        width: 16px;
+        text-align: center;
+        font-size: 14px;
+    }
+
+    .menu-item span:nth-child(2) {
+        flex: 1;
+    }
+
+    .menu-shortcut {
+        font-size: 11px;
+        color: #6c7086;
+        font-family: monospace;
+    }
+
+    .menu-note {
+        font-size: 10px;
+        color: #f38ba8;
+        font-style: italic;
     }
 
     .toolbar-icons {
@@ -1196,5 +1402,70 @@
         font-size: inherit;
         color: inherit;
         white-space: pre;
+    }
+
+    /* Toast notification */
+    .toast-notification {
+        position: absolute;
+        bottom: 20px;
+        left: 50%;
+        transform: translateX(-50%);
+        z-index: 200;
+        background: rgba(243, 139, 168, 0.95);
+        color: #1e1e2e;
+        padding: 12px 24px;
+        border-radius: 8px;
+        font-size: 13px;
+        font-weight: 500;
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+        pointer-events: none;
+        animation: toast-fade-in 0.2s ease;
+    }
+
+    @@keyframes toast-fade-in {
+        from { opacity: 0; transform: translateX(-50%) translateY(10px); }
+        to { opacity: 1; transform: translateX(-50%) translateY(0); }
+    }
+
+    /* Connecting / waiting overlay */
+    .connecting-overlay {
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        z-index: 50;
+        background: rgba(17, 17, 27, 0.95);
+    }
+
+    .connecting-spinner {
+        width: 48px;
+        height: 48px;
+        border: 3px solid #313244;
+        border-top-color: #89b4fa;
+        border-radius: 50%;
+        animation: spin 1s linear infinite;
+        margin-bottom: 20px;
+    }
+
+    @@keyframes spin {
+        to { transform: rotate(360deg); }
+    }
+
+    .connecting-text {
+        color: #cdd6f4;
+        font-size: 16px;
+        font-weight: 500;
+        margin: 0 0 8px 0;
+    }
+
+    .connecting-subtext {
+        color: #6c7086;
+        font-size: 13px;
+        margin: 0;
     }
 </style>

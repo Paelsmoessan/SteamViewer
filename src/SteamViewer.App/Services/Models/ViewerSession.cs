@@ -83,6 +83,16 @@ public sealed class ViewerSession : IAsyncDisposable
     public event Action<string>? OnStatsUpdated;
 
     /// <summary>
+    /// Raised when a control message is received from the host (e.g., hostStatus, ctrlAltDelError, rebootError).
+    /// </summary>
+    public event Action<string, string?>? OnControlMessage;
+
+    /// <summary>
+    /// Whether the host is running elevated (as admin).
+    /// </summary>
+    public bool? IsHostElevated { get; private set; }
+
+    /// <summary>
     /// Raised when an ICE candidate needs to be sent via signaling.
     /// </summary>
     public event Func<string, string?, ushort?, Task>? OnIceCandidate;
@@ -287,6 +297,20 @@ public sealed class ViewerSession : IAsyncDisposable
                         _logger.LogInformation("Session {SessionId}: Peer stopped sharing", SessionId);
                         IsPeerSharing = false;
                         OnPeerSharingChanged?.Invoke(false);
+                        break;
+
+                    case "hostStatus":
+                        var elevated = root.TryGetProperty("elevated", out var elProp) && elProp.GetBoolean();
+                        IsHostElevated = elevated;
+                        _logger.LogInformation("Session {SessionId}: Host elevated={Elevated}", SessionId, elevated);
+                        OnControlMessage?.Invoke(type, null);
+                        break;
+
+                    case "ctrlAltDelError":
+                    case "rebootError":
+                        var message = root.TryGetProperty("message", out var msgProp) ? msgProp.GetString() : null;
+                        _logger.LogWarning("Session {SessionId}: {Type}: {Message}", SessionId, type, message);
+                        OnControlMessage?.Invoke(type, message);
                         break;
                 }
             }

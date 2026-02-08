@@ -26,6 +26,11 @@ public sealed class ViewerSessionManager : IAsyncDisposable
     private bool _signalingSubscribed;
     private bool _disposed;
 
+#if DEBUG
+    // Counter for generating short test viewer IDs
+    private static int _debugViewerIdCounter = 100;
+#endif
+
     /// <summary>
     /// Maximum number of concurrent sessions allowed.
     /// </summary>
@@ -99,8 +104,13 @@ public sealed class ViewerSessionManager : IAsyncDisposable
         {
             await _signalingClient.ConnectAsync();
 
+#if DEBUG
+            // Use short test IDs for easier debugging (VIEWER100, VIEWER101, etc.)
+            var joinerId = $"VIEWER{_debugViewerIdCounter++}";
+#else
             // Register with a random ID for joining
             var joinerId = new Random().Next(100000000, 999999999).ToString();
+#endif
             var joinerPasswordHash = Convert.ToHexString(
                 Hasher.Hash(Encoding.UTF8.GetBytes(Guid.NewGuid().ToString())).AsSpan()
             ).ToLowerInvariant();
