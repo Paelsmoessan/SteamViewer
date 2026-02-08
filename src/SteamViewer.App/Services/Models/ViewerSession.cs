@@ -88,6 +88,12 @@ public sealed class ViewerSession : IAsyncDisposable
     public event Action<string, string?>? OnControlMessage;
 
     /// <summary>
+    /// Raised when clipboard data is received from the host.
+    /// Parameters: (format, data)
+    /// </summary>
+    public event Action<string, string>? OnClipboardReceived;
+
+    /// <summary>
     /// Whether the host is running elevated (as admin).
     /// </summary>
     public bool? IsHostElevated { get; private set; }
@@ -208,6 +214,45 @@ public sealed class ViewerSession : IAsyncDisposable
     }
 
     /// <summary>
+    /// Request the host's clipboard contents.
+    /// </summary>
+    public async Task RequestClipboardAsync()
+    {
+        if (_webrtc == null || !_webrtc.IsDataChannelOpen) return;
+
+        try
+        {
+            var json = JsonSerializer.Serialize<ClipboardMessage>(new ClipboardMessage.Request());
+            await _webrtc.SendDataAsync(json);
+            _logger.LogDebug("Session {SessionId}: Sent clipboard request", SessionId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to send clipboard request for session {SessionId}", SessionId);
+        }
+    }
+
+    /// <summary>
+    /// Send clipboard data to the host to set on their clipboard.
+    /// </summary>
+    public async Task SendClipboardAsync(string format, string data)
+    {
+        if (_webrtc == null || !_webrtc.IsDataChannelOpen) return;
+
+        try
+        {
+            var json = JsonSerializer.Serialize<ClipboardMessage>(new ClipboardMessage.Set(format, data));
+            await _webrtc.SendDataAsync(json);
+            _logger.LogDebug("Session {SessionId}: Sent clipboard set ({Format}, {Length} chars)",
+                SessionId, format, data.Length);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to send clipboard for session {SessionId}", SessionId);
+        }
+    }
+
+    /// <summary>
     /// Enable stats relay polling in JS for this session.
     /// </summary>
     public async Task EnableStatsRelayAsync()
@@ -311,6 +356,17 @@ public sealed class ViewerSession : IAsyncDisposable
                         var message = root.TryGetProperty("message", out var msgProp) ? msgProp.GetString() : null;
                         _logger.LogWarning("Session {SessionId}: {Type}: {Message}", SessionId, type, message);
                         OnControlMessage?.Invoke(type, message);
+                        break;
+
+                    case "clipboard_data":
+                        var cbFormat = root.TryGetProperty("format", out var fProp) ? fProp.GetString() : null;
+                        var cbData = root.TryGetProperty("data", out var dProp) ? dProp.GetString() : null;
+                        if (cbFormat != null && cbData != null)
+                        {
+                            _logger.LogDebug("Session {SessionId}: Received clipboard ({Format}, {Length} chars)",
+                                SessionId, cbFormat, cbData.Length);
+                            OnClipboardReceived?.Invoke(cbFormat, cbData);
+                        }
                         break;
                 }
             }

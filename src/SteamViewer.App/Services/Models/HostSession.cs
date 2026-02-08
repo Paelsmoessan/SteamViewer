@@ -349,6 +349,14 @@ public sealed class HostSession : IAsyncDisposable
                         }
                         return;
 
+                    case "clipboard_request":
+                        await HandleClipboardRequestAsync();
+                        return;
+
+                    case "clipboard_set":
+                        await HandleClipboardSetAsync(root);
+                        return;
+
                     case "screenShareStarted":
                         _logger.LogInformation("Peer started sharing their screen");
                         IsPeerSharingScreen = true;
@@ -414,6 +422,45 @@ public sealed class HostSession : IAsyncDisposable
         catch
         {
             // Silently ignore parse errors to reduce latency
+        }
+    }
+
+    #endregion
+
+    #region Clipboard
+
+    private async Task HandleClipboardRequestAsync()
+    {
+        if (_webrtc == null) return;
+        try
+        {
+            var text = await _jsRuntime.InvokeAsync<string>("navigator.clipboard.readText");
+            if (!string.IsNullOrEmpty(text))
+            {
+                var response = JsonSerializer.Serialize<ClipboardMessage>(
+                    new ClipboardMessage.Response("text", text));
+                await _webrtc.SendDataAsync(response);
+                _logger.LogDebug("Sent clipboard to viewer: {Length} chars", text.Length);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to read clipboard for viewer request");
+        }
+    }
+
+    private async Task HandleClipboardSetAsync(JsonElement root)
+    {
+        var data = root.TryGetProperty("data", out var d) ? d.GetString() : null;
+        if (data == null) return;
+        try
+        {
+            await _jsRuntime.InvokeVoidAsync("navigator.clipboard.writeText", data);
+            _logger.LogDebug("Set clipboard from viewer: {Length} chars", data.Length);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to set clipboard from viewer");
         }
     }
 

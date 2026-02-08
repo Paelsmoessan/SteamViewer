@@ -59,6 +59,18 @@
                                 <span class="menu-note">N/A</span>
                             </button>
                         </div>
+                        <div class="menu-divider"></div>
+                        <div class="menu-section">
+                            <span class="menu-section-title">Clipboard</span>
+                            <button class="menu-item" @onclick="SendClipboardToHost" title="Send your clipboard text to the remote machine">
+                                <span class="menu-icon">📋</span>
+                                <span>Paste to Remote</span>
+                            </button>
+                            <button class="menu-item" @onclick="GetClipboardFromHost" title="Copy the remote machine's clipboard text">
+                                <span class="menu-icon">📥</span>
+                                <span>Copy from Remote</span>
+                            </button>
+                        </div>
                     </div>
                 }
             </div>
@@ -343,6 +355,7 @@
             _activeSession.OnDisconnected -= HandleSessionDisconnected;
             _activeSession.OnStatsUpdated -= HandleStatsUpdate;
             _activeSession.OnControlMessage -= HandleControlMessage;
+            _activeSession.OnClipboardReceived -= HandleClipboardReceived;
             if (_statsVisible) _ = _activeSession.DisableStatsRelayAsync();
             _ = JSRuntime.InvokeVoidAsync("SteamViewerWebRTC.pauseFrameCapture", oldSessionId);
         }
@@ -369,6 +382,7 @@
                 _activeSession.OnDisconnected += HandleSessionDisconnected;
                 _activeSession.OnStatsUpdated += HandleStatsUpdate;
                 _activeSession.OnControlMessage += HandleControlMessage;
+                _activeSession.OnClipboardReceived += HandleClipboardReceived;
 
                 _ = JSRuntime.InvokeVoidAsync("SteamViewerWebRTC.resumeFrameCapture", sessionId);
 
@@ -635,6 +649,53 @@
         });
     }
 
+    #endregion
+
+    #region Clipboard
+
+    private async Task SendClipboardToHost()
+    {
+        CloseMenus();
+        if (_activeSession == null) return;
+        try
+        {
+            var text = await JSRuntime.InvokeAsync<string>("navigator.clipboard.readText");
+            if (string.IsNullOrEmpty(text))
+            {
+                ShowToast("Clipboard is empty");
+                return;
+            }
+            await _activeSession.SendClipboardAsync("text", text);
+            ShowToast($"Sent {text.Length} chars to remote");
+        }
+        catch
+        {
+            ShowToast("Failed to read clipboard");
+        }
+    }
+
+    private async Task GetClipboardFromHost()
+    {
+        CloseMenus();
+        if (_activeSession == null) return;
+        await _activeSession.RequestClipboardAsync();
+        ShowToast("Requesting remote clipboard...");
+    }
+
+    private void HandleClipboardReceived(string format, string data)
+    {
+        InvokeAsync(async () =>
+        {
+            if (format == "text")
+            {
+                await JSRuntime.InvokeVoidAsync("navigator.clipboard.writeText", data);
+                ShowToast($"Remote clipboard copied ({data.Length} chars)");
+            }
+        });
+    }
+
+    #endregion
+
     private async Task ToggleFullscreen()
     {
         // Check if currently in fullscreen and toggle
@@ -647,8 +708,6 @@
         ");
         CloseMenus();
     }
-
-    #endregion
 
     private void HandleStatsUpdate(string json)
     {
@@ -881,6 +940,7 @@
             _activeSession.OnDisconnected -= HandleSessionDisconnected;
             _activeSession.OnStatsUpdated -= HandleStatsUpdate;
             _activeSession.OnControlMessage -= HandleControlMessage;
+            _activeSession.OnClipboardReceived -= HandleClipboardReceived;
         }
 
         _dotNetRef?.Dispose();
