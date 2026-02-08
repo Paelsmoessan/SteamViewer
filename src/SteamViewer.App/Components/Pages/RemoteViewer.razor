@@ -230,9 +230,19 @@
         });
     }
 
+    private TabState? ActiveTab => _tabs.FirstOrDefault(t => t.SessionId == _activeSessionId);
+
     private void HandleActiveTabChanged(string windowId, string? sessionId)
     {
         if (windowId != _windowId) return;
+
+        // Save current tab's per-tab state before switching
+        var oldTab = _tabs.FirstOrDefault(t => t.SessionId == _activeSessionId);
+        if (oldTab != null)
+        {
+            oldTab.StatsVisible = _statsVisible;
+            oldTab.InputLocked = _inputLocked;
+        }
 
         // Disable legacy stats relay when switching away from legacy tab
         if (_activeSessionId == "legacy" && _statsVisible)
@@ -272,7 +282,6 @@
                 _activeSession.OnFrame += HandleSessionFrame;
                 _activeSession.OnDisconnected += HandleSessionDisconnected;
                 _activeSession.OnStatsUpdated += HandleStatsUpdate;
-                if (_statsVisible) _ = _activeSession.EnableStatsRelayAsync();
 
                 _ = JSRuntime.InvokeVoidAsync("SteamViewerWebRTC.resumeFrameCapture", sessionId);
 
@@ -286,13 +295,28 @@
         else
         {
             _activeSession = null;
-
-            // Re-enable legacy stats relay when switching to legacy tab
-            if (sessionId == "legacy" && _statsVisible)
-            {
-                ViewerService.RequestStatsToggle(true);
-            }
         }
+
+        // Restore new tab's per-tab state
+        var newTab = _tabs.FirstOrDefault(t => t.SessionId == sessionId);
+        _statsVisible = newTab?.StatsVisible ?? false;
+        _inputLocked = newTab?.InputLocked ?? false;
+        if (!_statsVisible) _statsText = null;
+
+        // Enable stats relay on new tab if it had stats on
+        if (_statsVisible)
+        {
+            if (sessionId == "legacy")
+                ViewerService.RequestStatsToggle(true);
+            else if (_activeSession != null)
+                _ = _activeSession.EnableStatsRelayAsync();
+        }
+
+        // Apply restored input lock state to JS
+        if (_inputLocked)
+            _ = JSRuntime.InvokeVoidAsync("SteamViewerInput.lock");
+        else
+            _ = JSRuntime.InvokeVoidAsync("SteamViewerInput.unlock");
 
         InvokeAsync(StateHasChanged);
     }
@@ -395,6 +419,7 @@
         }
 
         if (!_statsVisible) _statsText = null;
+        if (ActiveTab != null) ActiveTab.StatsVisible = _statsVisible;
         StateHasChanged();
     }
 
@@ -409,6 +434,7 @@
         {
             await JSRuntime.InvokeVoidAsync("SteamViewerInput.unlock");
         }
+        if (ActiveTab != null) ActiveTab.InputLocked = _inputLocked;
         StateHasChanged();
     }
 

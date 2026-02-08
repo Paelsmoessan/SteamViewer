@@ -45,6 +45,16 @@ public sealed class TabState
     /// Timestamp of last frame received (for staleness detection).
     /// </summary>
     public DateTime? LastFrameTime { get; set; }
+
+    /// <summary>
+    /// Whether the stats overlay is visible for this tab.
+    /// </summary>
+    public bool StatsVisible { get; set; }
+
+    /// <summary>
+    /// Whether input lock is enabled for this tab.
+    /// </summary>
+    public bool InputLocked { get; set; }
 }
 
 /// <summary>
