@@ -2,8 +2,8 @@
 @using SteamViewer.Client.Core.Capture
 @using SteamViewer.Client.Core.FileTransfer
 @using SteamViewer.Client.Core.Network
-@using SteamViewer.Client.Core.Session
 @using SteamViewer.App.Services
+@using SteamViewer.App.Services.Models
 @using SteamViewer.App.Components.FileTransfer
 @using Blake3
 @using System.Text
@@ -12,7 +12,6 @@
 @using Microsoft.Extensions.Configuration
 @implements IAsyncDisposable
 @inject SignalingClient SignalingClient
-@inject SessionManager SessionManager
 @inject CanvasRenderingService CanvasRenderer
 @inject IJSRuntime JSRuntime
 @inject ILoggerFactory LoggerFactory
@@ -155,7 +154,7 @@
         IsVisible="@_showFileTransferDialog"
         Mode="@_fileDialogMode"
         PendingTransfer="@_pendingFileTransfer"
-        Transfers="@SessionManager.ActiveTransfers"
+        Transfers="@(Enumerable.Empty<FileTransferState>())"
         OnClose="@CloseFileTransferDialog"
         OnAccept="@AcceptFileTransfer"
         OnReject="@RejectFileTransfer"
@@ -198,34 +197,23 @@
     private bool _copiedId;
     private bool _copiedPassword;
     private bool _canvasInitialized;
-    private bool _isRendering;
     private bool _inputCaptureInitialized;
     private DotNetObjectReference<Home>? _inputDotNetRef;
     private DotNetObjectReference<Home>? _loggerDotNetRef;
     private bool _jsLoggerInitialized;
 
-    // WebRTC state
-    private WebRTCManager? _webrtc;
-    private bool _webrtcInitialized;
-    private string _sessionId = "host"; // Session ID for JS interop (host uses constant "host")
-
-    // Screen sharing state
-    private bool _isSharingScreen;       // Am I sharing my screen?
-    private bool _peerIsSharingScreen;   // Is my peer sharing their screen?
-    private bool _dataChannelReady;      // Is data channel open and ready?
-
-    // Track last known capture dimensions from mouse events (for keyboard events)
-    private int _lastCaptureWidth = 1920;
-    private int _lastCaptureHeight = 1080;
-
-    // Pending SDP offer/ICE candidates (buffered if received before WebRTC init)
-    private SignalingMessage.SdpOffer? _pendingSdpOffer;
-    private List<SignalingMessage.IceCandidate> _pendingIceCandidates = new();
+    // Host session (encapsulates WebRTC, input injection, screen sharing)
+    private HostSession? _hostSession;
 
     // File transfer state
     private bool _showFileTransferDialog;
     private FileTransferDialog.DialogMode _fileDialogMode;
     private FileTransferState? _pendingFileTransfer;
+
+    // UI helper properties that delegate to HostSession
+    private bool _isSharingScreen => _hostSession?.IsSharingScreen ?? false;
+    private bool _peerIsSharingScreen => _hostSession?.IsPeerSharingScreen ?? false;
+    private bool _dataChannelReady => _hostSession?.IsDataChannelReady ?? false;
 
     // Render the connected view (same for both Start and Join modes)
     private RenderFragment RenderConnectedView() => __builder =>
@@ -286,11 +274,6 @@
         SignalingClient.OnMessageReceived += HandleMessage;
         SignalingClient.OnDisconnected += HandleDisconnected;
         SignalingClient.OnError += HandleError;
-        SessionManager.VideoFrameDecoded += OnVideoFrameDecoded;
-        SessionManager.IncomingFileTransfer += OnIncomingFileTransfer;
-        SessionManager.FileTransferProgress += OnFileTransferProgress;
-        SessionManager.FileTransferCompleted += OnFileTransferCompleted;
-        SessionManager.FileTransferFailed += OnFileTransferFailed;
     }
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
@@ -322,7 +305,7 @@
                 _canvasInitialized = true;
                 Logger.LogInformation("Canvas initialized for video rendering");
 
-                // Initialize input capture on canvas (no lock indicator - viewer window handles that)
+                // Initialize input capture on canvas
                 if (!_inputCaptureInitialized)
                 {
                     _inputDotNetRef = DotNetObjectReference.Create(this);
@@ -334,7 +317,7 @@
                     _inputCaptureInitialized = success;
                     if (success)
                     {
-                        await JSRuntime.InvokeVoidAsync("SteamViewerInput.setActiveSession", _sessionId);
+                        await JSRuntime.InvokeVoidAsync("SteamViewerInput.setActiveSession", "host");
                     }
                     Logger.LogInformation("Input capture initialized: {Success}", success);
                 }
@@ -346,67 +329,7 @@
         }
     }
 
-    private void OnVideoFrameDecoded(object? sender, DecodedFrame frame)
-    {
-        // Render in main window if canvas is ready
-        if (!_canvasInitialized || _isRendering)
-        {
-            return;
-        }
-
-        _ = InvokeAsync(async () =>
-        {
-            try
-            {
-                _isRendering = true;
-                await CanvasRenderer.RenderFrameAsync(frame);
-            }
-            catch (Exception ex)
-            {
-                Logger.LogWarning(ex, "Failed to render video frame");
-            }
-            finally
-            {
-                _isRendering = false;
-            }
-        });
-    }
-
     #region File Transfer Handlers
-
-    private void OnIncomingFileTransfer(object? sender, FileTransferState state)
-    {
-        InvokeAsync(() =>
-        {
-            _pendingFileTransfer = state;
-            _fileDialogMode = FileTransferDialog.DialogMode.IncomingRequest;
-            _showFileTransferDialog = true;
-            StateHasChanged();
-        });
-    }
-
-    private void OnFileTransferProgress(object? sender, FileTransferState state)
-    {
-        InvokeAsync(StateHasChanged);
-    }
-
-    private void OnFileTransferCompleted(object? sender, FileTransferState state)
-    {
-        InvokeAsync(() =>
-        {
-            Logger.LogInformation("File transfer completed: {Filename}", state.Filename);
-            StateHasChanged();
-        });
-    }
-
-    private void OnFileTransferFailed(object? sender, FileTransferState state)
-    {
-        InvokeAsync(() =>
-        {
-            Logger.LogWarning("File transfer failed: {Filename} - {Error}", state.Filename, state.ErrorMessage);
-            StateHasChanged();
-        });
-    }
 
     private void ShowTransfersDialog()
     {
@@ -424,49 +347,29 @@
 
     private async Task AcceptFileTransfer((Guid TransferId, string SavePath) args)
     {
-        try
-        {
-            await SessionManager.AcceptFileTransferAsync(args.TransferId, args.SavePath);
-            _showFileTransferDialog = false;
-            _pendingFileTransfer = null;
-            // Show active transfers dialog
-            _fileDialogMode = FileTransferDialog.DialogMode.ActiveTransfers;
-            _showFileTransferDialog = true;
-        }
-        catch (Exception ex)
-        {
-            Logger.LogError(ex, "Failed to accept file transfer");
-            errorMessage = ex.Message;
-        }
+        // TODO: Wire to _hostSession file transfer when implemented
+        _showFileTransferDialog = false;
+        _pendingFileTransfer = null;
+        _fileDialogMode = FileTransferDialog.DialogMode.ActiveTransfers;
+        _showFileTransferDialog = true;
         StateHasChanged();
+        await Task.CompletedTask;
     }
 
     private async Task RejectFileTransfer(Guid transferId)
     {
-        try
-        {
-            await SessionManager.RejectFileTransferAsync(transferId);
-        }
-        catch (Exception ex)
-        {
-            Logger.LogError(ex, "Failed to reject file transfer");
-        }
+        // TODO: Wire to _hostSession file transfer when implemented
         _showFileTransferDialog = false;
         _pendingFileTransfer = null;
         StateHasChanged();
+        await Task.CompletedTask;
     }
 
     private async Task CancelFileTransfer(Guid transferId)
     {
-        try
-        {
-            await SessionManager.CancelFileTransferAsync(transferId);
-        }
-        catch (Exception ex)
-        {
-            Logger.LogError(ex, "Failed to cancel file transfer");
-        }
+        // TODO: Wire to _hostSession file transfer when implemented
         StateHasChanged();
+        await Task.CompletedTask;
     }
 
     #endregion
@@ -475,7 +378,6 @@
     {
         currentMode = AppMode.StartConnection;
         StateHasChanged();
-        // Auto-start session immediately
         await StartSession();
     }
 
@@ -489,8 +391,6 @@
     {
         await StopSession();
         _canvasInitialized = false;
-        _isSharingScreen = false;
-        _peerIsSharingScreen = false;
         currentMode = AppMode.Select;
         connectionState = ConnectionState.Idle;
         errorMessage = "";
@@ -545,65 +445,25 @@
 
     private async Task StartSharingScreen()
     {
-        if (_webrtc == null) return;
+        if (_hostSession == null) return;
 
-        try
+        var success = await _hostSession.StartScreenShareAsync();
+        if (!success)
         {
-            Logger.LogInformation("Starting screen share...");
-            var success = await _webrtc.StartScreenCaptureAsync();
-            if (success)
-            {
-                _isSharingScreen = true;
-                Logger.LogInformation("Screen sharing started, notifying peer...");
-
-                // Wait a moment for track to be added, then notify peer
-                await Task.Delay(500);
-
-                // Send notification multiple times to ensure delivery
-                for (int i = 0; i < 3; i++)
-                {
-                    var sent = await _webrtc.SendDataAsync(JsonSerializer.Serialize(new { type = "screenShareStarted" }));
-                    Logger.LogInformation("screenShareStarted message sent: {Sent}", sent);
-                    if (sent) break;
-                    await Task.Delay(200);
-                }
-            }
-            else
-            {
-                errorMessage = "Failed to start screen capture";
-            }
-        }
-        catch (Exception ex)
-        {
-            Logger.LogError(ex, "Failed to start screen sharing");
-            errorMessage = ex.Message;
+            errorMessage = "Failed to start screen capture";
         }
         StateHasChanged();
     }
 
     private async Task StopSharingScreen()
     {
-        if (_webrtc == null) return;
+        if (_hostSession == null) return;
 
-        try
-        {
-            Logger.LogInformation("Stopping screen share...");
-            await _webrtc.StopScreenCaptureAsync();
-            _isSharingScreen = false;
-            // Notify peer that we stopped sharing
-            await _webrtc.SendDataAsync(JsonSerializer.Serialize(new { type = "screenShareStopped" }));
-            Logger.LogInformation("Screen sharing stopped");
-        }
-        catch (Exception ex)
-        {
-            Logger.LogError(ex, "Failed to stop screen sharing");
-        }
+        await _hostSession.StopScreenShareAsync();
         StateHasChanged();
     }
 
     #endregion
-
-    // Viewer window relay removed - ViewerSessionManager handles viewer connections directly
 
     private async Task StartSession()
     {
@@ -616,19 +476,14 @@
             await SignalingClient.ConnectAsync();
 
 #if DEBUG
-            // Use machine name for easier testing across multiple machines
             clientId = Environment.MachineName;
             password = "TESTPASS";
             Logger.LogInformation("DEBUG MODE: Using test credentials - ID: {Id}, Password: {Pass}", clientId, password);
 #else
-            // Generate 9-digit client ID
             clientId = new Random().Next(100000000, 999999999).ToString();
-
-            // Generate random password
             password = Guid.NewGuid().ToString("N")[..8].ToUpperInvariant();
 #endif
 
-            // Hash password for registration
             var passwordHash = Convert.ToHexString(
                 Hasher.Hash(Encoding.UTF8.GetBytes(password)).AsSpan()
             ).ToLowerInvariant();
@@ -660,10 +515,10 @@
         try
         {
             await SignalingClient.DisconnectAsync();
-            if (_webrtc != null)
+            if (_hostSession != null)
             {
-                await _webrtc.CloseAsync();
-                _webrtc = null;
+                await _hostSession.DisposeAsync();
+                _hostSession = null;
             }
         }
         catch (Exception ex)
@@ -674,8 +529,6 @@
         connectionState = ConnectionState.Idle;
         clientId = "";
         password = "";
-        _isSharingScreen = false;
-        _peerIsSharingScreen = false;
         StateHasChanged();
     }
 
@@ -687,13 +540,12 @@
             errorMessage = "";
             StateHasChanged();
 
-            // Delegate entirely to ViewerSessionManager (handles signaling, WebRTC, etc.)
+            // Delegate entirely to ViewerSessionManager
             var session = await ViewerSessionManager.CreateSessionAsync(
                 targetId, targetPassword, JSRuntime);
 
             if (session != null)
             {
-                // Open viewer window with this session as a tab
                 TabManager.OpenViewerForSession(session.SessionId, targetId);
                 Logger.LogInformation("Opened viewer for peer {PeerId} via ViewerSessionManager", targetId);
             }
@@ -702,7 +554,7 @@
                 errorMessage = "Failed to create session";
             }
 
-            // Return to select mode - viewer window handles everything from here
+            // Return to select mode - viewer window handles everything
             currentMode = AppMode.Select;
             connectionState = ConnectionState.Idle;
         }
@@ -723,8 +575,33 @@
             connectedPeerId = incomingPeerId;
             connectionState = ConnectionState.Connected;
 
-            // Initialize WebRTC as host
-            await InitializeWebRTCAsHost();
+            // Create and initialize host session
+            _hostSession = new HostSession(
+                connectedPeerId,
+                JSRuntime,
+                LoggerFactory,
+                InputInjector,
+                Configuration,
+                msg => SignalingClient.SendAsync(msg));
+
+            _hostSession.OnStateChanged += state => InvokeAsync(StateHasChanged);
+            _hostSession.OnReady += () => InvokeAsync(StateHasChanged);
+            _hostSession.OnDisconnected += reason => InvokeAsync(() =>
+            {
+                Logger.LogInformation("Host session disconnected: {Reason}", reason);
+                StateHasChanged();
+            });
+            _hostSession.OnPeerSharingChanged += sharing => InvokeAsync(() =>
+            {
+                _canvasInitialized = false; // Reset canvas when peer sharing changes
+                StateHasChanged();
+            });
+            _hostSession.OnIceCandidate += (candidate, sdpMid, sdpMLineIndex) =>
+                SignalingClient.SendIceCandidateAsync(connectedPeerId, candidate, sdpMid, sdpMLineIndex);
+            _hostSession.OnSdpMessage += (peerId, sdp) =>
+                SignalingClient.SendSdpOfferAsync(peerId, sdp);
+
+            await _hostSession.InitializeAsync();
         }
         catch (Exception ex)
         {
@@ -733,99 +610,6 @@
         }
         StateHasChanged();
     }
-
-    private async Task SetTurnConfigFromSettings()
-    {
-        // Read TURN server config from appsettings.json
-        var turnEnabled = Configuration.GetValue<bool>("TurnServer:Enabled");
-        if (!turnEnabled)
-        {
-            Logger.LogInformation("TURN server disabled in config");
-            return;
-        }
-
-        var urls = Configuration.GetSection("TurnServer:Urls").Get<string[]>();
-        var username = Configuration["TurnServer:Username"];
-        var credential = Configuration["TurnServer:Credential"];
-
-        if (urls == null || urls.Length == 0 || string.IsNullOrEmpty(username))
-        {
-            Logger.LogWarning("TURN server enabled but not configured - edit appsettings.json");
-            return;
-        }
-
-        // Check if URL is placeholder
-        if (urls[0].Contains("YOUR_TURN_SERVER"))
-        {
-            Logger.LogWarning("TURN server URL is placeholder - edit appsettings.json with your TURN server address");
-            return;
-        }
-
-        Logger.LogInformation("Configuring TURN server: {Urls}", string.Join(", ", urls));
-        await JSRuntime.InvokeVoidAsync("SteamViewerWebRTC.setTurnConfig", urls, username, credential);
-    }
-
-    private async Task InitializeWebRTCAsHost()
-    {
-        Logger.LogInformation("Initializing WebRTC as host");
-
-        // Configure TURN server before WebRTC init
-        await SetTurnConfigFromSettings();
-
-        // Set logger to host mode (receives logs from viewer)
-        await JSRuntime.InvokeVoidAsync("SteamViewerLogger.setMode", true);
-
-        _webrtc = new WebRTCManager(JSRuntime, LoggerFactory.CreateLogger<WebRTCManager>(), _sessionId, clientId, SendSignalingMessage);
-
-        // Subscribe to ICE candidates
-        _webrtc.OnIceCandidate += async (candidateJson) =>
-        {
-            var candidate = JsonSerializer.Deserialize<IceCandidateData>(candidateJson);
-            if (candidate != null)
-            {
-                await SignalingClient.SendIceCandidateAsync(connectedPeerId, candidate.candidate, candidate.sdpMid, (ushort?)candidate.sdpMLineIndex);
-            }
-        };
-
-        // Subscribe to data channel messages (for receiving input and screen share notifications)
-        _webrtc.OnDataChannelMessage += async (json) =>
-        {
-            await HandleDataChannelMessageAsync(json);
-        };
-
-        // Subscribe to renegotiation (triggered when screen capture track is added)
-        _webrtc.OnRenegotiationNeeded += async (offerJson) =>
-        {
-            Logger.LogInformation("Renegotiation: sending new offer to {PeerId}", connectedPeerId);
-            await SignalingClient.SendSdpOfferAsync(connectedPeerId, offerJson);
-        };
-
-        // Subscribe to data channel open (host needs this too!)
-        _webrtc.OnDataChannelOpen += async () =>
-        {
-            Logger.LogInformation("Host: Data channel opened - ready for communication");
-            _dataChannelReady = true;
-            await InvokeAsync(StateHasChanged);
-        };
-
-        await _webrtc.InitializeAsync();
-        _webrtcInitialized = true;
-        await _webrtc.CreateDataChannelAsync("data");
-
-        // NOTE: Screen capture is NOT auto-started; user chooses when to share
-
-        // Create and send offer
-        var offer = await _webrtc.CreateOfferAsync();
-        await SignalingClient.SendSdpOfferAsync(connectedPeerId, offer);
-        Logger.LogInformation("SDP offer sent to {PeerId}", connectedPeerId);
-    }
-
-    private async Task SendSignalingMessage(SignalingMessage message)
-    {
-        await SignalingClient.SendAsync(message);
-    }
-
-    private record IceCandidateData(string candidate, string? sdpMid, int? sdpMLineIndex);
 
     #region JS Logger
 
@@ -837,20 +621,19 @@
 
     #endregion
 
-    #region Input Event Handlers (Viewer -> Host)
+    #region Input Event Handlers - Home viewing peer screen
 
     [JSInvokable]
     public async Task OnMouseMove(double x, double y, int captureWidth = 0, int captureHeight = 0)
     {
-        if (_webrtc == null || !_webrtc.IsDataChannelOpen) return;
-        var inputEvent = new InputEvent.MouseMove(x, y, captureWidth, captureHeight);
-        await SendInputEventAsync(inputEvent);
+        if (_hostSession == null || !_hostSession.IsDataChannelReady) return;
+        await SendInputEventAsync(new InputEvent.MouseMove(x, y, captureWidth, captureHeight));
     }
 
     [JSInvokable]
     public async Task OnMouseDown(string button, double x, double y, int captureWidth = 0, int captureHeight = 0)
     {
-        if (_webrtc == null || !_webrtc.IsDataChannelOpen) return;
+        if (_hostSession == null || !_hostSession.IsDataChannelReady) return;
         var mouseButton = button.ToLowerInvariant() switch
         {
             "left" => MouseButton.Left,
@@ -858,14 +641,13 @@
             "middle" => MouseButton.Middle,
             _ => MouseButton.Left
         };
-        var inputEvent = new InputEvent.MouseDown(mouseButton, x, y, captureWidth, captureHeight);
-        await SendInputEventAsync(inputEvent);
+        await SendInputEventAsync(new InputEvent.MouseDown(mouseButton, x, y, captureWidth, captureHeight));
     }
 
     [JSInvokable]
     public async Task OnMouseUp(string button, double x, double y, int captureWidth = 0, int captureHeight = 0)
     {
-        if (_webrtc == null || !_webrtc.IsDataChannelOpen) return;
+        if (_hostSession == null || !_hostSession.IsDataChannelReady) return;
         var mouseButton = button.ToLowerInvariant() switch
         {
             "left" => MouseButton.Left,
@@ -873,34 +655,28 @@
             "middle" => MouseButton.Middle,
             _ => MouseButton.Left
         };
-        var inputEvent = new InputEvent.MouseUp(mouseButton, x, y, captureWidth, captureHeight);
-        await SendInputEventAsync(inputEvent);
+        await SendInputEventAsync(new InputEvent.MouseUp(mouseButton, x, y, captureWidth, captureHeight));
     }
 
     [JSInvokable]
     public async Task OnMouseWheel(double deltaX, double deltaY)
     {
-        if (_webrtc == null || !_webrtc.IsDataChannelOpen) return;
-        var inputEvent = new InputEvent.MouseWheel(deltaX, deltaY);
-        await SendInputEventAsync(inputEvent);
+        if (_hostSession == null || !_hostSession.IsDataChannelReady) return;
+        await SendInputEventAsync(new InputEvent.MouseWheel(deltaX, deltaY));
     }
 
     [JSInvokable]
     public async Task OnKeyDown(string key, JsonElement modifiers)
     {
-        if (_webrtc == null || !_webrtc.IsDataChannelOpen) return;
-        var mods = ParseModifiers(modifiers);
-        var inputEvent = new InputEvent.KeyDown(key, mods);
-        await SendInputEventAsync(inputEvent);
+        if (_hostSession == null || !_hostSession.IsDataChannelReady) return;
+        await SendInputEventAsync(new InputEvent.KeyDown(key, ParseModifiers(modifiers)));
     }
 
     [JSInvokable]
     public async Task OnKeyUp(string key, JsonElement modifiers)
     {
-        if (_webrtc == null || !_webrtc.IsDataChannelOpen) return;
-        var mods = ParseModifiers(modifiers);
-        var inputEvent = new InputEvent.KeyUp(key, mods);
-        await SendInputEventAsync(inputEvent);
+        if (_hostSession == null || !_hostSession.IsDataChannelReady) return;
+        await SendInputEventAsync(new InputEvent.KeyUp(key, ParseModifiers(modifiers)));
     }
 
     private KeyModifiers ParseModifiers(JsonElement modifiers)
@@ -917,134 +693,12 @@
     {
         try
         {
-            var json = System.Text.Json.JsonSerializer.Serialize(inputEvent);
-            await _webrtc!.SendDataAsync(json);
+            var json = JsonSerializer.Serialize(inputEvent);
+            await _hostSession!.SendDataAsync(json);
         }
         catch
         {
             // Silently ignore input send failures to reduce latency
-        }
-    }
-
-    #endregion
-
-    #region Input Injection (Host receives from Viewer)
-
-    private async Task HandleInputMessageAsync(string json)
-    {
-        // Only process input if we're sharing our screen (i.e., receiving remote control)
-        if (!_isSharingScreen) return;
-
-        try
-        {
-            var inputEvent = JsonSerializer.Deserialize<InputEvent>(json);
-            if (inputEvent != null)
-            {
-                // Track dimensions from mouse events (they carry the viewer's canvas size)
-                // Keyboard events will reuse the last known dimensions
-                switch (inputEvent)
-                {
-                    case InputEvent.MouseMove move when move.CaptureWidth > 0 && move.CaptureHeight > 0:
-                        _lastCaptureWidth = move.CaptureWidth;
-                        _lastCaptureHeight = move.CaptureHeight;
-                        break;
-                    case InputEvent.MouseDown down when down.CaptureWidth > 0 && down.CaptureHeight > 0:
-                        _lastCaptureWidth = down.CaptureWidth;
-                        _lastCaptureHeight = down.CaptureHeight;
-                        break;
-                    case InputEvent.MouseUp up when up.CaptureWidth > 0 && up.CaptureHeight > 0:
-                        _lastCaptureWidth = up.CaptureWidth;
-                        _lastCaptureHeight = up.CaptureHeight;
-                        break;
-                }
-
-                // Inject the input using tracked capture dimensions
-                InputInjector.InjectInput(inputEvent, _lastCaptureWidth, _lastCaptureHeight);
-            }
-        }
-        catch
-        {
-            // Silently ignore parse errors to reduce latency
-        }
-
-        await Task.CompletedTask;
-    }
-
-    #endregion
-
-    #region Data Channel Message Handler
-
-    private async Task HandleDataChannelMessageAsync(string json)
-    {
-        try
-        {
-            // Try to parse as a control message first
-            using var doc = JsonDocument.Parse(json);
-            var root = doc.RootElement;
-
-            if (root.TryGetProperty("type", out var typeElement))
-            {
-                var type = typeElement.GetString();
-                switch (type)
-                {
-                    case "rebootHost":
-                        Logger.LogInformation("Received reboot request from viewer");
-                        var rebootResult = InputInjector.RebootWithAutoRestart();
-                        if (!rebootResult && _webrtc != null)
-                        {
-                            await _webrtc.SendDataAsync(JsonSerializer.Serialize(new
-                            {
-                                type = "rebootError",
-                                message = "Host needs to run as administrator to reboot"
-                            }));
-                        }
-                        return;
-
-                    case "ctrlAltDel":
-                        Logger.LogInformation("Received Ctrl+Alt+Del request from viewer");
-                        var sasResult = InputInjector.SendSecureAttentionSequence();
-                        if (!sasResult && _webrtc != null)
-                        {
-                            await _webrtc.SendDataAsync(JsonSerializer.Serialize(new
-                            {
-                                type = "ctrlAltDelError",
-                                message = "Host needs to run as administrator"
-                            }));
-                        }
-                        return;
-
-                    case "screenShareStarted":
-                        Logger.LogInformation("Peer started sharing their screen");
-                        await InvokeAsync(() =>
-                        {
-                            _peerIsSharingScreen = true;
-                            StateHasChanged();
-                        });
-                        return;
-
-                    case "screenShareStopped":
-                        Logger.LogInformation("Peer stopped sharing their screen");
-                        await InvokeAsync(() =>
-                        {
-                            _peerIsSharingScreen = false;
-                            _canvasInitialized = false;
-                            StateHasChanged();
-                        });
-                        return;
-                }
-            }
-
-            // If not a control message, treat as input event
-            await HandleInputMessageAsync(json);
-        }
-        catch (JsonException)
-        {
-            // Not JSON, might be raw data - try as input
-            await HandleInputMessageAsync(json);
-        }
-        catch (Exception ex)
-        {
-            Logger.LogWarning(ex, "Failed to handle data channel message: {Json}", json);
         }
     }
 
@@ -1065,14 +719,14 @@
             await SignalingClient.DisconnectFromPeerAsync(connectedPeerId);
         }
 
+        if (_hostSession != null)
+        {
+            await _hostSession.DisposeAsync();
+            _hostSession = null;
+        }
+
         connectedPeerId = "";
         _canvasInitialized = false;
-        _dataChannelReady = false;
-        _webrtcInitialized = false;
-        _isSharingScreen = false;
-        _peerIsSharingScreen = false;
-        _pendingSdpOffer = null;
-        _pendingIceCandidates.Clear();
 
         if (currentMode == AppMode.StartConnection)
         {
@@ -1102,7 +756,6 @@
                     break;
 
                 case SignalingMessage.ConnectionResponse response:
-                    // Host only receives rejections here (approvals come via AcceptConnection)
                     if (response.TargetId != incomingPeerId) break;
                     if (!response.Approved)
                     {
@@ -1113,61 +766,32 @@
 
                 case SignalingMessage.SdpOffer offer:
                     if (offer.TargetId != connectedPeerId) break;
-                    Logger.LogInformation("Received SDP offer from {PeerId}", offer.TargetId);
-                    if (_webrtc != null && _webrtcInitialized)
-                    {
-                        await _webrtc.SetRemoteDescriptionAsync(offer.Sdp);
-                        var answer = await _webrtc.CreateAnswerAsync();
-                        await SignalingClient.SendSdpAnswerAsync(offer.TargetId, answer);
-                        Logger.LogInformation("SDP answer sent");
-                    }
-                    else
-                    {
-                        Logger.LogWarning("WebRTC not ready, buffering SDP offer");
-                        _pendingSdpOffer = offer;
-                    }
+                    if (_hostSession != null)
+                        await _hostSession.HandleSdpOfferAsync(offer.Sdp);
                     break;
 
                 case SignalingMessage.SdpAnswer answer:
                     if (answer.TargetId != connectedPeerId) break;
-                    Logger.LogInformation("Received SDP answer from {PeerId}", answer.TargetId);
-                    if (_webrtc != null)
-                    {
-                        await _webrtc.SetRemoteDescriptionAsync(answer.Sdp);
-                    }
+                    if (_hostSession != null)
+                        await _hostSession.HandleSdpAnswerAsync(answer.Sdp);
                     break;
 
                 case SignalingMessage.IceCandidate ice:
                     if (ice.TargetId != connectedPeerId) break;
-                    Logger.LogDebug("Received ICE candidate from {PeerId}", ice.TargetId);
-                    if (_webrtc != null && _webrtcInitialized)
-                    {
-                        var candidateJson = System.Text.Json.JsonSerializer.Serialize(new
-                        {
-                            candidate = ice.Candidate,
-                            sdpMid = ice.SdpMid,
-                            sdpMLineIndex = ice.SdpMLineIndex
-                        });
-                        await _webrtc.AddIceCandidateAsync(candidateJson);
-                    }
-                    else
-                    {
-                        Logger.LogDebug("WebRTC not ready, buffering ICE candidate");
-                        _pendingIceCandidates.Add(ice);
-                    }
+                    if (_hostSession != null)
+                        await _hostSession.HandleIceCandidateAsync(ice.Candidate, ice.SdpMid, (int?)ice.SdpMLineIndex);
                     break;
 
                 case SignalingMessage.Disconnected disconnected:
                     if (disconnected.PeerId != connectedPeerId) break;
-                    connectedPeerId = "";
-                    connectionState = ConnectionState.Registered;
-                    _isSharingScreen = false;
-                    _peerIsSharingScreen = false;
-                    if (_webrtc != null)
+                    if (_hostSession != null)
                     {
-                        await _webrtc.CloseAsync();
-                        _webrtc = null;
+                        await _hostSession.DisposeAsync();
+                        _hostSession = null;
                     }
+                    connectedPeerId = "";
+                    _canvasInitialized = false;
+                    connectionState = ConnectionState.Registered;
                     break;
 
                 case SignalingMessage.Error error:
@@ -1178,8 +802,6 @@
             StateHasChanged();
         });
     }
-
-    // InitializeWebRTCAsViewer removed - ViewerSessionManager handles viewer-side WebRTC
 
     private void HandleDisconnected(string? reason)
     {
@@ -1205,16 +827,11 @@
         SignalingClient.OnMessageReceived -= HandleMessage;
         SignalingClient.OnDisconnected -= HandleDisconnected;
         SignalingClient.OnError -= HandleError;
-        SessionManager.VideoFrameDecoded -= OnVideoFrameDecoded;
-        SessionManager.IncomingFileTransfer -= OnIncomingFileTransfer;
-        SessionManager.FileTransferProgress -= OnFileTransferProgress;
-        SessionManager.FileTransferCompleted -= OnFileTransferCompleted;
-        SessionManager.FileTransferFailed -= OnFileTransferFailed;
 
-        if (_webrtc != null)
+        if (_hostSession != null)
         {
-            await _webrtc.DisposeAsync();
-            _webrtc = null;
+            await _hostSession.DisposeAsync();
+            _hostSession = null;
         }
 
         if (_canvasInitialized)
@@ -1550,40 +1167,6 @@
         height: auto;
     }
 
-    .remote-screen-fullscreen {
-        position: fixed;
-        top: 0;
-        left: 0;
-        right: 0;
-        bottom: 0;
-        background: #000;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        z-index: 100;
-    }
-
-    .remote-screen-fullscreen canvas {
-        max-width: 100%;
-        max-height: 100%;
-        object-fit: contain;
-    }
-
-    .viewer-toolbar {
-        position: fixed;
-        top: 10px;
-        left: 10px;
-        display: flex;
-        gap: 8px;
-        z-index: 101;
-        opacity: 0.3;
-        transition: opacity 0.2s;
-    }
-
-    .viewer-toolbar:hover {
-        opacity: 1;
-    }
-
     .toolbar-btn {
         background: rgba(49, 50, 68, 0.9);
         color: #cdd6f4;
@@ -1598,12 +1181,6 @@
     .toolbar-btn:hover {
         background: rgba(69, 71, 90, 0.9);
         border-color: #89b4fa;
-    }
-
-    .connected-actions {
-        display: flex;
-        gap: 1rem;
-        margin-top: 1rem;
     }
 
     /* Connected view styles */
@@ -1717,102 +1294,6 @@
     .remote-label {
         color: #a6e3a1;
         font-weight: 500;
-    }
-
-    /* Fullscreen viewer overlay */
-    .fullscreen-viewer {
-        position: fixed;
-        top: 0;
-        left: 0;
-        right: 0;
-        bottom: 0;
-        background: #000;
-        z-index: 9999;
-        display: flex;
-        flex-direction: column;
-    }
-
-    .fullscreen-toolbar {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        padding: 0.5rem 1rem;
-        background: rgba(30, 30, 46, 0.95);
-        border-bottom: 1px solid #45475a;
-        opacity: 0.3;
-        transition: opacity 0.3s;
-    }
-
-    .fullscreen-toolbar:hover {
-        opacity: 1;
-    }
-
-    .toolbar-left,
-    .toolbar-center,
-    .toolbar-right {
-        display: flex;
-        align-items: center;
-        gap: 0.75rem;
-    }
-
-    .toolbar-left {
-        flex: 1;
-    }
-
-    .toolbar-center {
-        flex: 2;
-        justify-content: center;
-    }
-
-    .toolbar-right {
-        flex: 1;
-        justify-content: flex-end;
-    }
-
-    .connection-indicator {
-        font-size: 0.875rem;
-        color: #a6e3a1;
-    }
-
-    .peer-info {
-        font-size: 1rem;
-        color: #cdd6f4;
-        font-weight: 500;
-    }
-
-    .fs-toolbar-btn {
-        width: 36px;
-        height: 36px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        background: #45475a;
-        border: 1px solid #585b70;
-        border-radius: 6px;
-        color: #cdd6f4;
-        font-size: 1.1rem;
-        cursor: pointer;
-        transition: all 0.2s;
-    }
-
-    .fs-toolbar-btn:hover {
-        background: #585b70;
-        border-color: #89b4fa;
-    }
-
-    .fullscreen-canvas-container {
-        flex: 1;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        overflow: hidden;
-        background: #11111b;
-    }
-
-    .fullscreen-canvas-container canvas {
-        max-width: 100%;
-        max-height: 100%;
-        object-fit: contain;
     }
 
 </style>
