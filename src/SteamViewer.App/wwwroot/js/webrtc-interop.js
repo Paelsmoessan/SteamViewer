@@ -34,6 +34,15 @@
     };
 })();
 
+// Global error handlers - captured by console interceptor above → written to log file
+window.onerror = function(msg, src, line, col, error) {
+    console.error(`[Uncaught] ${msg} at ${src}:${line}:${col}`);
+    return false;
+};
+window.addEventListener('unhandledrejection', function(e) {
+    console.error(`[UnhandledPromise] ${e.reason}`);
+});
+
 // Logger bridge to C# with bidirectional WebRTC relay
 window.SteamViewerLogger = {
     dotNetRef: null,
@@ -135,7 +144,8 @@ window.SteamViewerWebRTC = {
             _statsPrev: null,
             _inputEventsCount: 0,
             _inputThrottledCount: 0,
-            _qualityMode: 'HQ'
+            _qualityMode: 'HQ',
+            _statsRelay: false
         };
     },
 
@@ -1130,19 +1140,44 @@ window.SteamViewerWebRTC = {
     // === Stats Overlay ===
 
     toggleStatsOverlay(sessionId) {
-        const session = this._getSession(sessionId);
+        const session = this.sessions.get(sessionId);
+        if (!session) {
+            console.warn(`[Stats] No session found for: ${sessionId}`);
+            return;
+        }
         session._statsVisible = !session._statsVisible;
         if (session._statsVisible) {
             this._createStatsOverlay(sessionId);
             this._startStatsPolling(sessionId);
         } else {
-            this._stopStatsPolling(sessionId);
+            if (!session._statsRelay) {
+                this._stopStatsPolling(sessionId);
+            }
             this._removeStatsOverlay(sessionId);
         }
     },
 
+    enableStatsRelay(sessionId) {
+        const session = this.sessions.get(sessionId);
+        if (!session) return;
+        session._statsRelay = true;
+        if (!session._statsInterval) {
+            this._startStatsPolling(sessionId);
+        }
+    },
+
+    disableStatsRelay(sessionId) {
+        const session = this.sessions.get(sessionId);
+        if (!session) return;
+        session._statsRelay = false;
+        if (!session._statsVisible) {
+            this._stopStatsPolling(sessionId);
+        }
+    },
+
     _createStatsOverlay(sessionId) {
-        const session = this._getSession(sessionId);
+        const session = this.sessions.get(sessionId);
+        if (!session) return;
         if (session._statsOverlayEl) return;
         const el = document.createElement('div');
         el.id = `svStatsOverlay-${sessionId}`;
@@ -1169,7 +1204,8 @@ window.SteamViewerWebRTC = {
     },
 
     _startStatsPolling(sessionId) {
-        const session = this._getSession(sessionId);
+        const session = this.sessions.get(sessionId);
+        if (!session) return;
         session._statsPrev = null;
         session._inputEventsCount = 0;
         session._inputThrottledCount = 0;
@@ -1186,17 +1222,19 @@ window.SteamViewerWebRTC = {
         session._statsPrev = null;
     },
 
-    _formatBytes(bytes) {
-        if (bytes < 1024) return '0 KB';
-        if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
-        if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-        return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
-    },
-
     async _pollStats(sessionId) {
         const session = this.sessions.get(sessionId);
-        if (!session || !session.peerConnection || !session._statsOverlayEl) return;
+        if (!session || !session.peerConnection) return;
+        if (!session._statsOverlayEl && !session._statsRelay) return;
 
+        const fmtBytes = (bytes) => {
+            if (bytes < 1024) return `${bytes} B`;
+            if (bytes < 1048576) return `${(bytes / 1024).toFixed(1)} KB`;
+            if (bytes < 1073741824) return `${(bytes / 1048576).toFixed(1)} MB`;
+            return `${(bytes / 1073741824).toFixed(2)} GB`;
+        };
+
+        try {
         const stats = await session.peerConnection.getStats();
         const now = performance.now();
 
@@ -1285,12 +1323,31 @@ window.SteamViewerWebRTC = {
             `Video: ${videoFps.toFixed(0)} FPS | ${bitrateMbps.toFixed(1)} Mbps | ${resolution}`,
             `Net:   RTT ${rttMs.toFixed(0)}ms | Loss ${lossPercent.toFixed(1)}%`,
             `Input: ${inputPerSec} evt/s${throttledPerSec > 0 ? ` (${throttledPerSec} throttled)` : ''} | Buf: ${bufferKB.toFixed(0)} KB`,
-            `Data:  ${this._formatBytes(currentBytes)} video | ${this._formatBytes(dataChannelBytes)} ctrl`,
+            `Data:  ${fmtBytes(currentBytes)} video | ${fmtBytes(dataChannelBytes)} ctrl`,
             `Mode:  [${session._qualityMode}]`
         ];
 
-        session._statsOverlayEl.textContent = lines.join('\n');
-        session._statsOverlayEl.style.whiteSpace = 'pre';
+        // Update DOM overlay if visible
+        if (session._statsOverlayEl) {
+            session._statsOverlayEl.textContent = lines.join('\n');
+            session._statsOverlayEl.style.whiteSpace = 'pre';
+        }
+
+        // Relay stats to C# if enabled (for cross-window overlay)
+        if (session._statsRelay && session.dotNetRef) {
+            try {
+                session.dotNetRef.invokeMethodAsync('OnStatsUpdate', JSON.stringify({
+                    videoFps, bitrateMbps, resolution,
+                    rttMs, lossPercent,
+                    inputPerSec, throttledPerSec, bufferKB,
+                    currentBytes, dataChannelBytes,
+                    qualityMode: session._qualityMode
+                }));
+            } catch (e) { /* ignore relay errors */ }
+        }
+        } catch (e) {
+            console.error('[Stats] _pollStats error:', e);
+        }
     },
 
     // Close connection

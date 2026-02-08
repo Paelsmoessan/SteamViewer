@@ -56,6 +56,11 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
     /// </summary>
     public event Func<string, Task>? OnRenegotiationNeeded;
 
+    /// <summary>
+    /// Raised when stats data is relayed from JS (for cross-window overlay).
+    /// </summary>
+    public event Action<string>? OnStatsUpdated;
+
     // IWebRTCManager events
     event EventHandler<string>? IWebRTCManager.ConnectionStateChanged
     {
@@ -465,6 +470,12 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
         {
             await OnRenegotiationNeeded.Invoke(offerJson);
         }
+    }
+
+    [JSInvokable]
+    public void OnStatsUpdate(string json)
+    {
+        OnStatsUpdated?.Invoke(json);
     }
 
     #endregion

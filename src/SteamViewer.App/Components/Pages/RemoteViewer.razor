@@ -10,6 +10,7 @@
 @inject ViewerTabManager TabManager
 @inject CanvasRenderingService CanvasRenderer
 @inject IJSRuntime JSRuntime
+@inject FileLoggerService FileLogger
 @implements IDisposable
 
 <div class="viewer-container">
@@ -58,6 +59,12 @@
                     <button class="add-connection-btn" @onclick="OpenConnectionDialog">+ Add Connection</button>
                 </div>
             }
+            @if (_statsVisible && _statsText != null)
+            {
+                <div class="stats-overlay">
+                    <pre>@_statsText</pre>
+                </div>
+            }
             @if (_showReconnectOverlay)
             {
                 <div class="reconnect-overlay">
@@ -93,6 +100,7 @@
 @code {
     private DotNetObjectReference<RemoteViewer>? _dotNetRef;
     private DotNetObjectReference<RemoteViewer>? _tabDragRef;
+    private DotNetObjectReference<RemoteViewer>? _loggerDotNetRef;
     private bool _canvasInitialized;
     private bool _inputInitialized;
     private bool _tabDragInitialized;
@@ -107,6 +115,7 @@
     private System.Threading.Timer? _reconnectTimer;
     private int _reconnectAttempts;
     private bool _statsVisible;
+    private string? _statsText;
 
     protected override void OnInitialized()
     {
@@ -119,6 +128,7 @@
 
         // Subscribe to legacy single-session service for backward compatibility
         ViewerService.OnJpegFrame += HandleJpegFrame;
+        ViewerService.OnStatsUpdate += HandleStatsUpdate;
 
         // If legacy service has a peer, register the tab with TabManager
         if (!string.IsNullOrEmpty(ViewerService.PeerId))
@@ -159,6 +169,10 @@
                 {
                     await JSRuntime.InvokeVoidAsync("SteamViewerTabDrag.setTabBarWindowId", _windowId);
                 }
+
+                // Initialize JS logger bridge so console output reaches the log file
+                _loggerDotNetRef = DotNetObjectReference.Create(this);
+                await JSRuntime.InvokeVoidAsync("SteamViewerLogger.initialize", _loggerDotNetRef);
             }
             catch (Exception ex)
             {
@@ -220,12 +234,20 @@
     {
         if (windowId != _windowId) return;
 
+        // Disable legacy stats relay when switching away from legacy tab
+        if (_activeSessionId == "legacy" && _statsVisible)
+        {
+            ViewerService.RequestStatsToggle(false);
+        }
+
         // Pause frame capture and unsubscribe from previous session
         if (_activeSession != null)
         {
             var oldSessionId = _activeSession.SessionId;
             _activeSession.OnFrame -= HandleSessionFrame;
             _activeSession.OnDisconnected -= HandleSessionDisconnected;
+            _activeSession.OnStatsUpdated -= HandleStatsUpdate;
+            if (_statsVisible) _ = _activeSession.DisableStatsRelayAsync();
             _ = JSRuntime.InvokeVoidAsync("SteamViewerWebRTC.pauseFrameCapture", oldSessionId);
         }
 
@@ -249,6 +271,8 @@
             {
                 _activeSession.OnFrame += HandleSessionFrame;
                 _activeSession.OnDisconnected += HandleSessionDisconnected;
+                _activeSession.OnStatsUpdated += HandleStatsUpdate;
+                if (_statsVisible) _ = _activeSession.EnableStatsRelayAsync();
 
                 _ = JSRuntime.InvokeVoidAsync("SteamViewerWebRTC.resumeFrameCapture", sessionId);
 
@@ -262,6 +286,12 @@
         else
         {
             _activeSession = null;
+
+            // Re-enable legacy stats relay when switching to legacy tab
+            if (sessionId == "legacy" && _statsVisible)
+            {
+                ViewerService.RequestStatsToggle(true);
+            }
         }
 
         InvokeAsync(StateHasChanged);
@@ -348,12 +378,23 @@
 
     private async Task ToggleStatsOverlay()
     {
-        // Use active session ID for stats, or "host" for legacy single-session mode
-        var statsSessionId = _activeSessionId == "legacy" ? "host" : _activeSessionId;
-        if (string.IsNullOrEmpty(statsSessionId)) return;
-
         _statsVisible = !_statsVisible;
-        await JSRuntime.InvokeVoidAsync("SteamViewerWebRTC.toggleStatsOverlay", statsSessionId);
+
+        if (_activeSessionId == "legacy" || _activeSessionId == null)
+        {
+            // Legacy mode: relay through Home.razor's JS context
+            ViewerService.RequestStatsToggle(_statsVisible);
+        }
+        else if (_activeSession != null)
+        {
+            // Multi-session: enable/disable relay in viewer's own JS
+            if (_statsVisible)
+                await _activeSession.EnableStatsRelayAsync();
+            else
+                await _activeSession.DisableStatsRelayAsync();
+        }
+
+        if (!_statsVisible) _statsText = null;
         StateHasChanged();
     }
 
@@ -378,6 +419,12 @@
         InvokeAsync(StateHasChanged);
     }
 
+    [JSInvokable]
+    public void OnJSLog(string level, string message)
+    {
+        FileLogger.LogJS(level, message);
+    }
+
     private async void HandleJpegFrame(JpegFrame frame)
     {
         if (_activeSessionId != "legacy") return;
@@ -396,6 +443,55 @@
                 // Ignore rendering errors during shutdown
             }
         }
+    }
+
+    private void HandleStatsUpdate(string json)
+    {
+        InvokeAsync(() =>
+        {
+            _statsText = FormatStats(json);
+            StateHasChanged();
+        });
+    }
+
+    private static string FormatStats(string json)
+    {
+        try
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(json);
+            var r = doc.RootElement;
+
+            var fps = r.GetProperty("videoFps").GetDouble();
+            var mbps = r.GetProperty("bitrateMbps").GetDouble();
+            var res = r.GetProperty("resolution").GetString() ?? "?";
+            var rtt = r.GetProperty("rttMs").GetDouble();
+            var loss = r.GetProperty("lossPercent").GetDouble();
+            var input = r.GetProperty("inputPerSec").GetInt32();
+            var throttled = r.GetProperty("throttledPerSec").GetInt32();
+            var bufKB = r.GetProperty("bufferKB").GetDouble();
+            var videoBytes = r.GetProperty("currentBytes").GetInt64();
+            var ctrlBytes = r.GetProperty("dataChannelBytes").GetInt64();
+            var mode = r.GetProperty("qualityMode").GetString() ?? "HQ";
+
+            var throttledStr = throttled > 0 ? $" ({throttled} throttled)" : "";
+            return $"Video: {fps:F0} FPS | {mbps:F1} Mbps | {res}\n"
+                 + $"Net:   RTT {rtt:F0}ms | Loss {loss:F1}%\n"
+                 + $"Input: {input} evt/s{throttledStr} | Buf: {bufKB:F0} KB\n"
+                 + $"Data:  {FmtBytes(videoBytes)} video | {FmtBytes(ctrlBytes)} ctrl\n"
+                 + $"Mode:  [{mode}]";
+        }
+        catch
+        {
+            return json; // Fallback: show raw JSON
+        }
+    }
+
+    private static string FmtBytes(long bytes)
+    {
+        if (bytes < 1024) return $"{bytes} B";
+        if (bytes < 1048576) return $"{bytes / 1024.0:F1} KB";
+        if (bytes < 1073741824) return $"{bytes / 1048576.0:F1} MB";
+        return $"{bytes / 1073741824.0:F2} GB";
     }
 
     private void CloseWindow()
@@ -627,16 +723,19 @@
         TabManager.OnTabsChanged -= HandleTabsChanged;
         TabManager.OnActiveTabChanged -= HandleActiveTabChanged;
         ViewerService.OnJpegFrame -= HandleJpegFrame;
+        ViewerService.OnStatsUpdate -= HandleStatsUpdate;
 
         // Unsubscribe from active session
         if (_activeSession != null)
         {
             _activeSession.OnFrame -= HandleSessionFrame;
             _activeSession.OnDisconnected -= HandleSessionDisconnected;
+            _activeSession.OnStatsUpdated -= HandleStatsUpdate;
         }
 
         _dotNetRef?.Dispose();
         _tabDragRef?.Dispose();
+        _loggerDotNetRef?.Dispose();
 
         // Dispose tab drag JS
         if (_tabDragInitialized)
@@ -1044,5 +1143,32 @@
         color: #6c7086;
         font-size: 12px;
         margin: 0;
+    }
+
+    /* Stats overlay */
+    .stats-overlay {
+        position: absolute;
+        top: 40px;
+        right: 10px;
+        z-index: 50;
+        background: rgba(17, 17, 27, 0.85);
+        color: #a6adc8;
+        font-family: 'Consolas', 'Courier New', monospace;
+        font-size: 12px;
+        padding: 8px 12px;
+        border-radius: 6px;
+        border: 1px solid #45475a;
+        pointer-events: none;
+        line-height: 1.6;
+        min-width: 260px;
+        backdrop-filter: blur(4px);
+    }
+
+    .stats-overlay pre {
+        margin: 0;
+        font-family: inherit;
+        font-size: inherit;
+        color: inherit;
+        white-space: pre;
     }
 </style>

@@ -38,6 +38,17 @@ public sealed class RemoteViewerService
     public event Action? OnViewerOpenRequested;
 
     /// <summary>
+    /// Raised when the viewer window requests stats relay start/stop.
+    /// Home.razor handles this since the WebRTC session lives in its JS context.
+    /// </summary>
+    public event Action<bool>? OnStatsToggleRequested;
+
+    /// <summary>
+    /// Raised when stats data is available from the host's JS context (relayed to viewer overlay).
+    /// </summary>
+    public event Action<string>? OnStatsUpdate;
+
+    /// <summary>
     /// Whether the viewer window is currently open.
     /// </summary>
     public bool IsViewerOpen => _viewerWindow != null;
@@ -130,6 +141,22 @@ public sealed class RemoteViewerService
     public void SendInputEvent(InputEventData inputEvent)
     {
         OnInputEvent?.Invoke(inputEvent);
+    }
+
+    /// <summary>
+    /// Request stats relay start/stop (routed to Home.razor's JS context).
+    /// </summary>
+    public void RequestStatsToggle(bool enable)
+    {
+        OnStatsToggleRequested?.Invoke(enable);
+    }
+
+    /// <summary>
+    /// Send stats update data from Home.razor to viewer window.
+    /// </summary>
+    public void SendStatsUpdate(string json)
+    {
+        OnStatsUpdate?.Invoke(json);
     }
 }
 

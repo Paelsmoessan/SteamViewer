@@ -19,10 +19,10 @@ public sealed class WindowsInputInjector : IInputInjector
     private readonly int _virtualScreenWidth;
     private readonly int _virtualScreenHeight;
 
-    // Debug log file for cursor diagnostics (in app folder for easy access via network share)
+    // Debug log file for cursor diagnostics (in logs/ folder alongside client/server logs)
     private static readonly string DebugLogPath = Path.Combine(
-        AppContext.BaseDirectory,
-        "SteamViewer_InputDebug.log");
+        FindLogsDirectory(),
+        $"input-{Environment.MachineName}.log");
     private static readonly object LogLock = new();
     private int _logCount;
     private const int MaxLogEntries = 100; // Limit to avoid huge log files
@@ -43,6 +43,7 @@ public sealed class WindowsInputInjector : IInputInjector
         // Initialize debug log file
         try
         {
+            Directory.CreateDirectory(Path.GetDirectoryName(DebugLogPath)!);
             File.WriteAllText(DebugLogPath,
                 $"=== SteamViewer Input Debug Log - {DateTime.Now:yyyy-MM-dd HH:mm:ss} ===\n" +
                 $"Virtual Screen: left={_virtualScreenLeft}, top={_virtualScreenTop}, " +
@@ -381,6 +382,24 @@ public sealed class WindowsInputInjector : IInputInjector
 
             _ => 0
         };
+    }
+
+    /// <summary>
+    /// Finds the logs directory by walking up from base directory looking for solution root markers.
+    /// Same algorithm as SharedFileLogger.FindLogsDirectory().
+    /// </summary>
+    private static string FindLogsDirectory()
+    {
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        while (dir != null)
+        {
+            if (dir.GetFiles("*.sln").Length > 0 || dir.GetFiles("CLAUDE.md").Length > 0)
+            {
+                return Path.Combine(dir.FullName, "logs");
+            }
+            dir = dir.Parent;
+        }
+        return Path.Combine(AppContext.BaseDirectory, "logs");
     }
 
     public void Dispose()

@@ -284,14 +284,46 @@
         SessionManager.FileTransferCompleted += OnFileTransferCompleted;
         SessionManager.FileTransferFailed += OnFileTransferFailed;
 
-        // Subscribe to viewer window input events
+        // Subscribe to viewer window events
         ViewerService.OnInputEvent += OnViewerInputEvent;
         ViewerService.OnViewerClosed += OnViewerClosed;
+        ViewerService.OnStatsToggleRequested += OnViewerStatsToggle;
     }
 
     private async void OnViewerClosed()
     {
+        // Stop stats relay when viewer closes
+        if (_statsRelayEnabled)
+        {
+            OnViewerStatsToggle(false);
+        }
         await StopFrameCaptureAsync();
+    }
+
+    private bool _statsRelayEnabled;
+
+    private async void OnViewerStatsToggle(bool enable)
+    {
+        _statsRelayEnabled = enable;
+        try
+        {
+            if (enable)
+                await JSRuntime.InvokeVoidAsync("SteamViewerWebRTC.enableStatsRelay", _sessionId);
+            else
+                await JSRuntime.InvokeVoidAsync("SteamViewerWebRTC.disableStatsRelay", _sessionId);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Failed to toggle stats relay");
+        }
+    }
+
+    private void OnWebRTCStatsUpdate(string json)
+    {
+        if (_statsRelayEnabled && ViewerService.IsViewerOpen)
+        {
+            ViewerService.SendStatsUpdate(json);
+        }
     }
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
@@ -867,6 +899,9 @@
             await InvokeAsync(StateHasChanged);
         };
 
+        // Subscribe to stats relay (for cross-window overlay)
+        _webrtc.OnStatsUpdated += OnWebRTCStatsUpdate;
+
         await _webrtc.InitializeAsync();
         _webrtcInitialized = true;
         await _webrtc.CreateDataChannelAsync("data");
@@ -1271,6 +1306,9 @@
             await SignalingClient.SendSdpOfferAsync(connectedPeerId, offerJson);
         };
 
+        // Subscribe to stats relay (for cross-window overlay)
+        _webrtc.OnStatsUpdated += OnWebRTCStatsUpdate;
+
         await _webrtc.InitializeAsync();
         _webrtcInitialized = true;
         Logger.LogInformation("WebRTC initialized as joiner, waiting for offer");
@@ -1334,6 +1372,7 @@
         SessionManager.FileTransferCompleted -= OnFileTransferCompleted;
         SessionManager.FileTransferFailed -= OnFileTransferFailed;
         ViewerService.OnViewerClosed -= OnViewerClosed;
+        ViewerService.OnStatsToggleRequested -= OnViewerStatsToggle;
 
         await StopFrameCaptureAsync();
 

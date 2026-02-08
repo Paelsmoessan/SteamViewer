@@ -78,6 +78,11 @@ public sealed class ViewerSession : IAsyncDisposable
     public event Action<string?>? OnDisconnected;
 
     /// <summary>
+    /// Raised when WebRTC stats are relayed from JS.
+    /// </summary>
+    public event Action<string>? OnStatsUpdated;
+
+    /// <summary>
     /// Raised when an ICE candidate needs to be sent via signaling.
     /// </summary>
     public event Func<string, string?, ushort?, Task>? OnIceCandidate;
@@ -124,6 +129,7 @@ public sealed class ViewerSession : IAsyncDisposable
         _webrtc.OnDataChannelMessage += HandleDataChannelMessage;
         _webrtc.OnRenegotiationNeeded += HandleRenegotiationNeeded;
         _webrtc.OnConnectionStateChange += HandleConnectionStateChange;
+        _webrtc.OnStatsUpdated += json => OnStatsUpdated?.Invoke(json);
 
         await _webrtc.InitializeAsync();
 
@@ -189,6 +195,24 @@ public sealed class ViewerSession : IAsyncDisposable
         {
             _logger.LogWarning(ex, "Failed to send input for session {SessionId}", SessionId);
         }
+    }
+
+    /// <summary>
+    /// Enable stats relay polling in JS for this session.
+    /// </summary>
+    public async Task EnableStatsRelayAsync()
+    {
+        if (_webrtc != null)
+            await _jsRuntime.InvokeVoidAsync("SteamViewerWebRTC.enableStatsRelay", SessionId);
+    }
+
+    /// <summary>
+    /// Disable stats relay polling in JS for this session.
+    /// </summary>
+    public async Task DisableStatsRelayAsync()
+    {
+        if (_webrtc != null)
+            await _jsRuntime.InvokeVoidAsync("SteamViewerWebRTC.disableStatsRelay", SessionId);
     }
 
     /// <summary>
