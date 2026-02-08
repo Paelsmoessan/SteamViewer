@@ -15,6 +15,7 @@ public sealed class ViewerTabManager
 
     private readonly ConcurrentDictionary<string, WindowState> _windows = new();
     private readonly ConcurrentDictionary<string, TabState> _tabs = new();
+    private readonly ConcurrentQueue<string> _pendingWindowIds = new();
     private int _windowCounter;
 
     /// <summary>
@@ -309,12 +310,34 @@ public sealed class ViewerTabManager
     }
 
     /// <summary>
+    /// Opens a new viewer window for a session and adds it as the first tab.
+    /// If the session already has a window, activates that window instead.
+    /// </summary>
+    public void OpenViewerForSession(string sessionId, string title)
+    {
+        // If session already has a window, just activate it
+        var existingWindow = FindWindowForSession(sessionId);
+        if (existingWindow != null)
+        {
+            SetActiveTab(existingWindow, sessionId);
+            return;
+        }
+
+        var windowId = CreateWindow();
+        AddTab(windowId, sessionId, title);
+        _pendingWindowIds.Enqueue(windowId);
+        // OnWindowRequested fires → App.xaml.cs opens the window
+        OnWindowRequested?.Invoke(windowId, 0, 0);
+    }
+
+    /// <summary>
     /// Detach a tab from a window into a new window at the specified position.
     /// </summary>
     public string DetachTab(string fromWindowId, string sessionId, int screenX, int screenY)
     {
         // Create new window
         var newWindowId = CreateWindow();
+        _pendingWindowIds.Enqueue(newWindowId);
 
         // Request the window to be created at the position
         OnWindowRequested?.Invoke(newWindowId, screenX, screenY);
@@ -350,6 +373,17 @@ public sealed class ViewerTabManager
             }
         }
         return null;
+    }
+
+    /// <summary>
+    /// Claim a pre-created window ID (from OpenViewerForSession/DetachTab) or create a new one.
+    /// Used by RemoteViewer.OnInitialized to avoid creating a duplicate empty window.
+    /// </summary>
+    public string ClaimOrCreateWindow()
+    {
+        if (_pendingWindowIds.TryDequeue(out var windowId))
+            return windowId;
+        return CreateWindow();
     }
 
     private void HandleSessionCreated(ViewerSession session)

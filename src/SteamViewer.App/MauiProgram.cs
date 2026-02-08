@@ -83,9 +83,6 @@ public static class MauiProgram
         // Register CanvasRenderingService (scoped for Blazor component lifetime)
         builder.Services.AddScoped<CanvasRenderingService>();
 
-        // Register RemoteViewerService for multi-window support
-        builder.Services.AddSingleton<RemoteViewerService>();
-
         // Register CollaborationViewerService for multi-user viewer window
         builder.Services.AddSingleton<CollaborationViewerService>();
 

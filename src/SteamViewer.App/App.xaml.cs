@@ -5,10 +5,8 @@ namespace SteamViewer.App;
 
 public partial class App : Application
 {
-    private RemoteViewerService? _viewerService;
     private CollaborationViewerService? _collabViewerService;
     private ViewerTabManager? _tabManager;
-    private Window? _viewerWindow;
     private Window? _collabViewerWindow;
     private readonly ConcurrentDictionary<string, Window> _viewerWindows = new();
     private bool _initialized;
@@ -39,13 +37,6 @@ public partial class App : Application
 
     private void InitializeViewerServices()
     {
-        // Remote viewer service (1:1 mode - legacy)
-        _viewerService = MauiProgram.ServiceProvider?.GetService<RemoteViewerService>();
-        if (_viewerService != null)
-        {
-            _viewerService.OnViewerOpenRequested += OpenViewerWindow;
-        }
-
         // Collaboration viewer service (multi-user mode)
         _collabViewerService = MauiProgram.ServiceProvider?.GetService<CollaborationViewerService>();
         if (_collabViewerService != null)
@@ -63,40 +54,7 @@ public partial class App : Application
     }
 
     /// <summary>
-    /// Opens the legacy viewer window (for 1:1 connections).
-    /// </summary>
-    private void OpenViewerWindow()
-    {
-        if (_viewerWindow != null)
-        {
-            // Window already open
-            return;
-        }
-
-        MainThread.BeginInvokeOnMainThread(() =>
-        {
-            _viewerWindow = new Window(new ViewerPage())
-            {
-                Title = $"Remote Viewer - {_viewerService?.PeerId ?? "Unknown"}",
-                Width = 1280,
-                Height = 800
-            };
-
-            _viewerWindow.Destroying += OnViewerWindowDestroying;
-            _viewerService?.RegisterViewerWindow(_viewerWindow);
-
-            Application.Current?.OpenWindow(_viewerWindow);
-        });
-    }
-
-    private void OnViewerWindowDestroying(object? sender, EventArgs e)
-    {
-        _viewerWindow = null;
-        _viewerService?.NotifyViewerClosed();
-    }
-
-    /// <summary>
-    /// Opens a new viewer window at a specific screen position (for tab detach).
+    /// Opens a new viewer window at a specific screen position (for new session or tab detach).
     /// </summary>
     private void OpenViewerWindowAtPosition(string windowId, int screenX, int screenY)
     {
