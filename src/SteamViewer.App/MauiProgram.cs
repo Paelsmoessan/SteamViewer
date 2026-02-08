@@ -2,7 +2,6 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using SteamViewer.Client.Core.Capture;
 using SteamViewer.Client.Core.Network;
-using SteamViewer.Client.Core.Session;
 using SteamViewer.App.Services;
 
 namespace SteamViewer.App;
@@ -65,19 +64,6 @@ public static class MauiProgram
         {
             var logger = sp.GetRequiredService<ILogger<SignalingClient>>();
             return new SignalingClient(serverUrl, logger);
-        });
-
-        // Register SessionManager
-        builder.Services.AddSingleton(sp =>
-        {
-            var config = new SessionConfig
-            {
-                SignalingServerUrl = serverUrl,
-                TargetFps = 30,
-                VideoBitrate = 4_000_000
-            };
-            var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
-            return new SessionManager(config, loggerFactory);
         });
 
         // Register CanvasRenderingService (scoped for Blazor component lifetime)
