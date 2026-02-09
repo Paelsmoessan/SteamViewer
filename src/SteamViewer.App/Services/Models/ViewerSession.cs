@@ -196,6 +196,15 @@ public sealed class ViewerSession : IAsyncDisposable
     }
 
     /// <summary>
+    /// Send a raw string message to the remote peer via WebRTC data channel.
+    /// </summary>
+    public async Task<bool> SendDataAsync(string data)
+    {
+        if (_webrtc == null || !_webrtc.IsDataChannelOpen) return false;
+        return await _webrtc.SendDataAsync(data);
+    }
+
+    /// <summary>
     /// Send an input event to the remote peer.
     /// </summary>
     public async Task SendInputAsync(InputEvent inputEvent)
@@ -353,9 +362,20 @@ public sealed class ViewerSession : IAsyncDisposable
 
                     case "ctrlAltDelError":
                     case "rebootError":
+                    case "elevationDenied":
                         var message = root.TryGetProperty("message", out var msgProp) ? msgProp.GetString() : null;
                         _logger.LogWarning("Session {SessionId}: {Type}: {Message}", SessionId, type, message);
                         OnControlMessage?.Invoke(type, message);
+                        break;
+
+                    case "elevationAlready":
+                        _logger.LogInformation("Session {SessionId}: Host is already elevated", SessionId);
+                        OnControlMessage?.Invoke(type, null);
+                        break;
+
+                    case "elevationRestarting":
+                        _logger.LogInformation("Session {SessionId}: Host is restarting for elevation", SessionId);
+                        OnControlMessage?.Invoke(type, null);
                         break;
 
                     case "clipboard_data":

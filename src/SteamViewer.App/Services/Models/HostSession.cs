@@ -1,10 +1,12 @@
+using System.Diagnostics;
+using System.Security.Principal;
+using System.Text.Json;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.JSInterop;
 using SteamViewer.Client.Core.Capture;
 using SteamViewer.Client.Core.Network;
 using SteamViewer.Common.Protocol;
-using System.Text.Json;
 
 namespace SteamViewer.App.Services.Models;
 
@@ -297,7 +299,22 @@ public sealed class HostSession : IAsyncDisposable
         _logger.LogInformation("Host: Data channel opened - ready for communication");
         SetState(HostSessionState.Connected);
         OnReady?.Invoke();
-        await Task.CompletedTask;
+
+        // Send elevation status to viewer
+        try
+        {
+            var elevated = IsCurrentProcessElevated();
+            await _webrtc!.SendDataAsync(JsonSerializer.Serialize(new
+            {
+                type = "hostStatus",
+                elevated
+            }));
+            _logger.LogInformation("Sent elevation status to viewer: elevated={Elevated}", elevated);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to send elevation status");
+        }
     }
 
     private async Task HandleDataChannelClose()
@@ -347,6 +364,10 @@ public sealed class HostSession : IAsyncDisposable
                                 message = "Host needs to run as administrator"
                             }));
                         }
+                        return;
+
+                    case "requestElevation":
+                        await HandleRequestElevationAsync();
                         return;
 
                     case "clipboard_request":
@@ -462,6 +483,86 @@ public sealed class HostSession : IAsyncDisposable
         {
             _logger.LogWarning(ex, "Failed to set clipboard from viewer");
         }
+    }
+
+    #endregion
+
+    #region Elevation
+
+    private async Task HandleRequestElevationAsync()
+    {
+        if (_webrtc == null) return;
+
+        if (IsCurrentProcessElevated())
+        {
+            _logger.LogInformation("Already elevated, notifying viewer");
+            await _webrtc.SendDataAsync(JsonSerializer.Serialize(new
+            {
+                type = "elevationAlready"
+            }));
+            return;
+        }
+
+        _logger.LogInformation("Attempting to restart as admin...");
+        try
+        {
+            var exePath = Process.GetCurrentProcess().MainModule?.FileName;
+            if (exePath == null)
+            {
+                _logger.LogError("Could not determine current process path");
+                await _webrtc.SendDataAsync(JsonSerializer.Serialize(new
+                {
+                    type = "elevationDenied",
+                    message = "Could not determine app path"
+                }));
+                return;
+            }
+
+            var psi = new ProcessStartInfo
+            {
+                FileName = exePath,
+                UseShellExecute = true,
+                Verb = "runas"
+            };
+
+            Process.Start(psi);
+            _logger.LogInformation("Elevated instance started, shutting down current instance");
+
+            // Notify viewer that elevation is in progress (they'll need to reconnect)
+            await _webrtc.SendDataAsync(JsonSerializer.Serialize(new
+            {
+                type = "elevationRestarting"
+            }));
+
+            // Give the message time to send before exiting
+            await Task.Delay(500);
+            Environment.Exit(0);
+        }
+        catch (System.ComponentModel.Win32Exception ex) when (ex.NativeErrorCode == 1223) // ERROR_CANCELLED (UAC denied)
+        {
+            _logger.LogWarning("UAC prompt denied by user");
+            await _webrtc.SendDataAsync(JsonSerializer.Serialize(new
+            {
+                type = "elevationDenied",
+                message = "UAC prompt was denied on host"
+            }));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to restart as admin");
+            await _webrtc.SendDataAsync(JsonSerializer.Serialize(new
+            {
+                type = "elevationDenied",
+                message = ex.Message
+            }));
+        }
+    }
+
+    private static bool IsCurrentProcessElevated()
+    {
+        using var identity = WindowsIdentity.GetCurrent();
+        var principal = new WindowsPrincipal(identity);
+        return principal.IsInRole(WindowsBuiltInRole.Administrator);
     }
 
     #endregion

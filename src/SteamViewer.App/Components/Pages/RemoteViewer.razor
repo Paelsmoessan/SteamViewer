@@ -53,11 +53,27 @@
                         <div class="menu-divider"></div>
                         <div class="menu-section">
                             <span class="menu-section-title">System</span>
-                            <button class="menu-item disabled" title="Requires direct access to host">
+                            <button class="menu-item @(_hostElevated != true ? "disabled" : "")"
+                                    @onclick="SendCtrlAltDel"
+                                    title="@(_hostElevated != true ? "Host needs admin privileges" : "Send Ctrl+Alt+Del to host")">
                                 <span class="menu-icon">🛡️</span>
                                 <span>Ctrl+Alt+Del</span>
-                                <span class="menu-note">N/A</span>
+                                @if (_hostElevated != true)
+                                {
+                                    <span class="menu-note">Needs admin</span>
+                                }
                             </button>
+                            <button class="menu-item" @onclick="SendRebootHost" title="Reboot the remote host">
+                                <span class="menu-icon">🔄</span>
+                                <span>Reboot Host</span>
+                            </button>
+                            @if (_hostElevated == false)
+                            {
+                                <button class="menu-item" @onclick="RequestElevation" title="Request host to restart as admin (requires someone at host)">
+                                    <span class="menu-icon">⬆️</span>
+                                    <span>Request Elevation</span>
+                                </button>
+                            }
                         </div>
                         <div class="menu-divider"></div>
                         <div class="menu-section">
@@ -433,7 +449,7 @@
             switch (type)
             {
                 case "hostStatus":
-                    _hostElevated = bool.TryParse(message, out var e) && e;
+                    _hostElevated = _activeSession?.IsHostElevated;
                     StateHasChanged();
                     break;
                 case "ctrlAltDelError":
@@ -441,6 +457,17 @@
                     break;
                 case "rebootError":
                     ShowToast(message ?? "Host needs to run as administrator to reboot");
+                    break;
+                case "elevationDenied":
+                    ShowToast(message ?? "Elevation denied on host");
+                    break;
+                case "elevationAlready":
+                    _hostElevated = true;
+                    ShowToast("Host is already running as admin");
+                    StateHasChanged();
+                    break;
+                case "elevationRestarting":
+                    ShowToast("Host is restarting as admin — reconnecting...");
                     break;
             }
         });
@@ -647,6 +674,62 @@
             await Task.Delay(50);
             await InvokeAsync(() => SendInputToActiveSession(new InputEvent.KeyUp(key, modifiers)));
         });
+    }
+
+    #endregion
+
+    #region System Actions
+
+    private async Task SendCtrlAltDel()
+    {
+        CloseMenus();
+        if (_activeSession == null || _hostElevated != true) return;
+
+        try
+        {
+            var json = System.Text.Json.JsonSerializer.Serialize(new { type = "ctrlAltDel" });
+            await _activeSession.SendDataAsync(json);
+        }
+        catch (Exception ex)
+        {
+            ShowToast("Failed to send Ctrl+Alt+Del");
+            Console.WriteLine($"SendCtrlAltDel error: {ex.Message}");
+        }
+    }
+
+    private async Task SendRebootHost()
+    {
+        CloseMenus();
+        if (_activeSession == null) return;
+
+        try
+        {
+            var json = System.Text.Json.JsonSerializer.Serialize(new { type = "rebootHost" });
+            await _activeSession.SendDataAsync(json);
+        }
+        catch (Exception ex)
+        {
+            ShowToast("Failed to send reboot request");
+            Console.WriteLine($"SendRebootHost error: {ex.Message}");
+        }
+    }
+
+    private async Task RequestElevation()
+    {
+        CloseMenus();
+        if (_activeSession == null) return;
+
+        try
+        {
+            var json = System.Text.Json.JsonSerializer.Serialize(new { type = "requestElevation" });
+            await _activeSession.SendDataAsync(json);
+            ShowToast("Elevation requested — waiting for approval on host...");
+        }
+        catch (Exception ex)
+        {
+            ShowToast("Failed to request elevation");
+            Console.WriteLine($"RequestElevation error: {ex.Message}");
+        }
     }
 
     #endregion

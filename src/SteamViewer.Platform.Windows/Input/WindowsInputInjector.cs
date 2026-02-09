@@ -1,5 +1,8 @@
+using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Security.Principal;
 using Microsoft.Extensions.Logging;
+using Microsoft.Win32;
 using SteamViewer.Client.Core.Capture;
 using SteamViewer.Common.Protocol;
 
@@ -58,6 +61,120 @@ public sealed class WindowsInputInjector : IInputInjector
     }
 
     public bool IsAvailable => !_disposed;
+
+    /// <summary>Whether the current process is running elevated (admin).</summary>
+    public static bool IsElevated
+    {
+        get
+        {
+            using var identity = WindowsIdentity.GetCurrent();
+            var principal = new WindowsPrincipal(identity);
+            return principal.IsInRole(WindowsBuiltInRole.Administrator);
+        }
+    }
+
+    public bool SendSecureAttentionSequence()
+    {
+        var helperPath = Path.Combine(AppContext.BaseDirectory, "SteamViewer.SasHelper.exe");
+        if (!File.Exists(helperPath))
+        {
+            _logger.LogWarning("SAS helper not found at {Path}", helperPath);
+            return false;
+        }
+
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = helperPath,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+
+            using var process = Process.Start(psi);
+            if (process == null)
+            {
+                _logger.LogWarning("Failed to start SAS helper");
+                return false;
+            }
+
+            process.WaitForExit(5000);
+            var success = process.ExitCode == 0;
+            _logger.LogInformation("SAS helper exited with code {Code}", process.ExitCode);
+            return success;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to launch SAS helper");
+            return false;
+        }
+    }
+
+    public bool RebootWithAutoRestart()
+    {
+        try
+        {
+            // If elevated, register auto-restart via registry
+            if (IsElevated)
+            {
+                var sasHelperPath = Path.Combine(AppContext.BaseDirectory, "SteamViewer.SasHelper.exe");
+                var appPath = Process.GetCurrentProcess().MainModule?.FileName;
+
+                // RunOnceEx — SAS helper runs pre-login to show Ctrl+Alt+Del screen
+                if (File.Exists(sasHelperPath))
+                {
+                    try
+                    {
+                        using var runOnceExKey = Registry.LocalMachine.CreateSubKey(
+                            @"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnceEx\SteamViewer");
+                        runOnceExKey?.SetValue("", sasHelperPath);
+                        _logger.LogInformation("Registered SAS helper in RunOnceEx");
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to write RunOnceEx key (SAS helper won't run pre-login)");
+                    }
+                }
+
+                // RunOnce — main app restarts after login
+                if (!string.IsNullOrEmpty(appPath))
+                {
+                    try
+                    {
+                        using var runOnceKey = Registry.LocalMachine.OpenSubKey(
+                            @"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce", writable: true);
+                        runOnceKey?.SetValue("SteamViewerRestart", appPath);
+                        _logger.LogInformation("Registered app in RunOnce for auto-restart");
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to write RunOnce key (app won't auto-restart)");
+                    }
+                }
+            }
+            else
+            {
+                _logger.LogInformation("Not elevated — rebooting without auto-restart");
+            }
+
+            // Reboot (works for standard users)
+            _logger.LogInformation("Initiating system reboot");
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = "shutdown",
+                Arguments = "/r /t 0",
+                UseShellExecute = false,
+                CreateNoWindow = true
+            });
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to initiate reboot");
+            return false;
+        }
+    }
 
     public void InjectInput(InputEvent inputEvent, int screenWidth, int screenHeight)
     {

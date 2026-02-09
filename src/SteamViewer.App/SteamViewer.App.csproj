@@ -67,4 +67,13 @@
     <ProjectReference Include="..\SteamViewer.Platform.macOS\SteamViewer.Platform.macOS.csproj" />
   </ItemGroup>
 
+  <!-- Build and copy SAS helper to output (Windows only) -->
+  <Target Name="CopySasHelper" AfterTargets="Build" Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows'">
+    <MSBuild Projects="..\..\tools\sas-helper\SteamViewer.SasHelper.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration);TargetFramework=net8.0-windows" />
+    <ItemGroup>
+      <SasHelperFiles Include="..\..\tools\sas-helper\bin\$(Configuration)\net8.0-windows\SteamViewer.SasHelper.*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(SasHelperFiles)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
+  </Target>
+
 </Project>
