@@ -127,7 +127,7 @@
             </div>
         </div>
         <div class="toolbar-icons">
-            <button class="icon-btn @(_inputLocked ? "locked" : "")" @onclick="ToggleInputLock" title="@(_inputLocked ? "Unlock (Esc)" : "Lock input")">
+            <button class="icon-btn @(_inputLocked ? "locked" : "")" @onclick="ToggleInputLock" title="@(_inputLocked ? "Unlock input" : "Lock input")">
                 @(_inputLocked ? "🔒" : "🔓")
             </button>
             <button class="icon-btn @(_statsVisible ? "active-toggle" : "")" @onclick="ToggleStatsOverlay" title="Toggle stats overlay">📊</button>

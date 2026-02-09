@@ -1469,11 +1469,6 @@ window.SteamViewerInput = {
         this._boundWheel = (e) => this.handleWheel(e);
         this._boundKeyDown = (e) => this.handleKeyDown(e);
         this._boundKeyUp = (e) => this.handleKeyUp(e);
-        this._boundDblClick = (e) => {
-            e.preventDefault();
-            this.toggleLock();
-        };
-
         // Mouse events
         this.canvas.addEventListener('mousemove', this._boundMouseMove);
         this.canvas.addEventListener('mousedown', this._boundMouseDown);
@@ -1487,12 +1482,9 @@ window.SteamViewerInput = {
         this.canvas.addEventListener('keydown', this._boundKeyDown);
         this.canvas.addEventListener('keyup', this._boundKeyUp);
 
-        // Double-click to lock/capture
-        this.canvas.addEventListener('dblclick', this._boundDblClick);
-
         this.isCapturing = true;
         this.isLocked = false;
-        console.log('Input capture initialized (double-click to lock, Escape to release)');
+        console.log('Input capture initialized (use toolbar button to lock/unlock)');
         return true;
     },
 
@@ -1524,25 +1516,13 @@ window.SteamViewerInput = {
     updateLockIndicator() {
         if (!this.lockIndicator || !this.showLockIndicator) return;
         if (this.isLocked) {
-            this.lockIndicator.textContent = '🔒 Input Locked (Esc to release)';
+            this.lockIndicator.textContent = '🔒 Input Locked';
             this.lockIndicator.style.background = '#a6e3a1';
             this.lockIndicator.style.color = '#1e1e2e';
         } else {
-            this.lockIndicator.textContent = '🔓 Double-click to capture';
+            this.lockIndicator.textContent = '🔓 Input Unlocked';
             this.lockIndicator.style.background = '#45475a';
             this.lockIndicator.style.color = '#cdd6f4';
-        }
-    },
-
-    toggleLock() {
-        this.isLocked = !this.isLocked;
-        this.updateLockIndicator();
-        this.notifyLockChange();
-        if (this.isLocked) {
-            this.canvas.focus();
-            console.log('Input LOCKED - sending inputs to host');
-        } else {
-            console.log('Input UNLOCKED - inputs disabled');
         }
     },
 
@@ -1667,14 +1647,6 @@ window.SteamViewerInput = {
 
     async handleKeyDown(e) {
         if (!this.isCapturing) return;
-
-        // Escape always releases the lock, even when locked
-        if (e.key === 'Escape') {
-            e.preventDefault();
-            this.unlock();
-            return;
-        }
-
         if (!this.isLocked) return;
         e.preventDefault();
         await this.dotNetRef.invokeMethodAsync('OnKeyDown', e.key, this.getModifiers(e));
@@ -1682,8 +1654,6 @@ window.SteamViewerInput = {
 
     async handleKeyUp(e) {
         if (!this.isCapturing || !this.isLocked) return;
-        // Don't send Escape keyup to host
-        if (e.key === 'Escape') return;
         e.preventDefault();
         await this.dotNetRef.invokeMethodAsync('OnKeyUp', e.key, this.getModifiers(e));
     },
@@ -1706,7 +1676,6 @@ window.SteamViewerInput = {
             this.canvas.removeEventListener('wheel', this._boundWheel);
             this.canvas.removeEventListener('keydown', this._boundKeyDown);
             this.canvas.removeEventListener('keyup', this._boundKeyUp);
-            this.canvas.removeEventListener('dblclick', this._boundDblClick);
         }
 
         this.canvas = null;
