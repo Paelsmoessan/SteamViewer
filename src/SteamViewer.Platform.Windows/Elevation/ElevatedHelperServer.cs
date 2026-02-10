@@ -21,71 +21,111 @@ public static class ElevatedHelperServer
     [DllImport("sas.dll", SetLastError = true)]
     private static extern void SendSAS(bool asUser);
 
+    private static string? _debugPath;
+
+    private static void DebugLog(string message)
+    {
+        var line = $"[{DateTime.Now:HH:mm:ss.fff}] {message}";
+        Console.WriteLine($"[ElevatedHelper] {message}");
+        try { if (_debugPath != null) File.AppendAllText(_debugPath, line + "\n"); } catch { }
+    }
+
     /// <summary>
     /// Run the elevated helper pipe server. Blocks until the client disconnects or sends "exit".
     /// </summary>
     public static void Run(string pipeName)
     {
-        Console.WriteLine($"[ElevatedHelper] Starting pipe server: {pipeName}");
+        _debugPath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "SteamViewer", "helper-debug.txt");
+        try { Directory.CreateDirectory(Path.GetDirectoryName(_debugPath)!); } catch { }
 
-        // Allow non-elevated (authenticated) users to connect to this elevated pipe
-        var pipeSecurity = new PipeSecurity();
-        pipeSecurity.AddAccessRule(new PipeAccessRule(
-            new SecurityIdentifier(WellKnownSidType.AuthenticatedUserSid, null),
-            PipeAccessRights.ReadWrite,
-            AccessControlType.Allow));
+        DebugLog($"Starting pipe server: {pipeName} (PID {Environment.ProcessId})");
 
-        using var pipeServer = NamedPipeServerStreamAcl.Create(
-            pipeName,
-            PipeDirection.InOut,
-            1,
-            PipeTransmissionMode.Byte,
-            PipeOptions.Asynchronous,
-            0, 0,
-            pipeSecurity);
-
-        Console.WriteLine("[ElevatedHelper] Waiting for client connection...");
-
-        // Wait for client with 30s timeout
-        var connectTask = pipeServer.WaitForConnectionAsync();
-        if (!connectTask.Wait(TimeSpan.FromSeconds(30)))
+        try
         {
-            Console.WriteLine("[ElevatedHelper] Timeout waiting for client. Exiting.");
-            return;
+            // Allow non-elevated (authenticated) users to connect to this elevated pipe
+            var pipeSecurity = new PipeSecurity();
+            pipeSecurity.AddAccessRule(new PipeAccessRule(
+                new SecurityIdentifier(WellKnownSidType.AuthenticatedUserSid, null),
+                PipeAccessRights.ReadWrite,
+                AccessControlType.Allow));
+
+            using var pipeServer = NamedPipeServerStreamAcl.Create(
+                pipeName,
+                PipeDirection.InOut,
+                1,
+                PipeTransmissionMode.Byte,
+                PipeOptions.Asynchronous,
+                0, 0,
+                pipeSecurity);
+
+            DebugLog("Pipe created. Waiting for client connection...");
+
+            // Wait for client with 30s timeout
+            var connectTask = pipeServer.WaitForConnectionAsync();
+            if (!connectTask.Wait(TimeSpan.FromSeconds(30)))
+            {
+                DebugLog("Timeout waiting for client. Exiting.");
+                return;
+            }
+
+            DebugLog("Client connected. Processing commands...");
+
+            using var reader = new StreamReader(pipeServer, Encoding.UTF8);
+            using var writer = new StreamWriter(pipeServer, Encoding.UTF8) { AutoFlush = true };
+
+            while (pipeServer.IsConnected)
+            {
+                string? line;
+                try
+                {
+                    line = reader.ReadLine();
+                }
+                catch (IOException ex)
+                {
+                    DebugLog($"Pipe read error (client disconnected?): {ex.Message}");
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    DebugLog($"Unexpected read error: {ex}");
+                    break;
+                }
+
+                if (line == null)
+                {
+                    DebugLog("Client closed connection (null read).");
+                    break;
+                }
+
+                DebugLog($"Received: {line}");
+
+                try
+                {
+                    var response = HandleCommand(line);
+                    DebugLog($"Sending: {response}");
+                    writer.WriteLine(response);
+                }
+                catch (IOException ex)
+                {
+                    DebugLog($"Pipe write error (broken pipe): {ex.Message}");
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    DebugLog($"Command error: {ex.Message}");
+                    var errorResponse = JsonSerializer.Serialize(new HelperResponse(false, ex.Message));
+                    try { writer.WriteLine(errorResponse); } catch { break; }
+                }
+            }
+
+            DebugLog("Client disconnected. Exiting normally.");
         }
-
-        Console.WriteLine("[ElevatedHelper] Client connected. Processing commands...");
-
-        using var reader = new StreamReader(pipeServer, Encoding.UTF8);
-        using var writer = new StreamWriter(pipeServer, Encoding.UTF8) { AutoFlush = true };
-
-        while (pipeServer.IsConnected)
+        catch (Exception ex)
         {
-            string? line;
-            try
-            {
-                line = reader.ReadLine();
-            }
-            catch
-            {
-                break; // Pipe disconnected
-            }
-
-            if (line == null) break; // Client closed
-
-            try
-            {
-                var response = HandleCommand(line);
-                writer.WriteLine(response);
-            }
-            catch (Exception ex)
-            {
-                var errorResponse = JsonSerializer.Serialize(new HelperResponse(false, ex.Message));
-                try { writer.WriteLine(errorResponse); } catch { break; }
-            }
+            DebugLog($"FATAL: {ex}");
         }
-
-        Console.WriteLine("[ElevatedHelper] Client disconnected. Exiting.");
     }
 
     private static string HandleCommand(string json)
