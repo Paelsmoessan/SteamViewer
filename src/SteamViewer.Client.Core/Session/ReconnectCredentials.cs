@@ -40,6 +40,8 @@ public static class ReconnectCredentials
             EncryptedHash = Convert.ToBase64String(encrypted)
         };
 
+        data.SavedAtUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
         var dir = Path.GetDirectoryName(FilePath)!;
         Directory.CreateDirectory(dir);
         File.WriteAllText(FilePath, JsonSerializer.Serialize(data));
@@ -64,6 +66,14 @@ public static class ReconnectCredentials
                 string.IsNullOrEmpty(data.IV) ||
                 string.IsNullOrEmpty(data.EncryptedHash))
                 return null;
+
+            // Reject stale reconnect data (older than 5 minutes)
+            if (data.SavedAtUnixMs > 0)
+            {
+                var savedAt = DateTimeOffset.FromUnixTimeMilliseconds(data.SavedAtUnixMs);
+                if (DateTimeOffset.UtcNow - savedAt > TimeSpan.FromMinutes(5))
+                    return null;
+            }
 
             var key = DeriveKey(data.ViewerPeerId, data.ClientId);
             var iv = Convert.FromBase64String(data.IV);
@@ -100,6 +110,7 @@ public static class ReconnectCredentials
         public string ViewerPeerId { get; set; } = "";
         public string IV { get; set; } = "";
         public string EncryptedHash { get; set; } = "";
+        public long SavedAtUnixMs { get; set; }
     }
 
     public sealed record ReconnectResult(string ClientId, string PasswordHash, string ViewerPeerId);

@@ -182,6 +182,7 @@
     private string incomingPeerId = "";
     private string connectedPeerId = "";
     private bool _isReconnect;
+    private ReconnectCredentials.ReconnectResult? _pendingReconnect;
 
     // Join mode state
 #if DEBUG
@@ -281,12 +282,17 @@
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
-        // Auto-start hosting if reconnect data exists (from reboot or elevation restart)
-        if (firstRender && ReconnectCredentials.Exists())
+        // Auto-start hosting if valid reconnect data exists (from reboot or elevation restart)
+        if (firstRender)
         {
-            currentMode = AppMode.StartConnection;
-            StateHasChanged();
-            _ = StartSessionWithRetryAsync();
+            _pendingReconnect = ReconnectCredentials.Load();
+            if (_pendingReconnect != null)
+            {
+                Logger.LogInformation("Found valid reconnect data for ID: {Id}", _pendingReconnect.ClientId);
+                currentMode = AppMode.StartConnection;
+                StateHasChanged();
+                _ = StartSessionWithRetryAsync();
+            }
         }
 
         // Initialize JS logger on first render
@@ -486,14 +492,14 @@
 
             await SignalingClient.ConnectAsync();
 
-            // Check for post-reboot reconnect data (saved credentials from previous session)
-            var reconnect = ReconnectCredentials.Load();
-            if (reconnect != null)
+            // Check for pre-loaded reconnect data (from reboot or elevation restart)
+            if (_pendingReconnect != null)
             {
-                clientId = reconnect.ClientId;
-                passwordHash = reconnect.PasswordHash;
+                clientId = _pendingReconnect.ClientId;
+                passwordHash = _pendingReconnect.PasswordHash;
                 password = "(reconnecting)"; // Plain password not available — hash is sufficient for registration
                 _isReconnect = true;
+                _pendingReconnect = null; // Consume — one-time use
                 Logger.LogInformation("Reconnecting with saved credentials - ID: {Id}", clientId);
             }
             else
