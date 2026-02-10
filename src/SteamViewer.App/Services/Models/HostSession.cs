@@ -118,6 +118,13 @@ public sealed class HostSession : IAsyncDisposable
         _sendSignaling = sendSignaling;
         _hostClientId = hostClientId;
         _hostPasswordHash = hostPasswordHash;
+
+        // Subscribe to Secure Desktop events (Phase 2) to forward to viewer
+        if (_elevationService != null)
+        {
+            _elevationService.OnSecureDesktopFrame += HandleSecureDesktopFrame;
+            _elevationService.OnSecureDesktopStateChanged += HandleSecureDesktopStateChanged;
+        }
     }
 
     /// <summary>
@@ -492,6 +499,50 @@ public sealed class HostSession : IAsyncDisposable
             }
         }
         catch { }
+    }
+
+    #endregion
+
+    #region Secure Desktop (Phase 2)
+
+    private void HandleSecureDesktopFrame(byte[] jpegData, int width, int height)
+    {
+        if (_webrtc == null || !IsDataChannelReady) return;
+
+        try
+        {
+            var base64 = Convert.ToBase64String(jpegData);
+            _ = _webrtc.SendDataAsync(JsonSerializer.Serialize(new
+            {
+                type = "secureDesktopFrame",
+                data = base64,
+                width,
+                height
+            }));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to send secure desktop frame");
+        }
+    }
+
+    private void HandleSecureDesktopStateChanged(bool active)
+    {
+        if (_webrtc == null || !IsDataChannelReady) return;
+
+        try
+        {
+            var message = active
+                ? JsonSerializer.Serialize(new { type = "secureDesktopActive" })
+                : JsonSerializer.Serialize(new { type = "secureDesktopInactive" });
+
+            _ = _webrtc.SendDataAsync(message);
+            _logger.LogInformation("Sent {Type} to viewer", active ? "secureDesktopActive" : "secureDesktopInactive");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to send secure desktop state change");
+        }
     }
 
     #endregion
@@ -969,6 +1020,8 @@ public sealed class HostSession : IAsyncDisposable
 
         if (_elevationService != null)
         {
+            _elevationService.OnSecureDesktopFrame -= HandleSecureDesktopFrame;
+            _elevationService.OnSecureDesktopStateChanged -= HandleSecureDesktopStateChanged;
             await _elevationService.DisposeAsync();
         }
 

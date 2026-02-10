@@ -1814,3 +1814,59 @@ window.SteamViewerVideoDecoder = {
         }
     }
 };
+
+// Secure Desktop overlay for UAC prompt capture (Phase 2)
+window.SteamViewerSecureDesktop = {
+    canvas: null,
+    ctx: null,
+    img: null,
+
+    show(canvasId) {
+        this.canvas = document.getElementById(canvasId);
+        if (!this.canvas) {
+            console.error(`Secure Desktop canvas '${canvasId}' not found`);
+            return;
+        }
+        this.ctx = this.canvas.getContext('2d');
+        this.canvas.style.display = 'block';
+        console.log('Secure Desktop overlay shown');
+    },
+
+    hide(canvasId) {
+        const canvas = document.getElementById(canvasId);
+        if (canvas) {
+            canvas.style.display = 'none';
+        }
+        this.canvas = null;
+        this.ctx = null;
+        this.img = null;
+        console.log('Secure Desktop overlay hidden');
+    },
+
+    renderFrame(canvasId, base64Jpeg, width, height) {
+        // Lazy-init canvas if show() wasn't called yet or canvas changed
+        if (!this.canvas || this.canvas.id !== canvasId) {
+            this.canvas = document.getElementById(canvasId);
+            if (!this.canvas) return;
+            this.ctx = this.canvas.getContext('2d');
+        }
+
+        // Update canvas size to match capture resolution
+        if (this.canvas.width !== width || this.canvas.height !== height) {
+            this.canvas.width = width;
+            this.canvas.height = height;
+        }
+
+        // Decode and draw JPEG frame
+        if (!this.img) {
+            this.img = new Image();
+            this.img.onload = () => {
+                if (this.ctx && this.canvas) {
+                    this.ctx.drawImage(this.img, 0, 0, this.canvas.width, this.canvas.height);
+                }
+            };
+        }
+
+        this.img.src = 'data:image/jpeg;base64,' + base64Jpeg;
+    }
+};

@@ -169,6 +169,11 @@
         </div>
         <div class="canvas-container" id="canvasContainer">
             <canvas id="viewerCanvas"></canvas>
+            <canvas id="secureDesktopOverlay" class="secure-desktop-overlay" style="display: @(_secureDesktopActive ? "block" : "none")"></canvas>
+            @if (_secureDesktopActive)
+            {
+                <div class="secure-desktop-banner">Secure Desktop (UAC)</div>
+            }
             @if (_tabs.Count == 0)
             {
                 <div class="no-tabs-message">
@@ -250,6 +255,7 @@
     private bool? _hostElevated;
     private bool? _hostSystemLevel;
     private bool _hasReceivedFrame;
+    private bool _secureDesktopActive;
 
     protected override void OnInitialized()
     {
@@ -384,6 +390,8 @@
             _activeSession.OnStatsUpdated -= HandleStatsUpdate;
             _activeSession.OnControlMessage -= HandleControlMessage;
             _activeSession.OnClipboardReceived -= HandleClipboardReceived;
+            _activeSession.OnSecureDesktopStateChanged -= HandleSecureDesktopStateChanged;
+            _activeSession.OnSecureDesktopFrame -= HandleSecureDesktopFrame;
             if (_statsVisible) _ = _activeSession.DisableStatsRelayAsync();
             _ = JSRuntime.InvokeVoidAsync("SteamViewerWebRTC.pauseFrameCapture", oldSessionId);
         }
@@ -391,6 +399,7 @@
         _activeSessionId = sessionId;
         _hasReceivedFrame = false;
         _showReconnectOverlay = false;
+        _secureDesktopActive = false;
         _reconnectTimer?.Dispose();
         _reconnectTimer = null;
 
@@ -411,6 +420,8 @@
                 _activeSession.OnStatsUpdated += HandleStatsUpdate;
                 _activeSession.OnControlMessage += HandleControlMessage;
                 _activeSession.OnClipboardReceived += HandleClipboardReceived;
+                _activeSession.OnSecureDesktopStateChanged += HandleSecureDesktopStateChanged;
+                _activeSession.OnSecureDesktopFrame += HandleSecureDesktopFrame;
 
                 _ = JSRuntime.InvokeVoidAsync("SteamViewerWebRTC.resumeFrameCapture", sessionId);
 
@@ -842,6 +853,33 @@
 
     #endregion
 
+    #region Secure Desktop
+
+    private void HandleSecureDesktopStateChanged(bool active)
+    {
+        InvokeAsync(async () =>
+        {
+            _secureDesktopActive = active;
+            if (active)
+            {
+                await JSRuntime.InvokeVoidAsync("SteamViewerSecureDesktop.show", "secureDesktopOverlay");
+            }
+            else
+            {
+                await JSRuntime.InvokeVoidAsync("SteamViewerSecureDesktop.hide", "secureDesktopOverlay");
+            }
+            StateHasChanged();
+        });
+    }
+
+    private void HandleSecureDesktopFrame(string base64Jpeg, int width, int height)
+    {
+        if (!_secureDesktopActive) return;
+        _ = JSRuntime.InvokeVoidAsync("SteamViewerSecureDesktop.renderFrame", "secureDesktopOverlay", base64Jpeg, width, height);
+    }
+
+    #endregion
+
     private async Task ToggleFullscreen()
     {
         // Check if currently in fullscreen and toggle
@@ -1054,6 +1092,8 @@
                 _activeSession.OnStatsUpdated -= HandleStatsUpdate;
                 _activeSession.OnControlMessage -= HandleControlMessage;
                 _activeSession.OnClipboardReceived -= HandleClipboardReceived;
+                _activeSession.OnSecureDesktopStateChanged -= HandleSecureDesktopStateChanged;
+                _activeSession.OnSecureDesktopFrame -= HandleSecureDesktopFrame;
 
                 // Update references (session ID stays the same for tab tracking)
                 _activeSessionId = newSession.SessionId;
@@ -1065,6 +1105,8 @@
                 _activeSession.OnStatsUpdated += HandleStatsUpdate;
                 _activeSession.OnControlMessage += HandleControlMessage;
                 _activeSession.OnClipboardReceived += HandleClipboardReceived;
+                _activeSession.OnSecureDesktopStateChanged += HandleSecureDesktopStateChanged;
+                _activeSession.OnSecureDesktopFrame += HandleSecureDesktopFrame;
 
                 // Update JS input routing
                 await JSRuntime.InvokeVoidAsync("SteamViewerInput.setActiveSession", newSession.SessionId);
@@ -1133,6 +1175,8 @@
             _activeSession.OnStatsUpdated -= HandleStatsUpdate;
             _activeSession.OnControlMessage -= HandleControlMessage;
             _activeSession.OnClipboardReceived -= HandleClipboardReceived;
+            _activeSession.OnSecureDesktopStateChanged -= HandleSecureDesktopStateChanged;
+            _activeSession.OnSecureDesktopFrame -= HandleSecureDesktopFrame;
         }
 
         _dotNetRef?.Dispose();
@@ -1510,6 +1554,33 @@
         width: 100%;
         height: 100%;
         object-fit: contain;
+    }
+
+    /* Secure Desktop overlay */
+    .secure-desktop-overlay {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        z-index: 10;
+        object-fit: contain;
+    }
+
+    .secure-desktop-banner {
+        position: absolute;
+        top: 8px;
+        left: 50%;
+        transform: translateX(-50%);
+        z-index: 11;
+        background: rgba(220, 50, 50, 0.85);
+        color: #fff;
+        padding: 4px 16px;
+        border-radius: 4px;
+        font-size: 13px;
+        font-weight: 600;
+        letter-spacing: 0.5px;
+        pointer-events: none;
     }
 
     /* No tabs message */

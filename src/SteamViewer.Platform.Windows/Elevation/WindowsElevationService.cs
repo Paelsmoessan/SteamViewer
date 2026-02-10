@@ -7,6 +7,7 @@ namespace SteamViewer.Platform.Windows.Elevation;
 /// Windows implementation of IElevationService.
 /// Owns the lifecycle of ElevatedHelperClient (admin) and SystemHelperClient (SYSTEM).
 /// Routes input through the highest available elevation tier.
+/// Forwards Secure Desktop events from SystemHelperClient to consumers (HostSession).
 /// </summary>
 public sealed class WindowsElevationService : IElevationService
 {
@@ -18,7 +19,7 @@ public sealed class WindowsElevationService : IElevationService
 
     public bool IsAdminConnected => _adminHelper?.IsConnected ?? false;
     public bool IsSystemConnected => _systemHelper?.IsConnected ?? false;
-    public bool IsSecureDesktopActive { get; private set; }
+    public bool IsSecureDesktopActive => _systemHelper?.IsSecureDesktopActive ?? false;
 
     public event Action<byte[], int, int>? OnSecureDesktopFrame;
     public event Action<bool>? OnSecureDesktopStateChanged;
@@ -87,6 +88,11 @@ public sealed class WindowsElevationService : IElevationService
         {
             var helperLogger = _loggerFactory.CreateLogger<SystemHelperClient>();
             _systemHelper = new SystemHelperClient(helperLogger, _adminHelper!);
+
+            // Subscribe to Secure Desktop events before connecting
+            _systemHelper.OnSecureDesktopFrame += HandleSecureDesktopFrame;
+            _systemHelper.OnSecureDesktopStateChanged += HandleSecureDesktopStateChanged;
+
             var success = await _systemHelper.LaunchAndConnectAsync();
 
             if (success)
@@ -97,6 +103,7 @@ public sealed class WindowsElevationService : IElevationService
             }
 
             _logger.LogWarning("SYSTEM helper failed to connect");
+            UnsubscribeSystemHelper();
             await _systemHelper.DisposeAsync();
             _systemHelper = null;
             return false;
@@ -106,6 +113,7 @@ public sealed class WindowsElevationService : IElevationService
             _logger.LogError(ex, "Failed to launch SYSTEM helper");
             if (_systemHelper != null)
             {
+                UnsubscribeSystemHelper();
                 await _systemHelper.DisposeAsync();
                 _systemHelper = null;
             }
@@ -116,11 +124,12 @@ public sealed class WindowsElevationService : IElevationService
     public async Task<bool> InjectInputAsync(string inputJson, int screenWidth, int screenHeight)
     {
         // Route input through the highest available elevation tier:
-        // 1. If Secure Desktop active + SYSTEM connected → SYSTEM helper (future Phase 2)
-        // 2. If admin connected → admin helper (UIPI bypass)
-        // 3. Return false → caller falls back to local injection
+        // 1. If Secure Desktop active + SYSTEM connected → SYSTEM helper (only way to reach Winlogon)
+        // 2. If SYSTEM connected → SYSTEM helper (can inject on both desktops)
+        // 3. If admin connected → admin helper (UIPI bypass)
+        // 4. Return false → caller falls back to local injection
 
-        if (IsSecureDesktopActive && _systemHelper?.IsConnected == true)
+        if (_systemHelper?.IsConnected == true)
         {
             await _systemHelper.SendInputEventAsync(inputJson, screenWidth, screenHeight);
             return true;
@@ -186,6 +195,30 @@ public sealed class WindowsElevationService : IElevationService
         return await _systemHelper.RunAsSystemAsync(path, args);
     }
 
+    #region Secure Desktop event forwarding
+
+    private void HandleSecureDesktopFrame(byte[] jpegData, int width, int height)
+    {
+        OnSecureDesktopFrame?.Invoke(jpegData, width, height);
+    }
+
+    private void HandleSecureDesktopStateChanged(bool active)
+    {
+        _logger.LogInformation("Secure Desktop state changed: {Active}", active);
+        OnSecureDesktopStateChanged?.Invoke(active);
+    }
+
+    private void UnsubscribeSystemHelper()
+    {
+        if (_systemHelper != null)
+        {
+            _systemHelper.OnSecureDesktopFrame -= HandleSecureDesktopFrame;
+            _systemHelper.OnSecureDesktopStateChanged -= HandleSecureDesktopStateChanged;
+        }
+    }
+
+    #endregion
+
     public async ValueTask DisposeAsync()
     {
         if (_disposed) return;
@@ -193,6 +226,7 @@ public sealed class WindowsElevationService : IElevationService
 
         if (_systemHelper != null)
         {
+            UnsubscribeSystemHelper();
             await _systemHelper.DisposeAsync();
             _systemHelper = null;
             OnSystemStateChanged?.Invoke(false);

@@ -94,6 +94,23 @@ public sealed class ViewerSession : IAsyncDisposable
     public event Action<string, string>? OnClipboardReceived;
 
     /// <summary>
+    /// Raised when the Secure Desktop state changes on the host.
+    /// Parameter: true = active (UAC prompt visible), false = inactive.
+    /// </summary>
+    public event Action<bool>? OnSecureDesktopStateChanged;
+
+    /// <summary>
+    /// Raised when a Secure Desktop frame is received.
+    /// Parameters: (base64JpegData, width, height).
+    /// </summary>
+    public event Action<string, int, int>? OnSecureDesktopFrame;
+
+    /// <summary>
+    /// Whether the Secure Desktop is currently active on the host.
+    /// </summary>
+    public bool IsSecureDesktopActive { get; private set; }
+
+    /// <summary>
     /// Whether the host is running elevated (as admin).
     /// </summary>
     public bool? IsHostElevated { get; private set; }
@@ -403,6 +420,28 @@ public sealed class ViewerSession : IAsyncDisposable
                             _logger.LogDebug("Session {SessionId}: Received clipboard ({Format}, {Length} chars)",
                                 SessionId, cbFormat, cbData.Length);
                             OnClipboardReceived?.Invoke(cbFormat, cbData);
+                        }
+                        break;
+
+                    case "secureDesktopActive":
+                        _logger.LogInformation("Session {SessionId}: Secure Desktop ACTIVE", SessionId);
+                        IsSecureDesktopActive = true;
+                        OnSecureDesktopStateChanged?.Invoke(true);
+                        break;
+
+                    case "secureDesktopInactive":
+                        _logger.LogInformation("Session {SessionId}: Secure Desktop INACTIVE", SessionId);
+                        IsSecureDesktopActive = false;
+                        OnSecureDesktopStateChanged?.Invoke(false);
+                        break;
+
+                    case "secureDesktopFrame":
+                        var frameData = root.TryGetProperty("data", out var frameProp) ? frameProp.GetString() : null;
+                        var frameW = root.TryGetProperty("width", out var fwProp) ? fwProp.GetInt32() : 0;
+                        var frameH = root.TryGetProperty("height", out var fhProp) ? fhProp.GetInt32() : 0;
+                        if (frameData != null && frameW > 0 && frameH > 0)
+                        {
+                            OnSecureDesktopFrame?.Invoke(frameData, frameW, frameH);
                         }
                         break;
                 }

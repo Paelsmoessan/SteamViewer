@@ -25,6 +25,15 @@ public static class SystemHelperServer
     private static extern void SendSAS(bool asUser);
 
     private static string? _debugPath;
+    private static SecureDesktopCapture? _capture;
+    private static StreamWriter? _controlWriter;
+    private static readonly object _controlWriteLock = new();
+
+    // Video pipe for binary JPEG frames (server → client)
+    private static NamedPipeServerStream? _videoPipeServer;
+    private static BinaryWriter? _videoWriter;
+    private static readonly object _videoWriteLock = new();
+    private static volatile bool _videoConnected;
 
     private static void DebugLog(string message)
     {
@@ -66,7 +75,7 @@ public static class SystemHelperServer
                 0, 0,
                 pipeSecurity);
 
-            DebugLog("Pipe created (sync mode). Waiting for client connection...");
+            DebugLog("Control pipe created (sync mode). Waiting for client connection...");
 
             // Wait for client with 30s timeout
             var connected = false;
@@ -99,6 +108,7 @@ public static class SystemHelperServer
 
             using var reader = new StreamReader(pipeServer, PipeEncoding);
             using var writer = new StreamWriter(pipeServer, PipeEncoding) { AutoFlush = true };
+            _controlWriter = writer;
 
             // First message MUST be authentication with the correct nonce
             if (!Authenticate(reader, writer, expectedNonce))
@@ -107,7 +117,62 @@ public static class SystemHelperServer
                 return;
             }
 
-            DebugLog("Authentication succeeded. Processing commands...");
+            DebugLog("Authentication succeeded. Starting video pipe and Secure Desktop capture...");
+
+            // Create video pipe for binary JPEG frames (server → client, outbound only)
+            var videoPipeName = $"{pipeName}_video";
+            var videoPipeSecurity = new PipeSecurity();
+            videoPipeSecurity.AddAccessRule(new PipeAccessRule(
+                new SecurityIdentifier(WellKnownSidType.AuthenticatedUserSid, null),
+                PipeAccessRights.ReadWrite,
+                AccessControlType.Allow));
+
+            _videoPipeServer = NamedPipeServerStreamAcl.Create(
+                videoPipeName,
+                PipeDirection.Out,
+                1,
+                PipeTransmissionMode.Byte,
+                PipeOptions.None,
+                0, 0,
+                videoPipeSecurity);
+
+            DebugLog($"Video pipe created: {videoPipeName}. Waiting for client...");
+
+            // Wait for video pipe connection on a background thread (with 15s timeout)
+            var videoConnected = false;
+            var videoConnectThread = new Thread(() =>
+            {
+                try
+                {
+                    _videoPipeServer.WaitForConnection();
+                    videoConnected = true;
+                }
+                catch (Exception ex)
+                {
+                    DebugLog($"Video pipe WaitForConnection error: {ex.Message}");
+                }
+            });
+            videoConnectThread.Start();
+            if (!videoConnectThread.Join(TimeSpan.FromSeconds(15)))
+            {
+                DebugLog("Timeout waiting for video pipe client. Continuing without video.");
+            }
+            else if (videoConnected)
+            {
+                _videoWriter = new BinaryWriter(_videoPipeServer);
+                _videoConnected = true;
+                DebugLog("Video pipe client connected");
+            }
+
+            // Start Secure Desktop capture
+            _capture = new SecureDesktopCapture();
+            _capture.OnSecureDesktopActive += OnCaptureSecureDesktopActive;
+            _capture.OnSecureDesktopInactive += OnCaptureSecureDesktopInactive;
+            _capture.OnFrameCaptured += OnCaptureFrameCaptured;
+            _capture.Start();
+            DebugLog("Secure Desktop capture started");
+
+            DebugLog("Processing commands...");
 
             while (pipeServer.IsConnected)
             {
@@ -133,7 +198,8 @@ public static class SystemHelperServer
                     break;
                 }
 
-                DebugLog($"Received: {line}");
+                if (line.Length < 200) // Don't log full input events (noisy)
+                    DebugLog($"Received: {line}");
 
                 try
                 {
@@ -157,13 +223,107 @@ public static class SystemHelperServer
                 }
             }
 
-            DebugLog("Client disconnected. Exiting normally.");
+            // Cleanup
+            DebugLog("Client disconnected. Cleaning up...");
+            CleanupCapture();
+            CleanupVideoPipe();
+            _controlWriter = null;
+
+            DebugLog("Exiting normally.");
         }
         catch (Exception ex)
         {
             DebugLog($"FATAL: {ex}");
+            CleanupCapture();
+            CleanupVideoPipe();
         }
     }
+
+    private static void CleanupCapture()
+    {
+        if (_capture != null)
+        {
+            _capture.OnSecureDesktopActive -= OnCaptureSecureDesktopActive;
+            _capture.OnSecureDesktopInactive -= OnCaptureSecureDesktopInactive;
+            _capture.OnFrameCaptured -= OnCaptureFrameCaptured;
+            _capture.Dispose();
+            _capture = null;
+            DebugLog("Secure Desktop capture disposed");
+        }
+    }
+
+    private static void CleanupVideoPipe()
+    {
+        _videoConnected = false;
+        try { _videoWriter?.Dispose(); } catch { }
+        _videoWriter = null;
+        try { _videoPipeServer?.Dispose(); } catch { }
+        _videoPipeServer = null;
+    }
+
+    #region SecureDesktopCapture event handlers
+
+    private static void OnCaptureSecureDesktopActive(int width, int height)
+    {
+        DebugLog($"Secure Desktop active notification → control pipe ({width}x{height})");
+        SendNotification(new { notification = "secureDesktopActive", width, height });
+    }
+
+    private static void OnCaptureSecureDesktopInactive()
+    {
+        DebugLog("Secure Desktop inactive notification → control pipe");
+        SendNotification(new { notification = "secureDesktopInactive" });
+    }
+
+    private static void OnCaptureFrameCaptured(byte[] jpegData, int width, int height)
+    {
+        if (!_videoConnected || _videoWriter == null) return;
+
+        lock (_videoWriteLock)
+        {
+            try
+            {
+                // Binary frame protocol: [uint32 length][jpeg bytes]
+                _videoWriter.Write((uint)jpegData.Length);
+                _videoWriter.Write(jpegData);
+                _videoWriter.Flush();
+            }
+            catch (IOException)
+            {
+                // Video pipe disconnected
+                DebugLog("Video pipe write failed (disconnected)");
+                _videoConnected = false;
+            }
+            catch (Exception ex)
+            {
+                DebugLog($"Video frame write error: {ex.Message}");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Send a server-initiated notification over the control pipe.
+    /// These are unsolicited messages (not responses to commands).
+    /// </summary>
+    private static void SendNotification(object notification)
+    {
+        if (_controlWriter == null) return;
+
+        lock (_controlWriteLock)
+        {
+            try
+            {
+                var json = JsonSerializer.Serialize(notification);
+                _controlWriter.WriteLine(json);
+            }
+            catch (Exception ex)
+            {
+                DebugLog($"Notification write error: {ex.Message}");
+            }
+        }
+    }
+
+    #endregion
 
     private static bool Authenticate(StreamReader reader, StreamWriter writer, string expectedNonce)
     {
@@ -232,7 +392,7 @@ public static class SystemHelperServer
             "ping" => JsonSerializer.Serialize(new HelperResponse(true, null)),
             "sendSAS" => HandleSendSAS(),
             "runAsSystem" => HandleRunAsSystem(doc.RootElement),
-            "injectInput" => HandleInjectInput(doc.RootElement),
+            "injectInput" => HandleInjectInput(json, doc.RootElement),
             "exit" => HandleExit(),
             _ => JsonSerializer.Serialize(new HelperResponse(false, $"Unknown command: {command}"))
         };
@@ -284,12 +444,24 @@ public static class SystemHelperServer
         }
     }
 
-    private static string? HandleInjectInput(JsonElement root)
+    private static string? HandleInjectInput(string rawJson, JsonElement root)
     {
         try
         {
             var sw = root.TryGetProperty("sw", out var swProp) ? swProp.GetInt32() : 1920;
             var sh = root.TryGetProperty("sh", out var shProp) ? shProp.GetInt32() : 1080;
+
+            // If Secure Desktop is active, route input to the Winlogon desktop
+            if (_capture != null && _capture.IsActive)
+            {
+                // Strip the command/sw/sh wrapper — pass just the input event JSON
+                // The rawJson has command + sw + sh + the rest of the input event fields.
+                // SecureDesktopCapture.InjectInputOnWinlogon parses type/x/y/etc directly.
+                _capture.InjectInputOnWinlogon(rawJson, sw, sh);
+                return null; // Fire-and-forget
+            }
+
+            // Normal (Default desktop) injection
             var type = root.GetProperty("type").GetString();
 
             switch (type)
