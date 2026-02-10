@@ -6,6 +6,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.JSInterop;
 using SteamViewer.Client.Core.Capture;
 using SteamViewer.Client.Core.Network;
+using SteamViewer.Client.Core.Session;
 using SteamViewer.Common.Protocol;
 
 namespace SteamViewer.App.Services.Models;
@@ -549,6 +550,17 @@ public sealed class HostSession : IAsyncDisposable
                 UseShellExecute = true,
                 Verb = "runas"
             };
+
+            // Save credentials so the elevated instance can reconnect with the same ID
+            try
+            {
+                ReconnectCredentials.Save(_hostClientId, _hostPasswordHash, PeerId);
+                _logger.LogInformation("Saved reconnect credentials for elevated instance");
+            }
+            catch (Exception saveEx)
+            {
+                _logger.LogWarning(saveEx, "Failed to save reconnect credentials");
+            }
 
             Process.Start(psi);
             _logger.LogInformation("Elevated instance started, shutting down current instance");

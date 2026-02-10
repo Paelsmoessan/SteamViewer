@@ -15,6 +15,9 @@ public static class ReconnectCredentials
         Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
         "SteamViewer", "reconnect.json");
 
+    /// <summary>Check if reconnect data exists (without loading/deleting it).</summary>
+    public static bool Exists() => File.Exists(FilePath);
+
     /// <summary>
     /// Encrypt and save session credentials for post-reboot reconnection.
     /// </summary>

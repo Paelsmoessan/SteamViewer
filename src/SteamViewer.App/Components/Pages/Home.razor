@@ -281,6 +281,14 @@
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
+        // Auto-start hosting if reconnect data exists (from reboot or elevation restart)
+        if (firstRender && ReconnectCredentials.Exists())
+        {
+            currentMode = AppMode.StartConnection;
+            StateHasChanged();
+            _ = StartSession();
+        }
+
         // Initialize JS logger on first render
         if (firstRender && !_jsLoggerInitialized)
         {
