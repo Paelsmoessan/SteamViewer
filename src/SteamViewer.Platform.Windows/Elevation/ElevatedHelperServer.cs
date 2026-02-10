@@ -170,7 +170,7 @@ public static class ElevatedHelperServer
             "sendSAS" => HandleSendSAS(),
             "reboot" => HandleReboot(doc.RootElement),
             "runElevated" => HandleRunElevated(doc.RootElement),
-            "injectInput" => HandleInjectInput(json),
+            "injectInput" => HandleInjectInput(doc.RootElement),
             "exit" => HandleExit(),
             _ => JsonSerializer.Serialize(new HelperResponse(false, $"Unknown command: {command}"))
         };
@@ -287,21 +287,55 @@ public static class ElevatedHelperServer
         }
     }
 
-    private static string? HandleInjectInput(string json)
+    private static string? HandleInjectInput(JsonElement root)
     {
         try
         {
-            // Extract screen dimensions from the combined JSON
-            using var doc = JsonDocument.Parse(json);
-            var root = doc.RootElement;
             var sw = root.TryGetProperty("sw", out var swProp) ? swProp.GetInt32() : 1920;
             var sh = root.TryGetProperty("sh", out var shProp) ? shProp.GetInt32() : 1080;
+            var type = root.GetProperty("type").GetString();
 
-            // Deserialize the InputEvent (extra fields like "command", "sw", "sh" are ignored)
-            var inputEvent = JsonSerializer.Deserialize<InputEvent>(json);
-            if (inputEvent != null)
+            // Extract fields directly from JSON — avoids InputEvent polymorphic deserialization
+            // (System.Text.Json can't deserialize InputEvent when extra fields like "command" are present)
+            switch (type)
             {
-                Win32Input.InjectInputEvent(inputEvent, sw, sh);
+                case "mouse_move":
+                    Win32Input.InjectMouseMove(
+                        root.GetProperty("x").GetDouble(),
+                        root.GetProperty("y").GetDouble(),
+                        sw, sh);
+                    break;
+                case "mouse_down":
+                    Win32Input.InjectMouseButton(
+                        ParseMouseButton(root.GetProperty("button").GetString()),
+                        root.GetProperty("x").GetDouble(),
+                        root.GetProperty("y").GetDouble(),
+                        sw, sh, isDown: true);
+                    break;
+                case "mouse_up":
+                    Win32Input.InjectMouseButton(
+                        ParseMouseButton(root.GetProperty("button").GetString()),
+                        root.GetProperty("x").GetDouble(),
+                        root.GetProperty("y").GetDouble(),
+                        sw, sh, isDown: false);
+                    break;
+                case "mouse_wheel":
+                    Win32Input.InjectMouseWheel(
+                        root.GetProperty("delta_x").GetDouble(),
+                        root.GetProperty("delta_y").GetDouble());
+                    break;
+                case "key_down":
+                    Win32Input.InjectKey(
+                        root.GetProperty("key").GetString()!,
+                        ParseModifiers(root),
+                        isDown: true);
+                    break;
+                case "key_up":
+                    Win32Input.InjectKey(
+                        root.GetProperty("key").GetString()!,
+                        ParseModifiers(root),
+                        isDown: false);
+                    break;
             }
         }
         catch (Exception ex)
@@ -309,8 +343,27 @@ public static class ElevatedHelperServer
             DebugLog($"InjectInput error: {ex.Message}");
         }
 
-        // Return null — no response for fire-and-forget input events
         return null;
+    }
+
+    private static MouseButton ParseMouseButton(string? button) => button switch
+    {
+        "Left" => MouseButton.Left,
+        "Right" => MouseButton.Right,
+        "Middle" => MouseButton.Middle,
+        _ => MouseButton.Left
+    };
+
+    private static KeyModifiers ParseModifiers(JsonElement root)
+    {
+        if (!root.TryGetProperty("modifiers", out var mods))
+            return KeyModifiers.None;
+
+        return new KeyModifiers(
+            mods.TryGetProperty("ctrl", out var c) && c.GetBoolean(),
+            mods.TryGetProperty("shift", out var s) && s.GetBoolean(),
+            mods.TryGetProperty("alt", out var a) && a.GetBoolean(),
+            mods.TryGetProperty("meta", out var m) && m.GetBoolean());
     }
 
     private static string HandleExit()

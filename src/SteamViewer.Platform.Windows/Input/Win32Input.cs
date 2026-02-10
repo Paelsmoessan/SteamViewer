@@ -83,7 +83,7 @@ internal static class Win32Input
         return (Math.Clamp(absX, 0, 65535), Math.Clamp(absY, 0, 65535));
     }
 
-    private static void InjectMouseMove(double x, double y, int screenWidth, int screenHeight)
+    internal static void InjectMouseMove(double x, double y, int screenWidth, int screenHeight)
     {
         var (absX, absY) = ConvertToAbsoluteCoordinates(x, y, screenWidth, screenHeight);
 
@@ -107,7 +107,7 @@ internal static class Win32Input
         SendInput(1, new[] { input }, Marshal.SizeOf<INPUT>());
     }
 
-    private static void InjectMouseButton(MouseButton button, double x, double y, int screenWidth, int screenHeight, bool isDown)
+    internal static void InjectMouseButton(MouseButton button, double x, double y, int screenWidth, int screenHeight, bool isDown)
     {
         var (absX, absY) = ConvertToAbsoluteCoordinates(x, y, screenWidth, screenHeight);
 
@@ -146,7 +146,7 @@ internal static class Win32Input
         SendInput(1, new[] { input }, Marshal.SizeOf<INPUT>());
     }
 
-    private static void InjectMouseWheel(double deltaX, double deltaY)
+    internal static void InjectMouseWheel(double deltaX, double deltaY)
     {
         var inputs = new List<INPUT>();
 
@@ -196,7 +196,7 @@ internal static class Win32Input
         }
     }
 
-    private static void InjectKey(string key, KeyModifiers modifiers, bool isDown)
+    internal static void InjectKey(string key, KeyModifiers modifiers, bool isDown)
     {
         var inputs = new List<INPUT>();
 
