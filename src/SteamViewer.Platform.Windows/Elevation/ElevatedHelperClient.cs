@@ -223,7 +223,8 @@ public sealed class ElevatedHelperClient : IAsyncDisposable
 
             if (responseLine == null) return null;
 
-            return JsonSerializer.Deserialize<HelperResponse>(responseLine);
+            return JsonSerializer.Deserialize<HelperResponse>(responseLine,
+                new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
         }
         catch (Exception ex)
         {
@@ -262,10 +263,5 @@ public sealed class ElevatedHelperClient : IAsyncDisposable
         await ShutdownHelperAsync();
     }
 
-    private record HelperResponse(bool success, string? error)
-    {
-        // Case-insensitive deserialization
-        public bool Success => success;
-        public string? Error => error;
-    }
+    private record HelperResponse(bool Success, string? Error);
 }
