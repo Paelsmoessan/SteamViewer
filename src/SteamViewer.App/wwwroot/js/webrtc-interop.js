@@ -1495,6 +1495,9 @@ window.SteamViewerInput = {
 
         // Focus canvas immediately so keyboard events are captured from the start
         this.canvas.focus();
+        // Re-focus after a delay — MAUI WebView or Blazor re-render can steal focus
+        setTimeout(() => { this.canvas?.focus(); }, 200);
+        setTimeout(() => { this.canvas?.focus(); }, 500);
 
         console.log('Input capture initialized (use toolbar button to lock/unlock)');
         return true;
