@@ -2,6 +2,8 @@ using Microsoft.Win32;
 using System.Diagnostics;
 using System.IO.Pipes;
 using System.Runtime.InteropServices;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Text;
 using System.Text.Json;
 using SteamViewer.Client.Core.Session;
@@ -26,12 +28,21 @@ public static class ElevatedHelperServer
     {
         Console.WriteLine($"[ElevatedHelper] Starting pipe server: {pipeName}");
 
-        using var pipeServer = new NamedPipeServerStream(
+        // Allow non-elevated (authenticated) users to connect to this elevated pipe
+        var pipeSecurity = new PipeSecurity();
+        pipeSecurity.AddAccessRule(new PipeAccessRule(
+            new SecurityIdentifier(WellKnownSidType.AuthenticatedUserSid, null),
+            PipeAccessRights.ReadWrite,
+            AccessControlType.Allow));
+
+        using var pipeServer = NamedPipeServerStreamAcl.Create(
             pipeName,
             PipeDirection.InOut,
             1,
             PipeTransmissionMode.Byte,
-            PipeOptions.Asynchronous);
+            PipeOptions.Asynchronous,
+            0, 0,
+            pipeSecurity);
 
         Console.WriteLine("[ElevatedHelper] Waiting for client connection...");
 
