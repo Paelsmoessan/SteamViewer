@@ -11,7 +11,10 @@
 @using System.Text.Json
 @using Microsoft.JSInterop
 @using Microsoft.Extensions.Configuration
+@using Microsoft.Extensions.DependencyInjection
+@using SteamViewer.Client.Core.Elevation
 @implements IAsyncDisposable
+@inject IServiceProvider ServiceProvider
 @inject SignalingClient SignalingClient
 @inject CanvasRenderingService CanvasRenderer
 @inject IJSRuntime JSRuntime
@@ -638,6 +641,9 @@
             connectedPeerId = incomingPeerId;
             connectionState = ConnectionState.Connected;
 
+            // Create elevation service (Transient — fresh instance per connection)
+            var elevationService = ServiceProvider.GetService<IElevationService>();
+
             // Create and initialize host session
             _hostSession = new HostSession(
                 connectedPeerId,
@@ -646,8 +652,9 @@
                 InputInjector,
                 Configuration,
                 msg => SignalingClient.SendAsync(msg),
-                clientId,
-                passwordHash);
+                elevationService: elevationService,
+                hostClientId: clientId,
+                hostPasswordHash: passwordHash);
 
             // Auto-share full screen on reconnect after reboot
             if (_isReconnect)

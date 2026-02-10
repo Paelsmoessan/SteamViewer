@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using SteamViewer.Client.Core.Capture;
+using SteamViewer.Client.Core.Elevation;
 using SteamViewer.Client.Core.Network;
 using SteamViewer.App.Services;
 
@@ -83,10 +84,12 @@ public static class MauiProgram
         builder.Services.AddSingleton<IMonitorEnumerator, SteamViewer.Platform.Windows.WindowsMonitorEnumerator>();
         builder.Services.AddSingleton<IScreenCapture, SteamViewer.Platform.Windows.ScreenCapture.DxgiScreenCapture>();
         builder.Services.AddSingleton<IInputInjector, SteamViewer.Platform.Windows.Input.WindowsInputInjector>();
+        builder.Services.AddTransient<IElevationService, SteamViewer.Platform.Windows.Elevation.WindowsElevationService>();
 #elif MACCATALYST
         builder.Services.AddSingleton<IMonitorEnumerator, SteamViewer.Platform.macOS.MacMonitorEnumerator>();
         builder.Services.AddSingleton<IScreenCapture, SteamViewer.Platform.macOS.ScreenCapture.MacScreenCapture>();
         builder.Services.AddSingleton<IInputInjector, SteamViewer.Platform.macOS.Input.MacInputInjector>();
+        builder.Services.AddTransient<IElevationService, SteamViewer.Platform.macOS.Elevation.MacElevationService>();
 #endif
 
         var app = builder.Build();

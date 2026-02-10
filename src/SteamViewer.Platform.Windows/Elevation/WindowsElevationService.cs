@@ -1,0 +1,208 @@
+using Microsoft.Extensions.Logging;
+using SteamViewer.Client.Core.Elevation;
+
+namespace SteamViewer.Platform.Windows.Elevation;
+
+/// <summary>
+/// Windows implementation of IElevationService.
+/// Owns the lifecycle of ElevatedHelperClient (admin) and SystemHelperClient (SYSTEM).
+/// Routes input through the highest available elevation tier.
+/// </summary>
+public sealed class WindowsElevationService : IElevationService
+{
+    private readonly ILogger<WindowsElevationService> _logger;
+    private readonly ILoggerFactory _loggerFactory;
+    private ElevatedHelperClient? _adminHelper;
+    private SystemHelperClient? _systemHelper;
+    private bool _disposed;
+
+    public bool IsAdminConnected => _adminHelper?.IsConnected ?? false;
+    public bool IsSystemConnected => _systemHelper?.IsConnected ?? false;
+    public bool IsSecureDesktopActive { get; private set; }
+
+    public event Action<byte[], int, int>? OnSecureDesktopFrame;
+    public event Action<bool>? OnSecureDesktopStateChanged;
+    public event Action<bool>? OnAdminStateChanged;
+    public event Action<bool>? OnSystemStateChanged;
+
+    public WindowsElevationService(ILogger<WindowsElevationService> logger, ILoggerFactory loggerFactory)
+    {
+        _logger = logger;
+        _loggerFactory = loggerFactory;
+    }
+
+    public async Task<bool> RequestAdminElevationAsync()
+    {
+        if (IsAdminConnected)
+        {
+            _logger.LogInformation("Admin helper already connected");
+            return true;
+        }
+
+        try
+        {
+            var helperLogger = _loggerFactory.CreateLogger<ElevatedHelperClient>();
+            _adminHelper = new ElevatedHelperClient(helperLogger);
+            var success = await _adminHelper.LaunchAndConnectAsync();
+
+            if (success)
+            {
+                _logger.LogInformation("Admin helper connected — admin features enabled");
+                OnAdminStateChanged?.Invoke(true);
+                return true;
+            }
+
+            _logger.LogWarning("Admin helper failed to connect (UAC denied or error)");
+            await _adminHelper.DisposeAsync();
+            _adminHelper = null;
+            return false;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to launch admin helper");
+            if (_adminHelper != null)
+            {
+                await _adminHelper.DisposeAsync();
+                _adminHelper = null;
+            }
+            return false;
+        }
+    }
+
+    public async Task<bool> RequestSystemElevationAsync()
+    {
+        if (IsSystemConnected)
+        {
+            _logger.LogInformation("SYSTEM helper already connected");
+            return true;
+        }
+
+        if (!IsAdminConnected)
+        {
+            _logger.LogWarning("Cannot launch SYSTEM helper: admin helper not connected");
+            return false;
+        }
+
+        try
+        {
+            var helperLogger = _loggerFactory.CreateLogger<SystemHelperClient>();
+            _systemHelper = new SystemHelperClient(helperLogger, _adminHelper!);
+            var success = await _systemHelper.LaunchAndConnectAsync();
+
+            if (success)
+            {
+                _logger.LogInformation("SYSTEM helper connected — SYSTEM features enabled");
+                OnSystemStateChanged?.Invoke(true);
+                return true;
+            }
+
+            _logger.LogWarning("SYSTEM helper failed to connect");
+            await _systemHelper.DisposeAsync();
+            _systemHelper = null;
+            return false;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to launch SYSTEM helper");
+            if (_systemHelper != null)
+            {
+                await _systemHelper.DisposeAsync();
+                _systemHelper = null;
+            }
+            return false;
+        }
+    }
+
+    public async Task<bool> InjectInputAsync(string inputJson, int screenWidth, int screenHeight)
+    {
+        // Route input through the highest available elevation tier:
+        // 1. If Secure Desktop active + SYSTEM connected → SYSTEM helper (future Phase 2)
+        // 2. If admin connected → admin helper (UIPI bypass)
+        // 3. Return false → caller falls back to local injection
+
+        if (IsSecureDesktopActive && _systemHelper?.IsConnected == true)
+        {
+            await _systemHelper.SendInputEventAsync(inputJson, screenWidth, screenHeight);
+            return true;
+        }
+
+        if (_adminHelper?.IsConnected == true)
+        {
+            await _adminHelper.SendInputEventAsync(inputJson, screenWidth, screenHeight);
+            return true;
+        }
+
+        return false;
+    }
+
+    public async Task<bool> SendSASAsync()
+    {
+        // Prefer SYSTEM helper for SAS (more reliable from SYSTEM context)
+        if (_systemHelper?.IsConnected == true)
+        {
+            var result = await _systemHelper.SendSASAsync();
+            if (result) return true;
+        }
+
+        if (_adminHelper?.IsConnected == true)
+        {
+            return await _adminHelper.SendSASAsync();
+        }
+
+        _logger.LogWarning("SendSAS failed: no elevated helper connected");
+        return false;
+    }
+
+    public async Task<bool> RebootAsync(string clientId, string passwordHash, string viewerPeerId)
+    {
+        if (_adminHelper?.IsConnected != true)
+        {
+            _logger.LogWarning("Reboot failed: admin helper not connected");
+            return false;
+        }
+
+        return await _adminHelper.RebootAsync(clientId, passwordHash, viewerPeerId);
+    }
+
+    public async Task<bool> RunElevatedAsync(string path, string? args)
+    {
+        if (_adminHelper?.IsConnected != true)
+        {
+            _logger.LogWarning("RunElevated failed: admin helper not connected");
+            return false;
+        }
+
+        return await _adminHelper.RunElevatedAsync(path, args);
+    }
+
+    public async Task<bool> RunAsSystemAsync(string path, string? args)
+    {
+        if (_systemHelper?.IsConnected != true)
+        {
+            _logger.LogWarning("RunAsSystem failed: SYSTEM helper not connected");
+            return false;
+        }
+
+        return await _systemHelper.RunAsSystemAsync(path, args);
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (_disposed) return;
+        _disposed = true;
+
+        if (_systemHelper != null)
+        {
+            await _systemHelper.DisposeAsync();
+            _systemHelper = null;
+            OnSystemStateChanged?.Invoke(false);
+        }
+
+        if (_adminHelper != null)
+        {
+            await _adminHelper.DisposeAsync();
+            _adminHelper = null;
+            OnAdminStateChanged?.Invoke(false);
+        }
+    }
+}

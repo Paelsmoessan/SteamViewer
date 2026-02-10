@@ -4,9 +4,9 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.JSInterop;
 using SteamViewer.Client.Core.Capture;
+using SteamViewer.Client.Core.Elevation;
 using SteamViewer.Client.Core.Network;
 using SteamViewer.Common.Protocol;
-using SteamViewer.Platform.Windows.Elevation;
 
 namespace SteamViewer.App.Services.Models;
 
@@ -37,13 +37,12 @@ public sealed class HostSession : IAsyncDisposable
     private readonly ILogger _logger;
     private readonly ILoggerFactory _loggerFactory;
     private readonly IInputInjector _inputInjector;
+    private readonly IElevationService? _elevationService;
     private readonly IConfiguration _configuration;
     private readonly Func<SignalingMessage, Task> _sendSignaling;
     private readonly string _hostClientId;
     private readonly string _hostPasswordHash;
     private WebRTCManager? _webrtc;
-    private ElevatedHelperClient? _elevatedHelper;
-    private SystemHelperClient? _systemHelper;
     private bool _webrtcInitialized;
     private bool _disposed;
 
@@ -105,6 +104,7 @@ public sealed class HostSession : IAsyncDisposable
         IInputInjector inputInjector,
         IConfiguration configuration,
         Func<SignalingMessage, Task> sendSignaling,
+        IElevationService? elevationService = null,
         string hostClientId = "",
         string hostPasswordHash = "")
     {
@@ -113,6 +113,7 @@ public sealed class HostSession : IAsyncDisposable
         _logger = loggerFactory.CreateLogger<HostSession>();
         _loggerFactory = loggerFactory;
         _inputInjector = inputInjector;
+        _elevationService = elevationService;
         _configuration = configuration;
         _sendSignaling = sendSignaling;
         _hostClientId = hostClientId;
@@ -312,8 +313,8 @@ public sealed class HostSession : IAsyncDisposable
         // Send elevation status to viewer (elevated = admin helper, systemLevel = SYSTEM helper)
         try
         {
-            var elevated = _elevatedHelper?.IsConnected == true;
-            var systemLevel = _systemHelper?.IsConnected == true;
+            var elevated = _elevationService?.IsAdminConnected ?? false;
+            var systemLevel = _elevationService?.IsSystemConnected ?? false;
             await _webrtc!.SendDataAsync(JsonSerializer.Serialize(new
             {
                 type = "hostStatus",
@@ -439,29 +440,46 @@ public sealed class HostSession : IAsyncDisposable
 
         try
         {
-            // If elevated helper is connected, route ALL input through it.
-            // Elevated SendInput can target both elevated and non-elevated windows (UIPI bypass).
-            if (_elevatedHelper?.IsConnected == true)
-            {
-                // Track dimensions from raw JSON (lightweight, no full InputEvent deserialization)
-                TrackCaptureDimensions(json);
+            TrackCaptureDimensions(json);
 
-                // Fire-and-forget — don't await (would block data channel processing)
-                _ = _elevatedHelper.SendInputEventAsync(json, _lastCaptureWidth, _lastCaptureHeight);
+            // Try elevated injection first (handles routing internally)
+            if (_elevationService != null)
+            {
+                _ = InjectInputWithFallbackAsync(json);
                 return;
             }
 
-            // Non-elevated path: local injection
+            // No elevation service — local injection
             var inputEvent = JsonSerializer.Deserialize<InputEvent>(json);
             if (inputEvent != null)
             {
-                TrackCaptureFromEvent(inputEvent);
                 _inputInjector.InjectInput(inputEvent, _lastCaptureWidth, _lastCaptureHeight);
             }
         }
         catch
         {
             // Silently ignore parse errors to reduce latency
+        }
+    }
+
+    private async Task InjectInputWithFallbackAsync(string json)
+    {
+        try
+        {
+            var handled = await _elevationService!.InjectInputAsync(json, _lastCaptureWidth, _lastCaptureHeight);
+            if (!handled)
+            {
+                // Elevated path not available — fall back to local injection
+                var inputEvent = JsonSerializer.Deserialize<InputEvent>(json);
+                if (inputEvent != null)
+                {
+                    _inputInjector.InjectInput(inputEvent, _lastCaptureWidth, _lastCaptureHeight);
+                }
+            }
+        }
+        catch
+        {
+            // Silently ignore errors on input path
         }
     }
 
@@ -483,25 +501,6 @@ public sealed class HostSession : IAsyncDisposable
             }
         }
         catch { }
-    }
-
-    private void TrackCaptureFromEvent(InputEvent inputEvent)
-    {
-        switch (inputEvent)
-        {
-            case InputEvent.MouseMove move when move.CaptureWidth > 0 && move.CaptureHeight > 0:
-                _lastCaptureWidth = move.CaptureWidth;
-                _lastCaptureHeight = move.CaptureHeight;
-                break;
-            case InputEvent.MouseDown down when down.CaptureWidth > 0 && down.CaptureHeight > 0:
-                _lastCaptureWidth = down.CaptureWidth;
-                _lastCaptureHeight = down.CaptureHeight;
-                break;
-            case InputEvent.MouseUp up when up.CaptureWidth > 0 && up.CaptureHeight > 0:
-                _lastCaptureWidth = up.CaptureWidth;
-                _lastCaptureHeight = up.CaptureHeight;
-                break;
-        }
     }
 
     #endregion
@@ -553,9 +552,9 @@ public sealed class HostSession : IAsyncDisposable
     /// </summary>
     private Task HandleRequestElevationAsync()
     {
-        if (_webrtc == null) return Task.CompletedTask;
+        if (_webrtc == null || _elevationService == null) return Task.CompletedTask;
 
-        if (_elevatedHelper?.IsConnected == true)
+        if (_elevationService.IsAdminConnected)
         {
             _logger.LogInformation("Elevated helper already connected");
             return _webrtc.SendDataAsync(JsonSerializer.Serialize(new
@@ -568,15 +567,14 @@ public sealed class HostSession : IAsyncDisposable
         // (which handles input events). The pipe connect can take up to 10 seconds.
         _ = Task.Run(async () =>
         {
-            _logger.LogInformation("Launching elevated helper process...");
+            _logger.LogInformation("Requesting admin elevation...");
             try
             {
-                _elevatedHelper = new ElevatedHelperClient(_logger);
-                var success = await _elevatedHelper.LaunchAndConnectAsync();
+                var success = await _elevationService.RequestAdminElevationAsync();
 
                 if (success)
                 {
-                    _logger.LogInformation("Elevated helper connected — admin features enabled");
+                    _logger.LogInformation("Admin elevation succeeded — admin features enabled");
                     await _webrtc!.SendDataAsync(JsonSerializer.Serialize(new
                     {
                         type = "hostStatus",
@@ -585,9 +583,7 @@ public sealed class HostSession : IAsyncDisposable
                 }
                 else
                 {
-                    _logger.LogWarning("Elevated helper failed to connect (UAC denied or error)");
-                    await _elevatedHelper.DisposeAsync();
-                    _elevatedHelper = null;
+                    _logger.LogWarning("Admin elevation failed (UAC denied or error)");
                     await _webrtc!.SendDataAsync(JsonSerializer.Serialize(new
                     {
                         type = "elevationDenied",
@@ -597,12 +593,7 @@ public sealed class HostSession : IAsyncDisposable
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Failed to launch elevated helper");
-                if (_elevatedHelper != null)
-                {
-                    await _elevatedHelper.DisposeAsync();
-                    _elevatedHelper = null;
-                }
+                _logger.LogError(ex, "Failed to request admin elevation");
                 try
                 {
                     await _webrtc!.SendDataAsync(JsonSerializer.Serialize(new
@@ -619,22 +610,22 @@ public sealed class HostSession : IAsyncDisposable
     }
 
     /// <summary>
-    /// Send Ctrl+Alt+Del (SAS) via elevated helper if available.
+    /// Send Ctrl+Alt+Del (SAS) via elevation service if available.
     /// </summary>
     private async Task HandleCtrlAltDelAsync()
     {
         if (_webrtc == null) return;
 
-        if (_elevatedHelper?.IsConnected == true)
+        if (_elevationService != null && (_elevationService.IsAdminConnected || _elevationService.IsSystemConnected))
         {
-            var success = await _elevatedHelper.SendSASAsync();
+            var success = await _elevationService.SendSASAsync();
             if (success)
             {
-                _logger.LogInformation("Ctrl+Alt+Del sent via elevated helper");
+                _logger.LogInformation("Ctrl+Alt+Del sent via elevation service");
             }
             else
             {
-                _logger.LogWarning("Ctrl+Alt+Del failed via elevated helper");
+                _logger.LogWarning("Ctrl+Alt+Del failed via elevation service");
                 await _webrtc.SendDataAsync(JsonSerializer.Serialize(new
                 {
                     type = "ctrlAltDelFailed",
@@ -654,21 +645,21 @@ public sealed class HostSession : IAsyncDisposable
     }
 
     /// <summary>
-    /// Reboot the host machine with auto-restart. Routes through elevated helper
+    /// Reboot the host machine with auto-restart. Routes through elevation service
     /// for RunOnceEx registry write, falls back to direct reboot if not elevated.
     /// </summary>
     private async Task HandleRebootAsync()
     {
-        if (_elevatedHelper?.IsConnected == true)
+        if (_elevationService?.IsAdminConnected == true)
         {
-            var success = await _elevatedHelper.RebootAsync(_hostClientId, _hostPasswordHash, PeerId);
+            var success = await _elevationService.RebootAsync(_hostClientId, _hostPasswordHash, PeerId);
             if (success)
             {
-                _logger.LogInformation("Reboot initiated via elevated helper (with auto-restart)");
+                _logger.LogInformation("Reboot initiated via elevation service (with auto-restart)");
             }
             else
             {
-                _logger.LogWarning("Reboot failed via elevated helper");
+                _logger.LogWarning("Reboot failed via elevation service");
                 if (_webrtc != null)
                     await _webrtc.SendDataAsync(JsonSerializer.Serialize(new
                     {
@@ -724,9 +715,9 @@ public sealed class HostSession : IAsyncDisposable
             return;
         }
 
-        if (_elevatedHelper?.IsConnected == true)
+        if (_elevationService?.IsAdminConnected == true)
         {
-            var success = await _elevatedHelper.RunElevatedAsync(path, args);
+            var success = await _elevationService.RunElevatedAsync(path, args);
             if (success)
             {
                 _logger.LogInformation("RunElevated succeeded: {Path}", path);
@@ -761,9 +752,9 @@ public sealed class HostSession : IAsyncDisposable
     /// </summary>
     private Task HandleRequestSystemElevationAsync()
     {
-        if (_webrtc == null) return Task.CompletedTask;
+        if (_webrtc == null || _elevationService == null) return Task.CompletedTask;
 
-        if (_systemHelper?.IsConnected == true)
+        if (_elevationService.IsSystemConnected)
         {
             _logger.LogInformation("SYSTEM helper already connected");
             return _webrtc.SendDataAsync(JsonSerializer.Serialize(new
@@ -772,7 +763,7 @@ public sealed class HostSession : IAsyncDisposable
             }));
         }
 
-        if (_elevatedHelper?.IsConnected != true)
+        if (!_elevationService.IsAdminConnected)
         {
             _logger.LogWarning("Cannot launch SYSTEM helper: admin helper not connected");
             return _webrtc.SendDataAsync(JsonSerializer.Serialize(new
@@ -785,15 +776,14 @@ public sealed class HostSession : IAsyncDisposable
         // Run on background thread (schtask creation + pipe connect can take 15+ seconds)
         _ = Task.Run(async () =>
         {
-            _logger.LogInformation("Launching SYSTEM helper via admin helper...");
+            _logger.LogInformation("Requesting SYSTEM elevation...");
             try
             {
-                _systemHelper = new SystemHelperClient(_logger, _elevatedHelper);
-                var success = await _systemHelper.LaunchAndConnectAsync();
+                var success = await _elevationService.RequestSystemElevationAsync();
 
                 if (success)
                 {
-                    _logger.LogInformation("SYSTEM helper connected — SYSTEM features enabled");
+                    _logger.LogInformation("SYSTEM elevation succeeded — SYSTEM features enabled");
                     await _webrtc!.SendDataAsync(JsonSerializer.Serialize(new
                     {
                         type = "hostStatus",
@@ -803,9 +793,7 @@ public sealed class HostSession : IAsyncDisposable
                 }
                 else
                 {
-                    _logger.LogWarning("SYSTEM helper failed to connect");
-                    await _systemHelper.DisposeAsync();
-                    _systemHelper = null;
+                    _logger.LogWarning("SYSTEM elevation failed");
                     await _webrtc!.SendDataAsync(JsonSerializer.Serialize(new
                     {
                         type = "systemElevationFailed",
@@ -815,12 +803,7 @@ public sealed class HostSession : IAsyncDisposable
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Failed to launch SYSTEM helper");
-                if (_systemHelper != null)
-                {
-                    await _systemHelper.DisposeAsync();
-                    _systemHelper = null;
-                }
+                _logger.LogError(ex, "Failed to request SYSTEM elevation");
                 try
                 {
                     await _webrtc!.SendDataAsync(JsonSerializer.Serialize(new
@@ -856,9 +839,9 @@ public sealed class HostSession : IAsyncDisposable
             return;
         }
 
-        if (_systemHelper?.IsConnected == true)
+        if (_elevationService?.IsSystemConnected == true)
         {
-            var success = await _systemHelper.RunAsSystemAsync(path, args);
+            var success = await _elevationService.RunAsSystemAsync(path, args);
             if (success)
             {
                 _logger.LogInformation("RunAsSystem succeeded: {Path}", path);
@@ -993,16 +976,9 @@ public sealed class HostSession : IAsyncDisposable
         if (_disposed) return;
         _disposed = true;
 
-        if (_systemHelper != null)
+        if (_elevationService != null)
         {
-            await _systemHelper.DisposeAsync();
-            _systemHelper = null;
-        }
-
-        if (_elevatedHelper != null)
-        {
-            await _elevatedHelper.DisposeAsync();
-            _elevatedHelper = null;
+            await _elevationService.DisposeAsync();
         }
 
         if (_webrtc != null)
