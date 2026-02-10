@@ -1492,6 +1492,10 @@ window.SteamViewerInput = {
 
         this.isCapturing = true;
         this.isLocked = false;
+
+        // Focus canvas immediately so keyboard events are captured from the start
+        this.canvas.focus();
+
         console.log('Input capture initialized (use toolbar button to lock/unlock)');
         return true;
     },

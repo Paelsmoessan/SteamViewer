@@ -442,14 +442,14 @@ public sealed class HostSession : IAsyncDisposable
         {
             TrackCaptureDimensions(json);
 
-            // Try elevated injection first (handles routing internally)
-            if (_elevationService != null)
+            // If an elevated helper is connected, route through the elevation service (async, fire-and-forget)
+            if (_elevationService != null && (_elevationService.IsAdminConnected || _elevationService.IsSystemConnected))
             {
-                _ = InjectInputWithFallbackAsync(json);
+                _ = InjectInputViaElevationAsync(json);
                 return;
             }
 
-            // No elevation service — local injection
+            // No elevation active — local injection (synchronous, no async overhead)
             var inputEvent = JsonSerializer.Deserialize<InputEvent>(json);
             if (inputEvent != null)
             {
@@ -462,24 +462,15 @@ public sealed class HostSession : IAsyncDisposable
         }
     }
 
-    private async Task InjectInputWithFallbackAsync(string json)
+    private async Task InjectInputViaElevationAsync(string json)
     {
         try
         {
-            var handled = await _elevationService!.InjectInputAsync(json, _lastCaptureWidth, _lastCaptureHeight);
-            if (!handled)
-            {
-                // Elevated path not available — fall back to local injection
-                var inputEvent = JsonSerializer.Deserialize<InputEvent>(json);
-                if (inputEvent != null)
-                {
-                    _inputInjector.InjectInput(inputEvent, _lastCaptureWidth, _lastCaptureHeight);
-                }
-            }
+            await _elevationService!.InjectInputAsync(json, _lastCaptureWidth, _lastCaptureHeight);
         }
         catch
         {
-            // Silently ignore errors on input path
+            // Silently ignore errors on elevated input path
         }
     }
 
