@@ -1,4 +1,5 @@
 using Microsoft.UI.Xaml;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -23,6 +24,14 @@ public partial class App : MauiWinUIApplication
 
     public App()
     {
+        // Lightweight mode: --sas sends Ctrl+Alt+Del and exits immediately (used by RunOnceEx pre-login)
+        var args = Environment.GetCommandLineArgs();
+        if (args.Contains("--sas"))
+        {
+            HandleSasMode();
+            return;
+        }
+
 #if DEBUG
         // Allocate a console window for debug output
         AllocConsole();
@@ -122,6 +131,209 @@ public partial class App : MauiWinUIApplication
 
         return false; // Don't continue without dependencies
     }
+
+    /// <summary>
+    /// Lightweight SAS mode: sends Ctrl+Alt+Del, waits for user logon, then launches full app as the user.
+    /// Runs as SYSTEM via RunOnceEx before the login screen. Never initializes MAUI/WebView2.
+    /// </summary>
+    private static void HandleSasMode()
+    {
+        try
+        {
+            SendSAS(false);
+
+            // Wait for user logon, then launch full app as the logged-in user
+            if (WaitForLogonAndLaunchApp(timeout: TimeSpan.FromMinutes(10)))
+                Environment.Exit(0);
+            else
+                Environment.Exit(3); // Timeout — no user logged in
+        }
+        catch
+        {
+            Environment.Exit(2);
+        }
+    }
+
+    /// <summary>
+    /// Polls WTS APIs until a user logs in, then launches the full app in their session.
+    /// </summary>
+    private static bool WaitForLogonAndLaunchApp(TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+
+        while (DateTime.UtcNow < deadline)
+        {
+            Thread.Sleep(2000);
+
+            var sessionId = WTSGetActiveConsoleSessionId();
+            if (sessionId == 0xFFFFFFFF)
+                continue;
+
+            // Try to get the logged-in user's token
+            if (!WTSQueryUserToken(sessionId, out var userToken))
+                continue;
+
+            try
+            {
+                // User is logged in — wait briefly for desktop to settle
+                Thread.Sleep(3000);
+                return LaunchAppAsUser(userToken);
+            }
+            finally
+            {
+                CloseHandle(userToken);
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Launches the full app (no --sas flag) in the user's session via CreateProcessAsUser.
+    /// </summary>
+    private static bool LaunchAppAsUser(IntPtr userToken)
+    {
+        var appPath = Process.GetCurrentProcess().MainModule?.FileName;
+        if (string.IsNullOrEmpty(appPath))
+            return false;
+
+        IntPtr dupToken = IntPtr.Zero;
+        IntPtr envBlock = IntPtr.Zero;
+
+        try
+        {
+            // Duplicate the token as a primary token for CreateProcessAsUser
+            if (!DuplicateTokenEx(userToken, 0, IntPtr.Zero,
+                SECURITY_IMPERSONATION_LEVEL.SecurityImpersonation,
+                TOKEN_TYPE.TokenPrimary, out dupToken))
+                return false;
+
+            // Create environment block for the user
+            if (!CreateEnvironmentBlock(out envBlock, dupToken, false))
+            {
+                CloseHandle(dupToken);
+                return false;
+            }
+
+            // Set up startup info
+            var si = new STARTUPINFO();
+            si.cb = Marshal.SizeOf(si);
+            si.lpDesktop = "winsta0\\default";
+
+            // Launch the app without --sas (normal mode)
+            var cmdLine = $"\"{appPath}\"";
+            var result = CreateProcessAsUser(
+                dupToken,
+                null,
+                cmdLine,
+                IntPtr.Zero,
+                IntPtr.Zero,
+                false,
+                CREATE_UNICODE_ENVIRONMENT | CREATE_NEW_CONSOLE,
+                envBlock,
+                Path.GetDirectoryName(appPath),
+                ref si,
+                out var pi);
+
+            if (result)
+            {
+                CloseHandle(pi.hProcess);
+                CloseHandle(pi.hThread);
+            }
+
+            return result;
+        }
+        finally
+        {
+            if (envBlock != IntPtr.Zero)
+                DestroyEnvironmentBlock(envBlock);
+            if (dupToken != IntPtr.Zero)
+                CloseHandle(dupToken);
+        }
+    }
+
+    #region Win32 Interop — SAS + WTS
+
+    [DllImport("sas.dll", SetLastError = true)]
+    private static extern void SendSAS(bool asUser);
+
+    [DllImport("kernel32.dll")]
+    private static extern uint WTSGetActiveConsoleSessionId();
+
+    [DllImport("wtsapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool WTSQueryUserToken(uint sessionId, out IntPtr token);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool DuplicateTokenEx(
+        IntPtr hExistingToken,
+        uint dwDesiredAccess,
+        IntPtr lpTokenAttributes,
+        SECURITY_IMPERSONATION_LEVEL impersonationLevel,
+        TOKEN_TYPE tokenType,
+        out IntPtr phNewToken);
+
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CreateProcessAsUser(
+        IntPtr hToken,
+        string? lpApplicationName,
+        string lpCommandLine,
+        IntPtr lpProcessAttributes,
+        IntPtr lpThreadAttributes,
+        [MarshalAs(UnmanagedType.Bool)] bool bInheritHandles,
+        uint dwCreationFlags,
+        IntPtr lpEnvironment,
+        string? lpCurrentDirectory,
+        ref STARTUPINFO lpStartupInfo,
+        out PROCESS_INFORMATION lpProcessInformation);
+
+    [DllImport("userenv.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CreateEnvironmentBlock(out IntPtr lpEnvironment, IntPtr hToken, [MarshalAs(UnmanagedType.Bool)] bool bInherit);
+
+    [DllImport("userenv.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool DestroyEnvironmentBlock(IntPtr lpEnvironment);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CloseHandle(IntPtr hObject);
+
+    private enum SECURITY_IMPERSONATION_LEVEL { SecurityImpersonation = 2 }
+    private enum TOKEN_TYPE { TokenPrimary = 1 }
+
+    private const uint CREATE_UNICODE_ENVIRONMENT = 0x00000400;
+    private const uint CREATE_NEW_CONSOLE = 0x00000010;
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct STARTUPINFO
+    {
+        public int cb;
+        public string? lpReserved;
+        public string? lpDesktop;
+        public string? lpTitle;
+        public int dwX, dwY, dwXSize, dwYSize;
+        public int dwXCountChars, dwYCountChars;
+        public int dwFillAttribute;
+        public int dwFlags;
+        public short wShowWindow;
+        public short cbReserved2;
+        public IntPtr lpReserved2;
+        public IntPtr hStdInput, hStdOutput, hStdError;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct PROCESS_INFORMATION
+    {
+        public IntPtr hProcess;
+        public IntPtr hThread;
+        public int dwProcessId;
+        public int dwThreadId;
+    }
+
+    #endregion
 
     protected override MauiApp CreateMauiApp() => MauiProgram.CreateMauiApp();
 }

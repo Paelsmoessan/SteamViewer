@@ -39,6 +39,8 @@ public sealed class HostSession : IAsyncDisposable
     private readonly IInputInjector _inputInjector;
     private readonly IConfiguration _configuration;
     private readonly Func<SignalingMessage, Task> _sendSignaling;
+    private readonly string _hostClientId;
+    private readonly string _hostPasswordHash;
     private WebRTCManager? _webrtc;
     private bool _webrtcInitialized;
     private bool _disposed;
@@ -68,6 +70,9 @@ public sealed class HostSession : IAsyncDisposable
 
     /// <summary>Whether the connected viewer is sharing their screen.</summary>
     public bool IsPeerSharingScreen { get; private set; }
+
+    /// <summary>When true, auto-start full screen sharing when the data channel opens (used for post-reboot reconnect).</summary>
+    public bool AutoShareOnReady { get; set; }
 
     #region Events
 
@@ -100,7 +105,9 @@ public sealed class HostSession : IAsyncDisposable
         ILoggerFactory loggerFactory,
         IInputInjector inputInjector,
         IConfiguration configuration,
-        Func<SignalingMessage, Task> sendSignaling)
+        Func<SignalingMessage, Task> sendSignaling,
+        string hostClientId = "",
+        string hostPasswordHash = "")
     {
         PeerId = peerId;
         _jsRuntime = jsRuntime;
@@ -109,6 +116,8 @@ public sealed class HostSession : IAsyncDisposable
         _inputInjector = inputInjector;
         _configuration = configuration;
         _sendSignaling = sendSignaling;
+        _hostClientId = hostClientId;
+        _hostPasswordHash = hostPasswordHash;
     }
 
     /// <summary>
@@ -229,14 +238,15 @@ public sealed class HostSession : IAsyncDisposable
     #region Screen Sharing
 
     /// <summary>Start sharing screen to the connected viewer.</summary>
-    public async Task<bool> StartScreenShareAsync()
+    /// <param name="autoFullScreen">When true, prefer full screen capture (monitor) over window.</param>
+    public async Task<bool> StartScreenShareAsync(bool autoFullScreen = false)
     {
         if (_webrtc == null) return false;
 
         try
         {
-            _logger.LogInformation("Starting screen share...");
-            var success = await _webrtc.StartScreenCaptureAsync();
+            _logger.LogInformation("Starting screen share (autoFullScreen={Auto})...", autoFullScreen);
+            var success = await _webrtc.StartScreenCaptureAsync(autoFullScreen);
             if (success)
             {
                 IsSharingScreen = true;
@@ -315,6 +325,21 @@ public sealed class HostSession : IAsyncDisposable
         {
             _logger.LogWarning(ex, "Failed to send elevation status");
         }
+
+        // Auto-start full screen sharing on reconnect after reboot
+        if (AutoShareOnReady)
+        {
+            AutoShareOnReady = false;
+            try
+            {
+                _logger.LogInformation("Auto-sharing screen after reboot reconnect");
+                await StartScreenShareAsync(autoFullScreen: true);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to auto-start screen share after reconnect");
+            }
+        }
     }
 
     private async Task HandleDataChannelClose()
@@ -342,7 +367,7 @@ public sealed class HostSession : IAsyncDisposable
                 {
                     case "rebootHost":
                         _logger.LogInformation("Received reboot request from viewer");
-                        var rebootResult = _inputInjector.RebootWithAutoRestart();
+                        var rebootResult = _inputInjector.RebootWithAutoRestart(_hostClientId, _hostPasswordHash, PeerId);
                         if (!rebootResult && _webrtc != null)
                         {
                             await _webrtc.SendDataAsync(JsonSerializer.Serialize(new

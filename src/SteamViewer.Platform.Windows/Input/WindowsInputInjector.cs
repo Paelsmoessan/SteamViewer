@@ -4,6 +4,7 @@ using System.Security.Principal;
 using Microsoft.Extensions.Logging;
 using Microsoft.Win32;
 using SteamViewer.Client.Core.Capture;
+using SteamViewer.Client.Core.Session;
 using SteamViewer.Common.Protocol;
 
 namespace SteamViewer.Platform.Windows.Input;
@@ -75,80 +76,62 @@ public sealed class WindowsInputInjector : IInputInjector
 
     public bool SendSecureAttentionSequence()
     {
-        var helperPath = Path.Combine(AppContext.BaseDirectory, "SteamViewer.SasHelper.exe");
-        if (!File.Exists(helperPath))
+        if (!IsElevated)
         {
-            _logger.LogWarning("SAS helper not found at {Path}", helperPath);
+            _logger.LogWarning("SendSAS requires elevation");
             return false;
         }
 
         try
         {
-            var psi = new ProcessStartInfo
-            {
-                FileName = helperPath,
-                UseShellExecute = false,
-                CreateNoWindow = true
-            };
-
-            using var process = Process.Start(psi);
-            if (process == null)
-            {
-                _logger.LogWarning("Failed to start SAS helper");
-                return false;
-            }
-
-            process.WaitForExit(5000);
-            var success = process.ExitCode == 0;
-            _logger.LogInformation("SAS helper exited with code {Code}", process.ExitCode);
-            return success;
+            SendSAS(false);
+            _logger.LogInformation("SendSAS succeeded");
+            return true;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to launch SAS helper");
+            _logger.LogError(ex, "SendSAS failed");
             return false;
         }
     }
 
-    public bool RebootWithAutoRestart()
+    public bool RebootWithAutoRestart(string? clientId = null, string? passwordHash = null, string? viewerPeerId = null)
     {
         try
         {
             // If elevated, register auto-restart via registry
             if (IsElevated)
             {
-                var sasHelperPath = Path.Combine(AppContext.BaseDirectory, "SteamViewer.SasHelper.exe");
                 var appPath = Process.GetCurrentProcess().MainModule?.FileName;
 
-                // RunOnceEx — SAS helper runs pre-login to show Ctrl+Alt+Del screen
-                if (File.Exists(sasHelperPath))
+                if (!string.IsNullOrEmpty(appPath))
                 {
+                    // Save encrypted reconnect credentials (if provided)
+                    if (!string.IsNullOrEmpty(clientId) && !string.IsNullOrEmpty(passwordHash) && !string.IsNullOrEmpty(viewerPeerId))
+                    {
+                        try
+                        {
+                            ReconnectCredentials.Save(clientId, passwordHash, viewerPeerId);
+                            _logger.LogInformation("Saved encrypted reconnect credentials for post-reboot auto-reconnect");
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning(ex, "Failed to save reconnect credentials (app won't auto-reconnect)");
+                        }
+                    }
+
+                    // RunOnceEx — main app with --sas runs pre-login to show Ctrl+Alt+Del screen,
+                    // waits for logon, then launches full app as the logged-in user
                     try
                     {
                         using var runOnceExKey = Registry.LocalMachine.CreateSubKey(
                             @"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnceEx\SteamViewer");
-                        runOnceExKey?.SetValue("", sasHelperPath);
-                        _logger.LogInformation("Registered SAS helper in RunOnceEx");
+                        runOnceExKey?.SetValue("", $"\"{appPath}\" --sas");
+                        _logger.LogInformation("Registered app --sas in RunOnceEx");
                     }
                     catch (Exception ex)
                     {
-                        _logger.LogWarning(ex, "Failed to write RunOnceEx key (SAS helper won't run pre-login)");
-                    }
-                }
-
-                // RunOnce — main app restarts after login
-                if (!string.IsNullOrEmpty(appPath))
-                {
-                    try
-                    {
-                        using var runOnceKey = Registry.LocalMachine.OpenSubKey(
-                            @"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce", writable: true);
-                        runOnceKey?.SetValue("SteamViewerRestart", appPath);
-                        _logger.LogInformation("Registered app in RunOnce for auto-restart");
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogWarning(ex, "Failed to write RunOnce key (app won't auto-restart)");
+                        _logger.LogWarning(ex, "Failed to write RunOnceEx key (SAS won't run pre-login)");
                     }
                 }
             }
@@ -597,6 +580,9 @@ public sealed class WindowsInputInjector : IInputInjector
     private const ushort VK_OEM_5 = 0xDC;      // \|
     private const ushort VK_OEM_6 = 0xDD;      // ]}
     private const ushort VK_OEM_7 = 0xDE;      // '"
+
+    [DllImport("sas.dll", SetLastError = true)]
+    private static extern void SendSAS(bool asUser);
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);

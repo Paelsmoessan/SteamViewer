@@ -2,6 +2,7 @@
 @using SteamViewer.Client.Core.Capture
 @using SteamViewer.Client.Core.FileTransfer
 @using SteamViewer.Client.Core.Network
+@using SteamViewer.Client.Core.Session
 @using SteamViewer.App.Services
 @using SteamViewer.App.Services.Models
 @using SteamViewer.App.Components.FileTransfer
@@ -177,8 +178,10 @@
     // Session state
     private string clientId = "";
     private string password = "";
+    private string passwordHash = "";
     private string incomingPeerId = "";
     private string connectedPeerId = "";
+    private bool _isReconnect;
 
     // Join mode state
 #if DEBUG
@@ -475,18 +478,30 @@
 
             await SignalingClient.ConnectAsync();
 
+            // Check for post-reboot reconnect data (saved credentials from previous session)
+            var reconnect = ReconnectCredentials.Load();
+            if (reconnect != null)
+            {
+                clientId = reconnect.ClientId;
+                passwordHash = reconnect.PasswordHash;
+                password = "(reconnecting)"; // Plain password not available — hash is sufficient for registration
+                _isReconnect = true;
+                Logger.LogInformation("Reconnecting with saved credentials - ID: {Id}", clientId);
+            }
+            else
+            {
 #if DEBUG
-            clientId = Environment.MachineName;
-            password = "TESTPASS";
-            Logger.LogInformation("DEBUG MODE: Using test credentials - ID: {Id}, Password: {Pass}", clientId, password);
+                clientId = Environment.MachineName;
+                password = "TESTPASS";
+                Logger.LogInformation("DEBUG MODE: Using test credentials - ID: {Id}, Password: {Pass}", clientId, password);
 #else
-            clientId = new Random().Next(100000000, 999999999).ToString();
-            password = Guid.NewGuid().ToString("N")[..8].ToUpperInvariant();
+                clientId = new Random().Next(100000000, 999999999).ToString();
+                password = Guid.NewGuid().ToString("N")[..8].ToUpperInvariant();
 #endif
-
-            var passwordHash = Convert.ToHexString(
-                Hasher.Hash(Encoding.UTF8.GetBytes(password)).AsSpan()
-            ).ToLowerInvariant();
+                passwordHash = Convert.ToHexString(
+                    Hasher.Hash(Encoding.UTF8.GetBytes(password)).AsSpan()
+                ).ToLowerInvariant();
+            }
 
             var success = await SignalingClient.RegisterAsync(clientId, passwordHash);
 
@@ -582,7 +597,16 @@
                 LoggerFactory,
                 InputInjector,
                 Configuration,
-                msg => SignalingClient.SendAsync(msg));
+                msg => SignalingClient.SendAsync(msg),
+                clientId,
+                passwordHash);
+
+            // Auto-share full screen on reconnect after reboot
+            if (_isReconnect)
+            {
+                _hostSession.AutoShareOnReady = true;
+                _isReconnect = false; // One-time
+            }
 
             _hostSession.OnStateChanged += state => InvokeAsync(StateHasChanged);
             _hostSession.OnReady += () => InvokeAsync(StateHasChanged);

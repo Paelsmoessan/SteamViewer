@@ -685,9 +685,10 @@ window.SteamViewerWebRTC = {
     },
 
     // Start screen capture (for host)
-    async startScreenCapture(sessionId) {
+    // autoFullScreen: when true, prefer full monitor capture (used for post-reboot reconnect)
+    async startScreenCapture(sessionId, autoFullScreen = false) {
         const session = this._getSession(sessionId);
-        console.log(`=== Starting screen capture [${sessionId}] ===`);
+        console.log(`=== Starting screen capture [${sessionId}] autoFullScreen=${autoFullScreen} ===`);
         console.log('navigator.mediaDevices:', !!navigator.mediaDevices);
         console.log('getDisplayMedia:', !!navigator.mediaDevices?.getDisplayMedia);
         console.log('peerConnection:', !!session.peerConnection);
@@ -700,13 +701,20 @@ window.SteamViewerWebRTC = {
         }
 
         try {
+            const videoConstraints = {
+                cursor: 'motion',  // Only redraw cursor when moving (reduces capture overhead)
+                width: { ideal: 1920, max: 3840 },
+                height: { ideal: 1080, max: 2160 },
+                frameRate: { ideal: 30, max: 60 }
+            };
+
+            // Prefer full monitor capture for post-reboot reconnect (avoids window picker)
+            if (autoFullScreen) {
+                videoConstraints.displaySurface = 'monitor';
+            }
+
             session.localStream = await navigator.mediaDevices.getDisplayMedia({
-                video: {
-                    cursor: 'motion',  // Only redraw cursor when moving (reduces capture overhead)
-                    width: { ideal: 1920, max: 3840 },
-                    height: { ideal: 1080, max: 2160 },
-                    frameRate: { ideal: 30, max: 60 }
-                },
+                video: videoConstraints,
                 audio: false,
                 preferCurrentTab: false,
                 selfBrowserSurface: 'exclude',

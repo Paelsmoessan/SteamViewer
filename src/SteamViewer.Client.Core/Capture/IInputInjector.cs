@@ -28,7 +28,8 @@ public interface IInputInjector : IDisposable
 
     /// <summary>
     /// Initiate a system reboot with auto-restart of the application.
+    /// Credentials are saved encrypted for post-reboot auto-reconnect.
     /// Returns true if reboot was initiated, false if elevated privileges are required.
     /// </summary>
-    bool RebootWithAutoRestart() => false;
+    bool RebootWithAutoRestart(string? clientId = null, string? passwordHash = null, string? viewerPeerId = null) => false;
 }

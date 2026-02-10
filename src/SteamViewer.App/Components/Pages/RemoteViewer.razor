@@ -58,7 +58,11 @@
                                     title="@(_hostElevated != true ? "Host needs admin privileges" : "Send Ctrl+Alt+Del to host")">
                                 <span class="menu-icon">🛡️</span>
                                 <span>Ctrl+Alt+Del</span>
-                                @if (_hostElevated != true)
+                                @if (_hostElevated == true)
+                                {
+                                    <span class="menu-shortcut">Ctrl+Alt+End</span>
+                                }
+                                else
                                 {
                                     <span class="menu-note">Needs admin</span>
                                 }
@@ -902,6 +906,14 @@
     public void OnKeyDown(string key, System.Text.Json.JsonElement modifiers)
     {
         var (ctrl, shift, alt) = ParseModifiers(modifiers);
+
+        // Ctrl+Alt+End → Ctrl+Alt+Del (standard RDP convention)
+        if (key == "End" && ctrl && alt)
+        {
+            _ = SendCtrlAltDel();
+            return;
+        }
+
         SendInputToActiveSession(new InputEvent.KeyDown(key, new KeyModifiers(ctrl, shift, alt, false)));
     }
 
@@ -909,6 +921,8 @@
     public void OnKeyUp(string key, System.Text.Json.JsonElement modifiers)
     {
         var (ctrl, shift, alt) = ParseModifiers(modifiers);
+        if (key == "End" && ctrl && alt) return;
+
         SendInputToActiveSession(new InputEvent.KeyUp(key, new KeyModifiers(ctrl, shift, alt, false)));
     }
 
