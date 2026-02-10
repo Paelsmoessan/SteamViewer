@@ -191,7 +191,7 @@
             {
                 <div class="reconnect-overlay">
                     <div class="reconnect-dialog">
-                        <h3>Host Disconnected</h3>
+                        <h3>@(_isElevationRestarting ? "Host Restarting as Admin" : "Host Disconnected")</h3>
                         @if (_reconnectCountdown > 0)
                         {
                             <p>Reconnecting in @_reconnectCountdown seconds...</p>
@@ -242,6 +242,7 @@
     private string? _toastMessage;
     private bool? _hostElevated;
     private bool _hasReceivedFrame;
+    private bool _isElevationRestarting;
 
     protected override void OnInitialized()
     {
@@ -471,6 +472,7 @@
                     StateHasChanged();
                     break;
                 case "elevationRestarting":
+                    _isElevationRestarting = true;
                     ShowToast("Host is restarting as admin — reconnecting...");
                     break;
             }
@@ -949,9 +951,11 @@
 
     private void StartReconnectCountdown()
     {
-        // Exponential backoff: 10s, 20s, 40s, ... max 300s (5 min)
-        var baseDelay = 10;
-        var delay = Math.Min(baseDelay * (int)Math.Pow(2, _reconnectAttempts), 300);
+        // Elevation restart: short 5s delay (host restarts quickly)
+        // Normal disconnect: exponential backoff 10s, 20s, 40s, ... max 300s (5 min)
+        var baseDelay = _isElevationRestarting ? 5 : 10;
+        var maxDelay = _isElevationRestarting ? 30 : 300;
+        var delay = Math.Min(baseDelay * (int)Math.Pow(2, _reconnectAttempts), maxDelay);
         _reconnectCountdown = delay;
 
         _reconnectTimer?.Dispose();
@@ -983,11 +987,47 @@
         _reconnectAttempts++;
         Console.WriteLine($"Reconnect attempt {_reconnectAttempts} for session {_activeSessionId}");
 
-        // TODO: Implement actual reconnection via SessionManager
-        // For now, just restart the countdown
-        // await SessionManager.ReconnectSessionAsync(_activeSessionId);
+        try
+        {
+            var newSession = await SessionManager.ReconnectSessionAsync(_activeSessionId, JSRuntime);
+            if (newSession != null)
+            {
+                // Unsubscribe from old session events
+                _activeSession.OnFrame -= HandleSessionFrame;
+                _activeSession.OnDisconnected -= HandleSessionDisconnected;
+                _activeSession.OnStatsUpdated -= HandleStatsUpdate;
+                _activeSession.OnControlMessage -= HandleControlMessage;
+                _activeSession.OnClipboardReceived -= HandleClipboardReceived;
 
-        // If reconnect fails, start countdown again
+                // Update references (session ID stays the same for tab tracking)
+                _activeSessionId = newSession.SessionId;
+                _activeSession = newSession;
+
+                // Subscribe to new session events
+                _activeSession.OnFrame += HandleSessionFrame;
+                _activeSession.OnDisconnected += HandleSessionDisconnected;
+                _activeSession.OnStatsUpdated += HandleStatsUpdate;
+                _activeSession.OnControlMessage += HandleControlMessage;
+                _activeSession.OnClipboardReceived += HandleClipboardReceived;
+
+                // Update JS input routing
+                await JSRuntime.InvokeVoidAsync("SteamViewerInput.setActiveSession", newSession.SessionId);
+
+                // Hide reconnect overlay, show "waiting for host screen"
+                _showReconnectOverlay = false;
+                _isElevationRestarting = false;
+                _hasReceivedFrame = false;
+                _reconnectAttempts = 0;
+                StateHasChanged();
+                return;
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Reconnect attempt {_reconnectAttempts} failed: {ex.Message}");
+        }
+
+        // Reconnect failed, try again with backoff
         StartReconnectCountdown();
     }
 

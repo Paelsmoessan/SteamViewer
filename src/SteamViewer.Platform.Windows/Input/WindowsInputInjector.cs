@@ -102,7 +102,7 @@ public sealed class WindowsInputInjector : IInputInjector
             // If elevated, register auto-restart via registry
             if (IsElevated)
             {
-                var appPath = Process.GetCurrentProcess().MainModule?.FileName;
+                var appPath = Environment.ProcessPath;
 
                 if (!string.IsNullOrEmpty(appPath))
                 {

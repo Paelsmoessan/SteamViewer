@@ -126,6 +126,7 @@ public sealed class ViewerSessionManager : IAsyncDisposable
             jsRuntime,
             _loggerFactory,
             SendSignalingMessage);
+        session.StoredPassword = password;
 
         // Subscribe to session events
         session.OnStateChanged += state => HandleSessionStateChanged(sessionId, state);
@@ -189,6 +190,87 @@ public sealed class ViewerSessionManager : IAsyncDisposable
             _logger.LogInformation("Removed session {SessionId}", sessionId);
             OnSessionRemoved?.Invoke(sessionId);
         }
+    }
+
+    /// <summary>
+    /// Reconnect an existing session (e.g., after elevation restart).
+    /// Disposes the old WebRTC connection and creates a new one with the same session ID and peer.
+    /// </summary>
+    public async Task<ViewerSession?> ReconnectSessionAsync(string sessionId, IJSRuntime jsRuntime)
+    {
+        if (!_sessions.TryRemove(sessionId, out var oldSession))
+        {
+            _logger.LogWarning("Cannot reconnect: session {SessionId} not found", sessionId);
+            return null;
+        }
+
+        var peerId = oldSession.PeerId;
+        var password = oldSession.StoredPassword;
+
+        // Clean up old session
+        _peerToSession.TryRemove(peerId, out _);
+        try { await oldSession.DisposeAsync(); }
+        catch (Exception ex) { _logger.LogWarning(ex, "Error disposing old session during reconnect"); }
+
+        if (string.IsNullOrEmpty(password))
+        {
+            _logger.LogError("Cannot reconnect session {SessionId}: no stored password", sessionId);
+            return null;
+        }
+
+        _logger.LogInformation("Reconnecting session {SessionId} to peer {PeerId}", sessionId, peerId);
+
+        EnsureSignalingSubscribed();
+
+        // Ensure signaling is connected
+        if (!_signalingClient.IsConnected)
+        {
+            await _signalingClient.ConnectAsync();
+
+#if DEBUG
+            var joinerId = $"VIEWER{_debugViewerIdCounter++}";
+#else
+            var joinerId = new Random().Next(100000000, 999999999).ToString();
+#endif
+            var joinerPasswordHash = Convert.ToHexString(
+                Hasher.Hash(Encoding.UTF8.GetBytes(Guid.NewGuid().ToString())).AsSpan()
+            ).ToLowerInvariant();
+
+            await _signalingClient.RegisterAsync(joinerId, joinerPasswordHash);
+        }
+
+        // Create new session with the SAME session ID (preserves tab tracking)
+        var session = new ViewerSession(
+            sessionId,
+            peerId,
+            jsRuntime,
+            _loggerFactory,
+            SendSignalingMessage);
+        session.StoredPassword = password;
+
+        // Subscribe to session events
+        session.OnStateChanged += state => HandleSessionStateChanged(sessionId, state);
+        session.OnDisconnected += reason => HandleSessionDisconnected(sessionId, reason);
+        session.OnIceCandidate += (candidate, sdpMid, sdpMLineIndex) =>
+            _signalingClient.SendIceCandidateAsync(peerId, candidate, sdpMid, sdpMLineIndex);
+        session.OnSdpMessage += (targetPeerId, sdp) =>
+            _signalingClient.SendSdpAnswerAsync(targetPeerId, sdp);
+
+        _sessions[sessionId] = session;
+        _peerToSession[peerId] = sessionId;
+
+        // Initialize WebRTC
+        await session.InitializeAsync();
+
+        // Configure TURN server
+        await ConfigureTurnServerAsync(jsRuntime);
+
+        // Request connection via signaling
+        await _signalingClient.RequestConnectionAsync(peerId, password);
+
+        _logger.LogInformation("Reconnect session {SessionId} created, awaiting host response", sessionId);
+
+        return session;
     }
 
     /// <summary>
@@ -304,6 +386,14 @@ public sealed class ViewerSessionManager : IAsyncDisposable
 
         _logger.LogInformation("Session {SessionId}: Peer {PeerId} disconnected",
             session.SessionId, disconnected.PeerId);
+
+        if (session.IsElevationRestarting)
+        {
+            _logger.LogInformation("Session {SessionId}: Skipping removal — host is restarting for elevation",
+                session.SessionId);
+            return;
+        }
+
         _ = RemoveSessionAsync(session.SessionId);
     }
 

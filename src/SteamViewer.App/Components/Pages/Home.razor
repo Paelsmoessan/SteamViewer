@@ -286,7 +286,7 @@
         {
             currentMode = AppMode.StartConnection;
             StateHasChanged();
-            _ = StartSession();
+            _ = StartSessionWithRetryAsync();
         }
 
         // Initialize JS logger on first render
@@ -521,6 +521,8 @@
             {
                 connectionState = ConnectionState.Error;
                 errorMessage = "Failed to register with server";
+                // Disconnect so next retry starts fresh
+                try { await SignalingClient.DisconnectAsync(); } catch { }
             }
         }
         catch (Exception ex)
@@ -528,9 +530,41 @@
             Logger.LogError(ex, "Failed to start hosting");
             connectionState = ConnectionState.Error;
             errorMessage = ex.Message;
+            try { await SignalingClient.DisconnectAsync(); } catch { }
         }
 
         StateHasChanged();
+    }
+
+    /// <summary>
+    /// Auto-start with retries for elevation/reboot reconnect.
+    /// Handles race condition where old client ID may still be registered.
+    /// </summary>
+    private async Task StartSessionWithRetryAsync(int maxAttempts = 4, int baseDelayMs = 2000)
+    {
+        for (int attempt = 1; attempt <= maxAttempts; attempt++)
+        {
+            Logger.LogInformation("Auto-start attempt {Attempt}/{Max}", attempt, maxAttempts);
+            await StartSession();
+
+            if (connectionState == ConnectionState.Registered)
+            {
+                Logger.LogInformation("Auto-start succeeded on attempt {Attempt}", attempt);
+                return;
+            }
+
+            if (attempt < maxAttempts)
+            {
+                var delay = baseDelayMs * (int)Math.Pow(2, attempt - 1);
+                Logger.LogWarning("Auto-start attempt {Attempt} failed, retrying in {Delay}ms", attempt, delay);
+                errorMessage = $"Connecting... (attempt {attempt + 1})";
+                connectionState = ConnectionState.Registering;
+                StateHasChanged();
+                await Task.Delay(delay);
+            }
+        }
+
+        Logger.LogError("Auto-start failed after {Max} attempts", maxAttempts);
     }
 
     private async Task StopSession()
@@ -632,6 +666,8 @@
                 SignalingClient.SendIceCandidateAsync(connectedPeerId, candidate, sdpMid, sdpMLineIndex);
             _hostSession.OnSdpMessage += (peerId, sdp) =>
                 SignalingClient.SendSdpOfferAsync(peerId, sdp);
+            _hostSession.OnGracefulShutdownRequested += async () =>
+                await SignalingClient.DisconnectAsync();
 
             await _hostSession.InitializeAsync();
         }
@@ -784,6 +820,15 @@
             {
                 case SignalingMessage.IncomingConnection incoming:
                     incomingPeerId = incoming.FromId;
+
+                    // Auto-accept during reconnect (post-elevation or post-reboot)
+                    if (_isReconnect)
+                    {
+                        Logger.LogInformation("Auto-accepting reconnect from {PeerId}", incoming.FromId);
+                        await AcceptConnection();
+                        break;
+                    }
+
                     connectionState = ConnectionState.Connecting;
                     break;
 

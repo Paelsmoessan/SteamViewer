@@ -99,6 +99,17 @@ public sealed class ViewerSession : IAsyncDisposable
     public bool? IsHostElevated { get; private set; }
 
     /// <summary>
+    /// Whether the host is restarting for elevation (admin restart).
+    /// When true, the viewer should attempt to reconnect rather than closing the tab.
+    /// </summary>
+    public bool IsElevationRestarting { get; set; }
+
+    /// <summary>
+    /// Stored password for reconnection after elevation restart.
+    /// </summary>
+    public string? StoredPassword { get; set; }
+
+    /// <summary>
     /// Raised when an ICE candidate needs to be sent via signaling.
     /// </summary>
     public event Func<string, string?, ushort?, Task>? OnIceCandidate;
@@ -374,6 +385,7 @@ public sealed class ViewerSession : IAsyncDisposable
                         break;
 
                     case "elevationRestarting":
+                        IsElevationRestarting = true;
                         _logger.LogInformation("Session {SessionId}: Host is restarting for elevation", SessionId);
                         OnControlMessage?.Invoke(type, null);
                         break;

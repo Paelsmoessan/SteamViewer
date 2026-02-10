@@ -193,7 +193,7 @@ public partial class App : MauiWinUIApplication
     /// </summary>
     private static bool LaunchAppAsUser(IntPtr userToken)
     {
-        var appPath = Process.GetCurrentProcess().MainModule?.FileName;
+        var appPath = Environment.ProcessPath;
         if (string.IsNullOrEmpty(appPath))
             return false;
 

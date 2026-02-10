@@ -98,6 +98,9 @@ public sealed class HostSession : IAsyncDisposable
     /// <summary>Raised when a control message error needs to be shown to the viewer.</summary>
     public event Action<string, string?>? OnControlMessage;
 
+    /// <summary>Raised before the process exits for elevation restart, allowing graceful signaling disconnect.</summary>
+    public event Func<Task>? OnGracefulShutdownRequested;
+
     #endregion
 
     public HostSession(
@@ -532,8 +535,8 @@ public sealed class HostSession : IAsyncDisposable
         _logger.LogInformation("Attempting to restart as admin...");
         try
         {
-            var exePath = Process.GetCurrentProcess().MainModule?.FileName;
-            if (exePath == null)
+            var exePath = Environment.ProcessPath;
+            if (string.IsNullOrEmpty(exePath))
             {
                 _logger.LogError("Could not determine current process path");
                 await _webrtc.SendDataAsync(JsonSerializer.Serialize(new
@@ -543,6 +546,7 @@ public sealed class HostSession : IAsyncDisposable
                 }));
                 return;
             }
+            _logger.LogInformation("Elevation restart: using exe path {ExePath}", exePath);
 
             var psi = new ProcessStartInfo
             {
@@ -571,8 +575,18 @@ public sealed class HostSession : IAsyncDisposable
                 type = "elevationRestarting"
             }));
 
-            // Give the message time to send before exiting
+            // Give the message time to send, then gracefully disconnect signaling
             await Task.Delay(500);
+            try
+            {
+                if (OnGracefulShutdownRequested != null)
+                    await OnGracefulShutdownRequested.Invoke();
+            }
+            catch (Exception shutdownEx)
+            {
+                _logger.LogWarning(shutdownEx, "Failed to gracefully disconnect signaling");
+            }
+            await Task.Delay(200);
             Environment.Exit(0);
         }
         catch (System.ComponentModel.Win32Exception ex) when (ex.NativeErrorCode == 1223) // ERROR_CANCELLED (UAC denied)
