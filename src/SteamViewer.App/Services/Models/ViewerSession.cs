@@ -99,13 +99,7 @@ public sealed class ViewerSession : IAsyncDisposable
     public bool? IsHostElevated { get; private set; }
 
     /// <summary>
-    /// Whether the host is restarting for elevation (admin restart).
-    /// When true, the viewer should attempt to reconnect rather than closing the tab.
-    /// </summary>
-    public bool IsElevationRestarting { get; set; }
-
-    /// <summary>
-    /// Stored password for reconnection after elevation restart.
+    /// Stored password for reconnection after disconnect.
     /// </summary>
     public string? StoredPassword { get; set; }
 
@@ -371,8 +365,8 @@ public sealed class ViewerSession : IAsyncDisposable
                         OnControlMessage?.Invoke(type, null);
                         break;
 
-                    case "ctrlAltDelError":
-                    case "rebootError":
+                    case "ctrlAltDelFailed":
+                    case "rebootFailed":
                     case "elevationDenied":
                         var message = root.TryGetProperty("message", out var msgProp) ? msgProp.GetString() : null;
                         _logger.LogWarning("Session {SessionId}: {Type}: {Message}", SessionId, type, message);
@@ -381,12 +375,6 @@ public sealed class ViewerSession : IAsyncDisposable
 
                     case "elevationAlready":
                         _logger.LogInformation("Session {SessionId}: Host is already elevated", SessionId);
-                        OnControlMessage?.Invoke(type, null);
-                        break;
-
-                    case "elevationRestarting":
-                        IsElevationRestarting = true;
-                        _logger.LogInformation("Session {SessionId}: Host is restarting for elevation", SessionId);
                         OnControlMessage?.Invoke(type, null);
                         break;
 

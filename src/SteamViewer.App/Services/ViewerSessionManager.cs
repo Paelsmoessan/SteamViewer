@@ -387,13 +387,6 @@ public sealed class ViewerSessionManager : IAsyncDisposable
         _logger.LogInformation("Session {SessionId}: Peer {PeerId} disconnected",
             session.SessionId, disconnected.PeerId);
 
-        if (session.IsElevationRestarting)
-        {
-            _logger.LogInformation("Session {SessionId}: Skipping removal — host is restarting for elevation",
-                session.SessionId);
-            return;
-        }
-
         _ = RemoveSessionAsync(session.SessionId);
     }
 

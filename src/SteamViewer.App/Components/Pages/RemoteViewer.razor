@@ -73,9 +73,9 @@
                             </button>
                             @if (_hostElevated == false)
                             {
-                                <button class="menu-item" @onclick="RequestElevation" title="Request host to restart as admin (requires someone at host)">
+                                <button class="menu-item" @onclick="RequestElevation" title="Enable admin features on host (UAC prompt will appear on host)">
                                     <span class="menu-icon">⬆️</span>
-                                    <span>Request Elevation</span>
+                                    <span>Enable Admin</span>
                                 </button>
                             }
                         </div>
@@ -191,7 +191,7 @@
             {
                 <div class="reconnect-overlay">
                     <div class="reconnect-dialog">
-                        <h3>@(_isElevationRestarting ? "Host Restarting as Admin" : "Host Disconnected")</h3>
+                        <h3>Host Disconnected</h3>
                         @if (_reconnectCountdown > 0)
                         {
                             <p>Reconnecting in @_reconnectCountdown seconds...</p>
@@ -242,7 +242,6 @@
     private string? _toastMessage;
     private bool? _hostElevated;
     private bool _hasReceivedFrame;
-    private bool _isElevationRestarting;
 
     protected override void OnInitialized()
     {
@@ -454,26 +453,25 @@
             switch (type)
             {
                 case "hostStatus":
+                    var wasElevated = _hostElevated;
                     _hostElevated = _activeSession?.IsHostElevated;
+                    if (_hostElevated == true && wasElevated != true)
+                        ShowToast("Admin features enabled");
                     StateHasChanged();
                     break;
-                case "ctrlAltDelError":
-                    ShowToast(message ?? "Host needs to run as administrator");
+                case "ctrlAltDelFailed":
+                    ShowToast(message ?? "Ctrl+Alt+Del failed");
                     break;
-                case "rebootError":
-                    ShowToast(message ?? "Host needs to run as administrator to reboot");
+                case "rebootFailed":
+                    ShowToast(message ?? "Reboot failed");
                     break;
                 case "elevationDenied":
                     ShowToast(message ?? "Elevation denied on host");
                     break;
                 case "elevationAlready":
                     _hostElevated = true;
-                    ShowToast("Host is already running as admin");
+                    ShowToast("Admin features already enabled");
                     StateHasChanged();
-                    break;
-                case "elevationRestarting":
-                    _isElevationRestarting = true;
-                    ShowToast("Host is restarting as admin — reconnecting...");
                     break;
             }
         });
@@ -729,7 +727,7 @@
         {
             var json = System.Text.Json.JsonSerializer.Serialize(new { type = "requestElevation" });
             await _activeSession.SendDataAsync(json);
-            ShowToast("Elevation requested — waiting for approval on host...");
+            ShowToast("Requesting admin features — UAC prompt on host...");
         }
         catch (Exception ex)
         {
@@ -951,10 +949,9 @@
 
     private void StartReconnectCountdown()
     {
-        // Elevation restart: short 5s delay (host restarts quickly)
-        // Normal disconnect: exponential backoff 10s, 20s, 40s, ... max 300s (5 min)
-        var baseDelay = _isElevationRestarting ? 5 : 10;
-        var maxDelay = _isElevationRestarting ? 30 : 300;
+        // Exponential backoff: 10s, 20s, 40s, ... max 300s (5 min)
+        var baseDelay = 10;
+        var maxDelay = 300;
         var delay = Math.Min(baseDelay * (int)Math.Pow(2, _reconnectAttempts), maxDelay);
         _reconnectCountdown = delay;
 
@@ -1015,7 +1012,6 @@
 
                 // Hide reconnect overlay, show "waiting for host screen"
                 _showReconnectOverlay = false;
-                _isElevationRestarting = false;
                 _hasReceivedFrame = false;
                 _reconnectAttempts = 0;
                 StateHasChanged();

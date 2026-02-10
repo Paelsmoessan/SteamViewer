@@ -1,13 +1,12 @@
 using System.Diagnostics;
-using System.Security.Principal;
 using System.Text.Json;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.JSInterop;
 using SteamViewer.Client.Core.Capture;
 using SteamViewer.Client.Core.Network;
-using SteamViewer.Client.Core.Session;
 using SteamViewer.Common.Protocol;
+using SteamViewer.Platform.Windows.Elevation;
 
 namespace SteamViewer.App.Services.Models;
 
@@ -43,6 +42,7 @@ public sealed class HostSession : IAsyncDisposable
     private readonly string _hostClientId;
     private readonly string _hostPasswordHash;
     private WebRTCManager? _webrtc;
+    private ElevatedHelperClient? _elevatedHelper;
     private bool _webrtcInitialized;
     private bool _disposed;
 
@@ -94,12 +94,6 @@ public sealed class HostSession : IAsyncDisposable
 
     /// <summary>Raised when an SDP offer/answer needs to be sent via signaling.</summary>
     public event Func<string, string, Task>? OnSdpMessage;
-
-    /// <summary>Raised when a control message error needs to be shown to the viewer.</summary>
-    public event Action<string, string?>? OnControlMessage;
-
-    /// <summary>Raised before the process exits for elevation restart, allowing graceful signaling disconnect.</summary>
-    public event Func<Task>? OnGracefulShutdownRequested;
 
     #endregion
 
@@ -314,10 +308,10 @@ public sealed class HostSession : IAsyncDisposable
         SetState(HostSessionState.Connected);
         OnReady?.Invoke();
 
-        // Send elevation status to viewer
+        // Send elevation status to viewer (elevated = helper is connected)
         try
         {
-            var elevated = IsCurrentProcessElevated();
+            var elevated = _elevatedHelper?.IsConnected == true;
             await _webrtc!.SendDataAsync(JsonSerializer.Serialize(new
             {
                 type = "hostStatus",
@@ -371,28 +365,12 @@ public sealed class HostSession : IAsyncDisposable
                 {
                     case "rebootHost":
                         _logger.LogInformation("Received reboot request from viewer");
-                        var rebootResult = _inputInjector.RebootWithAutoRestart(_hostClientId, _hostPasswordHash, PeerId);
-                        if (!rebootResult && _webrtc != null)
-                        {
-                            await _webrtc.SendDataAsync(JsonSerializer.Serialize(new
-                            {
-                                type = "rebootError",
-                                message = "Host needs to run as administrator to reboot"
-                            }));
-                        }
+                        await HandleRebootAsync();
                         return;
 
                     case "ctrlAltDel":
                         _logger.LogInformation("Received Ctrl+Alt+Del request from viewer");
-                        var sasResult = _inputInjector.SendSecureAttentionSequence();
-                        if (!sasResult && _webrtc != null)
-                        {
-                            await _webrtc.SendDataAsync(JsonSerializer.Serialize(new
-                            {
-                                type = "ctrlAltDelError",
-                                message = "Host needs to run as administrator"
-                            }));
-                        }
+                        await HandleCtrlAltDelAsync();
                         return;
 
                     case "requestElevation":
@@ -516,15 +494,19 @@ public sealed class HostSession : IAsyncDisposable
 
     #endregion
 
-    #region Elevation
+    #region Elevation & System Controls
 
+    /// <summary>
+    /// Launch the elevated helper process (triggers UAC on host).
+    /// No app restart — main app stays running, WebRTC stays connected.
+    /// </summary>
     private async Task HandleRequestElevationAsync()
     {
         if (_webrtc == null) return;
 
-        if (IsCurrentProcessElevated())
+        if (_elevatedHelper?.IsConnected == true)
         {
-            _logger.LogInformation("Already elevated, notifying viewer");
+            _logger.LogInformation("Elevated helper already connected");
             await _webrtc.SendDataAsync(JsonSerializer.Serialize(new
             {
                 type = "elevationAlready"
@@ -532,75 +514,41 @@ public sealed class HostSession : IAsyncDisposable
             return;
         }
 
-        _logger.LogInformation("Attempting to restart as admin...");
+        _logger.LogInformation("Launching elevated helper process...");
         try
         {
-            var exePath = Environment.ProcessPath;
-            if (string.IsNullOrEmpty(exePath))
+            _elevatedHelper = new ElevatedHelperClient(_logger);
+            var success = await _elevatedHelper.LaunchAndConnectAsync();
+
+            if (success)
             {
-                _logger.LogError("Could not determine current process path");
+                _logger.LogInformation("Elevated helper connected — admin features enabled");
+                await _webrtc.SendDataAsync(JsonSerializer.Serialize(new
+                {
+                    type = "hostStatus",
+                    elevated = true
+                }));
+            }
+            else
+            {
+                _logger.LogWarning("Elevated helper failed to connect (UAC denied or error)");
+                await _elevatedHelper.DisposeAsync();
+                _elevatedHelper = null;
                 await _webrtc.SendDataAsync(JsonSerializer.Serialize(new
                 {
                     type = "elevationDenied",
-                    message = "Could not determine app path"
+                    message = "UAC prompt was denied or helper failed to start"
                 }));
-                return;
             }
-            _logger.LogInformation("Elevation restart: using exe path {ExePath}", exePath);
-
-            var psi = new ProcessStartInfo
-            {
-                FileName = exePath,
-                UseShellExecute = true,
-                Verb = "runas"
-            };
-
-            // Save credentials so the elevated instance can reconnect with the same ID
-            try
-            {
-                ReconnectCredentials.Save(_hostClientId, _hostPasswordHash, PeerId);
-                _logger.LogInformation("Saved reconnect credentials for elevated instance");
-            }
-            catch (Exception saveEx)
-            {
-                _logger.LogWarning(saveEx, "Failed to save reconnect credentials");
-            }
-
-            Process.Start(psi);
-            _logger.LogInformation("Elevated instance started, shutting down current instance");
-
-            // Notify viewer that elevation is in progress (they'll need to reconnect)
-            await _webrtc.SendDataAsync(JsonSerializer.Serialize(new
-            {
-                type = "elevationRestarting"
-            }));
-
-            // Give the message time to send, then gracefully disconnect signaling
-            await Task.Delay(500);
-            try
-            {
-                if (OnGracefulShutdownRequested != null)
-                    await OnGracefulShutdownRequested.Invoke();
-            }
-            catch (Exception shutdownEx)
-            {
-                _logger.LogWarning(shutdownEx, "Failed to gracefully disconnect signaling");
-            }
-            await Task.Delay(200);
-            Environment.Exit(0);
-        }
-        catch (System.ComponentModel.Win32Exception ex) when (ex.NativeErrorCode == 1223) // ERROR_CANCELLED (UAC denied)
-        {
-            _logger.LogWarning("UAC prompt denied by user");
-            await _webrtc.SendDataAsync(JsonSerializer.Serialize(new
-            {
-                type = "elevationDenied",
-                message = "UAC prompt was denied on host"
-            }));
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to restart as admin");
+            _logger.LogError(ex, "Failed to launch elevated helper");
+            if (_elevatedHelper != null)
+            {
+                await _elevatedHelper.DisposeAsync();
+                _elevatedHelper = null;
+            }
             await _webrtc.SendDataAsync(JsonSerializer.Serialize(new
             {
                 type = "elevationDenied",
@@ -609,11 +557,90 @@ public sealed class HostSession : IAsyncDisposable
         }
     }
 
-    private static bool IsCurrentProcessElevated()
+    /// <summary>
+    /// Send Ctrl+Alt+Del (SAS) via elevated helper if available.
+    /// </summary>
+    private async Task HandleCtrlAltDelAsync()
     {
-        using var identity = WindowsIdentity.GetCurrent();
-        var principal = new WindowsPrincipal(identity);
-        return principal.IsInRole(WindowsBuiltInRole.Administrator);
+        if (_webrtc == null) return;
+
+        if (_elevatedHelper?.IsConnected == true)
+        {
+            var success = await _elevatedHelper.SendSASAsync();
+            if (success)
+            {
+                _logger.LogInformation("Ctrl+Alt+Del sent via elevated helper");
+            }
+            else
+            {
+                _logger.LogWarning("Ctrl+Alt+Del failed via elevated helper");
+                await _webrtc.SendDataAsync(JsonSerializer.Serialize(new
+                {
+                    type = "ctrlAltDelFailed",
+                    message = "SendSAS failed via elevated helper"
+                }));
+            }
+        }
+        else
+        {
+            _logger.LogWarning("Ctrl+Alt+Del requested but no elevated helper connected");
+            await _webrtc.SendDataAsync(JsonSerializer.Serialize(new
+            {
+                type = "ctrlAltDelFailed",
+                message = "Admin features not enabled — request elevation first"
+            }));
+        }
+    }
+
+    /// <summary>
+    /// Reboot the host machine with auto-restart. Routes through elevated helper
+    /// for RunOnceEx registry write, falls back to direct reboot if not elevated.
+    /// </summary>
+    private async Task HandleRebootAsync()
+    {
+        if (_elevatedHelper?.IsConnected == true)
+        {
+            var success = await _elevatedHelper.RebootAsync(_hostClientId, _hostPasswordHash, PeerId);
+            if (success)
+            {
+                _logger.LogInformation("Reboot initiated via elevated helper (with auto-restart)");
+            }
+            else
+            {
+                _logger.LogWarning("Reboot failed via elevated helper");
+                if (_webrtc != null)
+                    await _webrtc.SendDataAsync(JsonSerializer.Serialize(new
+                    {
+                        type = "rebootFailed",
+                        message = "Reboot command failed"
+                    }));
+            }
+        }
+        else
+        {
+            // No elevated helper — reboot without RunOnceEx (no auto-restart)
+            _logger.LogWarning("Reboot requested without elevated helper — rebooting without auto-restart");
+            try
+            {
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = "shutdown",
+                    Arguments = "/r /t 0",
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to initiate reboot");
+                if (_webrtc != null)
+                    await _webrtc.SendDataAsync(JsonSerializer.Serialize(new
+                    {
+                        type = "rebootFailed",
+                        message = ex.Message
+                    }));
+            }
+        }
     }
 
     #endregion
@@ -721,6 +748,12 @@ public sealed class HostSession : IAsyncDisposable
     {
         if (_disposed) return;
         _disposed = true;
+
+        if (_elevatedHelper != null)
+        {
+            await _elevatedHelper.DisposeAsync();
+            _elevatedHelper = null;
+        }
 
         if (_webrtc != null)
         {

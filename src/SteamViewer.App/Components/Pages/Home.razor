@@ -672,8 +672,6 @@
                 SignalingClient.SendIceCandidateAsync(connectedPeerId, candidate, sdpMid, sdpMLineIndex);
             _hostSession.OnSdpMessage += (peerId, sdp) =>
                 SignalingClient.SendSdpOfferAsync(peerId, sdp);
-            _hostSession.OnGracefulShutdownRequested += async () =>
-                await SignalingClient.DisconnectAsync();
 
             await _hostSession.InitializeAsync();
         }

@@ -2,6 +2,7 @@ using Microsoft.UI.Xaml;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
+using SteamViewer.Platform.Windows.Elevation;
 
 namespace SteamViewer.App.WinUI;
 
@@ -24,11 +25,22 @@ public partial class App : MauiWinUIApplication
 
     public App()
     {
-        // Lightweight mode: --sas sends Ctrl+Alt+Del and exits immediately (used by RunOnceEx pre-login)
+        // Lightweight modes: intercept before MAUI initialization
         var args = Environment.GetCommandLineArgs();
+
+        // --sas: sends Ctrl+Alt+Del and exits (used by RunOnceEx pre-login)
         if (args.Contains("--sas"))
         {
             HandleSasMode();
+            return;
+        }
+
+        // --elevated-helper <pipeName>: runs as elevated pipe server for privileged operations
+        var helperIdx = Array.IndexOf(args, "--elevated-helper");
+        if (helperIdx >= 0 && helperIdx + 1 < args.Length)
+        {
+            ElevatedHelperServer.Run(args[helperIdx + 1]);
+            Environment.Exit(0);
             return;
         }
 
