@@ -377,6 +377,10 @@ public sealed class HostSession : IAsyncDisposable
                         await HandleRequestElevationAsync();
                         return;
 
+                    case "runElevated":
+                        await HandleRunElevatedAsync(root);
+                        return;
+
                     case "clipboard_request":
                         await HandleClipboardRequestAsync();
                         return;
@@ -650,6 +654,57 @@ public sealed class HostSession : IAsyncDisposable
                         message = ex.Message
                     }));
             }
+        }
+    }
+
+    /// <summary>
+    /// Run a process elevated via the helper pipe (no additional UAC prompt).
+    /// </summary>
+    private async Task HandleRunElevatedAsync(JsonElement root)
+    {
+        if (_webrtc == null) return;
+
+        var path = root.TryGetProperty("path", out var p) ? p.GetString() : null;
+        var args = root.TryGetProperty("args", out var a) ? a.GetString() : null;
+
+        if (string.IsNullOrEmpty(path))
+        {
+            await _webrtc.SendDataAsync(JsonSerializer.Serialize(new
+            {
+                type = "runElevatedFailed",
+                message = "No path specified"
+            }));
+            return;
+        }
+
+        if (_elevatedHelper?.IsConnected == true)
+        {
+            var success = await _elevatedHelper.RunElevatedAsync(path, args);
+            if (success)
+            {
+                _logger.LogInformation("RunElevated succeeded: {Path}", path);
+                await _webrtc.SendDataAsync(JsonSerializer.Serialize(new
+                {
+                    type = "runElevatedSuccess",
+                    path
+                }));
+            }
+            else
+            {
+                await _webrtc.SendDataAsync(JsonSerializer.Serialize(new
+                {
+                    type = "runElevatedFailed",
+                    message = $"Failed to launch: {path}"
+                }));
+            }
+        }
+        else
+        {
+            await _webrtc.SendDataAsync(JsonSerializer.Serialize(new
+            {
+                type = "runElevatedFailed",
+                message = "Admin features not enabled — request elevation first"
+            }));
         }
     }
 

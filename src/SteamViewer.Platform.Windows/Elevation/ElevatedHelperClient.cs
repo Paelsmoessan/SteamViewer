@@ -12,6 +12,8 @@ namespace SteamViewer.Platform.Windows.Elevation;
 /// </summary>
 public sealed class ElevatedHelperClient : IAsyncDisposable
 {
+    private static readonly UTF8Encoding PipeEncoding = new(encoderShouldEmitUTF8Identifier: false);
+
     private readonly ILogger _logger;
     private NamedPipeClientStream? _pipeClient;
     private StreamReader? _reader;
@@ -66,7 +68,7 @@ public sealed class ElevatedHelperClient : IAsyncDisposable
                 return false;
             }
 
-            _logger.LogInformation("Elevated helper launched (PID: {PID}), connecting to pipe...", _helperProcess.Id);
+            _logger.LogInformation("Elevated helper launched (PID: {PID}), waiting for pipe...", _helperProcess.Id);
         }
         catch (System.ComponentModel.Win32Exception ex) when (ex.NativeErrorCode == 1223)
         {
@@ -79,30 +81,36 @@ public sealed class ElevatedHelperClient : IAsyncDisposable
             return false;
         }
 
+        // Small delay to let helper start and create the pipe
+        await Task.Delay(500);
+
         // Connect to the pipe (helper is the server)
         try
         {
+            _logger.LogInformation("Connecting to pipe: {PipeName}", _pipeName);
             _pipeClient = new NamedPipeClientStream(".", _pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
             await _pipeClient.ConnectAsync(10_000); // 10s timeout
+            _logger.LogInformation("Pipe connected successfully");
 
-            _reader = new StreamReader(_pipeClient, Encoding.UTF8);
-            _writer = new StreamWriter(_pipeClient, Encoding.UTF8) { AutoFlush = true };
+            _reader = new StreamReader(_pipeClient, PipeEncoding);
+            _writer = new StreamWriter(_pipeClient, PipeEncoding) { AutoFlush = true };
+            _logger.LogInformation("Reader/writer created, sending ping...");
 
             // Verify connection with ping
             var response = await SendCommandAsync(new { command = "ping" });
             if (response?.Success != true)
             {
-                _logger.LogError("Elevated helper ping failed");
+                _logger.LogError("Elevated helper ping failed: {Error}", response?.Error ?? "null response");
                 await CleanupAsync();
                 return false;
             }
 
-            _logger.LogInformation("Elevated helper connected and verified");
+            _logger.LogInformation("Elevated helper connected and verified (ping OK)");
             return true;
         }
         catch (TimeoutException)
         {
-            _logger.LogError("Timeout connecting to elevated helper pipe");
+            _logger.LogError("Timeout connecting to elevated helper pipe (10s)");
             await CleanupAsync();
             return false;
         }
@@ -127,6 +135,22 @@ public sealed class ElevatedHelperClient : IAsyncDisposable
         }
 
         _logger.LogWarning("SendSAS failed: {Error}", response?.Error ?? "no response");
+        return false;
+    }
+
+    /// <summary>
+    /// Run a process elevated via the helper (no additional UAC prompt).
+    /// </summary>
+    public async Task<bool> RunElevatedAsync(string path, string? args = null)
+    {
+        var response = await SendCommandAsync(new { command = "runElevated", path, args });
+        if (response?.Success == true)
+        {
+            _logger.LogInformation("RunElevated succeeded: {Path}", path);
+            return true;
+        }
+
+        _logger.LogWarning("RunElevated failed: {Error}", response?.Error ?? "no response");
         return false;
     }
 
@@ -181,12 +205,23 @@ public sealed class ElevatedHelperClient : IAsyncDisposable
         try
         {
             var json = JsonSerializer.Serialize(command);
+            _logger.LogDebug("Pipe send: {Json}", json);
             await _writer.WriteLineAsync(json);
+            await _writer.FlushAsync(); // Explicit flush in addition to AutoFlush
 
-            var responseLine = await _reader.ReadLineAsync();
+            // Read response with 10s timeout
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            var responseLine = await _reader.ReadLineAsync(cts.Token);
+            _logger.LogDebug("Pipe recv: {Response}", responseLine ?? "(null)");
+
             if (responseLine == null) return null;
 
             return JsonSerializer.Deserialize<HelperResponse>(responseLine);
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogWarning("Pipe read timeout (10s) — helper may be stuck");
+            return null;
         }
         catch (Exception ex)
         {

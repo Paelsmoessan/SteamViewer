@@ -13,11 +13,13 @@ namespace SteamViewer.Platform.Windows.Elevation;
 /// <summary>
 /// Named pipe server that runs in the elevated (admin) process.
 /// Launched via SteamViewer.App.exe --elevated-helper {pipeName}.
-/// Handles privileged operations: SendSAS, reboot with RunOnceEx.
+/// Handles privileged operations: SendSAS, reboot with RunOnceEx, run processes elevated.
 /// Never initializes MAUI — runs as a headless pipe server.
 /// </summary>
 public static class ElevatedHelperServer
 {
+    private static readonly UTF8Encoding PipeEncoding = new(encoderShouldEmitUTF8Identifier: false);
+
     [DllImport("sas.dll", SetLastError = true)]
     private static extern void SendSAS(bool asUser);
 
@@ -51,29 +53,49 @@ public static class ElevatedHelperServer
                 PipeAccessRights.ReadWrite,
                 AccessControlType.Allow));
 
+            // PipeOptions.None (synchronous) — sync ReadLine() hangs on async pipes
             using var pipeServer = NamedPipeServerStreamAcl.Create(
                 pipeName,
                 PipeDirection.InOut,
                 1,
                 PipeTransmissionMode.Byte,
-                PipeOptions.Asynchronous,
+                PipeOptions.None,
                 0, 0,
                 pipeSecurity);
 
-            DebugLog("Pipe created. Waiting for client connection...");
+            DebugLog("Pipe created (sync mode). Waiting for client connection...");
 
-            // Wait for client with 30s timeout
-            var connectTask = pipeServer.WaitForConnectionAsync();
-            if (!connectTask.Wait(TimeSpan.FromSeconds(30)))
+            // Wait for client with 30s timeout (sync pipe, use thread for timeout)
+            var connected = false;
+            var connectThread = new Thread(() =>
+            {
+                try
+                {
+                    pipeServer.WaitForConnection();
+                    connected = true;
+                }
+                catch (Exception ex)
+                {
+                    DebugLog($"WaitForConnection error: {ex.Message}");
+                }
+            });
+            connectThread.Start();
+            if (!connectThread.Join(TimeSpan.FromSeconds(30)))
             {
                 DebugLog("Timeout waiting for client. Exiting.");
                 return;
             }
 
+            if (!connected)
+            {
+                DebugLog("WaitForConnection failed. Exiting.");
+                return;
+            }
+
             DebugLog("Client connected. Processing commands...");
 
-            using var reader = new StreamReader(pipeServer, Encoding.UTF8);
-            using var writer = new StreamWriter(pipeServer, Encoding.UTF8) { AutoFlush = true };
+            using var reader = new StreamReader(pipeServer, PipeEncoding);
+            using var writer = new StreamWriter(pipeServer, PipeEncoding) { AutoFlush = true };
 
             while (pipeServer.IsConnected)
             {
@@ -133,13 +155,14 @@ public static class ElevatedHelperServer
         using var doc = JsonDocument.Parse(json);
         var command = doc.RootElement.GetProperty("command").GetString();
 
-        Console.WriteLine($"[ElevatedHelper] Command: {command}");
+        DebugLog($"Command: {command}");
 
         return command switch
         {
             "ping" => JsonSerializer.Serialize(new HelperResponse(true, null)),
             "sendSAS" => HandleSendSAS(),
             "reboot" => HandleReboot(doc.RootElement),
+            "runElevated" => HandleRunElevated(doc.RootElement),
             "exit" => HandleExit(),
             _ => JsonSerializer.Serialize(new HelperResponse(false, $"Unknown command: {command}"))
         };
@@ -150,12 +173,49 @@ public static class ElevatedHelperServer
         try
         {
             SendSAS(false);
-            Console.WriteLine("[ElevatedHelper] SendSAS succeeded");
+            DebugLog("SendSAS succeeded");
             return JsonSerializer.Serialize(new HelperResponse(true, null));
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[ElevatedHelper] SendSAS failed: {ex.Message}");
+            DebugLog($"SendSAS failed: {ex.Message}");
+            return JsonSerializer.Serialize(new HelperResponse(false, ex.Message));
+        }
+    }
+
+    private static string HandleRunElevated(JsonElement root)
+    {
+        try
+        {
+            var path = root.TryGetProperty("path", out var p) ? p.GetString() : null;
+            var args = root.TryGetProperty("args", out var a) ? a.GetString() : null;
+
+            if (string.IsNullOrEmpty(path))
+                return JsonSerializer.Serialize(new HelperResponse(false, "No path specified"));
+
+            // Validate the path exists (security: only allow launching real executables)
+            if (!File.Exists(path))
+                return JsonSerializer.Serialize(new HelperResponse(false, $"File not found: {path}"));
+
+            DebugLog($"RunElevated: {path} {args}");
+
+            var psi = new ProcessStartInfo
+            {
+                FileName = path,
+                Arguments = args ?? "",
+                UseShellExecute = false
+            };
+
+            var proc = Process.Start(psi);
+            if (proc == null)
+                return JsonSerializer.Serialize(new HelperResponse(false, "Failed to start process"));
+
+            DebugLog($"RunElevated launched PID {proc.Id}");
+            return JsonSerializer.Serialize(new HelperResponse(true, null));
+        }
+        catch (Exception ex)
+        {
+            DebugLog($"RunElevated failed: {ex.Message}");
             return JsonSerializer.Serialize(new HelperResponse(false, ex.Message));
         }
     }
@@ -176,11 +236,11 @@ public static class ElevatedHelperServer
                 try
                 {
                     ReconnectCredentials.Save(clientId, passwordHash, viewerPeerId);
-                    Console.WriteLine("[ElevatedHelper] Saved reconnect credentials");
+                    DebugLog("Saved reconnect credentials");
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"[ElevatedHelper] Failed to save reconnect credentials: {ex.Message}");
+                    DebugLog($"Failed to save reconnect credentials: {ex.Message}");
                 }
             }
 
@@ -192,16 +252,16 @@ public static class ElevatedHelperServer
                     using var runOnceExKey = Registry.LocalMachine.CreateSubKey(
                         @"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnceEx\SteamViewer");
                     runOnceExKey?.SetValue("", $"\"{appPath}\" --sas");
-                    Console.WriteLine("[ElevatedHelper] Registered RunOnceEx --sas entry");
+                    DebugLog("Registered RunOnceEx --sas entry");
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"[ElevatedHelper] Failed to write RunOnceEx: {ex.Message}");
+                    DebugLog($"Failed to write RunOnceEx: {ex.Message}");
                 }
             }
 
             // Initiate reboot
-            Console.WriteLine("[ElevatedHelper] Initiating system reboot");
+            DebugLog("Initiating system reboot");
             Process.Start(new ProcessStartInfo
             {
                 FileName = "shutdown",
@@ -214,15 +274,14 @@ public static class ElevatedHelperServer
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[ElevatedHelper] Reboot failed: {ex.Message}");
+            DebugLog($"Reboot failed: {ex.Message}");
             return JsonSerializer.Serialize(new HelperResponse(false, ex.Message));
         }
     }
 
     private static string HandleExit()
     {
-        Console.WriteLine("[ElevatedHelper] Exit command received");
-        // Return response, then the loop will exit when client disconnects
+        DebugLog("Exit command received");
         return JsonSerializer.Serialize(new HelperResponse(true, null));
     }
 
