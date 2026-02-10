@@ -536,6 +536,8 @@
     {
         _toastMessage = message;
         StateHasChanged();
+        // Refocus canvas after re-render to preserve keyboard capture
+        _ = RefocusCanvasAsync();
         _ = Task.Run(async () =>
         {
             await Task.Delay(4000);
@@ -545,6 +547,16 @@
                 StateHasChanged();
             });
         });
+    }
+
+    private async Task RefocusCanvasAsync()
+    {
+        try
+        {
+            await Task.Delay(50); // Let Blazor re-render complete
+            await JSRuntime.InvokeVoidAsync("eval", "document.getElementById('viewerCanvas')?.focus()");
+        }
+        catch { }
     }
 
     private void SwitchTab(string sessionId)

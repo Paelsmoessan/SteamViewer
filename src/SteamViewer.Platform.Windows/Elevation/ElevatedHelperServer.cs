@@ -384,16 +384,17 @@ public static class ElevatedHelperServer
                 return JsonSerializer.Serialize(new HelperResponse(false, "Cannot determine exe path"));
 
             DebugLog($"LaunchSystemHelper: task={taskName}, pipe={pipeName}");
+            DebugLog($"LaunchSystemHelper: exe={exePath}");
 
             var arguments = $"--system-helper {pipeName} {nonce}";
-            if (ScheduledTaskManager.CreateAndRun(taskName, exePath, arguments))
+            if (ScheduledTaskManager.CreateAndRun(taskName, exePath, arguments, out var schtasksError))
             {
                 DebugLog($"System helper scheduled task created and started: {taskName}");
                 return JsonSerializer.Serialize(new HelperResponse(true, null));
             }
 
-            DebugLog("Failed to create/run system helper scheduled task");
-            return JsonSerializer.Serialize(new HelperResponse(false, "Failed to create or run scheduled task"));
+            DebugLog($"schtasks failed: {schtasksError}");
+            return JsonSerializer.Serialize(new HelperResponse(false, schtasksError ?? "Failed to create or run scheduled task"));
         }
         catch (Exception ex)
         {

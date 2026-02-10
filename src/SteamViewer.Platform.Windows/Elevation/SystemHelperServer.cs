@@ -39,8 +39,9 @@ public static class SystemHelperServer
     /// </summary>
     public static void Run(string pipeName, string expectedNonce)
     {
+        // Use CommonApplicationData (C:\ProgramData) — SYSTEM user's %LOCALAPPDATA% is different
         _debugPath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
             "SteamViewer", "system-helper-debug.txt");
         try { Directory.CreateDirectory(Path.GetDirectoryName(_debugPath)!); } catch { }
 

@@ -14,18 +14,17 @@ internal static class ScheduledTaskManager
     /// <param name="taskName">Unique task name (e.g., "SteamViewer-System-{guid}").</param>
     /// <param name="exePath">Full path to the executable.</param>
     /// <param name="arguments">Command-line arguments for the executable.</param>
+    /// <param name="error">Error details if the operation failed.</param>
     /// <returns>True if both create and run succeeded.</returns>
-    public static bool CreateAndRun(string taskName, string exePath, string arguments)
+    public static bool CreateAndRun(string taskName, string exePath, string arguments, out string? error)
     {
-        // Create the task: on-demand trigger, runs as SYSTEM, force overwrite if exists
-        var createResult = RunSchtasks(
-            $"/create /tn \"{taskName}\" /tr \"\\\"{exePath}\\\" {arguments}\" /sc ondemand /ru SYSTEM /f");
-
-        if (!createResult)
+        // Create the task: one-time with past trigger (won't auto-run), runs as SYSTEM, force overwrite
+        var createArgs = $"/create /tn \"{taskName}\" /tr \"\\\"{exePath}\\\" {arguments}\" /sc once /st 00:00 /ru SYSTEM /f";
+        if (!RunSchtasks(createArgs, out error))
             return false;
 
         // Run it immediately
-        return RunSchtasks($"/run /tn \"{taskName}\"");
+        return RunSchtasks($"/run /tn \"{taskName}\"", out error);
     }
 
     /// <summary>
@@ -35,11 +34,12 @@ internal static class ScheduledTaskManager
     /// <returns>True if deletion succeeded (or task didn't exist).</returns>
     public static bool Delete(string taskName)
     {
-        return RunSchtasks($"/delete /tn \"{taskName}\" /f");
+        return RunSchtasks($"/delete /tn \"{taskName}\" /f", out _);
     }
 
-    private static bool RunSchtasks(string arguments)
+    private static bool RunSchtasks(string arguments, out string? error)
     {
+        error = null;
         try
         {
             var psi = new ProcessStartInfo
@@ -53,13 +53,27 @@ internal static class ScheduledTaskManager
             };
 
             using var process = Process.Start(psi);
-            if (process == null) return false;
+            if (process == null)
+            {
+                error = "Failed to start schtasks.exe";
+                return false;
+            }
 
+            var stdout = process.StandardOutput.ReadToEnd();
+            var stderr = process.StandardError.ReadToEnd();
             process.WaitForExit(10_000); // 10s timeout
-            return process.ExitCode == 0;
+
+            if (process.ExitCode != 0)
+            {
+                error = $"schtasks exit {process.ExitCode} | args: {arguments} | stdout: {stdout.Trim()} | stderr: {stderr.Trim()}";
+                return false;
+            }
+
+            return true;
         }
-        catch
+        catch (Exception ex)
         {
+            error = $"schtasks exception: {ex.Message} | args: {arguments}";
             return false;
         }
     }
