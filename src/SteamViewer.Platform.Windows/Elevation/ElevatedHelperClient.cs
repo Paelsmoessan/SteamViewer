@@ -88,7 +88,7 @@ public sealed class ElevatedHelperClient : IAsyncDisposable
         try
         {
             _logger.LogInformation("Connecting to pipe: {PipeName}", _pipeName);
-            _pipeClient = new NamedPipeClientStream(".", _pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
+            _pipeClient = new NamedPipeClientStream(".", _pipeName, PipeDirection.InOut, PipeOptions.None);
             await _pipeClient.ConnectAsync(10_000); // 10s timeout
             _logger.LogInformation("Pipe connected successfully");
 
@@ -205,23 +205,25 @@ public sealed class ElevatedHelperClient : IAsyncDisposable
         try
         {
             var json = JsonSerializer.Serialize(command);
-            _logger.LogDebug("Pipe send: {Json}", json);
+            _logger.LogInformation("Pipe send: {Json}", json);
             await _writer.WriteLineAsync(json);
             await _writer.FlushAsync(); // Explicit flush in addition to AutoFlush
 
-            // Read response with 10s timeout
-            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-            var responseLine = await _reader.ReadLineAsync(cts.Token);
-            _logger.LogDebug("Pipe recv: {Response}", responseLine ?? "(null)");
+            // Read response with 10s timeout (avoid CancellationToken — unreliable on named pipes)
+            var readTask = _reader.ReadLineAsync();
+            var completed = await Task.WhenAny(readTask, Task.Delay(10_000));
+            if (completed != readTask)
+            {
+                _logger.LogWarning("Pipe read timeout (10s) — helper may be stuck");
+                return null;
+            }
+
+            var responseLine = await readTask;
+            _logger.LogInformation("Pipe recv: {Response}", responseLine ?? "(null)");
 
             if (responseLine == null) return null;
 
             return JsonSerializer.Deserialize<HelperResponse>(responseLine);
-        }
-        catch (OperationCanceledException)
-        {
-            _logger.LogWarning("Pipe read timeout (10s) — helper may be stuck");
-            return null;
         }
         catch (Exception ex)
         {
