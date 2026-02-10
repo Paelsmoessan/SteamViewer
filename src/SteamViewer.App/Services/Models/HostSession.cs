@@ -500,61 +500,71 @@ public sealed class HostSession : IAsyncDisposable
     /// Launch the elevated helper process (triggers UAC on host).
     /// No app restart — main app stays running, WebRTC stays connected.
     /// </summary>
-    private async Task HandleRequestElevationAsync()
+    private Task HandleRequestElevationAsync()
     {
-        if (_webrtc == null) return;
+        if (_webrtc == null) return Task.CompletedTask;
 
         if (_elevatedHelper?.IsConnected == true)
         {
             _logger.LogInformation("Elevated helper already connected");
-            await _webrtc.SendDataAsync(JsonSerializer.Serialize(new
+            return _webrtc.SendDataAsync(JsonSerializer.Serialize(new
             {
                 type = "elevationAlready"
             }));
-            return;
         }
 
-        _logger.LogInformation("Launching elevated helper process...");
-        try
+        // Run on background thread so we don't block data channel message processing
+        // (which handles input events). The pipe connect can take up to 10 seconds.
+        _ = Task.Run(async () =>
         {
-            _elevatedHelper = new ElevatedHelperClient(_logger);
-            var success = await _elevatedHelper.LaunchAndConnectAsync();
+            _logger.LogInformation("Launching elevated helper process...");
+            try
+            {
+                _elevatedHelper = new ElevatedHelperClient(_logger);
+                var success = await _elevatedHelper.LaunchAndConnectAsync();
 
-            if (success)
-            {
-                _logger.LogInformation("Elevated helper connected — admin features enabled");
-                await _webrtc.SendDataAsync(JsonSerializer.Serialize(new
+                if (success)
                 {
-                    type = "hostStatus",
-                    elevated = true
-                }));
-            }
-            else
-            {
-                _logger.LogWarning("Elevated helper failed to connect (UAC denied or error)");
-                await _elevatedHelper.DisposeAsync();
-                _elevatedHelper = null;
-                await _webrtc.SendDataAsync(JsonSerializer.Serialize(new
+                    _logger.LogInformation("Elevated helper connected — admin features enabled");
+                    await _webrtc!.SendDataAsync(JsonSerializer.Serialize(new
+                    {
+                        type = "hostStatus",
+                        elevated = true
+                    }));
+                }
+                else
                 {
-                    type = "elevationDenied",
-                    message = "UAC prompt was denied or helper failed to start"
-                }));
+                    _logger.LogWarning("Elevated helper failed to connect (UAC denied or error)");
+                    await _elevatedHelper.DisposeAsync();
+                    _elevatedHelper = null;
+                    await _webrtc!.SendDataAsync(JsonSerializer.Serialize(new
+                    {
+                        type = "elevationDenied",
+                        message = "UAC prompt was denied or helper failed to start"
+                    }));
+                }
             }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed to launch elevated helper");
-            if (_elevatedHelper != null)
+            catch (Exception ex)
             {
-                await _elevatedHelper.DisposeAsync();
-                _elevatedHelper = null;
+                _logger.LogError(ex, "Failed to launch elevated helper");
+                if (_elevatedHelper != null)
+                {
+                    await _elevatedHelper.DisposeAsync();
+                    _elevatedHelper = null;
+                }
+                try
+                {
+                    await _webrtc!.SendDataAsync(JsonSerializer.Serialize(new
+                    {
+                        type = "elevationDenied",
+                        message = ex.Message
+                    }));
+                }
+                catch { /* webrtc may be gone */ }
             }
-            await _webrtc.SendDataAsync(JsonSerializer.Serialize(new
-            {
-                type = "elevationDenied",
-                message = ex.Message
-            }));
-        }
+        });
+
+        return Task.CompletedTask;
     }
 
     /// <summary>

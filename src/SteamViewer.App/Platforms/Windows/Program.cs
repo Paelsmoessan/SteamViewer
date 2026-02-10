@@ -30,7 +30,27 @@ public static class Program
         var helperIdx = Array.IndexOf(args, "--elevated-helper");
         if (helperIdx >= 0 && helperIdx + 1 < args.Length)
         {
-            SteamViewer.Platform.Windows.Elevation.ElevatedHelperServer.Run(args[helperIdx + 1]);
+            var pipeName = args[helperIdx + 1];
+            var debugPath = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "SteamViewer", "helper-debug.txt");
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(debugPath)!);
+                File.AppendAllText(debugPath,
+                    $"[{DateTime.Now:HH:mm:ss}] Helper intercepted. Args: {string.Join(" ", args)}\n" +
+                    $"[{DateTime.Now:HH:mm:ss}] PipeName: {pipeName}, PID: {Environment.ProcessId}\n");
+            }
+            catch { /* best-effort debug log */ }
+
+            try
+            {
+                SteamViewer.Platform.Windows.Elevation.ElevatedHelperServer.Run(pipeName);
+            }
+            catch (Exception ex)
+            {
+                try { File.AppendAllText(debugPath, $"[{DateTime.Now:HH:mm:ss}] CRASH: {ex}\n"); } catch { }
+            }
             return;
         }
 
