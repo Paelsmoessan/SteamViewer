@@ -428,32 +428,68 @@ public sealed class HostSession : IAsyncDisposable
 
         try
         {
+            // If elevated helper is connected, route ALL input through it.
+            // Elevated SendInput can target both elevated and non-elevated windows (UIPI bypass).
+            if (_elevatedHelper?.IsConnected == true)
+            {
+                // Track dimensions from raw JSON (lightweight, no full InputEvent deserialization)
+                TrackCaptureDimensions(json);
+
+                // Fire-and-forget — don't await (would block data channel processing)
+                _ = _elevatedHelper.SendInputEventAsync(json, _lastCaptureWidth, _lastCaptureHeight);
+                return;
+            }
+
+            // Non-elevated path: local injection
             var inputEvent = JsonSerializer.Deserialize<InputEvent>(json);
             if (inputEvent != null)
             {
-                // Track dimensions from mouse events
-                switch (inputEvent)
-                {
-                    case InputEvent.MouseMove move when move.CaptureWidth > 0 && move.CaptureHeight > 0:
-                        _lastCaptureWidth = move.CaptureWidth;
-                        _lastCaptureHeight = move.CaptureHeight;
-                        break;
-                    case InputEvent.MouseDown down when down.CaptureWidth > 0 && down.CaptureHeight > 0:
-                        _lastCaptureWidth = down.CaptureWidth;
-                        _lastCaptureHeight = down.CaptureHeight;
-                        break;
-                    case InputEvent.MouseUp up when up.CaptureWidth > 0 && up.CaptureHeight > 0:
-                        _lastCaptureWidth = up.CaptureWidth;
-                        _lastCaptureHeight = up.CaptureHeight;
-                        break;
-                }
-
+                TrackCaptureFromEvent(inputEvent);
                 _inputInjector.InjectInput(inputEvent, _lastCaptureWidth, _lastCaptureHeight);
             }
         }
         catch
         {
             // Silently ignore parse errors to reduce latency
+        }
+    }
+
+    private void TrackCaptureDimensions(string json)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+            if (root.TryGetProperty("captureWidth", out var cw) && cw.ValueKind == JsonValueKind.Number)
+            {
+                var w = cw.GetInt32();
+                if (w > 0) _lastCaptureWidth = w;
+            }
+            if (root.TryGetProperty("captureHeight", out var ch) && ch.ValueKind == JsonValueKind.Number)
+            {
+                var h = ch.GetInt32();
+                if (h > 0) _lastCaptureHeight = h;
+            }
+        }
+        catch { }
+    }
+
+    private void TrackCaptureFromEvent(InputEvent inputEvent)
+    {
+        switch (inputEvent)
+        {
+            case InputEvent.MouseMove move when move.CaptureWidth > 0 && move.CaptureHeight > 0:
+                _lastCaptureWidth = move.CaptureWidth;
+                _lastCaptureHeight = move.CaptureHeight;
+                break;
+            case InputEvent.MouseDown down when down.CaptureWidth > 0 && down.CaptureHeight > 0:
+                _lastCaptureWidth = down.CaptureWidth;
+                _lastCaptureHeight = down.CaptureHeight;
+                break;
+            case InputEvent.MouseUp up when up.CaptureWidth > 0 && up.CaptureHeight > 0:
+                _lastCaptureWidth = up.CaptureWidth;
+                _lastCaptureHeight = up.CaptureHeight;
+                break;
         }
     }
 

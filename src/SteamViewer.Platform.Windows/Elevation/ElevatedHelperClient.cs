@@ -15,6 +15,7 @@ public sealed class ElevatedHelperClient : IAsyncDisposable
     private static readonly UTF8Encoding PipeEncoding = new(encoderShouldEmitUTF8Identifier: false);
 
     private readonly ILogger _logger;
+    private readonly SemaphoreSlim _writeLock = new(1, 1);
     private NamedPipeClientStream? _pipeClient;
     private StreamReader? _reader;
     private StreamWriter? _writer;
@@ -178,6 +179,37 @@ public sealed class ElevatedHelperClient : IAsyncDisposable
     }
 
     /// <summary>
+    /// Send an input event to the elevated helper for injection (fire-and-forget, no response).
+    /// Used for high-frequency input (60+ Hz mouse events) where round-trip latency matters.
+    /// </summary>
+    public async Task SendInputEventAsync(string inputJson, int screenWidth, int screenHeight)
+    {
+        if (_writer == null || !IsConnected) return;
+
+        // Prepend command wrapper to raw input JSON (avoids re-serialization)
+        // Input:  {"type":"mouse_move","x":500,...}
+        // Output: {"command":"injectInput","sw":1920,"sh":1080,"type":"mouse_move","x":500,...}
+        var commandJson = string.Concat(
+            "{\"command\":\"injectInput\",\"sw\":", screenWidth.ToString(),
+            ",\"sh\":", screenHeight.ToString(), ",",
+            inputJson.Substring(1));
+
+        await _writeLock.WaitAsync();
+        try
+        {
+            await _writer.WriteLineAsync(commandJson);
+        }
+        catch
+        {
+            // Ignore write errors on fire-and-forget input
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    /// <summary>
     /// Shut down the elevated helper process.
     /// </summary>
     public async Task ShutdownHelperAsync()
@@ -202,12 +234,13 @@ public sealed class ElevatedHelperClient : IAsyncDisposable
             return null;
         }
 
+        await _writeLock.WaitAsync();
         try
         {
             var json = JsonSerializer.Serialize(command);
             _logger.LogInformation("Pipe send: {Json}", json);
             await _writer.WriteLineAsync(json);
-            await _writer.FlushAsync(); // Explicit flush in addition to AutoFlush
+            await _writer.FlushAsync();
 
             // Read response with 10s timeout (avoid CancellationToken — unreliable on named pipes)
             var readTask = _reader.ReadLineAsync();
@@ -230,6 +263,10 @@ public sealed class ElevatedHelperClient : IAsyncDisposable
         {
             _logger.LogWarning(ex, "Pipe communication error");
             return null;
+        }
+        finally
+        {
+            _writeLock.Release();
         }
     }
 

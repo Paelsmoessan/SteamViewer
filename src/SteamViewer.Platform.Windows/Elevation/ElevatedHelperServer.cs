@@ -7,6 +7,8 @@ using System.Security.Principal;
 using System.Text;
 using System.Text.Json;
 using SteamViewer.Client.Core.Session;
+using SteamViewer.Common.Protocol;
+using SteamViewer.Platform.Windows.Input;
 
 namespace SteamViewer.Platform.Windows.Elevation;
 
@@ -126,8 +128,11 @@ public static class ElevatedHelperServer
                 try
                 {
                     var response = HandleCommand(line);
-                    DebugLog($"Sending: {response}");
-                    writer.WriteLine(response);
+                    if (response != null)
+                    {
+                        DebugLog($"Sending: {response}");
+                        writer.WriteLine(response);
+                    }
                 }
                 catch (IOException ex)
                 {
@@ -150,12 +155,14 @@ public static class ElevatedHelperServer
         }
     }
 
-    private static string HandleCommand(string json)
+    private static string? HandleCommand(string json)
     {
         using var doc = JsonDocument.Parse(json);
         var command = doc.RootElement.GetProperty("command").GetString();
 
-        DebugLog($"Command: {command}");
+        // Don't log injectInput (too frequent — 60+ Hz mouse events)
+        if (command != "injectInput")
+            DebugLog($"Command: {command}");
 
         return command switch
         {
@@ -163,6 +170,7 @@ public static class ElevatedHelperServer
             "sendSAS" => HandleSendSAS(),
             "reboot" => HandleReboot(doc.RootElement),
             "runElevated" => HandleRunElevated(doc.RootElement),
+            "injectInput" => HandleInjectInput(json),
             "exit" => HandleExit(),
             _ => JsonSerializer.Serialize(new HelperResponse(false, $"Unknown command: {command}"))
         };
@@ -277,6 +285,32 @@ public static class ElevatedHelperServer
             DebugLog($"Reboot failed: {ex.Message}");
             return JsonSerializer.Serialize(new HelperResponse(false, ex.Message));
         }
+    }
+
+    private static string? HandleInjectInput(string json)
+    {
+        try
+        {
+            // Extract screen dimensions from the combined JSON
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+            var sw = root.TryGetProperty("sw", out var swProp) ? swProp.GetInt32() : 1920;
+            var sh = root.TryGetProperty("sh", out var shProp) ? shProp.GetInt32() : 1080;
+
+            // Deserialize the InputEvent (extra fields like "command", "sw", "sh" are ignored)
+            var inputEvent = JsonSerializer.Deserialize<InputEvent>(json);
+            if (inputEvent != null)
+            {
+                Win32Input.InjectInputEvent(inputEvent, sw, sh);
+            }
+        }
+        catch (Exception ex)
+        {
+            DebugLog($"InjectInput error: {ex.Message}");
+        }
+
+        // Return null — no response for fire-and-forget input events
+        return null;
     }
 
     private static string HandleExit()
