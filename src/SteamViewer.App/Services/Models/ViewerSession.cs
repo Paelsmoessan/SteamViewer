@@ -99,6 +99,11 @@ public sealed class ViewerSession : IAsyncDisposable
     public bool? IsHostElevated { get; private set; }
 
     /// <summary>
+    /// Whether the host has SYSTEM-level helper connected.
+    /// </summary>
+    public bool? IsHostSystemLevel { get; private set; }
+
+    /// <summary>
     /// Stored password for reconnection after disconnect.
     /// </summary>
     public string? StoredPassword { get; set; }
@@ -360,8 +365,10 @@ public sealed class ViewerSession : IAsyncDisposable
 
                     case "hostStatus":
                         var elevated = root.TryGetProperty("elevated", out var elProp) && elProp.GetBoolean();
+                        var systemLevel = root.TryGetProperty("systemLevel", out var slProp) && slProp.GetBoolean();
                         IsHostElevated = elevated;
-                        _logger.LogInformation("Session {SessionId}: Host elevated={Elevated}", SessionId, elevated);
+                        IsHostSystemLevel = systemLevel;
+                        _logger.LogInformation("Session {SessionId}: Host elevated={Elevated}, systemLevel={SystemLevel}", SessionId, elevated, systemLevel);
                         OnControlMessage?.Invoke(type, null);
                         break;
 
@@ -376,6 +383,16 @@ public sealed class ViewerSession : IAsyncDisposable
                     case "elevationAlready":
                         _logger.LogInformation("Session {SessionId}: Host is already elevated", SessionId);
                         OnControlMessage?.Invoke(type, null);
+                        break;
+
+                    case "systemElevationAlready":
+                    case "systemElevationDenied":
+                    case "systemElevationFailed":
+                    case "runAsSystemSuccess":
+                    case "runAsSystemFailed":
+                        var sysMessage = root.TryGetProperty("message", out var sysMsgProp) ? sysMsgProp.GetString() : null;
+                        _logger.LogInformation("Session {SessionId}: {Type}: {Message}", SessionId, type, sysMessage);
+                        OnControlMessage?.Invoke(type, sysMessage);
                         break;
 
                     case "clipboard_data":

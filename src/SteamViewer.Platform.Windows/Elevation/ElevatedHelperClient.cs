@@ -292,6 +292,32 @@ public sealed class ElevatedHelperClient : IAsyncDisposable
         _helperProcess = null;
     }
 
+    /// <summary>
+    /// Request the admin helper to create and launch a SYSTEM-level helper via scheduled task.
+    /// </summary>
+    internal async Task<HelperResponse?> LaunchSystemHelperAsync(string pipeName, string nonce, string taskName)
+    {
+        return await SendCommandAsync(new
+        {
+            command = "launchSystemHelper",
+            pipeName,
+            nonce,
+            taskName
+        });
+    }
+
+    /// <summary>
+    /// Request the admin helper to delete a SYSTEM scheduled task.
+    /// </summary>
+    internal async Task<HelperResponse?> DeleteSystemTaskAsync(string taskName)
+    {
+        return await SendCommandAsync(new
+        {
+            command = "deleteSystemTask",
+            taskName
+        });
+    }
+
     public async ValueTask DisposeAsync()
     {
         if (_disposed) return;
@@ -300,5 +326,5 @@ public sealed class ElevatedHelperClient : IAsyncDisposable
         await ShutdownHelperAsync();
     }
 
-    private record HelperResponse(bool Success, string? Error);
+    internal record HelperResponse(bool Success, string? Error);
 }

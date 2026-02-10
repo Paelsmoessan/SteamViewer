@@ -43,6 +43,7 @@ public sealed class HostSession : IAsyncDisposable
     private readonly string _hostPasswordHash;
     private WebRTCManager? _webrtc;
     private ElevatedHelperClient? _elevatedHelper;
+    private SystemHelperClient? _systemHelper;
     private bool _webrtcInitialized;
     private bool _disposed;
 
@@ -308,16 +309,18 @@ public sealed class HostSession : IAsyncDisposable
         SetState(HostSessionState.Connected);
         OnReady?.Invoke();
 
-        // Send elevation status to viewer (elevated = helper is connected)
+        // Send elevation status to viewer (elevated = admin helper, systemLevel = SYSTEM helper)
         try
         {
             var elevated = _elevatedHelper?.IsConnected == true;
+            var systemLevel = _systemHelper?.IsConnected == true;
             await _webrtc!.SendDataAsync(JsonSerializer.Serialize(new
             {
                 type = "hostStatus",
-                elevated
+                elevated,
+                systemLevel
             }));
-            _logger.LogInformation("Sent elevation status to viewer: elevated={Elevated}", elevated);
+            _logger.LogInformation("Sent elevation status: elevated={Elevated}, systemLevel={SystemLevel}", elevated, systemLevel);
         }
         catch (Exception ex)
         {
@@ -379,6 +382,14 @@ public sealed class HostSession : IAsyncDisposable
 
                     case "runElevated":
                         await HandleRunElevatedAsync(root);
+                        return;
+
+                    case "requestSystemElevation":
+                        await HandleRequestSystemElevationAsync();
+                        return;
+
+                    case "runAsSystem":
+                        await HandleRunAsSystemAsync(root);
                         return;
 
                     case "clipboard_request":
@@ -744,6 +755,138 @@ public sealed class HostSession : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Launch the SYSTEM-level helper via the admin helper (schtask as SYSTEM).
+    /// Requires admin helper to be connected first.
+    /// </summary>
+    private Task HandleRequestSystemElevationAsync()
+    {
+        if (_webrtc == null) return Task.CompletedTask;
+
+        if (_systemHelper?.IsConnected == true)
+        {
+            _logger.LogInformation("SYSTEM helper already connected");
+            return _webrtc.SendDataAsync(JsonSerializer.Serialize(new
+            {
+                type = "systemElevationAlready"
+            }));
+        }
+
+        if (_elevatedHelper?.IsConnected != true)
+        {
+            _logger.LogWarning("Cannot launch SYSTEM helper: admin helper not connected");
+            return _webrtc.SendDataAsync(JsonSerializer.Serialize(new
+            {
+                type = "systemElevationDenied",
+                message = "Admin features must be enabled first"
+            }));
+        }
+
+        // Run on background thread (schtask creation + pipe connect can take 15+ seconds)
+        _ = Task.Run(async () =>
+        {
+            _logger.LogInformation("Launching SYSTEM helper via admin helper...");
+            try
+            {
+                _systemHelper = new SystemHelperClient(_logger, _elevatedHelper);
+                var success = await _systemHelper.LaunchAndConnectAsync();
+
+                if (success)
+                {
+                    _logger.LogInformation("SYSTEM helper connected — SYSTEM features enabled");
+                    await _webrtc!.SendDataAsync(JsonSerializer.Serialize(new
+                    {
+                        type = "hostStatus",
+                        elevated = true,
+                        systemLevel = true
+                    }));
+                }
+                else
+                {
+                    _logger.LogWarning("SYSTEM helper failed to connect");
+                    await _systemHelper.DisposeAsync();
+                    _systemHelper = null;
+                    await _webrtc!.SendDataAsync(JsonSerializer.Serialize(new
+                    {
+                        type = "systemElevationFailed",
+                        message = "Failed to create SYSTEM helper (scheduled task or pipe error)"
+                    }));
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to launch SYSTEM helper");
+                if (_systemHelper != null)
+                {
+                    await _systemHelper.DisposeAsync();
+                    _systemHelper = null;
+                }
+                try
+                {
+                    await _webrtc!.SendDataAsync(JsonSerializer.Serialize(new
+                    {
+                        type = "systemElevationFailed",
+                        message = ex.Message
+                    }));
+                }
+                catch { /* webrtc may be gone */ }
+            }
+        });
+
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Run a process as SYSTEM in the user's desktop session via the SYSTEM helper.
+    /// </summary>
+    private async Task HandleRunAsSystemAsync(JsonElement root)
+    {
+        if (_webrtc == null) return;
+
+        var path = root.TryGetProperty("path", out var p) ? p.GetString() : null;
+        var args = root.TryGetProperty("args", out var a) ? a.GetString() : null;
+
+        if (string.IsNullOrEmpty(path))
+        {
+            await _webrtc.SendDataAsync(JsonSerializer.Serialize(new
+            {
+                type = "runAsSystemFailed",
+                message = "No path specified"
+            }));
+            return;
+        }
+
+        if (_systemHelper?.IsConnected == true)
+        {
+            var success = await _systemHelper.RunAsSystemAsync(path, args);
+            if (success)
+            {
+                _logger.LogInformation("RunAsSystem succeeded: {Path}", path);
+                await _webrtc.SendDataAsync(JsonSerializer.Serialize(new
+                {
+                    type = "runAsSystemSuccess",
+                    path
+                }));
+            }
+            else
+            {
+                await _webrtc.SendDataAsync(JsonSerializer.Serialize(new
+                {
+                    type = "runAsSystemFailed",
+                    message = $"Failed to launch: {path}"
+                }));
+            }
+        }
+        else
+        {
+            await _webrtc.SendDataAsync(JsonSerializer.Serialize(new
+            {
+                type = "runAsSystemFailed",
+                message = "SYSTEM features not enabled — request system elevation first"
+            }));
+        }
+    }
+
     #endregion
 
     #region WebRTC Event Handlers
@@ -849,6 +992,12 @@ public sealed class HostSession : IAsyncDisposable
     {
         if (_disposed) return;
         _disposed = true;
+
+        if (_systemHelper != null)
+        {
+            await _systemHelper.DisposeAsync();
+            _systemHelper = null;
+        }
 
         if (_elevatedHelper != null)
         {

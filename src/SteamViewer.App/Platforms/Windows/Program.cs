@@ -26,6 +26,35 @@ public static class Program
             return;
         }
 
+        // --system-helper <pipeName> <nonce>: SYSTEM-level pipe server (launched via scheduled task as SYSTEM)
+        var systemIdx = Array.IndexOf(args, "--system-helper");
+        if (systemIdx >= 0 && systemIdx + 2 < args.Length)
+        {
+            var sysPipeName = args[systemIdx + 1];
+            var nonce = args[systemIdx + 2];
+            var sysDebugPath = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "SteamViewer", "system-helper-debug.txt");
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(sysDebugPath)!);
+                File.AppendAllText(sysDebugPath,
+                    $"[{DateTime.Now:HH:mm:ss}] System helper intercepted. PID: {Environment.ProcessId}\n" +
+                    $"[{DateTime.Now:HH:mm:ss}] PipeName: {sysPipeName}, User: {Environment.UserName}\n");
+            }
+            catch { /* best-effort debug log */ }
+
+            try
+            {
+                SteamViewer.Platform.Windows.Elevation.SystemHelperServer.Run(sysPipeName, nonce);
+            }
+            catch (Exception ex)
+            {
+                try { File.AppendAllText(sysDebugPath, $"[{DateTime.Now:HH:mm:ss}] CRASH: {ex}\n"); } catch { }
+            }
+            return;
+        }
+
         // --elevated-helper <pipeName>: named pipe server for privileged operations
         var helperIdx = Array.IndexOf(args, "--elevated-helper");
         if (helperIdx >= 0 && helperIdx + 1 < args.Length)

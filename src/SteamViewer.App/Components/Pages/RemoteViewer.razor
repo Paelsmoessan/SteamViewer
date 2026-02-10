@@ -78,6 +78,13 @@
                                     <span>Enable Admin</span>
                                 </button>
                             }
+                            @if (_hostElevated == true && _hostSystemLevel != true)
+                            {
+                                <button class="menu-item" @onclick="RequestSystemElevation" title="Enable SYSTEM-level features (Secure Desktop, Run as SYSTEM)">
+                                    <span class="menu-icon">🔧</span>
+                                    <span>Enable SYSTEM</span>
+                                </button>
+                            }
                         </div>
                         <div class="menu-divider"></div>
                         <div class="menu-section">
@@ -241,6 +248,7 @@
     private string? _statsText;
     private string? _toastMessage;
     private bool? _hostElevated;
+    private bool? _hostSystemLevel;
     private bool _hasReceivedFrame;
 
     protected override void OnInitialized()
@@ -454,9 +462,13 @@
             {
                 case "hostStatus":
                     var wasElevated = _hostElevated;
+                    var wasSystemLevel = _hostSystemLevel;
                     _hostElevated = _activeSession?.IsHostElevated;
+                    _hostSystemLevel = _activeSession?.IsHostSystemLevel;
                     if (_hostElevated == true && wasElevated != true)
                         ShowToast("Admin features enabled");
+                    if (_hostSystemLevel == true && wasSystemLevel != true)
+                        ShowToast("SYSTEM features enabled");
                     StateHasChanged();
                     break;
                 case "ctrlAltDelFailed":
@@ -472,6 +484,23 @@
                     _hostElevated = true;
                     ShowToast("Admin features already enabled");
                     StateHasChanged();
+                    break;
+                case "systemElevationAlready":
+                    _hostSystemLevel = true;
+                    ShowToast("SYSTEM features already enabled");
+                    StateHasChanged();
+                    break;
+                case "systemElevationDenied":
+                    ShowToast(message ?? "SYSTEM elevation denied");
+                    break;
+                case "systemElevationFailed":
+                    ShowToast(message ?? "SYSTEM elevation failed");
+                    break;
+                case "runAsSystemSuccess":
+                    ShowToast("Launched as SYSTEM");
+                    break;
+                case "runAsSystemFailed":
+                    ShowToast(message ?? "Run as SYSTEM failed");
                     break;
             }
         });
@@ -733,6 +762,24 @@
         {
             ShowToast("Failed to request elevation");
             Console.WriteLine($"RequestElevation error: {ex.Message}");
+        }
+    }
+
+    private async Task RequestSystemElevation()
+    {
+        CloseMenus();
+        if (_activeSession == null) return;
+
+        try
+        {
+            var json = System.Text.Json.JsonSerializer.Serialize(new { type = "requestSystemElevation" });
+            await _activeSession.SendDataAsync(json);
+            ShowToast("Requesting SYSTEM privileges...");
+        }
+        catch (Exception ex)
+        {
+            ShowToast("Failed to request SYSTEM elevation");
+            Console.WriteLine($"RequestSystemElevation error: {ex.Message}");
         }
     }
 
