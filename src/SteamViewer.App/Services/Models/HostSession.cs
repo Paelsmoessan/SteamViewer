@@ -119,11 +119,12 @@ public sealed class HostSession : IAsyncDisposable
         _hostClientId = hostClientId;
         _hostPasswordHash = hostPasswordHash;
 
-        // Subscribe to Secure Desktop events (Phase 2) to forward to viewer
+        // Subscribe to elevation events to forward to viewer
         if (_elevationService != null)
         {
             _elevationService.OnSecureDesktopFrame += HandleSecureDesktopFrame;
             _elevationService.OnSecureDesktopStateChanged += HandleSecureDesktopStateChanged;
+            _elevationService.OnSystemStateChanged += HandleSystemStateChanged;
         }
     }
 
@@ -537,11 +538,38 @@ public sealed class HostSession : IAsyncDisposable
                 : JsonSerializer.Serialize(new { type = "secureDesktopInactive" });
 
             _ = _webrtc.SendDataAsync(message);
-            _logger.LogInformation("Sent {Type} to viewer", active ? "secureDesktopActive" : "secureDesktopInactive");
+
+            // Pause/resume video track to free bandwidth for Secure Desktop JPEG frames
+            _ = active ? _webrtc.PauseVideoTrackAsync() : _webrtc.ResumeVideoTrackAsync();
+
+            _logger.LogInformation("Sent {Type} to viewer, video track {Action}",
+                active ? "secureDesktopActive" : "secureDesktopInactive",
+                active ? "paused" : "resumed");
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Failed to send secure desktop state change");
+        }
+    }
+
+    private void HandleSystemStateChanged(bool connected)
+    {
+        if (_webrtc == null || !IsDataChannelReady) return;
+
+        try
+        {
+            // Notify viewer that SYSTEM helper connected (auto-launched with admin)
+            _ = _webrtc.SendDataAsync(JsonSerializer.Serialize(new
+            {
+                type = "hostStatus",
+                elevated = _elevationService?.IsAdminConnected ?? false,
+                systemLevel = connected
+            }));
+            _logger.LogInformation("SYSTEM helper state changed: {Connected} — notified viewer", connected);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to send SYSTEM state change to viewer");
         }
     }
 
@@ -1022,6 +1050,7 @@ public sealed class HostSession : IAsyncDisposable
         {
             _elevationService.OnSecureDesktopFrame -= HandleSecureDesktopFrame;
             _elevationService.OnSecureDesktopStateChanged -= HandleSecureDesktopStateChanged;
+            _elevationService.OnSystemStateChanged -= HandleSystemStateChanged;
             await _elevationService.DisposeAsync();
         }
 

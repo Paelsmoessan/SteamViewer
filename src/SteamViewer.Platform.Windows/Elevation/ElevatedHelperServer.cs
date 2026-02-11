@@ -406,5 +406,5 @@ public static class ElevatedHelperServer
         return JsonSerializer.Serialize(new HelperResponse(true, null));
     }
 
-    private record HelperResponse(bool success, string? error);
+    private record HelperResponse(bool Success, string? Error);
 }

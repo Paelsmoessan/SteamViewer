@@ -78,13 +78,7 @@
                                     <span>Enable Admin</span>
                                 </button>
                             }
-                            @if (_hostElevated == true && _hostSystemLevel != true)
-                            {
-                                <button class="menu-item" @onclick="RequestSystemElevation" title="Enable SYSTEM-level features (Secure Desktop, Run as SYSTEM)">
-                                    <span class="menu-icon">🔧</span>
-                                    <span>Enable SYSTEM</span>
-                                </button>
-                            }
+                            @* SYSTEM helper auto-launches with Admin — no separate button needed *@
                         </div>
                         <div class="menu-divider"></div>
                         <div class="menu-section">
@@ -168,11 +162,11 @@
             <button class="tab-add" title="New connection" @onclick="OpenConnectionDialog">+</button>
         </div>
         <div class="canvas-container" id="canvasContainer">
-            <canvas id="viewerCanvas"></canvas>
+            <canvas id="viewerCanvas" class="@(_secureDesktopActive ? "canvas-dimmed" : "")"></canvas>
             <canvas id="secureDesktopOverlay" class="secure-desktop-overlay" style="display: @(_secureDesktopActive ? "block" : "none")"></canvas>
             @if (_secureDesktopActive)
             {
-                <div class="secure-desktop-banner">Secure Desktop (UAC)</div>
+                <div class="secure-desktop-banner">@(_secureDesktopFrameReceived ? "Secure Desktop (UAC)" : "Secure Desktop — Waiting...")</div>
             }
             @if (_tabs.Count == 0)
             {
@@ -256,6 +250,7 @@
     private bool? _hostSystemLevel;
     private bool _hasReceivedFrame;
     private bool _secureDesktopActive;
+    private bool _secureDesktopFrameReceived;
 
     protected override void OnInitialized()
     {
@@ -400,6 +395,7 @@
         _hasReceivedFrame = false;
         _showReconnectOverlay = false;
         _secureDesktopActive = false;
+        _secureDesktopFrameReceived = false;
         _reconnectTimer?.Dispose();
         _reconnectTimer = null;
 
@@ -478,8 +474,7 @@
                     _hostSystemLevel = _activeSession?.IsHostSystemLevel;
                     if (_hostElevated == true && wasElevated != true)
                         ShowToast("Admin features enabled");
-                    if (_hostSystemLevel == true && wasSystemLevel != true)
-                        ShowToast("SYSTEM features enabled");
+                    // SYSTEM auto-launches with Admin — no toast (avoids focus race)
                     StateHasChanged();
                     break;
                 case "ctrlAltDelFailed":
@@ -792,23 +787,7 @@
         }
     }
 
-    private async Task RequestSystemElevation()
-    {
-        CloseMenus();
-        if (_activeSession == null) return;
-
-        try
-        {
-            var json = System.Text.Json.JsonSerializer.Serialize(new { type = "requestSystemElevation" });
-            await _activeSession.SendDataAsync(json);
-            ShowToast("Requesting SYSTEM privileges...");
-        }
-        catch (Exception ex)
-        {
-            ShowToast("Failed to request SYSTEM elevation");
-            Console.WriteLine($"RequestSystemElevation error: {ex.Message}");
-        }
-    }
+    // SYSTEM helper auto-launches with Admin in WindowsElevationService — no separate request needed
 
     #endregion
 
@@ -866,10 +845,12 @@
             _secureDesktopActive = active;
             if (active)
             {
+                _secureDesktopFrameReceived = false;
                 await JSRuntime.InvokeVoidAsync("SteamViewerSecureDesktop.show", "secureDesktopOverlay");
             }
             else
             {
+                _secureDesktopFrameReceived = false;
                 await JSRuntime.InvokeVoidAsync("SteamViewerSecureDesktop.hide", "secureDesktopOverlay");
             }
             StateHasChanged();
@@ -879,6 +860,13 @@
     private void HandleSecureDesktopFrame(string base64Jpeg, int width, int height)
     {
         if (!_secureDesktopActive) return;
+
+        if (!_secureDesktopFrameReceived)
+        {
+            _secureDesktopFrameReceived = true;
+            InvokeAsync(StateHasChanged); // Update banner text from "Waiting..." to "Secure Desktop (UAC)"
+        }
+
         _ = JSRuntime.InvokeVoidAsync("SteamViewerSecureDesktop.renderFrame", "secureDesktopOverlay", base64Jpeg, width, height);
     }
 
@@ -1558,6 +1546,12 @@
         width: 100%;
         height: 100%;
         object-fit: contain;
+    }
+
+    /* Secure Desktop - dimmed canvas when UAC active */
+    .canvas-dimmed {
+        filter: brightness(0.3);
+        transition: filter 0.3s ease;
     }
 
     /* Secure Desktop overlay */

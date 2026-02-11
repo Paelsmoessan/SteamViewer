@@ -50,6 +50,23 @@ public sealed class WindowsElevationService : IElevationService
             {
                 _logger.LogInformation("Admin helper connected — admin features enabled");
                 OnAdminStateChanged?.Invoke(true);
+
+                // Auto-launch SYSTEM helper in background for Secure Desktop capture.
+                // Fire-and-forget — admin features work even if SYSTEM fails.
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        var systemSuccess = await RequestSystemElevationAsync();
+                        if (!systemSuccess)
+                            _logger.LogWarning("Auto SYSTEM launch failed (non-fatal)");
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Auto SYSTEM launch failed (non-fatal)");
+                    }
+                });
+
                 return true;
             }
 

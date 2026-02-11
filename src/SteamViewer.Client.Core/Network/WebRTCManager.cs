@@ -232,6 +232,24 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
     }
 
     /// <summary>
+    /// Pause video track sender (frees bandwidth for data channel during Secure Desktop).
+    /// </summary>
+    public async Task PauseVideoTrackAsync()
+    {
+        EnsureInitialized();
+        await _jsRuntime.InvokeVoidAsync("SteamViewerWebRTC.pauseVideoTrack", _sessionId);
+    }
+
+    /// <summary>
+    /// Resume video track sender after Secure Desktop deactivates.
+    /// </summary>
+    public async Task ResumeVideoTrackAsync()
+    {
+        EnsureInitialized();
+        await _jsRuntime.InvokeVoidAsync("SteamViewerWebRTC.resumeVideoTrack", _sessionId);
+    }
+
+    /// <summary>
     /// Send string data over the data channel.
     /// </summary>
     public async Task<bool> SendDataAsync(string data)

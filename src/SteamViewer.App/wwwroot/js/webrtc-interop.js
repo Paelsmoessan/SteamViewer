@@ -222,7 +222,7 @@ window.SteamViewerWebRTC = {
                         console.log('*** RELAY CANDIDATE FOUND - TURN SERVER WORKING! ***');
                     }
 
-                    await session.dotNetRef.invokeMethodAsync('OnIceCandidateCallback', JSON.stringify(event.candidate));
+                    if (session.dotNetRef) await session.dotNetRef.invokeMethodAsync('OnIceCandidateCallback', JSON.stringify(event.candidate));
                 } else {
                     console.log(`=== ICE GATHERING COMPLETE [${sessionId}] ===`);
                     console.log('Final candidate counts:', candidateTypes);
@@ -273,7 +273,7 @@ window.SteamViewerWebRTC = {
                     }
                 }
 
-                await session.dotNetRef.invokeMethodAsync('OnConnectionStateChangeCallback', state);
+                if (session.dotNetRef) await session.dotNetRef.invokeMethodAsync('OnConnectionStateChangeCallback', state);
             };
 
             // Handle ICE connection state for more debugging
@@ -304,7 +304,7 @@ window.SteamViewerWebRTC = {
                         offer.sdp = this.modifySdpForLowLatency(offer.sdp);
                         await session.peerConnection.setLocalDescription(offer);
                         console.log('Renegotiation offer created, sending to peer...');
-                        await session.dotNetRef.invokeMethodAsync('OnRenegotiationNeededCallback', JSON.stringify(offer));
+                        if (session.dotNetRef) await session.dotNetRef.invokeMethodAsync('OnRenegotiationNeededCallback', JSON.stringify(offer));
                     } else {
                         console.log('Skipping renegotiation, signaling state:', session.peerConnection.signalingState);
                     }
@@ -521,12 +521,12 @@ window.SteamViewerWebRTC = {
 
         channel.onopen = async () => {
             console.log(`[${sessionId}] Data channel opened`);
-            await session.dotNetRef.invokeMethodAsync('OnDataChannelOpenCallback');
+            if (session.dotNetRef) await session.dotNetRef.invokeMethodAsync('OnDataChannelOpenCallback');
         };
 
         channel.onclose = async () => {
             console.log(`[${sessionId}] Data channel closed`);
-            await session.dotNetRef.invokeMethodAsync('OnDataChannelCloseCallback');
+            if (session.dotNetRef) await session.dotNetRef.invokeMethodAsync('OnDataChannelCloseCallback');
         };
 
         channel.onmessage = async (event) => {
@@ -544,16 +544,17 @@ window.SteamViewerWebRTC = {
                 }
 
                 console.log(`[${sessionId}] Data channel message received:`, event.data?.substring?.(0, 50));
-                await session.dotNetRef.invokeMethodAsync('OnDataChannelMessageCallback', event.data);
+                if (session.dotNetRef) await session.dotNetRef.invokeMethodAsync('OnDataChannelMessageCallback', event.data);
             } else if (event.data instanceof ArrayBuffer) {
                 console.log(`[${sessionId}] Data channel binary message received:`, event.data.byteLength, 'bytes');
                 const uint8Array = new Uint8Array(event.data);
-                await session.dotNetRef.invokeMethodAsync('OnDataChannelBinaryMessageCallback', Array.from(uint8Array));
+                if (session.dotNetRef) await session.dotNetRef.invokeMethodAsync('OnDataChannelBinaryMessageCallback', Array.from(uint8Array));
             }
         };
 
         channel.onerror = (error) => {
             console.error(`[${sessionId}] Data channel error:`, error);
+            window.SteamViewerLogger?.log('error', `Data channel error: ${JSON.stringify(error)}`);
         };
     },
 
@@ -795,6 +796,30 @@ window.SteamViewerWebRTC = {
             session.localStream = null;
             console.log(`[${sessionId}] Screen capture stopped`);
         }
+    },
+
+    // Pause video track sender (frees bandwidth for data channel during Secure Desktop)
+    pauseVideoTrack(sessionId) {
+        const session = this._getSession(sessionId);
+        if (!session.peerConnection) return;
+        session.peerConnection.getSenders().forEach(s => {
+            if (s.track?.kind === 'video') {
+                s.track.enabled = false;
+                console.log(`[${sessionId}] Video track paused (Secure Desktop active)`);
+            }
+        });
+    },
+
+    // Resume video track sender (Secure Desktop deactivated)
+    resumeVideoTrack(sessionId) {
+        const session = this._getSession(sessionId);
+        if (!session.peerConnection) return;
+        session.peerConnection.getSenders().forEach(s => {
+            if (s.track?.kind === 'video') {
+                s.track.enabled = true;
+                console.log(`[${sessionId}] Video track resumed (Secure Desktop inactive)`);
+            }
+        });
     },
 
     // Manually check for and setup any video tracks (call after renegotiation)
@@ -1139,7 +1164,7 @@ window.SteamViewerWebRTC = {
 
             // Send to C# - use original dimensions for coordinate scaling
             const base64Data = dataUrl.replace(/^data:image\/jpeg;base64,/, '');
-            session.frameCaptureDotNetRef.invokeMethodAsync('OnFrameCaptured', base64Data, srcWidth, srcHeight);
+            if (session.frameCaptureDotNetRef) session.frameCaptureDotNetRef.invokeMethodAsync('OnFrameCaptured', base64Data, srcWidth, srcHeight);
         } catch (e) {
             // Ignore capture errors
         }
@@ -1615,18 +1640,20 @@ window.SteamViewerInput = {
     },
 
     async handleMouseMove(e) {
-        if (!this.isCapturing || !this.isLocked) return;
+        if (!this.isCapturing || !this.isLocked || !this.dotNetRef) return;
         if (this._activeSessionId) {
             window.SteamViewerWebRTC._incrementInputCount(this._activeSessionId);
         }
         const coords = this.getScaledCoords(e);
         // Pass canvas dimensions (capture size) for accurate coordinate mapping on host
-        await this.dotNetRef.invokeMethodAsync('OnMouseMove', coords.x, coords.y,
-            this.canvas.width, this.canvas.height);
+        try {
+            await this.dotNetRef.invokeMethodAsync('OnMouseMove', coords.x, coords.y,
+                this.canvas.width, this.canvas.height);
+        } catch (e) { /* disposed */ }
     },
 
     async handleMouseDown(e) {
-        if (!this.isCapturing || !this.isLocked) return;
+        if (!this.isCapturing || !this.isLocked || !this.dotNetRef) return;
         if (this._activeSessionId) {
             window.SteamViewerWebRTC._incrementInputCount(this._activeSessionId);
         }
@@ -1634,12 +1661,14 @@ window.SteamViewerInput = {
         const coords = this.getScaledCoords(e);
         const button = ['left', 'middle', 'right'][e.button] || 'left';
         // Pass canvas dimensions (capture size) for accurate coordinate mapping on host
-        await this.dotNetRef.invokeMethodAsync('OnMouseDown', button, coords.x, coords.y,
-            this.canvas.width, this.canvas.height);
+        try {
+            await this.dotNetRef.invokeMethodAsync('OnMouseDown', button, coords.x, coords.y,
+                this.canvas.width, this.canvas.height);
+        } catch (e) { /* disposed */ }
     },
 
     async handleMouseUp(e) {
-        if (!this.isCapturing || !this.isLocked) return;
+        if (!this.isCapturing || !this.isLocked || !this.dotNetRef) return;
         if (this._activeSessionId) {
             window.SteamViewerWebRTC._incrementInputCount(this._activeSessionId);
         }
@@ -1647,30 +1676,37 @@ window.SteamViewerInput = {
         const coords = this.getScaledCoords(e);
         const button = ['left', 'middle', 'right'][e.button] || 'left';
         // Pass canvas dimensions (capture size) for accurate coordinate mapping on host
-        await this.dotNetRef.invokeMethodAsync('OnMouseUp', button, coords.x, coords.y,
-            this.canvas.width, this.canvas.height);
+        try {
+            await this.dotNetRef.invokeMethodAsync('OnMouseUp', button, coords.x, coords.y,
+                this.canvas.width, this.canvas.height);
+        } catch (e) { /* disposed */ }
     },
 
     async handleWheel(e) {
-        if (!this.isCapturing || !this.isLocked) return;
+        if (!this.isCapturing || !this.isLocked || !this.dotNetRef) return;
         if (this._activeSessionId) {
             window.SteamViewerWebRTC._incrementInputCount(this._activeSessionId);
         }
         e.preventDefault();
-        await this.dotNetRef.invokeMethodAsync('OnMouseWheel', e.deltaX, e.deltaY);
+        try {
+            await this.dotNetRef.invokeMethodAsync('OnMouseWheel', e.deltaX, e.deltaY);
+        } catch (e) { /* disposed */ }
     },
 
     async handleKeyDown(e) {
-        if (!this.isCapturing) return;
-        if (!this.isLocked) return;
+        if (!this.isCapturing || !this.isLocked || !this.dotNetRef) return;
         e.preventDefault();
-        await this.dotNetRef.invokeMethodAsync('OnKeyDown', e.key, this.getModifiers(e));
+        try {
+            await this.dotNetRef.invokeMethodAsync('OnKeyDown', e.key, this.getModifiers(e));
+        } catch (e) { /* disposed */ }
     },
 
     async handleKeyUp(e) {
-        if (!this.isCapturing || !this.isLocked) return;
+        if (!this.isCapturing || !this.isLocked || !this.dotNetRef) return;
         e.preventDefault();
-        await this.dotNetRef.invokeMethodAsync('OnKeyUp', e.key, this.getModifiers(e));
+        try {
+            await this.dotNetRef.invokeMethodAsync('OnKeyUp', e.key, this.getModifiers(e));
+        } catch (e) { /* disposed */ }
     },
 
     stop() {

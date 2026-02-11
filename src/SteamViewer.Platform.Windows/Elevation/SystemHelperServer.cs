@@ -138,10 +138,17 @@ public static class SystemHelperServer
 
             DebugLog($"Video pipe created: {videoPipeName}. Waiting for client (non-blocking)...");
 
+            // Create Secure Desktop capture and subscribe events (before thread starts)
+            _capture = new SecureDesktopCapture();
+            _capture.OnSecureDesktopActive += OnCaptureSecureDesktopActive;
+            _capture.OnSecureDesktopInactive += OnCaptureSecureDesktopInactive;
+            _capture.OnFrameCaptured += OnCaptureFrameCaptured;
+
             // Wait for video pipe connection on a background thread (non-blocking).
             // The client connects AFTER control pipe auth+ping, so we must not block the main thread
             // or the command loop won't be able to process the ping and the client will never
             // reach ConnectVideoPipeAsync().
+            // Capture starts AFTER pipe connects to avoid dropping frames.
             var videoConnectThread = new Thread(() =>
             {
                 try
@@ -153,6 +160,10 @@ public static class SystemHelperServer
                         _videoConnected = true;
                     }
                     DebugLog("Video pipe client connected");
+
+                    // Start capture AFTER pipe is connected — frames go directly to pipe
+                    _capture.Start();
+                    DebugLog("Secure Desktop capture started");
                 }
                 catch (Exception ex)
                 {
@@ -164,14 +175,6 @@ public static class SystemHelperServer
                 IsBackground = true
             };
             videoConnectThread.Start();
-
-            // Start Secure Desktop capture
-            _capture = new SecureDesktopCapture();
-            _capture.OnSecureDesktopActive += OnCaptureSecureDesktopActive;
-            _capture.OnSecureDesktopInactive += OnCaptureSecureDesktopInactive;
-            _capture.OnFrameCaptured += OnCaptureFrameCaptured;
-            _capture.Start();
-            DebugLog("Secure Desktop capture started");
 
             DebugLog("Processing commands...");
 
@@ -276,6 +279,8 @@ public static class SystemHelperServer
         SendNotification(new { notification = "secureDesktopInactive" });
     }
 
+    private static int _frameCount;
+
     private static void OnCaptureFrameCaptured(byte[] jpegData, int width, int height)
     {
         if (!_videoConnected || _videoWriter == null) return;
@@ -284,6 +289,10 @@ public static class SystemHelperServer
         {
             try
             {
+                _frameCount++;
+                if (_frameCount <= 3 || _frameCount % 100 == 0)
+                    DebugLog($"Video frame #{_frameCount}: {jpegData.Length} bytes ({width}x{height})");
+
                 // Binary frame protocol: [uint32 length][jpeg bytes]
                 _videoWriter.Write((uint)jpegData.Length);
                 _videoWriter.Write(jpegData);
