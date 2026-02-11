@@ -1,6 +1,7 @@
 # AI assistant context (private)
 misc/.AI.md
 .claude/settings.local.json
+.claude/ClaudeToClaude-communication.md
 
 # Build outputs
 bin/
