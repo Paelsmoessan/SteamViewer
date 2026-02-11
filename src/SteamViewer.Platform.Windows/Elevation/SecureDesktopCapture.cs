@@ -183,10 +183,24 @@ public sealed class SecureDesktopCapture : IDisposable
     /// </summary>
     private void CaptureLoop()
     {
+        try
+        {
+            CaptureLoopInner();
+        }
+        catch (Exception ex)
+        {
+            DebugLog($"FATAL: CaptureLoop crashed: {ex}");
+        }
+    }
+
+    private void CaptureLoopInner()
+    {
         DebugLog("Capture loop starting");
 
         var originalDesktop = GetThreadDesktop(GetCurrentThreadId());
         var wasActive = false;
+        string? lastLoggedDesktopName = null;
+        var pollCount = 0;
 
         // GDI resources — created once, reused across frames, recreated on resolution change
         IntPtr hDesktopDC = IntPtr.Zero;
@@ -215,8 +229,16 @@ public sealed class SecureDesktopCapture : IDisposable
                     }
 
                     var desktopName = GetDesktopName(hDesk);
+                    pollCount++;
 
-                    if (desktopName == "Winlogon" && !wasActive)
+                    // Log desktop name on first poll, on change, and every ~5s (33 polls at 150ms)
+                    if (desktopName != lastLoggedDesktopName || pollCount % 33 == 1)
+                    {
+                        DebugLog($"Desktop: \"{desktopName}\" (poll #{pollCount}, hDesk=0x{hDesk:X})");
+                        lastLoggedDesktopName = desktopName;
+                    }
+
+                    if (string.Equals(desktopName, "Winlogon", StringComparison.OrdinalIgnoreCase) && !wasActive)
                     {
                         // Secure Desktop just activated
                         DebugLog("Secure Desktop ACTIVE (Winlogon detected)");
@@ -242,7 +264,7 @@ public sealed class SecureDesktopCapture : IDisposable
                         try { OnSecureDesktopActive?.Invoke(_desktopWidth, _desktopHeight); }
                         catch (Exception ex) { DebugLog($"OnSecureDesktopActive handler error: {ex.Message}"); }
                     }
-                    else if (desktopName == "Winlogon" && wasActive)
+                    else if (string.Equals(desktopName, "Winlogon", StringComparison.OrdinalIgnoreCase) && wasActive)
                     {
                         // Still on Winlogon — capture a frame
                         CloseDesktop(hDesk); // Close the newly opened handle, we already have _winlogonDesktop
@@ -299,7 +321,7 @@ public sealed class SecureDesktopCapture : IDisposable
                         Thread.Sleep(66);
                         continue; // Skip the 150ms poll sleep
                     }
-                    else if (desktopName != "Winlogon" && wasActive)
+                    else if (!string.Equals(desktopName, "Winlogon", StringComparison.OrdinalIgnoreCase) && wasActive)
                     {
                         // Secure Desktop deactivated — switch back to original
                         DebugLog("Secure Desktop INACTIVE (returned to Default desktop)");
@@ -389,10 +411,11 @@ public sealed class SecureDesktopCapture : IDisposable
     private static string? GetDesktopName(IntPtr hDesktop)
     {
         var buffer = new byte[256];
-        if (GetUserObjectInformation(hDesktop, UOI_NAME, buffer, buffer.Length, out _))
+        if (GetUserObjectInformation(hDesktop, UOI_NAME, buffer, buffer.Length, out int lengthNeeded))
         {
-            // The buffer is null-terminated Unicode string
-            return System.Text.Encoding.Unicode.GetString(buffer).TrimEnd('\0');
+            // lengthNeeded includes the null terminator (2 bytes for Unicode)
+            var charCount = Math.Max(0, lengthNeeded / 2 - 1);
+            return System.Text.Encoding.Unicode.GetString(buffer, 0, charCount * 2);
         }
         return null;
     }

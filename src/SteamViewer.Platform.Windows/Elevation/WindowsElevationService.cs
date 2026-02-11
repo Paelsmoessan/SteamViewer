@@ -146,15 +146,22 @@ public sealed class WindowsElevationService : IElevationService
 
     public async Task<bool> SendSASAsync()
     {
-        // Prefer SYSTEM helper for SAS (more reliable from SYSTEM context)
+        _logger.LogInformation("SendSAS requested. SYSTEM connected: {System}, Admin connected: {Admin}",
+            _systemHelper?.IsConnected == true, _adminHelper?.IsConnected == true);
+
+        // Prefer SYSTEM helper for SAS — SendSAS(false) requires SeTcbPrivilege which only SYSTEM has.
+        // From admin context, the P/Invoke succeeds but Windows silently ignores it.
         if (_systemHelper?.IsConnected == true)
         {
+            _logger.LogInformation("Routing SAS through SYSTEM helper");
             var result = await _systemHelper.SendSASAsync();
             if (result) return true;
+            _logger.LogWarning("SYSTEM helper SendSAS failed, falling through to admin");
         }
 
         if (_adminHelper?.IsConnected == true)
         {
+            _logger.LogWarning("Routing SAS through admin helper — may be silently ignored by Windows (SeTcbPrivilege required)");
             return await _adminHelper.SendSASAsync();
         }
 

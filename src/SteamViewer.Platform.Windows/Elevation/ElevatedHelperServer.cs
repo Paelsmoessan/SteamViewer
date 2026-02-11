@@ -183,7 +183,7 @@ public static class ElevatedHelperServer
         try
         {
             SendSAS(false);
-            DebugLog("SendSAS succeeded");
+            DebugLog("SendSAS called (note: may be silently ignored from admin context — SYSTEM required for reliable SAS)");
             return JsonSerializer.Serialize(new HelperResponse(true, null));
         }
         catch (Exception ex)

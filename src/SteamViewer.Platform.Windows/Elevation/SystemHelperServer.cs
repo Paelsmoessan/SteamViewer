@@ -136,33 +136,34 @@ public static class SystemHelperServer
                 0, 0,
                 videoPipeSecurity);
 
-            DebugLog($"Video pipe created: {videoPipeName}. Waiting for client...");
+            DebugLog($"Video pipe created: {videoPipeName}. Waiting for client (non-blocking)...");
 
-            // Wait for video pipe connection on a background thread (with 15s timeout)
-            var videoConnected = false;
+            // Wait for video pipe connection on a background thread (non-blocking).
+            // The client connects AFTER control pipe auth+ping, so we must not block the main thread
+            // or the command loop won't be able to process the ping and the client will never
+            // reach ConnectVideoPipeAsync().
             var videoConnectThread = new Thread(() =>
             {
                 try
                 {
                     _videoPipeServer.WaitForConnection();
-                    videoConnected = true;
+                    lock (_videoWriteLock)
+                    {
+                        _videoWriter = new BinaryWriter(_videoPipeServer);
+                        _videoConnected = true;
+                    }
+                    DebugLog("Video pipe client connected");
                 }
                 catch (Exception ex)
                 {
                     DebugLog($"Video pipe WaitForConnection error: {ex.Message}");
                 }
-            });
+            })
+            {
+                Name = "VideoPipeConnect",
+                IsBackground = true
+            };
             videoConnectThread.Start();
-            if (!videoConnectThread.Join(TimeSpan.FromSeconds(15)))
-            {
-                DebugLog("Timeout waiting for video pipe client. Continuing without video.");
-            }
-            else if (videoConnected)
-            {
-                _videoWriter = new BinaryWriter(_videoPipeServer);
-                _videoConnected = true;
-                DebugLog("Video pipe client connected");
-            }
 
             // Start Secure Desktop capture
             _capture = new SecureDesktopCapture();

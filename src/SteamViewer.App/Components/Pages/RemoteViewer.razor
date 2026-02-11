@@ -564,7 +564,11 @@
     {
         try
         {
-            await Task.Delay(50); // Let Blazor re-render complete
+            // Multiple refocus attempts with increasing delays to combat Blazor re-render stealing focus.
+            // StateHasChanged() triggers an async re-render that can complete at varying times.
+            await Task.Delay(200);
+            await JSRuntime.InvokeVoidAsync("eval", "document.getElementById('viewerCanvas')?.focus()");
+            await Task.Delay(300);
             await JSRuntime.InvokeVoidAsync("eval", "document.getElementById('viewerCanvas')?.focus()");
         }
         catch { }
