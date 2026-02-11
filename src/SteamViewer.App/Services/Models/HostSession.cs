@@ -506,8 +506,15 @@ public sealed class HostSession : IAsyncDisposable
 
     #region Secure Desktop (Phase 2)
 
+    private int _sdHostFrameCount;
+
     private void HandleSecureDesktopFrame(byte[] jpegData, int width, int height)
     {
+        _sdHostFrameCount++;
+        if (_sdHostFrameCount <= 3 || _sdHostFrameCount % 100 == 0)
+            _logger.LogInformation("SD frame #{Count}: {Bytes}b {W}x{H}, webrtc={Webrtc}, dcReady={DcReady}",
+                _sdHostFrameCount, jpegData.Length, width, height, _webrtc != null, IsDataChannelReady);
+
         if (_webrtc == null || !IsDataChannelReady) return;
 
         try
@@ -529,6 +536,9 @@ public sealed class HostSession : IAsyncDisposable
 
     private void HandleSecureDesktopStateChanged(bool active)
     {
+        _logger.LogInformation("SD state handler: active={Active}, webrtc={Webrtc}, dcReady={DcReady}",
+            active, _webrtc != null, IsDataChannelReady);
+
         if (_webrtc == null || !IsDataChannelReady) return;
 
         try

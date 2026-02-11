@@ -19,6 +19,7 @@ public sealed class SecureDesktopCapture : IDisposable
     private volatile bool _isSecureDesktopActive;
     private int _desktopWidth;
     private int _desktopHeight;
+    private int _frameCount;
 
     // The Winlogon desktop handle held by the capture thread (valid while active)
     private IntPtr _winlogonDesktop;
@@ -251,7 +252,9 @@ public sealed class SecureDesktopCapture : IDisposable
                             continue;
                         }
 
+                        DebugLog("SetThreadDesktop(winlogon) succeeded");
                         _winlogonDesktop = hDesk;
+                        _frameCount = 0;
 
                         // Query resolution AFTER switching desktop (per research findings)
                         _desktopWidth = GetSystemMetrics(SM_CXSCREEN);
@@ -310,6 +313,9 @@ public sealed class SecureDesktopCapture : IDisposable
                             using var ms = new MemoryStream();
                             bitmap.Save(ms, jpegEncoder!, encoderParams);
                             var jpegData = ms.ToArray();
+                            _frameCount++;
+                            if (_frameCount <= 3 || _frameCount % 100 == 0)
+                                DebugLog($"Frame #{_frameCount}: {jpegData.Length}b, {_desktopWidth}x{_desktopHeight}, subscribers={OnFrameCaptured?.GetInvocationList().Length ?? 0}");
                             OnFrameCaptured?.Invoke(jpegData, _desktopWidth, _desktopHeight);
                         }
                         catch (Exception ex)

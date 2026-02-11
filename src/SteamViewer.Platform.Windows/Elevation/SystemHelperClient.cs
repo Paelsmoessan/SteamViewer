@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.IO.Pipes;
 using System.Security.Cryptography;
 using System.Text;
@@ -31,6 +32,12 @@ public sealed class SystemHelperClient : IAsyncDisposable
     private BinaryReader? _videoReader;
     private Thread? _videoReaderThread;
     private volatile bool _videoStopRequested;
+    private int _videoFrameCount;
+
+    // Control pipe notification reader thread + response queue
+    private Thread? _notificationReaderThread;
+    private volatile bool _notificationStopRequested;
+    private readonly BlockingCollection<string> _responseQueue = new(boundedCapacity: 16);
 
     // Secure Desktop state tracked from notifications
     private volatile bool _isSecureDesktopActive;
@@ -132,6 +139,18 @@ public sealed class SystemHelperClient : IAsyncDisposable
             // Connect to the video pipe for Secure Desktop frames
             await ConnectVideoPipeAsync();
 
+            // Start notification reader thread — reads control pipe continuously for
+            // server-pushed notifications (secureDesktopActive/Inactive).
+            // Command responses are enqueued to _responseQueue for SendCommandAsync.
+            _notificationStopRequested = false;
+            _notificationReaderThread = new Thread(NotificationReaderLoop)
+            {
+                Name = "SystemPipeNotificationReader",
+                IsBackground = true
+            };
+            _notificationReaderThread.Start();
+            _logger.LogInformation("Notification reader thread started");
+
             return true;
         }
         catch (TimeoutException)
@@ -215,6 +234,11 @@ public sealed class SystemHelperClient : IAsyncDisposable
                     }
 
                     // Use the last known secure desktop dimensions
+                    _videoFrameCount++;
+                    if (_videoFrameCount <= 3 || _videoFrameCount % 100 == 0)
+                        _logger.LogInformation("SD video frame #{Count}: {Bytes}b, dims={W}x{H}, active={Active}",
+                            _videoFrameCount, jpegData.Length, _secureDesktopWidth, _secureDesktopHeight, _isSecureDesktopActive);
+
                     OnSecureDesktopFrame?.Invoke(jpegData, _secureDesktopWidth, _secureDesktopHeight);
                 }
                 catch (EndOfStreamException)
@@ -301,9 +325,68 @@ public sealed class SystemHelperClient : IAsyncDisposable
         await CleanupPipeAsync();
     }
 
+    /// <summary>
+    /// Background thread that continuously reads the control pipe.
+    /// Notifications are processed immediately; command responses are enqueued for SendCommandAsync.
+    /// </summary>
+    private void NotificationReaderLoop()
+    {
+        _logger.LogInformation("Notification reader loop starting");
+
+        try
+        {
+            while (!_notificationStopRequested && _reader != null && IsConnected)
+            {
+                var line = _reader.ReadLine();
+                if (line == null)
+                {
+                    _logger.LogInformation("Notification reader: pipe closed (null read)");
+                    break;
+                }
+
+                // Check if it's a notification or a command response
+                if (TryHandleNotification(line))
+                {
+                    // Already processed
+                    continue;
+                }
+
+                // It's a command response — enqueue for SendCommandAsync
+                _logger.LogInformation("Notification reader: enqueuing command response");
+                try
+                {
+                    _responseQueue.Add(line);
+                }
+                catch (InvalidOperationException)
+                {
+                    // Queue was marked complete
+                    break;
+                }
+            }
+        }
+        catch (IOException)
+        {
+            _logger.LogInformation("Notification reader: pipe disconnected");
+        }
+        catch (ObjectDisposedException)
+        {
+            _logger.LogInformation("Notification reader: pipe disposed");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Notification reader error");
+        }
+        finally
+        {
+            // Signal that no more responses will come
+            try { _responseQueue.CompleteAdding(); } catch { }
+            _logger.LogInformation("Notification reader loop exited");
+        }
+    }
+
     private async Task<ElevatedHelperClient.HelperResponse?> SendCommandAsync(object command)
     {
-        if (_writer == null || _reader == null || !IsConnected)
+        if (_writer == null || !IsConnected)
         {
             _logger.LogWarning("Cannot send command: SYSTEM pipe not connected");
             return null;
@@ -317,32 +400,57 @@ public sealed class SystemHelperClient : IAsyncDisposable
             await _writer.WriteLineAsync(json);
             await _writer.FlushAsync();
 
-            // Read response — may need to skip server-initiated notifications
-            while (true)
+            // If notification reader is running, get response from queue
+            if (_notificationReaderThread != null)
             {
-                var readTask = _reader.ReadLineAsync();
-                var completed = await Task.WhenAny(readTask, Task.Delay(10_000));
-                if (completed != readTask)
+                try
                 {
-                    _logger.LogWarning("System pipe read timeout (10s)");
+                    // Wait up to 10s for the notification reader to enqueue a command response
+                    using var cts = new CancellationTokenSource(10_000);
+                    var responseLine = _responseQueue.Take(cts.Token);
+                    _logger.LogInformation("System pipe recv (via queue): {Response}", responseLine);
+
+                    return JsonSerializer.Deserialize<ElevatedHelperClient.HelperResponse>(responseLine,
+                        new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                }
+                catch (OperationCanceledException)
+                {
+                    _logger.LogWarning("System pipe read timeout (10s, via queue)");
                     return null;
                 }
-
-                var responseLine = await readTask;
-                _logger.LogInformation("System pipe recv: {Response}", responseLine ?? "(null)");
-
-                if (responseLine == null) return null;
-
-                // Check if this is a server-initiated notification (not a command response)
-                if (TryHandleNotification(responseLine))
+                catch (InvalidOperationException)
                 {
-                    // It was a notification — read the next line for the actual command response
-                    continue;
+                    _logger.LogWarning("Response queue completed — pipe likely closed");
+                    return null;
                 }
-
-                return JsonSerializer.Deserialize<ElevatedHelperClient.HelperResponse>(responseLine,
-                    new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
             }
+
+            // Fallback: direct read (used during auth/ping before notification reader starts)
+            var readTask = _reader!.ReadLineAsync();
+            var completed = await Task.WhenAny(readTask, Task.Delay(10_000));
+            if (completed != readTask)
+            {
+                _logger.LogWarning("System pipe read timeout (10s)");
+                return null;
+            }
+
+            var directLine = await readTask;
+            _logger.LogInformation("System pipe recv (direct): {Response}", directLine ?? "(null)");
+            if (directLine == null) return null;
+
+            // During early auth phase, notifications can still arrive
+            if (TryHandleNotification(directLine))
+            {
+                // Read again for the actual response
+                readTask = _reader.ReadLineAsync();
+                completed = await Task.WhenAny(readTask, Task.Delay(10_000));
+                if (completed != readTask) return null;
+                directLine = await readTask;
+                if (directLine == null) return null;
+            }
+
+            return JsonSerializer.Deserialize<ElevatedHelperClient.HelperResponse>(directLine,
+                new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
         }
         catch (Exception ex)
         {
@@ -409,6 +517,9 @@ public sealed class SystemHelperClient : IAsyncDisposable
 
     private async Task CleanupPipeAsync()
     {
+        _notificationStopRequested = true;
+        try { _responseQueue.CompleteAdding(); } catch { }
+
         _reader?.Dispose();
         _reader = null;
 
@@ -420,6 +531,8 @@ public sealed class SystemHelperClient : IAsyncDisposable
             await _pipeClient.DisposeAsync();
             _pipeClient = null;
         }
+
+        _notificationReaderThread = null;
     }
 
     private async Task CleanupAsync()

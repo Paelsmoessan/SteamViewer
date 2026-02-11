@@ -221,14 +221,22 @@ public sealed class WindowsElevationService : IElevationService
 
     #region Secure Desktop event forwarding
 
+    private int _sdFrameForwardCount;
+
     private void HandleSecureDesktopFrame(byte[] jpegData, int width, int height)
     {
+        _sdFrameForwardCount++;
+        if (_sdFrameForwardCount <= 3 || _sdFrameForwardCount % 100 == 0)
+            _logger.LogInformation("Forwarding SD frame #{Count}: {Bytes}b {W}x{H}, subscribers={Sub}",
+                _sdFrameForwardCount, jpegData.Length, width, height,
+                OnSecureDesktopFrame?.GetInvocationList().Length ?? 0);
         OnSecureDesktopFrame?.Invoke(jpegData, width, height);
     }
 
     private void HandleSecureDesktopStateChanged(bool active)
     {
-        _logger.LogInformation("Secure Desktop state changed: {Active}", active);
+        _logger.LogInformation("Secure Desktop state changed: {Active}, subscribers={Sub}",
+            active, OnSecureDesktopStateChanged?.GetInvocationList().Length ?? 0);
         OnSecureDesktopStateChanged?.Invoke(active);
     }
 

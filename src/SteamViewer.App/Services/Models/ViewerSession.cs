@@ -17,6 +17,7 @@ public sealed class ViewerSession : IAsyncDisposable
     private readonly ILogger _logger;
     private readonly ILoggerFactory _loggerFactory;
     private readonly Func<SignalingMessage, Task> _sendSignaling;
+    private int _sdViewerFrameCount;
     private WebRTCManager? _webrtc;
     private DotNetObjectReference<ViewerSession>? _dotNetRef;
     private bool _frameCaptureStarted;
@@ -436,12 +437,21 @@ public sealed class ViewerSession : IAsyncDisposable
                         break;
 
                     case "secureDesktopFrame":
+                        _sdViewerFrameCount++;
                         var frameData = root.TryGetProperty("data", out var frameProp) ? frameProp.GetString() : null;
                         var frameW = root.TryGetProperty("width", out var fwProp) ? fwProp.GetInt32() : 0;
                         var frameH = root.TryGetProperty("height", out var fhProp) ? fhProp.GetInt32() : 0;
+                        if (_sdViewerFrameCount <= 3 || _sdViewerFrameCount % 100 == 0)
+                            _logger.LogInformation("Session {SessionId}: SD frame #{Count}: data={HasData} {W}x{H}",
+                                SessionId, _sdViewerFrameCount, frameData != null, frameW, frameH);
                         if (frameData != null && frameW > 0 && frameH > 0)
                         {
                             OnSecureDesktopFrame?.Invoke(frameData, frameW, frameH);
+                        }
+                        else
+                        {
+                            _logger.LogWarning("Session {SessionId}: SD frame DROPPED (data={HasData}, w={W}, h={H})",
+                                SessionId, frameData != null, frameW, frameH);
                         }
                         break;
                 }

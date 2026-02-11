@@ -838,11 +838,15 @@
 
     #region Secure Desktop
 
+    private int _sdRazorFrameCount;
+
     private void HandleSecureDesktopStateChanged(bool active)
     {
+        FileLogger.Log("INFO", "RemoteViewer", $"HandleSecureDesktopStateChanged: active={active}");
         InvokeAsync(async () =>
         {
             _secureDesktopActive = active;
+            FileLogger.Log("INFO", "RemoteViewer", $"Calling JS SteamViewerSecureDesktop.{(active ? "show" : "hide")}");
             if (active)
             {
                 _secureDesktopFrameReceived = false;
@@ -859,7 +863,15 @@
 
     private void HandleSecureDesktopFrame(string base64Jpeg, int width, int height)
     {
-        if (!_secureDesktopActive) return;
+        _sdRazorFrameCount++;
+        if (_sdRazorFrameCount <= 3 || _sdRazorFrameCount % 100 == 0)
+            FileLogger.Log("INFO", "RemoteViewer", $"SD frame #{_sdRazorFrameCount}: {base64Jpeg.Length} chars, {width}x{height}, active={_secureDesktopActive}");
+
+        if (!_secureDesktopActive)
+        {
+            FileLogger.Log("WARN", "RemoteViewer", "SD frame received but _secureDesktopActive=false — dropping");
+            return;
+        }
 
         if (!_secureDesktopFrameReceived)
         {

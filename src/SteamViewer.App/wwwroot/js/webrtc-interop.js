@@ -1859,8 +1859,10 @@ window.SteamViewerSecureDesktop = {
     canvas: null,
     ctx: null,
     img: null,
+    _frameCount: 0,
 
     show(canvasId) {
+        this._frameCount = 0;
         this.canvas = document.getElementById(canvasId);
         if (!this.canvas) {
             console.error(`Secure Desktop canvas '${canvasId}' not found`);
@@ -1883,6 +1885,10 @@ window.SteamViewerSecureDesktop = {
     },
 
     renderFrame(canvasId, base64Jpeg, width, height) {
+        this._frameCount++;
+        if (this._frameCount <= 3 || this._frameCount % 100 === 0) {
+            console.log(`[SecureDesktop] renderFrame #${this._frameCount}: ${width}x${height}, dataLen=${base64Jpeg?.length}`);
+        }
         // Lazy-init canvas if show() wasn't called yet or canvas changed
         if (!this.canvas || this.canvas.id !== canvasId) {
             this.canvas = document.getElementById(canvasId);
