@@ -4,7 +4,7 @@ using SteamViewer.Server.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// Configure port - use PORT env var (for Render/Railway) or default to 8080
+// Configure port - use PORT env var (for Railway) or default to 8080
 var port = Environment.GetEnvironmentVariable("PORT") ?? "8080";
 builder.WebHost.UseUrls($"http://0.0.0.0:{port}");
 
