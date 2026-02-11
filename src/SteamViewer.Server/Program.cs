@@ -69,17 +69,11 @@ app.MapGet("/api/logs/{type}/{machine?}", (string type, string? machine, int? li
 
     string? path = type.ToLowerInvariant() switch
     {
-        "server" => Path.Combine(AppContext.BaseDirectory, "logs", $"server-{Environment.MachineName}.log"),
+        "server" => fileLogger.LogFilePath,
         "client" => $@"\\{machineName}\SteamViewer\logs\client-{machineName}.log",
         "input" => $@"\\{machineName}\SteamViewer\SteamViewer_InputDebug.log",
         _ => null
     };
-
-    // For server logs, also try the development path
-    if (type.ToLowerInvariant() == "server" && !File.Exists(path))
-    {
-        path = $@"C:\_Development\SteamViewer.NET\logs\server-{Environment.MachineName}.log";
-    }
 
     if (path == null)
         return Results.BadRequest($"Unknown log type: {type}. Valid types: server, client, input");
