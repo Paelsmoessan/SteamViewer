@@ -24,7 +24,6 @@ public sealed class SystemHelperClient : IAsyncDisposable
     private StreamWriter? _writer;
     private string? _pipeName;
     private string? _nonce;
-    private string? _taskName;
     private bool _disposed;
 
     // Video pipe for receiving JPEG frames from Secure Desktop capture
@@ -47,11 +46,6 @@ public sealed class SystemHelperClient : IAsyncDisposable
     /// Whether the Secure Desktop (Winlogon) is currently active on the host.
     /// </summary>
     public bool IsSecureDesktopActive => _isSecureDesktopActive;
-
-    /// <summary>
-    /// The scheduled task name (for cleanup).
-    /// </summary>
-    public string? TaskName => _taskName;
 
     /// <summary>
     /// Raised when a JPEG frame is received from the Secure Desktop.
@@ -88,23 +82,22 @@ public sealed class SystemHelperClient : IAsyncDisposable
         // Generate unique identifiers for this session
         _pipeName = $"SteamViewer-System-{Guid.NewGuid():N}";
         _nonce = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32));
-        _taskName = $"SteamViewer-System-{Guid.NewGuid().ToString()[..8]}";
 
-        _logger.LogInformation("Requesting admin helper to create SYSTEM task: {TaskName}", _taskName);
+        _logger.LogInformation("Requesting admin helper to launch SYSTEM helper (token duplication)");
 
         try
         {
-            // Ask the admin helper to create and run the scheduled task
-            var response = await _adminHelper.LaunchSystemHelperAsync(_pipeName, _nonce, _taskName);
+            // Ask the admin helper to launch SYSTEM process via token duplication
+            var response = await _adminHelper.LaunchSystemHelperAsync(_pipeName, _nonce);
             if (response?.Success != true)
             {
-                _logger.LogError("Admin helper failed to create SYSTEM task: {Error}", response?.Error ?? "null response");
+                _logger.LogError("Admin helper failed to launch SYSTEM helper: {Error}", response?.Error ?? "null response");
                 return false;
             }
 
-            _logger.LogInformation("SYSTEM task created. Waiting for helper to start...");
+            _logger.LogInformation("SYSTEM helper launched. Waiting for pipe server to start...");
 
-            // Small delay to let the scheduled task start and create the pipe
+            // Small delay to let the process start and create the pipe
             await Task.Delay(1000);
 
             // Connect to the SYSTEM helper control pipe
@@ -294,26 +287,7 @@ public sealed class SystemHelperClient : IAsyncDisposable
     }
 
     /// <summary>
-    /// Clean up the scheduled task via the admin helper.
-    /// </summary>
-    public async Task CleanupScheduledTaskAsync()
-    {
-        if (_adminHelper.IsConnected && !string.IsNullOrEmpty(_taskName))
-        {
-            try
-            {
-                await _adminHelper.DeleteSystemTaskAsync(_taskName);
-                _logger.LogInformation("Deleted SYSTEM scheduled task: {TaskName}", _taskName);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Failed to delete SYSTEM task: {TaskName}", _taskName);
-            }
-        }
-    }
-
-    /// <summary>
-    /// Shut down the SYSTEM helper process and clean up the scheduled task.
+    /// Shut down the SYSTEM helper process and clean up pipes.
     /// </summary>
     public async Task ShutdownAsync()
     {
@@ -323,7 +297,6 @@ public sealed class SystemHelperClient : IAsyncDisposable
         }
         catch { /* Helper may already be gone */ }
 
-        await CleanupScheduledTaskAsync();
         CleanupVideoPipe();
         await CleanupPipeAsync();
     }
@@ -453,7 +426,6 @@ public sealed class SystemHelperClient : IAsyncDisposable
     {
         CleanupVideoPipe();
         await CleanupPipeAsync();
-        await CleanupScheduledTaskAsync();
     }
 
     public async ValueTask DisposeAsync()

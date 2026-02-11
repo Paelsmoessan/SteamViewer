@@ -171,7 +171,6 @@ public static class ElevatedHelperServer
             "reboot" => HandleReboot(doc.RootElement),
             "runElevated" => HandleRunElevated(doc.RootElement),
             "launchSystemHelper" => HandleLaunchSystemHelper(doc.RootElement),
-            "deleteSystemTask" => HandleDeleteSystemTask(doc.RootElement),
             "injectInput" => HandleInjectInput(doc.RootElement),
             "exit" => HandleExit(),
             _ => JsonSerializer.Serialize(new HelperResponse(false, $"Unknown command: {command}"))
@@ -374,51 +373,29 @@ public static class ElevatedHelperServer
         {
             var pipeName = root.TryGetProperty("pipeName", out var pn) ? pn.GetString() : null;
             var nonce = root.TryGetProperty("nonce", out var n) ? n.GetString() : null;
-            var taskName = root.TryGetProperty("taskName", out var tn) ? tn.GetString() : null;
 
-            if (string.IsNullOrEmpty(pipeName) || string.IsNullOrEmpty(nonce) || string.IsNullOrEmpty(taskName))
-                return JsonSerializer.Serialize(new HelperResponse(false, "Missing pipeName, nonce, or taskName"));
+            if (string.IsNullOrEmpty(pipeName) || string.IsNullOrEmpty(nonce))
+                return JsonSerializer.Serialize(new HelperResponse(false, "Missing pipeName or nonce"));
 
             var exePath = Environment.ProcessPath;
             if (string.IsNullOrEmpty(exePath))
                 return JsonSerializer.Serialize(new HelperResponse(false, "Cannot determine exe path"));
 
-            DebugLog($"LaunchSystemHelper: task={taskName}, pipe={pipeName}");
-            DebugLog($"LaunchSystemHelper: exe={exePath}");
+            DebugLog($"LaunchSystemHelper: pipe={pipeName}, exe={exePath}");
 
             var arguments = $"--system-helper {pipeName} {nonce}";
-            if (ScheduledTaskManager.CreateAndRun(taskName, exePath, arguments, out var schtasksError))
+            if (ProcessLauncher.LaunchAsSystemFromAdmin(exePath, arguments, out var pid, out var launchError))
             {
-                DebugLog($"System helper scheduled task created and started: {taskName}");
+                DebugLog($"SYSTEM helper launched via token duplication: PID {pid}");
                 return JsonSerializer.Serialize(new HelperResponse(true, null));
             }
 
-            DebugLog($"schtasks failed: {schtasksError}");
-            return JsonSerializer.Serialize(new HelperResponse(false, schtasksError ?? "Failed to create or run scheduled task"));
+            DebugLog($"Token duplication launch failed: {launchError}");
+            return JsonSerializer.Serialize(new HelperResponse(false, launchError ?? "Failed to launch SYSTEM helper"));
         }
         catch (Exception ex)
         {
             DebugLog($"LaunchSystemHelper failed: {ex.Message}");
-            return JsonSerializer.Serialize(new HelperResponse(false, ex.Message));
-        }
-    }
-
-    private static string HandleDeleteSystemTask(JsonElement root)
-    {
-        try
-        {
-            var taskName = root.TryGetProperty("taskName", out var tn) ? tn.GetString() : null;
-            if (string.IsNullOrEmpty(taskName))
-                return JsonSerializer.Serialize(new HelperResponse(false, "No taskName specified"));
-
-            DebugLog($"DeleteSystemTask: {taskName}");
-            ScheduledTaskManager.Delete(taskName);
-            DebugLog($"System helper task deleted: {taskName}");
-            return JsonSerializer.Serialize(new HelperResponse(true, null));
-        }
-        catch (Exception ex)
-        {
-            DebugLog($"DeleteSystemTask failed: {ex.Message}");
             return JsonSerializer.Serialize(new HelperResponse(false, ex.Message));
         }
     }

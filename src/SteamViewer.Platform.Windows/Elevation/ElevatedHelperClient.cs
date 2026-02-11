@@ -293,28 +293,15 @@ public sealed class ElevatedHelperClient : IAsyncDisposable
     }
 
     /// <summary>
-    /// Request the admin helper to create and launch a SYSTEM-level helper via scheduled task.
+    /// Request the admin helper to launch a SYSTEM-level helper via token duplication.
     /// </summary>
-    internal async Task<HelperResponse?> LaunchSystemHelperAsync(string pipeName, string nonce, string taskName)
+    internal async Task<HelperResponse?> LaunchSystemHelperAsync(string pipeName, string nonce)
     {
         return await SendCommandAsync(new
         {
             command = "launchSystemHelper",
             pipeName,
-            nonce,
-            taskName
-        });
-    }
-
-    /// <summary>
-    /// Request the admin helper to delete a SYSTEM scheduled task.
-    /// </summary>
-    internal async Task<HelperResponse?> DeleteSystemTaskAsync(string taskName)
-    {
-        return await SendCommandAsync(new
-        {
-            command = "deleteSystemTask",
-            taskName
+            nonce
         });
     }
 
