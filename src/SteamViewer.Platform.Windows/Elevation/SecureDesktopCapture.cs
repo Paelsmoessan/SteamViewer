@@ -485,7 +485,7 @@ public sealed class SecureDesktopCapture : IDisposable
     [DllImport("kernel32.dll")]
     private static extern uint GetCurrentThreadId();
 
-    [DllImport("user32.dll", SetLastError = true)]
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     private static extern bool GetUserObjectInformation(IntPtr hObj, int nIndex,
         [Out] byte[] pvInfo, int nLength, out int lpnLengthNeeded);
 
