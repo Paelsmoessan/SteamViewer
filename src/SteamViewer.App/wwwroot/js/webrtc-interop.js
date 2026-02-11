@@ -246,6 +246,10 @@ window.SteamViewerWebRTC = {
                 if (state === 'connected') {
                     // Recovery from temporary disconnect — resume capture if it was paused
                     this.resumeFrameCapture(sessionId);
+                    // Re-focus canvas on reconnect to ensure keyboard events work
+                    if (window.SteamViewerInput && window.SteamViewerInput.canvas) {
+                        window.SteamViewerInput.canvas.focus();
+                    }
                 } else if (state === 'failed') {
                     console.error('CONNECTION FAILED - Possible causes:');
                     console.error('1. No relay candidates (TURN not working)');
@@ -255,14 +259,10 @@ window.SteamViewerWebRTC = {
 
                 // Handle disconnect/failure
                 if (state === 'disconnected') {
-                    // Temporary disconnect — pause capture (preserves dotNetRef for recovery)
+                    // Temporary disconnect — pause capture but KEEP input locked
+                    // ICE will usually reconnect within seconds
                     this.pauseFrameCapture(sessionId);
-                    // Only unlock input if THIS session is the active input session
-                    if (window.SteamViewerInput && window.SteamViewerInput.isLocked
-                        && window.SteamViewerInput._activeSessionId === sessionId) {
-                        window.SteamViewerInput.unlock();
-                        console.log('Input lock released due to connection state:', state);
-                    }
+                    console.log('Temporary disconnect — input lock preserved');
                 } else if (state === 'failed' || state === 'closed') {
                     // Permanent failure — full cleanup
                     this.stopFrameCapture(sessionId);
@@ -1472,6 +1472,7 @@ window.SteamViewerInput = {
     isLocked: false,  // Capture lock - only send inputs when locked
     // Track which session the input is associated with (for stats counting)
     _activeSessionId: null,
+    _inputEventCount: 0,
 
     initialize(canvasId, dotNetReference, options = {}) {
         const { showLockIndicator = true } = options;
@@ -1533,6 +1534,34 @@ window.SteamViewerInput = {
         this._activeSessionId = sessionId;
     },
 
+    // Verify canvas DOM reference is still valid; re-attach listeners if Blazor recreated it
+    ensureCanvas() {
+        const current = document.getElementById('viewerCanvas');
+        if (current && current !== this.canvas) {
+            console.warn('[Input] Canvas DOM node changed — re-attaching listeners');
+            // Remove listeners from old canvas (if still in DOM)
+            if (this.canvas) {
+                this.canvas.removeEventListener('mousemove', this._boundMouseMove);
+                this.canvas.removeEventListener('mousedown', this._boundMouseDown);
+                this.canvas.removeEventListener('mouseup', this._boundMouseUp);
+                this.canvas.removeEventListener('keydown', this._boundKeyDown);
+                this.canvas.removeEventListener('keyup', this._boundKeyUp);
+            }
+            this.canvas = current;
+            this.canvas.addEventListener('mousemove', this._boundMouseMove);
+            this.canvas.addEventListener('mousedown', this._boundMouseDown);
+            this.canvas.addEventListener('mouseup', this._boundMouseUp);
+            this.canvas.addEventListener('wheel', this._boundWheel, { passive: false });
+            this.canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+            this.canvas.tabIndex = 0;
+            this.canvas.style.outline = 'none';
+            this.canvas.addEventListener('keydown', this._boundKeyDown);
+            this.canvas.addEventListener('keyup', this._boundKeyUp);
+            this.isCapturing = true;
+            this.canvas.focus();
+        }
+    },
+
     createLockIndicator() {
         // Add a visual indicator for lock state
         this.lockIndicator = document.createElement('div');
@@ -1567,6 +1596,7 @@ window.SteamViewerInput = {
     },
 
     lock() {
+        this.ensureCanvas();
         this.isLocked = true;
         this.updateLockIndicator();
         this.notifyLockChange();
@@ -1641,15 +1671,19 @@ window.SteamViewerInput = {
 
     async handleMouseMove(e) {
         if (!this.isCapturing || !this.isLocked || !this.dotNetRef) return;
+        this._inputEventCount++;
+        if (this._inputEventCount <= 3) {
+            console.log(`[Input] event #${this._inputEventCount}: capturing=${this.isCapturing}, locked=${this.isLocked}, dotNetRef=${!!this.dotNetRef}, session=${this._activeSessionId}`);
+        }
         if (this._activeSessionId) {
             window.SteamViewerWebRTC._incrementInputCount(this._activeSessionId);
         }
+        this.ensureCanvas();
         const coords = this.getScaledCoords(e);
-        // Pass canvas dimensions (capture size) for accurate coordinate mapping on host
         try {
             await this.dotNetRef.invokeMethodAsync('OnMouseMove', coords.x, coords.y,
                 this.canvas.width, this.canvas.height);
-        } catch (e) { /* disposed */ }
+        } catch (err) { console.error('[Input] OnMouseMove failed:', err); }
     },
 
     async handleMouseDown(e) {
@@ -1660,11 +1694,10 @@ window.SteamViewerInput = {
         e.preventDefault();
         const coords = this.getScaledCoords(e);
         const button = ['left', 'middle', 'right'][e.button] || 'left';
-        // Pass canvas dimensions (capture size) for accurate coordinate mapping on host
         try {
             await this.dotNetRef.invokeMethodAsync('OnMouseDown', button, coords.x, coords.y,
                 this.canvas.width, this.canvas.height);
-        } catch (e) { /* disposed */ }
+        } catch (err) { console.error('[Input] OnMouseDown failed:', err); }
     },
 
     async handleMouseUp(e) {
@@ -1675,11 +1708,10 @@ window.SteamViewerInput = {
         e.preventDefault();
         const coords = this.getScaledCoords(e);
         const button = ['left', 'middle', 'right'][e.button] || 'left';
-        // Pass canvas dimensions (capture size) for accurate coordinate mapping on host
         try {
             await this.dotNetRef.invokeMethodAsync('OnMouseUp', button, coords.x, coords.y,
                 this.canvas.width, this.canvas.height);
-        } catch (e) { /* disposed */ }
+        } catch (err) { console.error('[Input] OnMouseUp failed:', err); }
     },
 
     async handleWheel(e) {
@@ -1698,7 +1730,7 @@ window.SteamViewerInput = {
         e.preventDefault();
         try {
             await this.dotNetRef.invokeMethodAsync('OnKeyDown', e.key, this.getModifiers(e));
-        } catch (e) { /* disposed */ }
+        } catch (err) { console.error('[Input] OnKeyDown failed:', err); }
     },
 
     async handleKeyUp(e) {
@@ -1706,7 +1738,7 @@ window.SteamViewerInput = {
         e.preventDefault();
         try {
             await this.dotNetRef.invokeMethodAsync('OnKeyUp', e.key, this.getModifiers(e));
-        } catch (e) { /* disposed */ }
+        } catch (err) { console.error('[Input] OnKeyUp failed:', err); }
     },
 
     stop() {

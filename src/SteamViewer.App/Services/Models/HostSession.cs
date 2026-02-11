@@ -441,10 +441,14 @@ public sealed class HostSession : IAsyncDisposable
 
     #region Input Injection
 
+    private int _inputCount;
+
     private void HandleInputMessage(string json)
     {
         // Only process input if we're sharing our screen
         if (!IsSharingScreen) return;
+
+        _inputCount++;
 
         try
         {
@@ -453,9 +457,15 @@ public sealed class HostSession : IAsyncDisposable
             // If an elevated helper is connected, route through the elevation service (async, fire-and-forget)
             if (_elevationService != null && (_elevationService.IsAdminConnected || _elevationService.IsSystemConnected))
             {
+                if (_inputCount <= 3 || _inputCount % 500 == 0)
+                    _logger.LogInformation("Input #{Count}: routing via elevation (admin={Admin}, system={System})",
+                        _inputCount, _elevationService.IsAdminConnected, _elevationService.IsSystemConnected);
                 _ = InjectInputViaElevationAsync(json);
                 return;
             }
+
+            if (_inputCount <= 3 || _inputCount % 500 == 0)
+                _logger.LogInformation("Input #{Count}: local injection", _inputCount);
 
             // No elevation active — local injection (synchronous, no async overhead)
             var inputEvent = JsonSerializer.Deserialize<InputEvent>(json);
@@ -474,12 +484,29 @@ public sealed class HostSession : IAsyncDisposable
     {
         try
         {
-            await _elevationService!.InjectInputAsync(json, _lastCaptureWidth, _lastCaptureHeight);
+            var success = await _elevationService!.InjectInputAsync(json, _lastCaptureWidth, _lastCaptureHeight);
+            if (!success)
+            {
+                _logger.LogWarning("Elevation service returned false — falling back to local injection");
+                FallbackToLocalInjection(json);
+            }
         }
-        catch
+        catch (Exception ex)
         {
-            // Silently ignore errors on elevated input path
+            _logger.LogWarning(ex, "Elevated input failed — falling back to local injection");
+            FallbackToLocalInjection(json);
         }
+    }
+
+    private void FallbackToLocalInjection(string json)
+    {
+        try
+        {
+            var inputEvent = JsonSerializer.Deserialize<InputEvent>(json);
+            if (inputEvent != null)
+                _inputInjector.InjectInput(inputEvent, _lastCaptureWidth, _lastCaptureHeight);
+        }
+        catch { }
     }
 
     private void TrackCaptureDimensions(string json)

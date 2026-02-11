@@ -182,26 +182,38 @@ public sealed class ElevatedHelperClient : IAsyncDisposable
     /// Send an input event to the elevated helper for injection (fire-and-forget, no response).
     /// Used for high-frequency input (60+ Hz mouse events) where round-trip latency matters.
     /// </summary>
+    private int _inputWriteCount;
+    private int _inputDropCount;
+
     public async Task SendInputEventAsync(string inputJson, int screenWidth, int screenHeight)
     {
-        if (_writer == null || !IsConnected) return;
+        if (_writer == null || !IsConnected)
+        {
+            _inputDropCount++;
+            if (_inputDropCount <= 3 || _inputDropCount % 100 == 0)
+                _logger.LogWarning("Admin pipe input dropped #{Count}: writer={Writer}, connected={Connected}",
+                    _inputDropCount, _writer != null, IsConnected);
+            return;
+        }
 
-        // Prepend command wrapper to raw input JSON (avoids re-serialization)
-        // Input:  {"type":"mouse_move","x":500,...}
-        // Output: {"command":"injectInput","sw":1920,"sh":1080,"type":"mouse_move","x":500,...}
         var commandJson = string.Concat(
             "{\"command\":\"injectInput\",\"sw\":", screenWidth.ToString(),
             ",\"sh\":", screenHeight.ToString(), ",",
             inputJson.Substring(1));
 
+        _inputWriteCount++;
         await _writeLock.WaitAsync();
         try
         {
             await _writer.WriteLineAsync(commandJson);
+            if (_inputWriteCount <= 3 || _inputWriteCount % 500 == 0)
+                _logger.LogInformation("Admin pipe input #{Count}: {Len}b written", _inputWriteCount, commandJson.Length);
         }
-        catch
+        catch (Exception ex)
         {
-            // Ignore write errors on fire-and-forget input
+            _inputDropCount++;
+            if (_inputDropCount <= 3 || _inputDropCount % 100 == 0)
+                _logger.LogWarning(ex, "Admin pipe write error #{Count}", _inputDropCount);
         }
         finally
         {

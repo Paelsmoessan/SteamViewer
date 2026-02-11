@@ -138,6 +138,8 @@ public sealed class WindowsElevationService : IElevationService
         }
     }
 
+    private int _inputRouteCount;
+
     public async Task<bool> InjectInputAsync(string inputJson, int screenWidth, int screenHeight)
     {
         // Route input through the highest available elevation tier:
@@ -146,18 +148,25 @@ public sealed class WindowsElevationService : IElevationService
         // 3. If admin connected → admin helper (UIPI bypass)
         // 4. Return false → caller falls back to local injection
 
+        _inputRouteCount++;
+
         if (_systemHelper?.IsConnected == true)
         {
+            if (_inputRouteCount <= 3 || _inputRouteCount % 500 == 0)
+                _logger.LogInformation("Input route #{Count}: SYSTEM helper", _inputRouteCount);
             await _systemHelper.SendInputEventAsync(inputJson, screenWidth, screenHeight);
             return true;
         }
 
         if (_adminHelper?.IsConnected == true)
         {
+            if (_inputRouteCount <= 3 || _inputRouteCount % 500 == 0)
+                _logger.LogInformation("Input route #{Count}: admin helper", _inputRouteCount);
             await _adminHelper.SendInputEventAsync(inputJson, screenWidth, screenHeight);
             return true;
         }
 
+        _logger.LogWarning("Input route #{Count}: NO helper connected — input dropped", _inputRouteCount);
         return false;
     }
 
