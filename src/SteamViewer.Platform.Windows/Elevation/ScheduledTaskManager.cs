@@ -19,7 +19,7 @@ internal static class ScheduledTaskManager
     public static bool CreateAndRun(string taskName, string exePath, string arguments, out string? error)
     {
         // Create the task: one-time with past trigger (won't auto-run), runs as SYSTEM, force overwrite
-        var createArgs = $"/create /tn \"{taskName}\" /tr \"\\\"{exePath}\\\" {arguments}\" /sc once /st 00:00 /ru SYSTEM /f";
+        var createArgs = $"/create /tn \"{taskName}\" /tr \"\\\"{exePath}\\\" {arguments}\" /sc once /st 00:00 /ru SYSTEM /it /f";
         if (!RunSchtasks(createArgs, out error))
             return false;
 
