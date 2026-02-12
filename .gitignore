@@ -3,6 +3,8 @@ misc/.AI.md
 .claude/settings.local.json
 .claude/ClaudeToClaude-communication.md
 .claude/test-notes.md
+gist-comms-temp.md
+gist-id.txt
 
 # Build outputs
 bin/
