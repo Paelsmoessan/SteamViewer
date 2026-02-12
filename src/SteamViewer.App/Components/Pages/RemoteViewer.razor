@@ -311,6 +311,17 @@
                 Console.WriteLine($"Failed to initialize viewer canvas: {ex.Message}");
             }
         }
+        else if (_canvasInitialized && _inputInitialized)
+        {
+            // After every re-render, verify canvas DOM reference is still valid.
+            // Blazor may destroy/recreate the <canvas> element during re-render,
+            // leaving SteamViewerInput with a stale reference and dead event listeners.
+            try
+            {
+                await JSRuntime.InvokeVoidAsync("SteamViewerInput.reattachIfNeeded");
+            }
+            catch { }
+        }
     }
 
     #region Tab Drag Callbacks
@@ -476,16 +487,6 @@
                         ShowToast("Admin features enabled");
                     // SYSTEM auto-launches with Admin — no toast (avoids focus race)
                     StateHasChanged();
-                    // Re-attach input listeners after Blazor re-render completes
-                    // (StateHasChanged may destroy/recreate the canvas DOM node)
-                    _ = Task.Run(async () =>
-                    {
-                        await Task.Delay(100);
-                        await InvokeAsync(async () =>
-                        {
-                            await JSRuntime.InvokeVoidAsync("SteamViewerInput.reattachIfNeeded");
-                        });
-                    });
                     break;
                 case "ctrlAltDelFailed":
                     ShowToast(message ?? "Ctrl+Alt+Del failed");
