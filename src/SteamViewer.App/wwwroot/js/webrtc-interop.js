@@ -1534,6 +1534,14 @@ window.SteamViewerInput = {
         this._activeSessionId = sessionId;
     },
 
+    // Called from C# after Blazor re-renders (e.g., elevation state change) to fix canvas reference
+    reattachIfNeeded() {
+        this.ensureCanvas();
+        if (this.canvas) {
+            this.canvas.focus();
+        }
+    },
+
     // Verify canvas DOM reference is still valid; re-attach listeners if Blazor recreated it
     ensureCanvas() {
         const current = document.getElementById('viewerCanvas');

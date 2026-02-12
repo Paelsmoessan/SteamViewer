@@ -476,6 +476,16 @@
                         ShowToast("Admin features enabled");
                     // SYSTEM auto-launches with Admin — no toast (avoids focus race)
                     StateHasChanged();
+                    // Re-attach input listeners after Blazor re-render completes
+                    // (StateHasChanged may destroy/recreate the canvas DOM node)
+                    _ = Task.Run(async () =>
+                    {
+                        await Task.Delay(100);
+                        await InvokeAsync(async () =>
+                        {
+                            await JSRuntime.InvokeVoidAsync("SteamViewerInput.reattachIfNeeded");
+                        });
+                    });
                     break;
                 case "ctrlAltDelFailed":
                     ShowToast(message ?? "Ctrl+Alt+Del failed");
