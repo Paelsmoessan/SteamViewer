@@ -1535,7 +1535,14 @@ window.SteamViewerInput = {
     },
 
     // Called from C# after Blazor re-renders (e.g., elevation state change) to fix canvas reference
+    _reattachCount: 0,
     reattachIfNeeded() {
+        this._reattachCount++;
+        const current = document.getElementById('viewerCanvas');
+        const same = current === this.canvas;
+        if (this._reattachCount <= 5 || !same) {
+            console.log(`[Input] reattachIfNeeded #${this._reattachCount}: canvasSame=${same}, capturing=${this.isCapturing}, locked=${this.isLocked}, dotNetRef=${!!this.dotNetRef}`);
+        }
         this.ensureCanvas();
         if (this.canvas) {
             this.canvas.focus();
@@ -1677,7 +1684,12 @@ window.SteamViewerInput = {
         };
     },
 
+    _rawEventCount: 0,
     async handleMouseMove(e) {
+        this._rawEventCount++;
+        if (this._rawEventCount <= 5 || this._rawEventCount % 500 === 0) {
+            console.log(`[Input] raw #${this._rawEventCount}: capturing=${this.isCapturing}, locked=${this.isLocked}, dotNetRef=${!!this.dotNetRef}`);
+        }
         if (!this.isCapturing || !this.isLocked || !this.dotNetRef) return;
         this._inputEventCount++;
         if (this._inputEventCount <= 3) {

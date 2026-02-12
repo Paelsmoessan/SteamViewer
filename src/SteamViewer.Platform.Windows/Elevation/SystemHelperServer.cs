@@ -24,6 +24,18 @@ public static class SystemHelperServer
     [DllImport("sas.dll", SetLastError = true)]
     private static extern void SendSAS(bool asUser);
 
+    // Desktop switching — SYSTEM process needs explicit desktop attachment for SendInput
+    private const uint DESKTOP_SWITCHDESKTOP = 0x0100;
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr OpenInputDesktop(uint dwFlags, bool fInherit, uint dwDesiredAccess);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool SetThreadDesktop(IntPtr hDesktop);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool CloseDesktop(IntPtr hDesktop);
+
     private static string? _debugPath;
     private static SecureDesktopCapture? _capture;
     private static StreamWriter? _controlWriter;
@@ -471,7 +483,15 @@ public static class SystemHelperServer
                 return null; // Fire-and-forget
             }
 
-            // Normal (Default desktop) injection
+            // Normal (Default desktop) injection — SYSTEM process needs explicit desktop attachment
+            // (launched via token duplication from winlogon, thread not on user's desktop by default)
+            var hDesk = OpenInputDesktop(0, false, DESKTOP_SWITCHDESKTOP);
+            if (hDesk != IntPtr.Zero)
+            {
+                SetThreadDesktop(hDesk);
+                CloseDesktop(hDesk);
+            }
+
             var type = root.GetProperty("type").GetString();
 
             switch (type)
