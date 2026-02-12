@@ -98,6 +98,9 @@ public static class SystemHelperServer
             DebugLog($"OpenWindowStation('WinSta0') failed (error {Marshal.GetLastWin32Error()})");
         }
 
+        // Enable software-generated SAS — required for SendSAS(false) to work
+        EnsureSoftwareSASEnabled();
+
         // Spawn dedicated input thread — SetThreadDesktop must be the very first user32 call
         _inputQueue = new BlockingCollection<(string json, int sw, int sh)>();
         _inputThread = new Thread(() => InputThreadProc())
@@ -463,14 +466,45 @@ public static class SystemHelperServer
     {
         try
         {
+            // Re-check registry before each call — GPO may have overwritten it
+            EnsureSoftwareSASEnabled();
+
+            DebugLog("Calling SendSAS(false)...");
             SendSAS(false);
-            DebugLog("SendSAS succeeded");
+            DebugLog("SendSAS(false) returned (no exception)");
             return JsonSerializer.Serialize(new HelperResponse(true, null));
         }
         catch (Exception ex)
         {
             DebugLog($"SendSAS failed: {ex.Message}");
             return JsonSerializer.Serialize(new HelperResponse(false, ex.Message));
+        }
+    }
+
+    /// <summary>
+    /// Ensure SoftwareSASGeneration registry value is set to 3 (services + applications).
+    /// Required for SendSAS(false) from sas.dll to work. SYSTEM has HKLM write access.
+    /// Called at startup and before each SendSAS call (GPO can overwrite between calls).
+    /// </summary>
+    private static void EnsureSoftwareSASEnabled()
+    {
+        try
+        {
+            using var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(
+                @"Software\Microsoft\Windows\CurrentVersion\Policies\System", writable: true);
+            if (key != null)
+            {
+                var current = key.GetValue("SoftwareSASGeneration");
+                if (current == null || (int)current < 3)
+                {
+                    key.SetValue("SoftwareSASGeneration", 3, Microsoft.Win32.RegistryValueKind.DWord);
+                    DebugLog("Set SoftwareSASGeneration=3 (enable software SAS)");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            DebugLog($"Failed to set SoftwareSASGeneration: {ex.Message}");
         }
     }
 
