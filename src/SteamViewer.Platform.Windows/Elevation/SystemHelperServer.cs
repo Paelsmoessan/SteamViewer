@@ -36,6 +36,20 @@ public static class SystemHelperServer
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool CloseDesktop(IntPtr hDesktop);
 
+    // Window station — SYSTEM process may need to attach to WinSta0 (interactive)
+    private const uint WINSTA_ALL_ACCESS = 0x37F;
+
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern IntPtr OpenWindowStation(string lpszWinSta, bool fInherit, uint dwDesiredAccess);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool SetProcessWindowStation(IntPtr hWinSta);
+
+    // Throttled diagnostics for per-input desktop attachment (60+ Hz)
+    private static int _desktopAttachFailCount;
+    private static bool _desktopAttachLoggedSuccess;
+    private static bool _desktopAttachLoggedFailure;
+
     private static string? _debugPath;
     private static SecureDesktopCapture? _capture;
     private static StreamWriter? _controlWriter;
@@ -68,6 +82,21 @@ public static class SystemHelperServer
 
         DebugLog($"Starting SYSTEM pipe server: {pipeName} (PID {Environment.ProcessId})");
         DebugLog($"Running as: {Environment.UserName} (SYSTEM expected)");
+
+        // Attach to interactive window station — SYSTEM process may be in Service-0x0-3e7$
+        var hWinSta = OpenWindowStation("WinSta0", false, WINSTA_ALL_ACCESS);
+        if (hWinSta != IntPtr.Zero)
+        {
+            if (SetProcessWindowStation(hWinSta))
+                DebugLog("Attached to WinSta0 (interactive window station)");
+            else
+                DebugLog($"SetProcessWindowStation failed (error {Marshal.GetLastWin32Error()})");
+            // Don't close — needed for process lifetime
+        }
+        else
+        {
+            DebugLog($"OpenWindowStation('WinSta0') failed (error {Marshal.GetLastWin32Error()})");
+        }
 
         try
         {
@@ -484,12 +513,27 @@ public static class SystemHelperServer
             }
 
             // Normal (Default desktop) injection — SYSTEM process needs explicit desktop attachment
-            // (launched via token duplication from winlogon, thread not on user's desktop by default)
             var hDesk = OpenInputDesktop(0, false, DESKTOP_SWITCHDESKTOP);
             if (hDesk != IntPtr.Zero)
             {
-                SetThreadDesktop(hDesk);
+                var ok = SetThreadDesktop(hDesk);
                 CloseDesktop(hDesk);
+                if (!ok && !_desktopAttachLoggedFailure)
+                {
+                    DebugLog($"SetThreadDesktop failed (error {Marshal.GetLastWin32Error()})");
+                    _desktopAttachLoggedFailure = true;
+                }
+                if (ok && !_desktopAttachLoggedSuccess)
+                {
+                    DebugLog("SetThreadDesktop(Default) succeeded");
+                    _desktopAttachLoggedSuccess = true;
+                }
+            }
+            else
+            {
+                _desktopAttachFailCount++;
+                if (_desktopAttachFailCount == 1 || _desktopAttachFailCount % 1000 == 0)
+                    DebugLog($"OpenInputDesktop failed (error {Marshal.GetLastWin32Error()}, attempt #{_desktopAttachFailCount})");
             }
 
             var type = root.GetProperty("type").GetString();
