@@ -45,11 +45,6 @@ public static class SystemHelperServer
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool SetProcessWindowStation(IntPtr hWinSta);
 
-    // Throttled diagnostics for per-input desktop attachment (60+ Hz)
-    private static int _desktopAttachFailCount;
-    private static bool _desktopAttachLoggedSuccess;
-    private static bool _desktopAttachLoggedFailure;
-
     private static string? _debugPath;
     private static SecureDesktopCapture? _capture;
     private static StreamWriter? _controlWriter;
@@ -96,6 +91,22 @@ public static class SystemHelperServer
         else
         {
             DebugLog($"OpenWindowStation('WinSta0') failed (error {Marshal.GetLastWin32Error()})");
+        }
+
+        // Attach thread to Default desktop while thread is still clean
+        // (SetThreadDesktop fails once thread has pipes/COM/message loop state)
+        var hDesk = OpenInputDesktop(0, false, DESKTOP_SWITCHDESKTOP);
+        if (hDesk != IntPtr.Zero)
+        {
+            if (SetThreadDesktop(hDesk))
+                DebugLog("SetThreadDesktop(Default) succeeded at startup");
+            else
+                DebugLog($"SetThreadDesktop failed at startup (error {Marshal.GetLastWin32Error()})");
+            CloseDesktop(hDesk);
+        }
+        else
+        {
+            DebugLog($"OpenInputDesktop failed at startup (error {Marshal.GetLastWin32Error()})");
         }
 
         try
@@ -512,30 +523,7 @@ public static class SystemHelperServer
                 return null; // Fire-and-forget
             }
 
-            // Normal (Default desktop) injection — SYSTEM process needs explicit desktop attachment
-            var hDesk = OpenInputDesktop(0, false, DESKTOP_SWITCHDESKTOP);
-            if (hDesk != IntPtr.Zero)
-            {
-                var ok = SetThreadDesktop(hDesk);
-                CloseDesktop(hDesk);
-                if (!ok && !_desktopAttachLoggedFailure)
-                {
-                    DebugLog($"SetThreadDesktop failed (error {Marshal.GetLastWin32Error()})");
-                    _desktopAttachLoggedFailure = true;
-                }
-                if (ok && !_desktopAttachLoggedSuccess)
-                {
-                    DebugLog("SetThreadDesktop(Default) succeeded");
-                    _desktopAttachLoggedSuccess = true;
-                }
-            }
-            else
-            {
-                _desktopAttachFailCount++;
-                if (_desktopAttachFailCount == 1 || _desktopAttachFailCount % 1000 == 0)
-                    DebugLog($"OpenInputDesktop failed (error {Marshal.GetLastWin32Error()}, attempt #{_desktopAttachFailCount})");
-            }
-
+            // Desktop already attached at startup (SetThreadDesktop in Run())
             var type = root.GetProperty("type").GetString();
 
             switch (type)
