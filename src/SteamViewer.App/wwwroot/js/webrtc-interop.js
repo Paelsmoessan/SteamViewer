@@ -1812,6 +1812,12 @@ window.SteamViewerInput = {
         const sd = window.SteamViewerSecureDesktop;
         const captureW = (sd?.isActive && sd._width) ? sd._width : this.canvas.width;
         const captureH = (sd?.isActive && sd._height) ? sd._height : this.canvas.height;
+        // Update SD cursor position for overlay rendering
+        if (sd?.isActive && sd._width && sd._height) {
+            sd._cursorX = (coords.x / this.canvas.width) * sd._width;
+            sd._cursorY = (coords.y / this.canvas.height) * sd._height;
+            sd._drawCursor();
+        }
         try {
             await this.dotNetRef.invokeMethodAsync('OnMouseMove', coords.x, coords.y,
                 captureW, captureH);
@@ -1858,8 +1864,12 @@ window.SteamViewerInput = {
             window.SteamViewerWebRTC._incrementInputCount(this._activeSessionId);
         }
         e.preventDefault();
+        // Normalize delta to pixels (mode 0=pixels, 1=lines, 2=pages)
+        let dx = e.deltaX, dy = e.deltaY;
+        if (e.deltaMode === 1) { dx *= 40; dy *= 40; }
+        else if (e.deltaMode === 2) { dx *= 800; dy *= 800; }
         try {
-            await this.dotNetRef.invokeMethodAsync('OnMouseWheel', e.deltaX, e.deltaY);
+            await this.dotNetRef.invokeMethodAsync('OnMouseWheel', dx, dy);
         } catch (e) { /* disposed */ }
     },
 
@@ -2039,6 +2049,9 @@ window.SteamViewerSecureDesktop = {
     isActive: false,
     _width: 0,
     _height: 0,
+    _cursorX: -1,
+    _cursorY: -1,
+    _lastFrameData: null,
 
     show(canvasId) {
         this._frameCount = 0;
@@ -2093,10 +2106,41 @@ window.SteamViewerSecureDesktop = {
             this.img.onload = () => {
                 if (this.ctx && this.canvas) {
                     this.ctx.drawImage(this.img, 0, 0, this.canvas.width, this.canvas.height);
+                    this._drawCursor();
                 }
             };
         }
 
         this.img.src = 'data:image/jpeg;base64,' + base64Jpeg;
+    },
+
+    _drawCursor() {
+        if (!this.ctx || !this.canvas || this._cursorX < 0 || this._cursorY < 0) return;
+        const x = this._cursorX;
+        const y = this._cursorY;
+        const ctx = this.ctx;
+        const size = 12;
+
+        // Crosshair
+        ctx.strokeStyle = '#fff';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(x - size, y); ctx.lineTo(x + size, y);
+        ctx.moveTo(x, y - size); ctx.lineTo(x, y + size);
+        ctx.stroke();
+
+        // Dark outline for visibility
+        ctx.strokeStyle = '#000';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(x - size, y); ctx.lineTo(x + size, y);
+        ctx.moveTo(x, y - size); ctx.lineTo(x, y + size);
+        ctx.stroke();
+
+        // Center dot
+        ctx.fillStyle = '#ff3333';
+        ctx.beginPath();
+        ctx.arc(x, y, 3, 0, Math.PI * 2);
+        ctx.fill();
     }
 };

@@ -14,9 +14,6 @@ internal static class Win32Input
     private static bool _initialized;
     private static readonly object InitLock = new();
 
-    // Wheel delta accumulators — fire SendInput only when |accumulated| >= WHEEL_DELTA
-    private static double _accumulatedWheelY;
-    private static double _accumulatedWheelX;
 
     private static void EnsureInitialized()
     {
@@ -156,56 +153,42 @@ internal static class Win32Input
 
         if (Math.Abs(deltaY) > 0.001)
         {
-            _accumulatedWheelY += -deltaY * WHEEL_DELTA / 100.0;
-
-            while (Math.Abs(_accumulatedWheelY) >= WHEEL_DELTA)
+            var wheelDelta = (int)(-deltaY * WHEEL_DELTA / 100.0);
+            inputs.Add(new INPUT
             {
-                var wheelDelta = _accumulatedWheelY > 0 ? WHEEL_DELTA : -WHEEL_DELTA;
-                _accumulatedWheelY -= wheelDelta;
-
-                inputs.Add(new INPUT
+                type = INPUT_MOUSE,
+                union = new InputUnion
                 {
-                    type = INPUT_MOUSE,
-                    union = new InputUnion
+                    mi = new MOUSEINPUT
                     {
-                        mi = new MOUSEINPUT
-                        {
-                            dx = 0, dy = 0,
-                            mouseData = (uint)wheelDelta,
-                            dwFlags = MOUSEEVENTF_WHEEL,
-                            time = 0,
-                            dwExtraInfo = IntPtr.Zero
-                        }
+                        dx = 0, dy = 0,
+                        mouseData = (uint)wheelDelta,
+                        dwFlags = MOUSEEVENTF_WHEEL,
+                        time = 0,
+                        dwExtraInfo = IntPtr.Zero
                     }
-                });
-            }
+                }
+            });
         }
 
         if (Math.Abs(deltaX) > 0.001)
         {
-            _accumulatedWheelX += deltaX * WHEEL_DELTA / 100.0;
-
-            while (Math.Abs(_accumulatedWheelX) >= WHEEL_DELTA)
+            var wheelDelta = (int)(deltaX * WHEEL_DELTA / 100.0);
+            inputs.Add(new INPUT
             {
-                var wheelDelta = _accumulatedWheelX > 0 ? WHEEL_DELTA : -WHEEL_DELTA;
-                _accumulatedWheelX -= wheelDelta;
-
-                inputs.Add(new INPUT
+                type = INPUT_MOUSE,
+                union = new InputUnion
                 {
-                    type = INPUT_MOUSE,
-                    union = new InputUnion
+                    mi = new MOUSEINPUT
                     {
-                        mi = new MOUSEINPUT
-                        {
-                            dx = 0, dy = 0,
-                            mouseData = (uint)wheelDelta,
-                            dwFlags = MOUSEEVENTF_HWHEEL,
-                            time = 0,
-                            dwExtraInfo = IntPtr.Zero
-                        }
+                        dx = 0, dy = 0,
+                        mouseData = (uint)wheelDelta,
+                        dwFlags = MOUSEEVENTF_HWHEEL,
+                        time = 0,
+                        dwExtraInfo = IntPtr.Zero
                     }
-                });
-            }
+                }
+            });
         }
 
         if (inputs.Count > 0)
