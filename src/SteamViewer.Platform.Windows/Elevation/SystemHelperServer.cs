@@ -3,6 +3,7 @@ using System.IO.Pipes;
 using System.Runtime.InteropServices;
 using System.Security.AccessControl;
 using System.Security.Principal;
+using System.Collections.Concurrent;
 using System.Text;
 using System.Text.Json;
 using SteamViewer.Common.Protocol;
@@ -44,6 +45,10 @@ public static class SystemHelperServer
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool SetProcessWindowStation(IntPtr hWinSta);
+
+    // Dedicated input thread — SetThreadDesktop requires a thread with zero prior user32 calls
+    private static BlockingCollection<(string json, int sw, int sh)>? _inputQueue;
+    private static Thread? _inputThread;
 
     private static string? _debugPath;
     private static SecureDesktopCapture? _capture;
@@ -93,21 +98,15 @@ public static class SystemHelperServer
             DebugLog($"OpenWindowStation('WinSta0') failed (error {Marshal.GetLastWin32Error()})");
         }
 
-        // Attach thread to Default desktop while thread is still clean
-        // (SetThreadDesktop fails once thread has pipes/COM/message loop state)
-        var hDesk = OpenInputDesktop(0, false, DESKTOP_SWITCHDESKTOP);
-        if (hDesk != IntPtr.Zero)
+        // Spawn dedicated input thread — SetThreadDesktop must be the very first user32 call
+        _inputQueue = new BlockingCollection<(string json, int sw, int sh)>();
+        _inputThread = new Thread(() => InputThreadProc())
         {
-            if (SetThreadDesktop(hDesk))
-                DebugLog("SetThreadDesktop(Default) succeeded at startup");
-            else
-                DebugLog($"SetThreadDesktop failed at startup (error {Marshal.GetLastWin32Error()})");
-            CloseDesktop(hDesk);
-        }
-        else
-        {
-            DebugLog($"OpenInputDesktop failed at startup (error {Marshal.GetLastWin32Error()})");
-        }
+            IsBackground = true,
+            Name = "SystemHelper-Input"
+        };
+        _inputThread.SetApartmentState(ApartmentState.MTA);
+        _inputThread.Start();
 
         try
         {
@@ -516,56 +515,12 @@ public static class SystemHelperServer
             // If Secure Desktop is active, route input to the Winlogon desktop
             if (_capture != null && _capture.IsActive)
             {
-                // Strip the command/sw/sh wrapper — pass just the input event JSON
-                // The rawJson has command + sw + sh + the rest of the input event fields.
-                // SecureDesktopCapture.InjectInputOnWinlogon parses type/x/y/etc directly.
                 _capture.InjectInputOnWinlogon(rawJson, sw, sh);
                 return null; // Fire-and-forget
             }
 
-            // Desktop already attached at startup (SetThreadDesktop in Run())
-            var type = root.GetProperty("type").GetString();
-
-            switch (type)
-            {
-                case "mouse_move":
-                    Win32Input.InjectMouseMove(
-                        root.GetProperty("x").GetDouble(),
-                        root.GetProperty("y").GetDouble(),
-                        sw, sh);
-                    break;
-                case "mouse_down":
-                    Win32Input.InjectMouseButton(
-                        ParseMouseButton(root.GetProperty("button").GetString()),
-                        root.GetProperty("x").GetDouble(),
-                        root.GetProperty("y").GetDouble(),
-                        sw, sh, isDown: true);
-                    break;
-                case "mouse_up":
-                    Win32Input.InjectMouseButton(
-                        ParseMouseButton(root.GetProperty("button").GetString()),
-                        root.GetProperty("x").GetDouble(),
-                        root.GetProperty("y").GetDouble(),
-                        sw, sh, isDown: false);
-                    break;
-                case "mouse_wheel":
-                    Win32Input.InjectMouseWheel(
-                        root.GetProperty("delta_x").GetDouble(),
-                        root.GetProperty("delta_y").GetDouble());
-                    break;
-                case "key_down":
-                    Win32Input.InjectKey(
-                        root.GetProperty("key").GetString()!,
-                        ParseModifiers(root),
-                        isDown: true);
-                    break;
-                case "key_up":
-                    Win32Input.InjectKey(
-                        root.GetProperty("key").GetString()!,
-                        ParseModifiers(root),
-                        isDown: false);
-                    break;
-            }
+            // Enqueue for dedicated input thread (which has SetThreadDesktop applied)
+            _inputQueue?.TryAdd((rawJson, sw, sh));
         }
         catch (Exception ex)
         {
@@ -573,6 +528,89 @@ public static class SystemHelperServer
         }
 
         return null; // Fire-and-forget
+    }
+
+    /// <summary>
+    /// Dedicated input thread — attaches to Default desktop as its very first user32 call,
+    /// then processes input from queue. SetThreadDesktop requires zero prior user32 calls.
+    /// </summary>
+    private static void InputThreadProc()
+    {
+        try
+        {
+            // First user32 call on this thread — attach to Default desktop
+            var hDesk = OpenInputDesktop(0, false, DESKTOP_SWITCHDESKTOP);
+            if (hDesk != IntPtr.Zero)
+            {
+                var ok = SetThreadDesktop(hDesk);
+                DebugLog($"Input thread SetThreadDesktop: {ok} (error {Marshal.GetLastWin32Error()})");
+                CloseDesktop(hDesk);
+            }
+            else
+            {
+                DebugLog($"Input thread OpenInputDesktop failed (error {Marshal.GetLastWin32Error()})");
+            }
+
+            // Process input commands from queue
+            foreach (var (json, sw, sh) in _inputQueue!.GetConsumingEnumerable())
+            {
+                try
+                {
+                    using var doc = JsonDocument.Parse(json);
+                    var root = doc.RootElement;
+                    var type = root.GetProperty("type").GetString();
+
+                    switch (type)
+                    {
+                        case "mouse_move":
+                            Win32Input.InjectMouseMove(
+                                root.GetProperty("x").GetDouble(),
+                                root.GetProperty("y").GetDouble(),
+                                sw, sh);
+                            break;
+                        case "mouse_down":
+                            Win32Input.InjectMouseButton(
+                                ParseMouseButton(root.GetProperty("button").GetString()),
+                                root.GetProperty("x").GetDouble(),
+                                root.GetProperty("y").GetDouble(),
+                                sw, sh, isDown: true);
+                            break;
+                        case "mouse_up":
+                            Win32Input.InjectMouseButton(
+                                ParseMouseButton(root.GetProperty("button").GetString()),
+                                root.GetProperty("x").GetDouble(),
+                                root.GetProperty("y").GetDouble(),
+                                sw, sh, isDown: false);
+                            break;
+                        case "mouse_wheel":
+                            Win32Input.InjectMouseWheel(
+                                root.GetProperty("delta_x").GetDouble(),
+                                root.GetProperty("delta_y").GetDouble());
+                            break;
+                        case "key_down":
+                            Win32Input.InjectKey(
+                                root.GetProperty("key").GetString()!,
+                                ParseModifiers(root),
+                                isDown: true);
+                            break;
+                        case "key_up":
+                            Win32Input.InjectKey(
+                                root.GetProperty("key").GetString()!,
+                                ParseModifiers(root),
+                                isDown: false);
+                            break;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    DebugLog($"Input thread error: {ex.Message}");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            DebugLog($"Input thread fatal: {ex.Message}");
+        }
     }
 
     private static MouseButton ParseMouseButton(string? button) => button switch
