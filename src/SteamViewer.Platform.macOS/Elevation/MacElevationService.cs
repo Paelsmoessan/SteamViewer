@@ -20,8 +20,11 @@ public sealed class MacElevationService : IElevationService
     public Task<bool> RequestAdminElevationAsync() => Task.FromResult(false);
     public Task<bool> RequestSystemElevationAsync() => Task.FromResult(false);
     public Task<bool> InjectInputAsync(string inputJson, int screenWidth, int screenHeight) => Task.FromResult(false);
+    public Task<bool> LockWorkStationAsync() => Task.FromResult(false);
     public Task<bool> SendSASAsync() => Task.FromResult(false);
-    public Task<bool> RebootAsync(string clientId, string passwordHash, string viewerPeerId) => Task.FromResult(false);
+    public Task<bool> RebootAsync(string clientId, string passwordHash, string viewerPeerId,
+        string? serverUrl = null, string[]? stunUrls = null,
+        string[]? turnUrls = null, string? turnUsername = null, string? turnCredential = null) => Task.FromResult(false);
     public Task<bool> RunElevatedAsync(string path, string? args) => Task.FromResult(false);
     public Task<bool> RunAsSystemAsync(string path, string? args) => Task.FromResult(false);
 

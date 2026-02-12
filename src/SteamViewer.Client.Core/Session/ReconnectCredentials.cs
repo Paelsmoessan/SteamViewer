@@ -6,7 +6,8 @@ namespace SteamViewer.Client.Core.Session;
 
 /// <summary>
 /// Encrypts and persists session credentials for auto-reconnect after reboot.
-/// One-time use: file is deleted immediately after reading.
+/// Read by both SYSTEM helper (at boot, before login) and main app (after login).
+/// Call Delete() explicitly after main app takes over the connection.
 /// Encryption key is derived from viewerPeerId + clientId (session-bound).
 /// </summary>
 public static class ReconnectCredentials
@@ -20,16 +21,28 @@ public static class ReconnectCredentials
 
     /// <summary>
     /// Encrypt and save session credentials for post-reboot reconnection.
+    /// Includes signaling server URL and ICE server config for boot relay WebRTC.
     /// </summary>
-    public static void Save(string clientId, string passwordHash, string viewerPeerId)
+    public static void Save(string clientId, string passwordHash, string viewerPeerId,
+        string? serverUrl = null, string[]? stunUrls = null,
+        string[]? turnUrls = null, string? turnUsername = null, string? turnCredential = null)
     {
         var key = DeriveKey(viewerPeerId, clientId);
+
+        // Encrypt the sensitive payload (passwordHash + ICE credentials)
+        var payload = new ReconnectPayload
+        {
+            PasswordHash = passwordHash,
+            TurnUsername = turnUsername ?? "",
+            TurnCredential = turnCredential ?? ""
+        };
+        var payloadJson = JsonSerializer.Serialize(payload);
 
         using var aes = Aes.Create();
         aes.Key = key;
         aes.GenerateIV();
 
-        var plainText = Encoding.UTF8.GetBytes(passwordHash);
+        var plainText = Encoding.UTF8.GetBytes(payloadJson);
         var encrypted = aes.EncryptCbc(plainText, aes.IV, PaddingMode.PKCS7);
 
         var data = new ReconnectData
@@ -37,10 +50,12 @@ public static class ReconnectCredentials
             ClientId = clientId,
             ViewerPeerId = viewerPeerId,
             IV = Convert.ToBase64String(aes.IV),
-            EncryptedHash = Convert.ToBase64String(encrypted)
+            EncryptedHash = Convert.ToBase64String(encrypted),
+            SavedAtUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            ServerUrl = serverUrl ?? "",
+            StunUrls = stunUrls ?? [],
+            TurnUrls = turnUrls ?? []
         };
-
-        data.SavedAtUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
         var dir = Path.GetDirectoryName(FilePath)!;
         Directory.CreateDirectory(dir);
@@ -48,8 +63,10 @@ public static class ReconnectCredentials
     }
 
     /// <summary>
-    /// Load and decrypt session credentials. Deletes the file after reading.
-    /// Returns null if no reconnect data exists or decryption fails.
+    /// Load and decrypt session credentials. Does NOT delete the file —
+    /// both SYSTEM helper and main app may need to read it.
+    /// Call Delete() explicitly after the main app takes over.
+    /// Returns null if no reconnect data exists, is stale, or decryption fails.
     /// </summary>
     public static ReconnectResult? Load()
     {
@@ -67,11 +84,11 @@ public static class ReconnectCredentials
                 string.IsNullOrEmpty(data.EncryptedHash))
                 return null;
 
-            // Reject stale reconnect data (older than 5 minutes)
+            // Reject stale reconnect data (older than 60 minutes — Windows Update reboots can take 30+ min)
             if (data.SavedAtUnixMs > 0)
             {
                 var savedAt = DateTimeOffset.FromUnixTimeMilliseconds(data.SavedAtUnixMs);
-                if (DateTimeOffset.UtcNow - savedAt > TimeSpan.FromMinutes(5))
+                if (DateTimeOffset.UtcNow - savedAt > TimeSpan.FromMinutes(60))
                     return null;
             }
 
@@ -83,19 +100,48 @@ public static class ReconnectCredentials
             aes.Key = key;
 
             var decrypted = aes.DecryptCbc(encrypted, iv, PaddingMode.PKCS7);
-            var passwordHash = Encoding.UTF8.GetString(decrypted);
+            var decryptedStr = Encoding.UTF8.GetString(decrypted);
 
-            return new ReconnectResult(data.ClientId, passwordHash, data.ViewerPeerId);
+            // Try new payload format first (JSON with PasswordHash + TURN creds)
+            string passwordHash;
+            string turnUsername = "";
+            string turnCredential = "";
+            try
+            {
+                var payload = JsonSerializer.Deserialize<ReconnectPayload>(decryptedStr);
+                if (payload != null && !string.IsNullOrEmpty(payload.PasswordHash))
+                {
+                    passwordHash = payload.PasswordHash;
+                    turnUsername = payload.TurnUsername;
+                    turnCredential = payload.TurnCredential;
+                }
+                else
+                {
+                    // Fallback: old format where decrypted string is just the passwordHash
+                    passwordHash = decryptedStr;
+                }
+            }
+            catch
+            {
+                // Fallback: old format where decrypted string is just the passwordHash
+                passwordHash = decryptedStr;
+            }
+
+            return new ReconnectResult(data.ClientId, passwordHash, data.ViewerPeerId,
+                data.ServerUrl, data.StunUrls, data.TurnUrls, turnUsername, turnCredential);
         }
         catch
         {
             return null;
         }
-        finally
-        {
-            // Always delete the file — one-time use
-            try { File.Delete(FilePath); } catch { }
-        }
+    }
+
+    /// <summary>
+    /// Delete the reconnect credentials file. Call after main app takes over the connection.
+    /// </summary>
+    public static void Delete()
+    {
+        try { File.Delete(FilePath); } catch { }
     }
 
     private static byte[] DeriveKey(string viewerPeerId, string clientId)
@@ -111,7 +157,21 @@ public static class ReconnectCredentials
         public string IV { get; set; } = "";
         public string EncryptedHash { get; set; } = "";
         public long SavedAtUnixMs { get; set; }
+        public string ServerUrl { get; set; } = "";
+        public string[] StunUrls { get; set; } = [];
+        public string[] TurnUrls { get; set; } = [];
     }
 
-    public sealed record ReconnectResult(string ClientId, string PasswordHash, string ViewerPeerId);
+    /// <summary>Encrypted payload inside EncryptedHash — contains sensitive credentials.</summary>
+    private sealed class ReconnectPayload
+    {
+        public string PasswordHash { get; set; } = "";
+        public string TurnUsername { get; set; } = "";
+        public string TurnCredential { get; set; } = "";
+    }
+
+    public sealed record ReconnectResult(
+        string ClientId, string PasswordHash, string ViewerPeerId,
+        string? ServerUrl = null, string[]? StunUrls = null, string[]? TurnUrls = null,
+        string? TurnUsername = null, string? TurnCredential = null);
 }

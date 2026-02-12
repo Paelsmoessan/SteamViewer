@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using Microsoft.Extensions.Logging;
 using SteamViewer.Client.Core.Elevation;
 
@@ -182,6 +183,29 @@ public sealed class WindowsElevationService : IElevationService
         return false;
     }
 
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool LockWorkStation();
+
+    public Task<bool> LockWorkStationAsync()
+    {
+        try
+        {
+            if (LockWorkStation())
+            {
+                _logger.LogInformation("LockWorkStation() succeeded");
+                return Task.FromResult(true);
+            }
+            _logger.LogWarning("LockWorkStation() failed (error {Error})", Marshal.GetLastWin32Error());
+            return Task.FromResult(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "LockWorkStation() exception");
+            return Task.FromResult(false);
+        }
+    }
+
     public async Task<bool> SendSASAsync()
     {
         _logger.LogInformation("SendSAS requested. SYSTEM connected: {System}, Admin connected: {Admin}",
@@ -207,7 +231,9 @@ public sealed class WindowsElevationService : IElevationService
         return false;
     }
 
-    public async Task<bool> RebootAsync(string clientId, string passwordHash, string viewerPeerId)
+    public async Task<bool> RebootAsync(string clientId, string passwordHash, string viewerPeerId,
+        string? serverUrl = null, string[]? stunUrls = null,
+        string[]? turnUrls = null, string? turnUsername = null, string? turnCredential = null)
     {
         if (_adminHelper?.IsConnected != true)
         {
@@ -215,7 +241,8 @@ public sealed class WindowsElevationService : IElevationService
             return false;
         }
 
-        return await _adminHelper.RebootAsync(clientId, passwordHash, viewerPeerId);
+        return await _adminHelper.RebootAsync(clientId, passwordHash, viewerPeerId,
+            serverUrl, stunUrls, turnUrls, turnUsername, turnCredential);
     }
 
     public async Task<bool> RunElevatedAsync(string path, string? args)

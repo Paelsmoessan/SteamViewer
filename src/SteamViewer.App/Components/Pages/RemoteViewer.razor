@@ -706,11 +706,20 @@
         CloseMenus();
     }
 
-    private void SendWinL()
+    private async Task SendWinL()
     {
-        // Send Win+L to lock screen
-        SendKeyCombo("l", meta: true);
         CloseMenus();
+        if (_activeSession == null) return;
+        try
+        {
+            var json = System.Text.Json.JsonSerializer.Serialize(new { type = "lockWorkstation" });
+            await _activeSession.SendDataAsync(json);
+        }
+        catch (Exception ex)
+        {
+            ShowToast("Failed to lock workstation");
+            Console.WriteLine($"SendWinL error: {ex.Message}");
+        }
     }
 
     private void SendAltTab()

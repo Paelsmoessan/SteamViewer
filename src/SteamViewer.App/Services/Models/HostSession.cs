@@ -385,6 +385,11 @@ public sealed class HostSession : IAsyncDisposable
                         await HandleCtrlAltDelAsync();
                         return;
 
+                    case "lockWorkstation":
+                        _logger.LogInformation("Received lock workstation request from viewer");
+                        await HandleLockWorkstationAsync();
+                        return;
+
                     case "requestElevation":
                         await HandleRequestElevationAsync();
                         return;
@@ -751,6 +756,36 @@ public sealed class HostSession : IAsyncDisposable
         }
     }
 
+    private async Task HandleLockWorkstationAsync()
+    {
+        if (_elevationService != null)
+        {
+            var success = await _elevationService.LockWorkStationAsync();
+            if (success)
+            {
+                _logger.LogInformation("Workstation locked via elevation service");
+                return;
+            }
+        }
+
+        // Fallback: rundll32 (works without elevation service being wired up)
+        try
+        {
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = "rundll32.exe",
+                Arguments = "user32.dll,LockWorkStation",
+                UseShellExecute = false,
+                CreateNoWindow = true
+            });
+            _logger.LogInformation("Workstation locked via rundll32 fallback");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to lock workstation");
+        }
+    }
+
     /// <summary>
     /// Reboot the host machine with auto-restart. Routes through elevation service
     /// for RunOnceEx registry write, falls back to direct reboot if not elevated.
@@ -759,7 +794,14 @@ public sealed class HostSession : IAsyncDisposable
     {
         if (_elevationService?.IsAdminConnected == true)
         {
-            var success = await _elevationService.RebootAsync(_hostClientId, _hostPasswordHash, PeerId);
+            // Pass server URL + STUN/TURN config for boot relay WebRTC reconnection
+            var serverUrl = _configuration["SignalingServer"];
+            var stunUrls = new[] { "stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302" };
+            var turnUrls = _configuration.GetSection("TurnServer:Urls").Get<string[]>();
+            var turnUser = _configuration["TurnServer:Username"];
+            var turnCred = _configuration["TurnServer:Credential"];
+            var success = await _elevationService.RebootAsync(_hostClientId, _hostPasswordHash, PeerId,
+                serverUrl, stunUrls, turnUrls, turnUser, turnCred);
             if (success)
             {
                 _logger.LogInformation("Reboot initiated via elevation service (with auto-restart)");

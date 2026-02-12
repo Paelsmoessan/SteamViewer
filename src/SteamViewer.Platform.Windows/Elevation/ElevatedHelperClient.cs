@@ -158,14 +158,21 @@ public sealed class ElevatedHelperClient : IAsyncDisposable
     /// <summary>
     /// Reboot with auto-restart via the elevated helper (writes RunOnceEx + shutdown).
     /// </summary>
-    public async Task<bool> RebootAsync(string? clientId = null, string? passwordHash = null, string? viewerPeerId = null)
+    public async Task<bool> RebootAsync(string? clientId = null, string? passwordHash = null, string? viewerPeerId = null,
+        string? serverUrl = null, string[]? stunUrls = null,
+        string[]? turnUrls = null, string? turnUsername = null, string? turnCredential = null)
     {
         var response = await SendCommandAsync(new
         {
             command = "reboot",
             clientId,
             passwordHash,
-            viewerPeerId
+            viewerPeerId,
+            serverUrl,
+            stunUrls,
+            turnUrls,
+            turnUsername,
+            turnCredential
         });
 
         if (response?.Success == true)

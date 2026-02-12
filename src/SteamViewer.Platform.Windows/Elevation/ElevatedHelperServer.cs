@@ -235,17 +235,29 @@ public static class ElevatedHelperServer
         {
             var appPath = Environment.ProcessPath;
 
-            // Save reconnect credentials if provided
+            // Save reconnect credentials if provided (with server URL + STUN/TURN for boot relay)
             var clientId = root.TryGetProperty("clientId", out var cid) ? cid.GetString() : null;
             var passwordHash = root.TryGetProperty("passwordHash", out var ph) ? ph.GetString() : null;
             var viewerPeerId = root.TryGetProperty("viewerPeerId", out var vp) ? vp.GetString() : null;
+            var serverUrl = root.TryGetProperty("serverUrl", out var su) ? su.GetString() : null;
+            var turnUsername = root.TryGetProperty("turnUsername", out var tu) ? tu.GetString() : null;
+            var turnCredential = root.TryGetProperty("turnCredential", out var tc) ? tc.GetString() : null;
+
+            string[]? stunUrls = null;
+            if (root.TryGetProperty("stunUrls", out var stunArr) && stunArr.ValueKind == JsonValueKind.Array)
+                stunUrls = stunArr.EnumerateArray().Select(e => e.GetString()!).ToArray();
+
+            string[]? turnUrls = null;
+            if (root.TryGetProperty("turnUrls", out var turnArr) && turnArr.ValueKind == JsonValueKind.Array)
+                turnUrls = turnArr.EnumerateArray().Select(e => e.GetString()!).ToArray();
 
             if (!string.IsNullOrEmpty(clientId) && !string.IsNullOrEmpty(passwordHash) && !string.IsNullOrEmpty(viewerPeerId))
             {
                 try
                 {
-                    ReconnectCredentials.Save(clientId, passwordHash, viewerPeerId);
-                    DebugLog("Saved reconnect credentials");
+                    ReconnectCredentials.Save(clientId, passwordHash, viewerPeerId,
+                        serverUrl, stunUrls, turnUrls, turnUsername, turnCredential);
+                    DebugLog($"Saved reconnect credentials (serverUrl={serverUrl}, stunUrls={stunUrls?.Length ?? 0}, turnUrls={turnUrls?.Length ?? 0})");
                 }
                 catch (Exception ex)
                 {
@@ -253,9 +265,47 @@ public static class ElevatedHelperServer
                 }
             }
 
-            // Write RunOnceEx for auto-restart with --sas mode
+            // Disable "Press Ctrl+Alt+Del to log in" — persists across reboots.
+            // Allows login screen to show password field directly.
+            // Domain GPO may overwrite, but survives at least one reboot.
+            try
+            {
+                using var policyKey = Registry.LocalMachine.OpenSubKey(
+                    @"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System", writable: true);
+                policyKey?.SetValue("DisableCAD", 1, RegistryValueKind.DWord);
+                DebugLog("Set DisableCAD=1 (skip Ctrl+Alt+Del at login)");
+            }
+            catch (Exception ex)
+            {
+                DebugLog($"Failed to set DisableCAD: {ex.Message}");
+            }
+
             if (!string.IsNullOrEmpty(appPath))
             {
+                // Create boot relay schtask — runs as SYSTEM at boot (before login)
+                // Streams login screen via SIPSorcery WebRTC so viewer can type password
+                try
+                {
+                    var schtaskResult = Process.Start(new ProcessStartInfo
+                    {
+                        FileName = "schtasks",
+                        Arguments = $"/create /tn \"SteamViewerBootRelay\" /tr \"\\\"{appPath}\\\" --boot-relay\" /sc onstart /ru SYSTEM /f",
+                        UseShellExecute = false,
+                        CreateNoWindow = true,
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true
+                    });
+                    schtaskResult?.WaitForExit(5000);
+                    var schtaskOut = schtaskResult?.StandardOutput.ReadToEnd();
+                    var schtaskErr = schtaskResult?.StandardError.ReadToEnd();
+                    DebugLog($"Boot relay schtask created (exit={schtaskResult?.ExitCode}, out={schtaskOut?.Trim()}, err={schtaskErr?.Trim()})");
+                }
+                catch (Exception ex)
+                {
+                    DebugLog($"Failed to create boot relay schtask: {ex.Message}");
+                }
+
+                // Write RunOnceEx for auto-restart with --sas mode (after user logs in)
                 try
                 {
                     using var runOnceExKey = Registry.LocalMachine.CreateSubKey(

@@ -26,6 +26,32 @@ public static class Program
             return;
         }
 
+        // --boot-relay: SYSTEM-level boot relay — captures login screen, relays via SIPSorcery WebRTC
+        if (args.Contains("--boot-relay"))
+        {
+            var bootDebugPath = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+                "SteamViewer", "boot-relay-debug.txt");
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(bootDebugPath)!);
+                File.AppendAllText(bootDebugPath,
+                    $"[{DateTime.Now:HH:mm:ss}] Boot relay intercepted. PID: {Environment.ProcessId}\n" +
+                    $"[{DateTime.Now:HH:mm:ss}] User: {Environment.UserName}\n");
+            }
+            catch { }
+
+            try
+            {
+                SteamViewer.Platform.Windows.Elevation.BootRelayService.Run();
+            }
+            catch (Exception ex)
+            {
+                try { File.AppendAllText(bootDebugPath, $"[{DateTime.Now:HH:mm:ss}] CRASH: {ex}\n"); } catch { }
+            }
+            return;
+        }
+
         // --system-helper <pipeName> <nonce>: SYSTEM-level pipe server (launched via scheduled task as SYSTEM)
         var systemIdx = Array.IndexOf(args, "--system-helper");
         if (systemIdx >= 0 && systemIdx + 2 < args.Length)

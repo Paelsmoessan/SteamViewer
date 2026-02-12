@@ -58,16 +58,26 @@ public interface IElevationService : IAsyncDisposable
     #region Admin Features
 
     /// <summary>
+    /// Lock the workstation. Uses LockWorkStation() API — Win+L is blocked by Windows from SendInput.
+    /// Does not require elevation.
+    /// </summary>
+    Task<bool> LockWorkStationAsync();
+
+    /// <summary>
     /// Send the Secure Attention Sequence (Ctrl+Alt+Del) via elevated helper.
-    /// Requires admin or SYSTEM elevation.
+    /// NOTE: Dead end without Windows service or uiAccess=true manifest (Authenticode + Program Files).
+    /// Kept for future use if we convert to a service or sign the exe.
     /// </summary>
     Task<bool> SendSASAsync();
 
     /// <summary>
     /// Reboot the host with auto-restart credentials saved for reconnection.
-    /// On Windows, writes RunOnceEx registry key via admin helper.
+    /// On Windows, writes RunOnceEx registry key and boot relay schtask via admin helper.
+    /// Server URL + STUN/TURN config saved for boot relay WebRTC reconnection.
     /// </summary>
-    Task<bool> RebootAsync(string clientId, string passwordHash, string viewerPeerId);
+    Task<bool> RebootAsync(string clientId, string passwordHash, string viewerPeerId,
+        string? serverUrl = null, string[]? stunUrls = null,
+        string[]? turnUrls = null, string? turnUsername = null, string? turnCredential = null);
 
     /// <summary>
     /// Run a process elevated (as admin) without an additional UAC prompt.
