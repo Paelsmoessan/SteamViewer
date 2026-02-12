@@ -79,6 +79,37 @@ public static class SystemHelperServer
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool CloseHandle(IntPtr hObject);
 
+    // Winlogon token impersonation — fallback for SendSAS when process token lacks SeTcbPrivilege
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ImpersonateLoggedOnUser(IntPtr hToken);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool RevertToSelf();
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool DuplicateTokenEx(IntPtr hExistingToken, uint dwDesiredAccess,
+        IntPtr lpTokenAttributes, int impersonationLevel, int tokenType, out IntPtr phNewToken);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, uint dwProcessId);
+
+    // Desktop access by name — needed for explicit Winlogon desktop access
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern IntPtr OpenDesktop(string lpszDesktop, uint dwFlags, bool fInherit, uint dwDesiredAccess);
+
+    private const uint PROCESS_QUERY_INFORMATION = 0x0400;
+    private const uint TOKEN_DUPLICATE = 0x0002;
+    private const uint MAXIMUM_ALLOWED = 0x02000000;
+    private const uint GENERIC_ALL = 0x10000000;
+    private const int SecurityImpersonation = 2;
+    private const int TokenImpersonation = 2;
+
+    [DllImport("kernel32.dll")]
+    private static extern uint WTSGetActiveConsoleSessionId();
+
     [StructLayout(LayoutKind.Sequential)]
     private struct TOKEN_PRIVILEGES
     {
@@ -372,6 +403,11 @@ public static class SystemHelperServer
 
             // Cleanup
             DebugLog("Client disconnected. Cleaning up...");
+
+            // Signal input thread to exit (unblocks GetConsumingEnumerable)
+            try { _inputQueue?.CompleteAdding(); } catch { }
+            _inputThread?.Join(2000);
+
             CleanupCapture();
             CleanupVideoPipe();
             CleanupNotifyPipe();
@@ -381,6 +417,7 @@ public static class SystemHelperServer
         catch (Exception ex)
         {
             DebugLog($"FATAL: {ex}");
+            try { _inputQueue?.CompleteAdding(); } catch { }
             CleanupCapture();
             CleanupVideoPipe();
             CleanupNotifyPipe();
@@ -566,13 +603,26 @@ public static class SystemHelperServer
     {
         try
         {
-            // Re-check registry and privilege before each call — GPO can overwrite registry
+            // Re-check registry before each call — GPO can overwrite between calls
             EnsureSoftwareSASEnabled();
-            EnableTcbPrivilege();
 
-            DebugLog("Calling SendSAS(false)...");
-            SendSAS(false);
-            DebugLog("SendSAS(false) returned (no exception)");
+            // Try process token first (cheap)
+            if (EnableTcbPrivilege())
+            {
+                DebugLog("Calling SendSAS(false) with process token...");
+                SendSAS(false);
+                DebugLog("SendSAS(false) returned with process token");
+            }
+            else
+            {
+                // Fallback: impersonate winlogon's token which has SeTcbPrivilege
+                DebugLog("Process token lacks SeTcbPrivilege — trying winlogon impersonation");
+                if (!CallSendSASWithImpersonation())
+                {
+                    return JsonSerializer.Serialize(new HelperResponse(false, "Both SAS methods failed"));
+                }
+            }
+
             return JsonSerializer.Serialize(new HelperResponse(true, null));
         }
         catch (Exception ex)
@@ -652,6 +702,112 @@ public static class SystemHelperServer
         }
     }
 
+    /// <summary>
+    /// Enable a named privilege on a specific token handle.
+    /// </summary>
+    private static bool EnablePrivilegeOnToken(IntPtr token, string privilegeName)
+    {
+        if (!LookupPrivilegeValue(null, privilegeName, out var luid))
+            return false;
+
+        var tp = new TOKEN_PRIVILEGES
+        {
+            PrivilegeCount = 1,
+            Luid = luid,
+            Attributes = SE_PRIVILEGE_ENABLED
+        };
+
+        AdjustTokenPrivileges(token, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero);
+        var err = Marshal.GetLastWin32Error();
+        if (err == 0)
+        {
+            DebugLog($"EnablePrivilegeOnToken({privilegeName}): enabled on impersonation token");
+            return true;
+        }
+        DebugLog($"EnablePrivilegeOnToken({privilegeName}): failed (error {err})");
+        return false;
+    }
+
+    /// <summary>
+    /// Impersonate winlogon.exe's token (which has SeTcbPrivilege), call SendSAS, revert.
+    /// Fallback when the process's own token lacks SeTcbPrivilege.
+    /// </summary>
+    private static bool CallSendSASWithImpersonation()
+    {
+        var sessionId = WTSGetActiveConsoleSessionId();
+        Process? winlogon = null;
+        foreach (var p in Process.GetProcessesByName("winlogon"))
+        {
+            try
+            {
+                if (p.SessionId == (int)sessionId) { winlogon = p; break; }
+            }
+            catch { /* Access denied for some processes */ }
+        }
+        if (winlogon == null)
+        {
+            DebugLog($"CallSendSASWithImpersonation: winlogon.exe not found in session {sessionId}");
+            return false;
+        }
+
+        DebugLog($"CallSendSASWithImpersonation: found winlogon PID {winlogon.Id} in session {sessionId}");
+
+        var hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, false, (uint)winlogon.Id);
+        if (hProcess == IntPtr.Zero)
+        {
+            DebugLog($"CallSendSASWithImpersonation: OpenProcess failed ({Marshal.GetLastWin32Error()})");
+            return false;
+        }
+
+        try
+        {
+            if (!OpenProcessToken(hProcess, TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES, out var hToken))
+            {
+                DebugLog($"CallSendSASWithImpersonation: OpenProcessToken failed ({Marshal.GetLastWin32Error()})");
+                return false;
+            }
+
+            try
+            {
+                // Duplicate as impersonation token (SecurityImpersonation level)
+                if (!DuplicateTokenEx(hToken, MAXIMUM_ALLOWED, IntPtr.Zero,
+                    SecurityImpersonation, TokenImpersonation, out var hDup))
+                {
+                    DebugLog($"CallSendSASWithImpersonation: DuplicateTokenEx failed ({Marshal.GetLastWin32Error()})");
+                    return false;
+                }
+
+                try
+                {
+                    // Enable SeTcbPrivilege on the impersonation token
+                    EnablePrivilegeOnToken(hDup, SE_TCB_NAME);
+
+                    // Impersonate winlogon
+                    if (!ImpersonateLoggedOnUser(hDup))
+                    {
+                        DebugLog($"CallSendSASWithImpersonation: ImpersonateLoggedOnUser failed ({Marshal.GetLastWin32Error()})");
+                        return false;
+                    }
+
+                    try
+                    {
+                        DebugLog("Calling SendSAS(false) under winlogon impersonation...");
+                        SendSAS(false);
+                        DebugLog("SendSAS(false) returned under impersonation");
+                        return true;
+                    }
+                    finally
+                    {
+                        RevertToSelf();
+                    }
+                }
+                finally { CloseHandle(hDup); }
+            }
+            finally { CloseHandle(hToken); }
+        }
+        finally { CloseHandle(hProcess); }
+    }
+
     private static string HandleRunAsSystem(JsonElement root)
     {
         try
@@ -708,6 +864,8 @@ public static class SystemHelperServer
     /// dynamically switching desktops when _capture.IsActive changes.
     /// SetThreadDesktop works because this thread never creates windows.
     /// </summary>
+    private static int _sdInputLogCount;
+
     private static void InputThreadProc()
     {
         try
@@ -735,20 +893,29 @@ public static class SystemHelperServer
                     IntPtr hWinlogon = IntPtr.Zero;
                     if (onSecureDesktop)
                     {
-                        // Switch to Winlogon desktop for this input event
-                        hWinlogon = OpenInputDesktop(0, false, DESKTOP_SWITCHDESKTOP);
+                        // Use explicit desktop name — OpenInputDesktop may not return Winlogon desktop
+                        hWinlogon = OpenDesktop("Winlogon", 0, false, GENERIC_ALL);
+                        _sdInputLogCount++;
+                        if (_sdInputLogCount <= 5 || _sdInputLogCount % 50 == 0)
+                            DebugLog($"SD input #{_sdInputLogCount}: OpenDesktop(Winlogon)={hWinlogon != IntPtr.Zero} (err {Marshal.GetLastWin32Error()})");
+
                         if (hWinlogon != IntPtr.Zero)
                         {
-                            if (!SetThreadDesktop(hWinlogon))
+                            var switched = SetThreadDesktop(hWinlogon);
+                            if (!switched)
                             {
-                                DebugLog($"Input thread SetThreadDesktop(Winlogon) failed (error {Marshal.GetLastWin32Error()})");
+                                DebugLog($"SD input: SetThreadDesktop(Winlogon) failed (error {Marshal.GetLastWin32Error()})");
                                 CloseDesktop(hWinlogon);
                                 continue;
                             }
+                            if (_sdInputLogCount <= 5)
+                                DebugLog("SD input: SetThreadDesktop(Winlogon) succeeded");
                         }
                         else
                         {
-                            continue; // Can't open Winlogon desktop — skip event
+                            if (_sdInputLogCount <= 5)
+                                DebugLog("SD input: Can't open Winlogon desktop — skipping event");
+                            continue;
                         }
                     }
 
@@ -801,7 +968,9 @@ public static class SystemHelperServer
                     // Switch back to Default desktop after SD input
                     if (onSecureDesktop && hWinlogon != IntPtr.Zero)
                     {
-                        SetThreadDesktop(hDefaultDesk);
+                        var switchedBack = SetThreadDesktop(hDefaultDesk);
+                        if (_sdInputLogCount <= 5)
+                            DebugLog($"SD input: SetThreadDesktop(Default) back={switchedBack}");
                         CloseDesktop(hWinlogon);
                     }
                 }
