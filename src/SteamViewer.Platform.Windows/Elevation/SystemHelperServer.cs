@@ -52,14 +52,18 @@ public static class SystemHelperServer
 
     private static string? _debugPath;
     private static SecureDesktopCapture? _capture;
-    private static StreamWriter? _controlWriter;
-    private static readonly object _controlWriteLock = new();
 
     // Video pipe for binary JPEG frames (server → client)
     private static NamedPipeServerStream? _videoPipeServer;
     private static BinaryWriter? _videoWriter;
     private static readonly object _videoWriteLock = new();
     private static volatile bool _videoConnected;
+
+    // Notify pipe for server-push notifications (server → client)
+    private static NamedPipeServerStream? _notifyPipeServer;
+    private static StreamWriter? _notifyWriter;
+    private static readonly object _notifyWriteLock = new();
+    private static volatile bool _notifyConnected;
 
     private static void DebugLog(string message)
     {
@@ -162,7 +166,6 @@ public static class SystemHelperServer
 
             using var reader = new StreamReader(pipeServer, PipeEncoding);
             using var writer = new StreamWriter(pipeServer, PipeEncoding) { AutoFlush = true };
-            _controlWriter = writer;
 
             // First message MUST be authentication with the correct nonce
             if (!Authenticate(reader, writer, expectedNonce))
@@ -230,6 +233,48 @@ public static class SystemHelperServer
             };
             videoConnectThread.Start();
 
+            // Create notify pipe for server-push notifications (server → client, outbound only)
+            var notifyPipeName = $"{pipeName}_notify";
+            var notifyPipeSecurity = new PipeSecurity();
+            notifyPipeSecurity.AddAccessRule(new PipeAccessRule(
+                new SecurityIdentifier(WellKnownSidType.AuthenticatedUserSid, null),
+                PipeAccessRights.ReadWrite,
+                AccessControlType.Allow));
+
+            _notifyPipeServer = NamedPipeServerStreamAcl.Create(
+                notifyPipeName,
+                PipeDirection.Out,
+                1,
+                PipeTransmissionMode.Byte,
+                PipeOptions.None,
+                0, 0,
+                notifyPipeSecurity);
+
+            DebugLog($"Notify pipe created: {notifyPipeName}. Waiting for client (non-blocking)...");
+
+            var notifyConnectThread = new Thread(() =>
+            {
+                try
+                {
+                    _notifyPipeServer.WaitForConnection();
+                    lock (_notifyWriteLock)
+                    {
+                        _notifyWriter = new StreamWriter(_notifyPipeServer, PipeEncoding) { AutoFlush = true };
+                        _notifyConnected = true;
+                    }
+                    DebugLog("Notify pipe client connected");
+                }
+                catch (Exception ex)
+                {
+                    DebugLog($"Notify pipe WaitForConnection error: {ex.Message}");
+                }
+            })
+            {
+                Name = "NotifyPipeConnect",
+                IsBackground = true
+            };
+            notifyConnectThread.Start();
+
             DebugLog("Processing commands...");
 
             while (pipeServer.IsConnected)
@@ -285,7 +330,7 @@ public static class SystemHelperServer
             DebugLog("Client disconnected. Cleaning up...");
             CleanupCapture();
             CleanupVideoPipe();
-            _controlWriter = null;
+            CleanupNotifyPipe();
 
             DebugLog("Exiting normally.");
         }
@@ -294,6 +339,7 @@ public static class SystemHelperServer
             DebugLog($"FATAL: {ex}");
             CleanupCapture();
             CleanupVideoPipe();
+            CleanupNotifyPipe();
         }
     }
 
@@ -319,17 +365,26 @@ public static class SystemHelperServer
         _videoPipeServer = null;
     }
 
+    private static void CleanupNotifyPipe()
+    {
+        _notifyConnected = false;
+        try { _notifyWriter?.Dispose(); } catch { }
+        _notifyWriter = null;
+        try { _notifyPipeServer?.Dispose(); } catch { }
+        _notifyPipeServer = null;
+    }
+
     #region SecureDesktopCapture event handlers
 
     private static void OnCaptureSecureDesktopActive(int width, int height)
     {
-        DebugLog($"Secure Desktop active notification → control pipe ({width}x{height})");
+        DebugLog($"Secure Desktop active notification → notify pipe ({width}x{height})");
         SendNotification(new { notification = "secureDesktopActive", width, height });
     }
 
     private static void OnCaptureSecureDesktopInactive()
     {
-        DebugLog("Secure Desktop inactive notification → control pipe");
+        DebugLog("Secure Desktop inactive notification → notify pipe");
         SendNotification(new { notification = "secureDesktopInactive" });
     }
 
@@ -366,23 +421,24 @@ public static class SystemHelperServer
     }
 
     /// <summary>
-    /// Send a server-initiated notification over the control pipe.
-    /// These are unsolicited messages (not responses to commands).
+    /// Send a server-initiated notification over the dedicated notify pipe.
+    /// Uses a separate pipe from the control pipe to avoid synchronous I/O deadlocks.
     /// </summary>
     private static void SendNotification(object notification)
     {
-        if (_controlWriter == null) return;
+        if (!_notifyConnected || _notifyWriter == null) return;
 
-        lock (_controlWriteLock)
+        lock (_notifyWriteLock)
         {
             try
             {
                 var json = JsonSerializer.Serialize(notification);
-                _controlWriter.WriteLine(json);
+                _notifyWriter.WriteLine(json);
             }
             catch (Exception ex)
             {
                 DebugLog($"Notification write error: {ex.Message}");
+                _notifyConnected = false;
             }
         }
     }
