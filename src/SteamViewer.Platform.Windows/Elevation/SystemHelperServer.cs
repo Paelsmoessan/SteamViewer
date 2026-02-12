@@ -67,7 +67,7 @@ public static class SystemHelperServer
 
     [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool LookupPrivilegeValue(string? lpSystemName, string lpName, out long lpLuid);
+    private static extern bool LookupPrivilegeValue(string? lpSystemName, string lpName, out LUID lpLuid);
 
     [DllImport("advapi32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
@@ -111,11 +111,24 @@ public static class SystemHelperServer
     private static extern uint WTSGetActiveConsoleSessionId();
 
     [StructLayout(LayoutKind.Sequential)]
+    private struct LUID
+    {
+        public uint LowPart;
+        public int HighPart;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct LUID_AND_ATTRIBUTES
+    {
+        public LUID Luid;
+        public uint Attributes;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
     private struct TOKEN_PRIVILEGES
     {
         public int PrivilegeCount;
-        public long Luid;
-        public uint Attributes;
+        public LUID_AND_ATTRIBUTES Privileges;
     }
 
     // Dedicated input thread — SetThreadDesktop requires a thread with zero prior user32 calls
@@ -682,8 +695,11 @@ public static class SystemHelperServer
             var tp = new TOKEN_PRIVILEGES
             {
                 PrivilegeCount = 1,
-                Luid = luid,
-                Attributes = SE_PRIVILEGE_ENABLED
+                Privileges = new LUID_AND_ATTRIBUTES
+                {
+                    Luid = luid,
+                    Attributes = SE_PRIVILEGE_ENABLED
+                }
             };
 
             if (AdjustTokenPrivileges(token, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero)
@@ -713,8 +729,11 @@ public static class SystemHelperServer
         var tp = new TOKEN_PRIVILEGES
         {
             PrivilegeCount = 1,
-            Luid = luid,
-            Attributes = SE_PRIVILEGE_ENABLED
+            Privileges = new LUID_AND_ATTRIBUTES
+            {
+                Luid = luid,
+                Attributes = SE_PRIVILEGE_ENABLED
+            }
         };
 
         AdjustTokenPrivileges(token, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero);
