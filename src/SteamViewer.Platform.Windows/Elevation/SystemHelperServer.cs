@@ -46,6 +46,47 @@ public static class SystemHelperServer
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool SetProcessWindowStation(IntPtr hWinSta);
 
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr GetThreadDesktop(uint dwThreadId);
+
+    [DllImport("kernel32.dll")]
+    private static extern uint GetCurrentThreadId();
+
+    // Token privilege management — needed to enable SeTcbPrivilege for SendSAS
+    private const uint TOKEN_ADJUST_PRIVILEGES = 0x0020;
+    private const uint TOKEN_QUERY = 0x0008;
+    private const uint SE_PRIVILEGE_ENABLED = 0x00000002;
+    private const string SE_TCB_NAME = "SeTcbPrivilege";
+
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr GetCurrentProcess();
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool OpenProcessToken(IntPtr processHandle, uint desiredAccess, out IntPtr tokenHandle);
+
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool LookupPrivilegeValue(string? lpSystemName, string lpName, out long lpLuid);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool AdjustTokenPrivileges(
+        IntPtr tokenHandle, [MarshalAs(UnmanagedType.Bool)] bool disableAllPrivileges,
+        ref TOKEN_PRIVILEGES newState, int bufferLength, IntPtr previousState, IntPtr returnLength);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CloseHandle(IntPtr hObject);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct TOKEN_PRIVILEGES
+    {
+        public int PrivilegeCount;
+        public long Luid;
+        public uint Attributes;
+    }
+
     // Dedicated input thread — SetThreadDesktop requires a thread with zero prior user32 calls
     private static BlockingCollection<(string json, int sw, int sh)>? _inputQueue;
     private static Thread? _inputThread;
@@ -101,6 +142,9 @@ public static class SystemHelperServer
         {
             DebugLog($"OpenWindowStation('WinSta0') failed (error {Marshal.GetLastWin32Error()})");
         }
+
+        // Enable SeTcbPrivilege — required for SendSAS(false) to actually trigger the lock screen
+        EnableTcbPrivilege();
 
         // Enable software-generated SAS — required for SendSAS(false) to work
         EnsureSoftwareSASEnabled();
@@ -522,8 +566,9 @@ public static class SystemHelperServer
     {
         try
         {
-            // Re-check registry before each call — GPO may have overwritten it
+            // Re-check registry and privilege before each call — GPO can overwrite registry
             EnsureSoftwareSASEnabled();
+            EnableTcbPrivilege();
 
             DebugLog("Calling SendSAS(false)...");
             SendSAS(false);
@@ -561,6 +606,49 @@ public static class SystemHelperServer
         catch (Exception ex)
         {
             DebugLog($"Failed to set SoftwareSASGeneration: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Enable SeTcbPrivilege on the current process token.
+    /// Required for SendSAS(false) from sas.dll — SYSTEM tokens have it but it may be disabled.
+    /// </summary>
+    private static bool EnableTcbPrivilege()
+    {
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, out var token))
+        {
+            DebugLog($"EnableTcbPrivilege: OpenProcessToken failed (error {Marshal.GetLastWin32Error()})");
+            return false;
+        }
+
+        try
+        {
+            if (!LookupPrivilegeValue(null, SE_TCB_NAME, out var luid))
+            {
+                DebugLog($"EnableTcbPrivilege: LookupPrivilegeValue failed (error {Marshal.GetLastWin32Error()})");
+                return false;
+            }
+
+            var tp = new TOKEN_PRIVILEGES
+            {
+                PrivilegeCount = 1,
+                Luid = luid,
+                Attributes = SE_PRIVILEGE_ENABLED
+            };
+
+            if (AdjustTokenPrivileges(token, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero)
+                && Marshal.GetLastWin32Error() == 0)
+            {
+                DebugLog("SeTcbPrivilege enabled successfully");
+                return true;
+            }
+
+            DebugLog($"EnableTcbPrivilege: AdjustTokenPrivileges failed (error {Marshal.GetLastWin32Error()})");
+            return false;
+        }
+        finally
+        {
+            CloseHandle(token);
         }
     }
 
@@ -602,14 +690,8 @@ public static class SystemHelperServer
             var sw = root.TryGetProperty("sw", out var swProp) ? swProp.GetInt32() : 1920;
             var sh = root.TryGetProperty("sh", out var shProp) ? shProp.GetInt32() : 1080;
 
-            // If Secure Desktop is active, route input to the Winlogon desktop
-            if (_capture != null && _capture.IsActive)
-            {
-                _capture.InjectInputOnWinlogon(rawJson, sw, sh);
-                return null; // Fire-and-forget
-            }
-
-            // Enqueue for dedicated input thread (which has SetThreadDesktop applied)
+            // Always enqueue — the input thread handles both Default and Secure Desktop
+            // by switching desktops dynamically (clean thread, no prior user32 calls)
             _inputQueue?.TryAdd((rawJson, sw, sh));
         }
         catch (Exception ex)
@@ -622,19 +704,21 @@ public static class SystemHelperServer
 
     /// <summary>
     /// Dedicated input thread — attaches to Default desktop as its very first user32 call,
-    /// then processes input from queue. SetThreadDesktop requires zero prior user32 calls.
+    /// then processes input from queue. Handles both Default and Secure Desktop input by
+    /// dynamically switching desktops when _capture.IsActive changes.
+    /// SetThreadDesktop works because this thread never creates windows.
     /// </summary>
     private static void InputThreadProc()
     {
         try
         {
             // First user32 call on this thread — attach to Default desktop
-            var hDesk = OpenInputDesktop(0, false, DESKTOP_SWITCHDESKTOP);
-            if (hDesk != IntPtr.Zero)
+            // Keep the handle open so we can switch back from Winlogon later
+            var hDefaultDesk = OpenInputDesktop(0, false, DESKTOP_SWITCHDESKTOP);
+            if (hDefaultDesk != IntPtr.Zero)
             {
-                var ok = SetThreadDesktop(hDesk);
-                DebugLog($"Input thread SetThreadDesktop: {ok} (error {Marshal.GetLastWin32Error()})");
-                CloseDesktop(hDesk);
+                var ok = SetThreadDesktop(hDefaultDesk);
+                DebugLog($"Input thread SetThreadDesktop(Default): {ok} (error {Marshal.GetLastWin32Error()})");
             }
             else
             {
@@ -646,6 +730,29 @@ public static class SystemHelperServer
             {
                 try
                 {
+                    var onSecureDesktop = _capture != null && _capture.IsActive;
+
+                    IntPtr hWinlogon = IntPtr.Zero;
+                    if (onSecureDesktop)
+                    {
+                        // Switch to Winlogon desktop for this input event
+                        hWinlogon = OpenInputDesktop(0, false, DESKTOP_SWITCHDESKTOP);
+                        if (hWinlogon != IntPtr.Zero)
+                        {
+                            if (!SetThreadDesktop(hWinlogon))
+                            {
+                                DebugLog($"Input thread SetThreadDesktop(Winlogon) failed (error {Marshal.GetLastWin32Error()})");
+                                CloseDesktop(hWinlogon);
+                                continue;
+                            }
+                        }
+                        else
+                        {
+                            continue; // Can't open Winlogon desktop — skip event
+                        }
+                    }
+
+                    // Parse and inject input
                     using var doc = JsonDocument.Parse(json);
                     var root = doc.RootElement;
                     var type = root.GetProperty("type").GetString();
@@ -690,12 +797,23 @@ public static class SystemHelperServer
                                 isDown: false);
                             break;
                     }
+
+                    // Switch back to Default desktop after SD input
+                    if (onSecureDesktop && hWinlogon != IntPtr.Zero)
+                    {
+                        SetThreadDesktop(hDefaultDesk);
+                        CloseDesktop(hWinlogon);
+                    }
                 }
                 catch (Exception ex)
                 {
                     DebugLog($"Input thread error: {ex.Message}");
                 }
             }
+
+            // Cleanup
+            if (hDefaultDesk != IntPtr.Zero)
+                CloseDesktop(hDefaultDesk);
         }
         catch (Exception ex)
         {
