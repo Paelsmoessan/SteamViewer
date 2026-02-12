@@ -142,18 +142,22 @@ public sealed class WindowsElevationService : IElevationService
 
     public async Task<bool> InjectInputAsync(string inputJson, int screenWidth, int screenHeight)
     {
-        // Route input through the highest available elevation tier:
-        // 1. If Secure Desktop active + SYSTEM connected → SYSTEM helper (only way to reach Winlogon)
-        // 2. If SYSTEM connected → SYSTEM helper (can inject on both desktops)
-        // 3. If admin connected → admin helper (UIPI bypass)
+        // Route input based on active desktop:
+        // 1. Secure Desktop active + SYSTEM connected → SYSTEM helper (only way to reach Winlogon)
+        // 2. Admin connected → admin helper (Default desktop — user session, no UIPI issues)
+        // 3. SYSTEM connected (no admin) → SYSTEM helper (fallback, may not work due to UIPI)
         // 4. Return false → caller falls back to local injection
+        //
+        // IMPORTANT: SYSTEM processes cannot reliably SendInput on the Default desktop due to UIPI
+        // silently blocking it (confirmed by testing + UltraVNC architecture analysis).
+        // Admin helper runs in the user's session and handles Default desktop input correctly.
 
         _inputRouteCount++;
 
-        if (_systemHelper?.IsConnected == true)
+        if (IsSecureDesktopActive && _systemHelper?.IsConnected == true)
         {
             if (_inputRouteCount <= 3 || _inputRouteCount % 500 == 0)
-                _logger.LogInformation("Input route #{Count}: SYSTEM helper", _inputRouteCount);
+                _logger.LogInformation("Input route #{Count}: SYSTEM helper (Secure Desktop)", _inputRouteCount);
             await _systemHelper.SendInputEventAsync(inputJson, screenWidth, screenHeight);
             return true;
         }
@@ -163,6 +167,14 @@ public sealed class WindowsElevationService : IElevationService
             if (_inputRouteCount <= 3 || _inputRouteCount % 500 == 0)
                 _logger.LogInformation("Input route #{Count}: admin helper", _inputRouteCount);
             await _adminHelper.SendInputEventAsync(inputJson, screenWidth, screenHeight);
+            return true;
+        }
+
+        if (_systemHelper?.IsConnected == true)
+        {
+            if (_inputRouteCount <= 3 || _inputRouteCount % 500 == 0)
+                _logger.LogInformation("Input route #{Count}: SYSTEM helper (no admin)", _inputRouteCount);
+            await _systemHelper.SendInputEventAsync(inputJson, screenWidth, screenHeight);
             return true;
         }
 
