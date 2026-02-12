@@ -2,6 +2,7 @@
 misc/.AI.md
 .claude/settings.local.json
 .claude/ClaudeToClaude-communication.md
+.claude/test-notes.md
 
 # Build outputs
 bin/
