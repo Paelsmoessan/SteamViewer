@@ -666,9 +666,22 @@
 
             _hostSession.OnStateChanged += state => InvokeAsync(StateHasChanged);
             _hostSession.OnReady += () => InvokeAsync(StateHasChanged);
-            _hostSession.OnDisconnected += reason => InvokeAsync(() =>
+            _hostSession.OnDisconnected += reason => InvokeAsync(async () =>
             {
-                Logger.LogInformation("Host session disconnected: {Reason}", reason);
+                Logger.LogWarning("Host session disconnected: {Reason}. Resetting to accept reconnections.", reason);
+
+                // Clean up old session
+                if (_hostSession != null)
+                {
+                    await _hostSession.DisposeAsync();
+                    _hostSession = null;
+                }
+
+                // Reset to registered state — host is still registered on signaling server
+                connectedPeerId = "";
+                _canvasInitialized = false;
+                _isReconnect = true; // Auto-accept viewer's reconnect
+                connectionState = ConnectionState.Registered;
                 StateHasChanged();
             });
             _hostSession.OnPeerSharingChanged += sharing => InvokeAsync(() =>

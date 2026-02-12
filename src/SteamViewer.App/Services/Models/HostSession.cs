@@ -1055,6 +1055,10 @@ public sealed class HostSession : IAsyncDisposable
                 SetState(HostSessionState.Connected);
                 break;
             case "disconnected":
+                // Temporary ICE state — don't tear down. ICE will usually recover within seconds.
+                // JS side already handles this (pauses capture, keeps input lock).
+                _logger.LogWarning("WebRTC temporarily disconnected (ICE recovering)");
+                break;
             case "failed":
             case "closed":
                 SetState(HostSessionState.Disconnected);
