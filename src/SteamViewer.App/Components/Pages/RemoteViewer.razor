@@ -869,6 +869,7 @@
                 await JSRuntime.InvokeVoidAsync("SteamViewerSecureDesktop.hide", "secureDesktopOverlay");
             }
             StateHasChanged();
+            _ = RefocusCanvasAsync();
         });
     }
 
@@ -1586,6 +1587,7 @@
         height: 100%;
         z-index: 10;
         object-fit: contain;
+        pointer-events: none;
     }
 
     .secure-desktop-banner {

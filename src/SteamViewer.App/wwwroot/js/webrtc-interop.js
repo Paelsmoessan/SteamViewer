@@ -145,7 +145,14 @@ window.SteamViewerWebRTC = {
             _inputEventsCount: 0,
             _inputThrottledCount: 0,
             _qualityMode: 'HQ',
-            _statsRelay: false
+            _statsRelay: false,
+            // Dynamic bitrate adaptation
+            _bitrateAdaptEnabled: true,
+            _targetBitrate: 3_000_000,
+            _minBitrate: 500_000,
+            _maxBitrate: 8_000_000,
+            _bitrateHistory: [],
+            _lastBitrateAdjust: 0
         };
     },
 
@@ -1255,6 +1262,82 @@ window.SteamViewerWebRTC = {
         session._statsPrev = null;
     },
 
+    async _adaptBitrate(sessionId) {
+        const session = this.sessions.get(sessionId);
+        if (!session || !session.peerConnection || !session._bitrateAdaptEnabled) return;
+
+        const now = performance.now();
+        if (now - session._lastBitrateAdjust < 3000) return; // Adjust every 3s
+        session._lastBitrateAdjust = now;
+
+        try {
+            const stats = await session.peerConnection.getStats();
+            let availableBandwidth = 0;
+            let packetsLost = 0, packetsReceived = 0;
+
+            stats.forEach(report => {
+                if (report.type === 'candidate-pair' && report.state === 'succeeded') {
+                    if (report.availableOutgoingBitrate) {
+                        availableBandwidth = report.availableOutgoingBitrate;
+                    }
+                }
+                if (report.type === 'inbound-rtp' && report.kind === 'video') {
+                    packetsLost = report.packetsLost || 0;
+                    packetsReceived = report.packetsReceived || 0;
+                }
+            });
+
+            if (availableBandwidth <= 0) return;
+
+            // Rolling average of last 5 samples
+            session._bitrateHistory.push(availableBandwidth);
+            if (session._bitrateHistory.length > 5) session._bitrateHistory.shift();
+            const avgBandwidth = session._bitrateHistory.reduce((a, b) => a + b, 0) / session._bitrateHistory.length;
+
+            // Target 80% of available bandwidth
+            let newTarget = Math.floor(avgBandwidth * 0.8);
+
+            // Reduce on packet loss
+            let lossPercent = 0;
+            if (packetsReceived + packetsLost > 0) {
+                lossPercent = (packetsLost / (packetsReceived + packetsLost)) * 100;
+            }
+            if (lossPercent > 2) newTarget = Math.floor(newTarget * 0.7);
+            else if (lossPercent > 0.5) newTarget = Math.floor(newTarget * 0.9);
+
+            // Clamp
+            newTarget = Math.max(session._minBitrate, Math.min(session._maxBitrate, newTarget));
+
+            // Only adjust if >10% change
+            const changePct = Math.abs(newTarget - session._targetBitrate) / session._targetBitrate;
+            if (changePct < 0.1) return;
+
+            // Apply via setParameters
+            const senders = session.peerConnection.getSenders();
+            for (const sender of senders) {
+                if (sender.track?.kind !== 'video') continue;
+                const params = sender.getParameters();
+                if (params.encodings && params.encodings.length > 0) {
+                    params.encodings[0].maxBitrate = newTarget;
+                    await sender.setParameters(params);
+                }
+            }
+
+            const oldMbps = (session._targetBitrate / 1_000_000).toFixed(1);
+            const newMbps = (newTarget / 1_000_000).toFixed(1);
+            console.log(`[Bitrate] ${oldMbps} → ${newMbps} Mbps (avail: ${(avgBandwidth / 1_000_000).toFixed(1)}, loss: ${lossPercent.toFixed(1)}%)`);
+
+            session._targetBitrate = newTarget;
+
+            if (newTarget >= 4_000_000) session._qualityMode = 'HQ';
+            else if (newTarget >= 2_000_000) session._qualityMode = 'MQ';
+            else if (newTarget >= 1_000_000) session._qualityMode = 'LQ';
+            else session._qualityMode = 'MIN';
+        } catch (e) {
+            console.warn('[Bitrate] adaptation error:', e);
+        }
+    },
+
     async _pollStats(sessionId) {
         const session = this.sessions.get(sessionId);
         if (!session || !session.peerConnection) return;
@@ -1357,7 +1440,7 @@ window.SteamViewerWebRTC = {
             `Net:   RTT ${rttMs.toFixed(0)}ms | Loss ${lossPercent.toFixed(1)}%`,
             `Input: ${inputPerSec} evt/s${throttledPerSec > 0 ? ` (${throttledPerSec} throttled)` : ''} | Buf: ${bufferKB.toFixed(0)} KB`,
             `Data:  ${fmtBytes(currentBytes)} video | ${fmtBytes(dataChannelBytes)} ctrl`,
-            `Mode:  [${session._qualityMode}]`
+            `Mode:  [${session._qualityMode}] Target: ${(session._targetBitrate / 1_000_000).toFixed(1)} Mbps`
         ];
 
         // Update DOM overlay if visible
@@ -1378,6 +1461,9 @@ window.SteamViewerWebRTC = {
                 }));
             } catch (e) { /* ignore relay errors */ }
         }
+
+        // Dynamic bitrate adaptation
+        this._adaptBitrate(sessionId);
         } catch (e) {
             console.error('[Stats] _pollStats error:', e);
         }
@@ -1473,6 +1559,7 @@ window.SteamViewerInput = {
     // Track which session the input is associated with (for stats counting)
     _activeSessionId: null,
     _inputEventCount: 0,
+    _focusWatchdogId: null,
 
     initialize(canvasId, dotNetReference, options = {}) {
         const { showLockIndicator = true } = options;
@@ -1525,8 +1612,26 @@ window.SteamViewerInput = {
         setTimeout(() => { this.canvas?.focus(); }, 200);
         setTimeout(() => { this.canvas?.focus(); }, 500);
 
+        // Start periodic focus watchdog (restores focus if lost while locked)
+        this._startFocusWatchdog();
+
         console.log('Input capture initialized (use toolbar button to lock/unlock)');
         return true;
+    },
+
+    _startFocusWatchdog() {
+        if (this._focusWatchdogId) clearInterval(this._focusWatchdogId);
+        this._focusWatchdogId = setInterval(() => {
+            if (this.isLocked && this.canvas && document.activeElement !== this.canvas) {
+                const active = document.activeElement;
+                if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA'
+                    || active.tagName === 'SELECT' || active.closest('.menu-dropdown')
+                    || active.closest('.connection-dialog'))) {
+                    return;
+                }
+                this.canvas.focus();
+            }
+        }, 500);
     },
 
     // Set which session input events count toward (for stats overlay)
@@ -1546,6 +1651,10 @@ window.SteamViewerInput = {
         this.ensureCanvas();
         if (this.canvas) {
             this.canvas.focus();
+        }
+        // Restart watchdog in case interval was lost during re-render
+        if (!this._focusWatchdogId && this.isCapturing) {
+            this._startFocusWatchdog();
         }
     },
 
@@ -1700,9 +1809,12 @@ window.SteamViewerInput = {
         }
         this.ensureCanvas();
         const coords = this.getScaledCoords(e);
+        const sd = window.SteamViewerSecureDesktop;
+        const captureW = (sd?.isActive && sd._width) ? sd._width : this.canvas.width;
+        const captureH = (sd?.isActive && sd._height) ? sd._height : this.canvas.height;
         try {
             await this.dotNetRef.invokeMethodAsync('OnMouseMove', coords.x, coords.y,
-                this.canvas.width, this.canvas.height);
+                captureW, captureH);
         } catch (err) { console.error('[Input] OnMouseMove failed:', err); }
     },
 
@@ -1714,9 +1826,12 @@ window.SteamViewerInput = {
         e.preventDefault();
         const coords = this.getScaledCoords(e);
         const button = ['left', 'middle', 'right'][e.button] || 'left';
+        const sd = window.SteamViewerSecureDesktop;
+        const captureW = (sd?.isActive && sd._width) ? sd._width : this.canvas.width;
+        const captureH = (sd?.isActive && sd._height) ? sd._height : this.canvas.height;
         try {
             await this.dotNetRef.invokeMethodAsync('OnMouseDown', button, coords.x, coords.y,
-                this.canvas.width, this.canvas.height);
+                captureW, captureH);
         } catch (err) { console.error('[Input] OnMouseDown failed:', err); }
     },
 
@@ -1728,9 +1843,12 @@ window.SteamViewerInput = {
         e.preventDefault();
         const coords = this.getScaledCoords(e);
         const button = ['left', 'middle', 'right'][e.button] || 'left';
+        const sd = window.SteamViewerSecureDesktop;
+        const captureW = (sd?.isActive && sd._width) ? sd._width : this.canvas.width;
+        const captureH = (sd?.isActive && sd._height) ? sd._height : this.canvas.height;
         try {
             await this.dotNetRef.invokeMethodAsync('OnMouseUp', button, coords.x, coords.y,
-                this.canvas.width, this.canvas.height);
+                captureW, captureH);
         } catch (err) { console.error('[Input] OnMouseUp failed:', err); }
     },
 
@@ -1764,6 +1882,12 @@ window.SteamViewerInput = {
     stop() {
         this.isCapturing = false;
         this.isLocked = false;
+
+        // Stop focus watchdog
+        if (this._focusWatchdogId) {
+            clearInterval(this._focusWatchdogId);
+            this._focusWatchdogId = null;
+        }
 
         // Remove lock indicator
         if (this.lockIndicator) {
@@ -1912,9 +2036,13 @@ window.SteamViewerSecureDesktop = {
     ctx: null,
     img: null,
     _frameCount: 0,
+    isActive: false,
+    _width: 0,
+    _height: 0,
 
     show(canvasId) {
         this._frameCount = 0;
+        this.isActive = true;
         this.canvas = document.getElementById(canvasId);
         if (!this.canvas) {
             console.error(`Secure Desktop canvas '${canvasId}' not found`);
@@ -1930,6 +2058,9 @@ window.SteamViewerSecureDesktop = {
         if (canvas) {
             canvas.style.display = 'none';
         }
+        this.isActive = false;
+        this._width = 0;
+        this._height = 0;
         this.canvas = null;
         this.ctx = null;
         this.img = null;
@@ -1938,6 +2069,8 @@ window.SteamViewerSecureDesktop = {
 
     renderFrame(canvasId, base64Jpeg, width, height) {
         this._frameCount++;
+        this._width = width;
+        this._height = height;
         if (this._frameCount <= 3 || this._frameCount % 100 === 0) {
             console.log(`[SecureDesktop] renderFrame #${this._frameCount}: ${width}x${height}, dataLen=${base64Jpeg?.length}`);
         }
