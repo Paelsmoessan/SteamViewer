@@ -434,6 +434,10 @@
                 _activeSession.OnSecureDesktopStateChanged += HandleSecureDesktopStateChanged;
                 _activeSession.OnSecureDesktopFrame += HandleSecureDesktopFrame;
 
+                // Try direct rendering first (zero-latency, bypasses JPEG relay)
+                // Falls back to JPEG frame capture if JSRuntime doesn't match
+                _ = TryEnableDirectRenderingAsync(sessionId);
+
                 _ = JSRuntime.InvokeVoidAsync("SteamViewerWebRTC.resumeFrameCapture", sessionId);
 
                 // Show reconnect overlay if session is already disconnected
@@ -568,6 +572,27 @@
                 StateHasChanged();
             });
         });
+    }
+
+    private async Task TryEnableDirectRenderingAsync(string sessionId)
+    {
+        try
+        {
+            // Wait briefly for canvas and video to be ready
+            await Task.Delay(200);
+            var session = SessionManager.GetSession(sessionId);
+            if (session == null) return;
+
+            var enabled = await session.TryEnableDirectRenderingAsync("viewerCanvas", JSRuntime);
+            if (enabled)
+            {
+                Console.WriteLine($"[DirectRender] Session {sessionId}: direct rendering active");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[DirectRender] Failed: {ex.Message}");
+        }
     }
 
     private async Task RefocusCanvasAsync()

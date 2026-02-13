@@ -525,6 +525,36 @@ public sealed class ViewerSession : IAsyncDisposable
     }
 
     /// <summary>
+    /// Enable direct rendering to a visible canvas (bypasses JPEG relay).
+    /// Only works when PeerConnection's JSRuntime matches the viewer's window.
+    /// </summary>
+    public async Task<bool> TryEnableDirectRenderingAsync(string canvasId, IJSRuntime viewerJsRuntime)
+    {
+        // Direct rendering only works if the PeerConnection is in the same JS context
+        if (!ReferenceEquals(_jsRuntime, viewerJsRuntime))
+        {
+            _logger.LogInformation("Session {SessionId}: JSRuntime mismatch — using JPEG relay", SessionId);
+            return false;
+        }
+
+        try
+        {
+            var result = await _jsRuntime.InvokeAsync<bool>(
+                "SteamViewerWebRTC.setDirectRenderTarget", SessionId, canvasId);
+            if (result)
+            {
+                _logger.LogInformation("Session {SessionId}: Direct rendering enabled → '{CanvasId}'", SessionId, canvasId);
+            }
+            return result;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Session {SessionId}: Failed to enable direct rendering", SessionId);
+            return false;
+        }
+    }
+
+    /// <summary>
     /// Start capturing frames from the JS WebRTC video track.
     /// </summary>
     private async Task StartFrameCaptureAsync()

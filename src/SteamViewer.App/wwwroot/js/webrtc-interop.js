@@ -134,9 +134,12 @@ window.SteamViewerWebRTC = {
             frameCaptureEnabled: false,
             frameCaptureAnimationId: null,
             lastFrameTime: 0,
-            frameInterval: 50, // ~20fps
+            frameInterval: 33, // ~30fps (match WebRTC source)
             captureCanvas: null,
             captureCtx: null,
+            // Direct rendering (bypasses JPEG relay when canvas is in same JS context)
+            _directRenderCanvas: null,
+            _directRenderCtx: null,
             // Stats overlay
             _statsInterval: null,
             _statsOverlayEl: null,
@@ -425,6 +428,12 @@ window.SteamViewerWebRTC = {
                             canvas.width = width;
                             canvas.height = height;
 
+                            // Sync direct render canvas dimensions if set
+                            if (session._directRenderCanvas) {
+                                session._directRenderCanvas.width = width;
+                                session._directRenderCanvas.height = height;
+                            }
+
                             // Use requestVideoFrameCallback for lower latency (renders when frame arrives, not on monitor refresh)
                             const renderFrameRVFC = (now, metadata) => {
                                 if (video.paused || video.ended) {
@@ -440,12 +449,25 @@ window.SteamViewerWebRTC = {
 
                                 try {
                                     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+                                    // Direct render: also draw to visible canvas (bypasses JPEG relay)
+                                    if (session._directRenderCtx) {
+                                        const dc = session._directRenderCanvas;
+                                        // Sync dimensions on resolution change
+                                        if (dc.width !== canvas.width || dc.height !== canvas.height) {
+                                            dc.width = canvas.width;
+                                            dc.height = canvas.height;
+                                        }
+                                        session._directRenderCtx.drawImage(video, 0, 0, dc.width, dc.height);
+                                    }
+
                                     frameCount++;
 
                                     // Log frame rate every 2 seconds
                                     if (now - lastFrameTime > 2000) {
                                         const fps = frameCount / ((now - lastFrameTime) / 1000);
-                                        console.log(`Video rendering (RVFC): ${fps.toFixed(1)} FPS, ${frameCount} frames`);
+                                        const mode = session._directRenderCtx ? 'DIRECT' : 'RVFC';
+                                        console.log(`Video rendering (${mode}): ${fps.toFixed(1)} FPS, ${frameCount} frames`);
                                         frameCount = 0;
                                         lastFrameTime = now;
                                     }
@@ -466,6 +488,17 @@ window.SteamViewerWebRTC = {
                                 if (video.readyState >= 2) {
                                     try {
                                         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+                                        // Direct render: also draw to visible canvas
+                                        if (session._directRenderCtx) {
+                                            const dc = session._directRenderCanvas;
+                                            if (dc.width !== canvas.width || dc.height !== canvas.height) {
+                                                dc.width = canvas.width;
+                                                dc.height = canvas.height;
+                                            }
+                                            session._directRenderCtx.drawImage(video, 0, 0, dc.width, dc.height);
+                                        }
+
                                         frameCount++;
 
                                         // Log frame rate every 2 seconds
@@ -1141,6 +1174,43 @@ window.SteamViewerWebRTC = {
                session.remoteVideo.readyState >= 2;
     },
 
+    // Enable direct rendering to a visible canvas (bypasses JPEG relay)
+    // Only works when PeerConnection is in the same JS context as the canvas
+    setDirectRenderTarget(sessionId, canvasId) {
+        const session = this.sessions.get(sessionId);
+        if (!session) {
+            console.warn(`[DirectRender] No session: ${sessionId}`);
+            return false;
+        }
+
+        const canvas = document.getElementById(canvasId);
+        if (!canvas) {
+            console.warn(`[DirectRender] Canvas '${canvasId}' not found`);
+            return false;
+        }
+
+        session._directRenderCanvas = canvas;
+        session._directRenderCtx = canvas.getContext('2d');
+
+        // Sync canvas dimensions with video if already loaded
+        if (session.remoteVideo && session.remoteVideo.videoWidth > 0) {
+            canvas.width = session.remoteVideo.videoWidth;
+            canvas.height = session.remoteVideo.videoHeight;
+        }
+
+        console.log(`[DirectRender] Enabled for session ${sessionId} → canvas '${canvasId}'`);
+        return true;
+    },
+
+    // Disable direct rendering (falls back to JPEG relay)
+    clearDirectRenderTarget(sessionId) {
+        const session = this.sessions.get(sessionId);
+        if (!session) return;
+        session._directRenderCanvas = null;
+        session._directRenderCtx = null;
+        console.log(`[DirectRender] Disabled for session ${sessionId}`);
+    },
+
     // Enable frame capture to relay to viewer window
     async startFrameCapture(sessionId, dotNetRef) {
         const session = this._getSession(sessionId);
@@ -1257,8 +1327,8 @@ window.SteamViewerWebRTC = {
             // Draw downscaled frame
             session.captureCtx.drawImage(session.remoteCanvas, 0, 0, destWidth, destHeight);
 
-            // Convert to JPEG (0.85 quality balances size/quality/CPU)
-            const dataUrl = session.captureCanvas.toDataURL('image/jpeg', 0.85);
+            // Convert to JPEG (0.65 quality — faster encode/decode, smaller payload for relay path)
+            const dataUrl = session.captureCanvas.toDataURL('image/jpeg', 0.65);
 
             // Send to C# - use original dimensions for coordinate scaling
             const base64Data = dataUrl.replace(/^data:image\/jpeg;base64,/, '');
@@ -1657,6 +1727,13 @@ window.SteamViewerInput = {
     _inputEventCount: 0,
     _lastMouseDownCoords: null,  // Cache coords from mouse_down for identical mouse_up (prevents micro-drag)
     _focusWatchdogId: null,
+    // Mouse throttle — send at 30 Hz max, draw local cursor on every move
+    _lastMouseSendTime: 0,
+    _mouseSendInterval: 33, // ms (~30 Hz)
+    _pendingMouseCoords: null, // Buffered coords for trailing send
+    _pendingMouseTimer: null,
+    // Local cursor overlay
+    _cursorOverlay: null,
 
     initialize(canvasId, dotNetReference, options = {}) {
         const { showLockIndicator = true } = options;
@@ -1700,6 +1777,9 @@ window.SteamViewerInput = {
         this.canvas.addEventListener('keydown', this._boundKeyDown);
         this.canvas.addEventListener('keyup', this._boundKeyUp);
 
+        // Create local cursor overlay (hidden until input lock)
+        this._createCursorOverlay();
+
         this.isCapturing = true;
         this.isLocked = false;
 
@@ -1729,6 +1809,29 @@ window.SteamViewerInput = {
                 this.canvas.focus();
             }
         }, 500);
+    },
+
+    // Create a lightweight local cursor overlay (positioned via CSS, no canvas drawing)
+    _createCursorOverlay() {
+        if (this._cursorOverlay) return;
+        const el = document.createElement('div');
+        el.style.cssText = `
+            position: fixed; pointer-events: none; z-index: 10000;
+            width: 12px; height: 12px; border-radius: 50%;
+            border: 2px solid white; background: rgba(255,50,50,0.6);
+            box-shadow: 0 0 3px rgba(0,0,0,0.7);
+            transform: translate(-50%, -50%); display: none;
+        `;
+        document.body.appendChild(el);
+        this._cursorOverlay = el;
+    },
+
+    // Update local cursor overlay position (called on every mousemove, instant)
+    _updateCursorOverlay(e) {
+        if (this._cursorOverlay && this.isLocked) {
+            this._cursorOverlay.style.left = e.clientX + 'px';
+            this._cursorOverlay.style.top = e.clientY + 'px';
+        }
     },
 
     // Set which session input events count toward (for stats overlay)
@@ -1822,6 +1925,9 @@ window.SteamViewerInput = {
         this.updateLockIndicator();
         this.notifyLockChange();
         this.canvas.focus();
+        // Hide system cursor, show local cursor overlay
+        if (this.canvas) this.canvas.style.cursor = 'none';
+        if (this._cursorOverlay) this._cursorOverlay.style.display = 'block';
         // Gesture-backed restart: user click to lock = user gesture for getDisplayMedia
         this._restartSharingIfLost();
         console.log('Input LOCKED - sending inputs to host');
@@ -1848,6 +1954,9 @@ window.SteamViewerInput = {
         this.isLocked = false;
         this.updateLockIndicator();
         this.notifyLockChange();
+        // Restore system cursor, hide local cursor overlay
+        if (this.canvas) this.canvas.style.cursor = '';
+        if (this._cursorOverlay) this._cursorOverlay.style.display = 'none';
         console.log('Input UNLOCKED');
     },
 
@@ -1947,6 +2056,10 @@ window.SteamViewerInput = {
             console.log(`[Input] raw #${this._rawEventCount}: capturing=${this.isCapturing}, locked=${this.isLocked}, dotNetRef=${!!this.dotNetRef}`);
         }
         if (!this.isCapturing || !this.isLocked || !this.dotNetRef) return;
+
+        // Always update local cursor overlay instantly (zero latency)
+        this._updateCursorOverlay(e);
+
         this._inputEventCount++;
         if (this._inputEventCount <= 3) {
             console.log(`[Input] event #${this._inputEventCount}: capturing=${this.isCapturing}, locked=${this.isLocked}, dotNetRef=${!!this.dotNetRef}, session=${this._activeSessionId}`);
@@ -1979,9 +2092,37 @@ window.SteamViewerInput = {
             captureH = this.canvas.height;
         }
 
-        try {
-            await this.dotNetRef.invokeMethodAsync('OnMouseMove', x, y, captureW, captureH);
-        } catch (err) { console.error('[Input] OnMouseMove failed:', err); }
+        // Throttle data channel sends to ~30 Hz (local cursor is already updated above)
+        const now = performance.now();
+        const elapsed = now - this._lastMouseSendTime;
+
+        if (elapsed >= this._mouseSendInterval) {
+            // Enough time passed — send immediately
+            this._lastMouseSendTime = now;
+            if (this._pendingMouseTimer) {
+                clearTimeout(this._pendingMouseTimer);
+                this._pendingMouseTimer = null;
+            }
+            try {
+                await this.dotNetRef.invokeMethodAsync('OnMouseMove', x, y, captureW, captureH);
+            } catch (err) { console.error('[Input] OnMouseMove failed:', err); }
+        } else {
+            // Buffer coords for trailing send (ensures final position is always sent)
+            this._pendingMouseCoords = { x, y, captureW, captureH };
+            if (!this._pendingMouseTimer) {
+                this._pendingMouseTimer = setTimeout(async () => {
+                    this._pendingMouseTimer = null;
+                    const c = this._pendingMouseCoords;
+                    if (c && this.dotNetRef && this.isLocked) {
+                        this._lastMouseSendTime = performance.now();
+                        this._pendingMouseCoords = null;
+                        try {
+                            await this.dotNetRef.invokeMethodAsync('OnMouseMove', c.x, c.y, c.captureW, c.captureH);
+                        } catch (err) { /* ignore trailing send errors */ }
+                    }
+                }, this._mouseSendInterval - elapsed);
+            }
+        }
     },
 
     _getMouseCoords(e) {
@@ -2076,6 +2217,18 @@ window.SteamViewerInput = {
         if (this.lockIndicator) {
             this.lockIndicator.remove();
             this.lockIndicator = null;
+        }
+
+        // Remove local cursor overlay
+        if (this._cursorOverlay) {
+            this._cursorOverlay.remove();
+            this._cursorOverlay = null;
+        }
+
+        // Clear throttle timers
+        if (this._pendingMouseTimer) {
+            clearTimeout(this._pendingMouseTimer);
+            this._pendingMouseTimer = null;
         }
 
         // Remove event listeners from canvas
