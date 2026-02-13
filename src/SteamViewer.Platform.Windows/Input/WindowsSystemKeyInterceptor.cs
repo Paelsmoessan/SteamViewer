@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using System.Runtime.InteropServices;
 using SteamViewer.Client.Core.Capture;
 
@@ -15,6 +14,7 @@ public sealed class WindowsSystemKeyInterceptor : ISystemKeyInterceptor
     private uint _hookThreadId;
     private volatile bool _running;
     private HookProc? _hookProc; // prevent GC collection of delegate
+    private volatile bool _firstCallback = true;
 
     public bool IsInstalled => _hookId != IntPtr.Zero;
     public event Action<string, bool, bool>? SystemKeyIntercepted;
@@ -31,11 +31,20 @@ public sealed class WindowsSystemKeyInterceptor : ISystemKeyInterceptor
             _hookThreadId = GetCurrentThreadId();
             _hookProc = HookCallback;
 
-            using var curProcess = Process.GetCurrentProcess();
-            using var curModule = curProcess.MainModule!;
+            // GetModuleHandle(null) returns the main EXE handle — works reliably in .NET 8 MAUI.
+            // The previous approach (Process.MainModule.ModuleName) can fail in .NET Core hosts.
             _hookId = SetWindowsHookEx(WH_KEYBOARD_LL, _hookProc,
-                GetModuleHandle(curModule.ModuleName), 0);
+                GetModuleHandle(null), 0);
 
+            if (_hookId == IntPtr.Zero)
+            {
+                var error = Marshal.GetLastWin32Error();
+                Console.WriteLine($"[SystemKeyHook] SetWindowsHookEx FAILED — Win32 error {error}");
+                ready.Set();
+                return;
+            }
+
+            Console.WriteLine("[SystemKeyHook] Installed successfully");
             ready.Set();
 
             // Message pump required for WH_KEYBOARD_LL
@@ -54,6 +63,9 @@ public sealed class WindowsSystemKeyInterceptor : ISystemKeyInterceptor
 
     public void Uninstall()
     {
+        if (_hookId == IntPtr.Zero && _hookThread == null) return;
+
+        Console.WriteLine("[SystemKeyHook] Uninstalling...");
         _running = false;
 
         if (_hookId != IntPtr.Zero)
@@ -71,6 +83,7 @@ public sealed class WindowsSystemKeyInterceptor : ISystemKeyInterceptor
         }
 
         _hookProc = null;
+        _firstCallback = true;
     }
 
     public void Dispose() => Uninstall();
@@ -81,6 +94,12 @@ public sealed class WindowsSystemKeyInterceptor : ISystemKeyInterceptor
         {
             var kb = Marshal.PtrToStructure<KBDLLHOOKSTRUCT>(lParam);
             var vk = (ushort)kb.vkCode;
+
+            if (_firstCallback)
+            {
+                Console.WriteLine($"[SystemKeyHook] First callback — vk=0x{vk:X2}, wParam=0x{wParam:X}");
+                _firstCallback = false;
+            }
             var isDown = wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN;
             var isUp = wParam == WM_KEYUP || wParam == WM_SYSKEYUP;
             var altDown = (kb.flags & LLKHF_ALTDOWN) != 0;
@@ -100,6 +119,7 @@ public sealed class WindowsSystemKeyInterceptor : ISystemKeyInterceptor
                 var key = VkToKeyString(vk);
                 if (key != null)
                 {
+                    Console.WriteLine($"[SystemKeyHook] Intercepted: {key} {(isDown ? "down" : "up")}");
                     SystemKeyIntercepted?.Invoke(key, isDown, altDown);
                     return (IntPtr)1; // Suppress the key
                 }
@@ -179,7 +199,7 @@ public sealed class WindowsSystemKeyInterceptor : ISystemKeyInterceptor
     private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern IntPtr GetModuleHandle(string lpModuleName);
+    private static extern IntPtr GetModuleHandle(string? lpModuleName);
 
     [DllImport("user32.dll")]
     private static extern int GetMessage(out MSG lpMsg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax);
