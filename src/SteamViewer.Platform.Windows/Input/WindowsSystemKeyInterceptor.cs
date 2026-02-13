@@ -120,7 +120,12 @@ public sealed class WindowsSystemKeyInterceptor : ISystemKeyInterceptor
                 if (key != null)
                 {
                     Console.WriteLine($"[SystemKeyHook] Intercepted: {key} {(isDown ? "down" : "up")}");
-                    SystemKeyIntercepted?.Invoke(key, isDown, altDown);
+                    // Dispatch off hook thread immediately — LL hooks have a ~200ms Windows timeout.
+                    // Blocking here (sync event → async SendInput → thread marshal) causes 3s+ delays.
+                    var capturedKey = key;
+                    var capturedDown = isDown;
+                    var capturedAlt = altDown;
+                    ThreadPool.QueueUserWorkItem(_ => SystemKeyIntercepted?.Invoke(capturedKey, capturedDown, capturedAlt));
                     return (IntPtr)1; // Suppress the key
                 }
             }
