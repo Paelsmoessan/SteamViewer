@@ -953,24 +953,55 @@ public static class SystemHelperServer
                     switch (type)
                     {
                         case "mouse_move":
-                            Win32Input.InjectMouseMove(
-                                root.GetProperty("x").GetDouble(),
-                                root.GetProperty("y").GetDouble(),
-                                sw, sh);
+                            if (onSecureDesktop)
+                            {
+                                var (ax, ay) = Win32Input.ConvertToAbsoluteDirect(
+                                    root.GetProperty("x").GetDouble(),
+                                    root.GetProperty("y").GetDouble(), sw, sh);
+                                Win32Input.InjectMouseMoveRaw(ax, ay);
+                            }
+                            else
+                            {
+                                Win32Input.InjectMouseMove(
+                                    root.GetProperty("x").GetDouble(),
+                                    root.GetProperty("y").GetDouble(), sw, sh);
+                            }
                             break;
                         case "mouse_down":
-                            Win32Input.InjectMouseButton(
-                                ParseMouseButton(root.GetProperty("button").GetString()),
-                                root.GetProperty("x").GetDouble(),
-                                root.GetProperty("y").GetDouble(),
-                                sw, sh, isDown: true);
+                            if (onSecureDesktop)
+                            {
+                                var (ax, ay) = Win32Input.ConvertToAbsoluteDirect(
+                                    root.GetProperty("x").GetDouble(),
+                                    root.GetProperty("y").GetDouble(), sw, sh);
+                                Win32Input.InjectMouseButtonRaw(
+                                    ParseMouseButton(root.GetProperty("button").GetString()),
+                                    ax, ay, isDown: true);
+                            }
+                            else
+                            {
+                                Win32Input.InjectMouseButton(
+                                    ParseMouseButton(root.GetProperty("button").GetString()),
+                                    root.GetProperty("x").GetDouble(),
+                                    root.GetProperty("y").GetDouble(), sw, sh, isDown: true);
+                            }
                             break;
                         case "mouse_up":
-                            Win32Input.InjectMouseButton(
-                                ParseMouseButton(root.GetProperty("button").GetString()),
-                                root.GetProperty("x").GetDouble(),
-                                root.GetProperty("y").GetDouble(),
-                                sw, sh, isDown: false);
+                            if (onSecureDesktop)
+                            {
+                                var (ax, ay) = Win32Input.ConvertToAbsoluteDirect(
+                                    root.GetProperty("x").GetDouble(),
+                                    root.GetProperty("y").GetDouble(), sw, sh);
+                                Win32Input.InjectMouseButtonRaw(
+                                    ParseMouseButton(root.GetProperty("button").GetString()),
+                                    ax, ay, isDown: false);
+                            }
+                            else
+                            {
+                                Win32Input.InjectMouseButton(
+                                    ParseMouseButton(root.GetProperty("button").GetString()),
+                                    root.GetProperty("x").GetDouble(),
+                                    root.GetProperty("y").GetDouble(), sw, sh, isDown: false);
+                            }
                             break;
                         case "mouse_wheel":
                             Win32Input.InjectMouseWheel(
