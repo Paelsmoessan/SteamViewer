@@ -305,10 +305,22 @@ window.SteamViewerWebRTC = {
                 console.error('ICE candidate error:', event.errorCode, event.errorText, event.url);
             };
 
-            // Visibility change — just log; restart happens on next user gesture (input lock click)
-            const visibilityHandler = () => {
-                if (document.visibilityState === 'visible' && session._sharingLost && !session._sharingStoppedByUser) {
-                    console.log('Page visible + sharing lost — will restart on next input lock click');
+            // Visibility change fallback — restart sharing when page becomes visible after lock screen
+            const visibilityHandler = async () => {
+                if (document.visibilityState !== 'visible') return;
+                if (!session._sharingLost || session._sharingStoppedByUser || session._restartingShare) return;
+                const pcState = session.peerConnection?.connectionState;
+                if (pcState === 'closed' || pcState === 'failed') return;
+                console.log('Page visible + sharing lost — attempting restart from visibilitychange');
+                session._sharingLost = false;
+                session._restartingShare = true;
+                try {
+                    const ok = await window.SteamViewerWebRTC.startScreenCapture(sessionId);
+                    session._restartingShare = false;
+                    if (!ok) session._sharingLost = true;
+                } catch (e) {
+                    session._restartingShare = false;
+                    session._sharingLost = true;
                 }
             };
             document.addEventListener('visibilitychange', visibilityHandler);
@@ -783,11 +795,71 @@ window.SteamViewerWebRTC = {
                 params.encodings[0].degradationPreference = 'maintain-framerate';
                 sender.setParameters(params).catch(e => console.warn('Could not set encoding params:', e));
 
-                // Handle track ending — mark as lost, no auto-retry (avoids picker popup)
-                // Restart happens on next user gesture (input lock click) via _restartSharingIfLost
-                const restartHandler = () => {
-                    if (session._sharingStoppedByUser) return;
-                    console.log('Screen sharing track ended unexpectedly — marked as lost');
+                // Handle track ending — retry with fullscreen constraints (keeps connection alive during lock screen)
+                const restartHandler = async () => {
+                    if (session._sharingStoppedByUser) {
+                        console.log('Screen sharing stopped by user');
+                        return;
+                    }
+                    if (session._restartingShare) {
+                        console.log('Screen share restart already in progress');
+                        return;
+                    }
+                    session._restartingShare = true;
+                    session._sharingLost = false;
+                    const delays = [2000, 3000, 5000, 8000, 12000];
+                    console.log(`Screen sharing track ended unexpectedly — will retry ${delays.length} times`);
+
+                    for (let attempt = 0; attempt < delays.length; attempt++) {
+                        await new Promise(r => setTimeout(r, delays[attempt]));
+                        if (session._sharingStoppedByUser) {
+                            console.log('User stopped sharing during restart — aborting');
+                            session._restartingShare = false;
+                            return;
+                        }
+                        const pcState = session.peerConnection?.connectionState;
+                        if (pcState === 'closed' || pcState === 'failed') {
+                            console.log(`Peer connection ${pcState} — aborting restart`);
+                            session._restartingShare = false;
+                            return;
+                        }
+                        try {
+                            console.log(`Auto-restart attempt ${attempt + 1}/${delays.length}...`);
+                            const newStream = await navigator.mediaDevices.getDisplayMedia({
+                                video: {
+                                    displaySurface: 'monitor',
+                                    cursor: 'motion',
+                                    width: { ideal: 1920, max: 3840 },
+                                    height: { ideal: 1080, max: 2160 },
+                                    frameRate: { ideal: 30, max: 60 }
+                                },
+                                audio: false,
+                                preferCurrentTab: false,
+                                selfBrowserSurface: 'exclude',
+                                systemAudio: 'exclude',
+                                monitorTypeSurfaces: 'include'
+                            });
+                            const newTrack = newStream.getVideoTracks()[0];
+                            const videoSender = session.peerConnection.getSenders()
+                                .find(s => s.track?.kind === 'video' || s.track === null);
+                            if (videoSender) {
+                                await videoSender.replaceTrack(newTrack);
+                                console.log(`Screen sharing auto-restarted via replaceTrack (attempt ${attempt + 1})`);
+                            } else {
+                                session.peerConnection.addTrack(newTrack, newStream);
+                                console.log(`Screen sharing restarted via addTrack (attempt ${attempt + 1})`);
+                            }
+                            newTrack.onended = restartHandler;
+                            session.localStream = newStream;
+                            session._sharingLost = false;
+                            session._restartingShare = false;
+                            return; // Success
+                        } catch (err) {
+                            console.warn(`Auto-restart attempt ${attempt + 1}/${delays.length} failed: ${err.name}: ${err.message}`);
+                        }
+                    }
+                    // All retries exhausted
+                    console.error('Screen sharing auto-restart failed after all retries');
                     session._sharingLost = true;
                     session._restartingShare = false;
                     if (session.dotNetRef) {
