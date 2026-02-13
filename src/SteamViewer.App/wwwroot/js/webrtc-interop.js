@@ -1732,8 +1732,7 @@ window.SteamViewerInput = {
     _mouseSendInterval: 33, // ms (~30 Hz)
     _pendingMouseCoords: null, // Buffered coords for trailing send
     _pendingMouseTimer: null,
-    // Local cursor overlay
-    _cursorOverlay: null,
+
 
     initialize(canvasId, dotNetReference, options = {}) {
         const { showLockIndicator = true } = options;
@@ -1777,9 +1776,6 @@ window.SteamViewerInput = {
         this.canvas.addEventListener('keydown', this._boundKeyDown);
         this.canvas.addEventListener('keyup', this._boundKeyUp);
 
-        // Create local cursor overlay (hidden until input lock)
-        this._createCursorOverlay();
-
         this.isCapturing = true;
         this.isLocked = false;
 
@@ -1809,29 +1805,6 @@ window.SteamViewerInput = {
                 this.canvas.focus();
             }
         }, 500);
-    },
-
-    // Create a lightweight local cursor overlay (positioned via CSS, no canvas drawing)
-    _createCursorOverlay() {
-        if (this._cursorOverlay) return;
-        const el = document.createElement('div');
-        el.style.cssText = `
-            position: fixed; pointer-events: none; z-index: 10000;
-            width: 12px; height: 12px; border-radius: 50%;
-            border: 2px solid white; background: rgba(255,50,50,0.6);
-            box-shadow: 0 0 3px rgba(0,0,0,0.7);
-            transform: translate(-50%, -50%); display: none;
-        `;
-        document.body.appendChild(el);
-        this._cursorOverlay = el;
-    },
-
-    // Update local cursor overlay position (called on every mousemove, instant)
-    _updateCursorOverlay(e) {
-        if (this._cursorOverlay && this.isLocked) {
-            this._cursorOverlay.style.left = e.clientX + 'px';
-            this._cursorOverlay.style.top = e.clientY + 'px';
-        }
     },
 
     // Set which session input events count toward (for stats overlay)
@@ -1925,9 +1898,6 @@ window.SteamViewerInput = {
         this.updateLockIndicator();
         this.notifyLockChange();
         this.canvas.focus();
-        // Hide system cursor, show local cursor overlay
-        if (this.canvas) this.canvas.style.cursor = 'none';
-        if (this._cursorOverlay) this._cursorOverlay.style.display = 'block';
         // Gesture-backed restart: user click to lock = user gesture for getDisplayMedia
         this._restartSharingIfLost();
         console.log('Input LOCKED - sending inputs to host');
@@ -1954,9 +1924,6 @@ window.SteamViewerInput = {
         this.isLocked = false;
         this.updateLockIndicator();
         this.notifyLockChange();
-        // Restore system cursor, hide local cursor overlay
-        if (this.canvas) this.canvas.style.cursor = '';
-        if (this._cursorOverlay) this._cursorOverlay.style.display = 'none';
         console.log('Input UNLOCKED');
     },
 
@@ -2056,9 +2023,6 @@ window.SteamViewerInput = {
             console.log(`[Input] raw #${this._rawEventCount}: capturing=${this.isCapturing}, locked=${this.isLocked}, dotNetRef=${!!this.dotNetRef}`);
         }
         if (!this.isCapturing || !this.isLocked || !this.dotNetRef) return;
-
-        // Always update local cursor overlay instantly (zero latency)
-        this._updateCursorOverlay(e);
 
         this._inputEventCount++;
         if (this._inputEventCount <= 3) {
@@ -2217,12 +2181,6 @@ window.SteamViewerInput = {
         if (this.lockIndicator) {
             this.lockIndicator.remove();
             this.lockIndicator = null;
-        }
-
-        // Remove local cursor overlay
-        if (this._cursorOverlay) {
-            this._cursorOverlay.remove();
-            this._cursorOverlay = null;
         }
 
         // Clear throttle timers

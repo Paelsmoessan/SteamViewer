@@ -9,11 +9,14 @@ namespace SteamViewer.Platform.Windows.Input;
 /// </summary>
 internal static class Win32Input
 {
-    // Lazy-init virtual screen dimensions
+    // Lazy-init virtual screen dimensions and monitor layout
     private static int _vsLeft, _vsTop, _vsWidth, _vsHeight;
     private static bool _initialized;
     private static readonly object InitLock = new();
 
+    // Multi-monitor support: cached monitor rectangles for coordinate mapping
+    private record struct MonitorRect(int X, int Y, int Width, int Height, bool IsPrimary);
+    private static MonitorRect[]? _monitors;
 
     private static void EnsureInitialized()
     {
@@ -25,8 +28,34 @@ internal static class Win32Input
             _vsTop = GetSystemMetrics(SM_YVIRTUALSCREEN);
             _vsWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
             _vsHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+            EnumerateMonitors();
             _initialized = true;
         }
+    }
+
+    private static List<MonitorRect>? _monitorCollector;
+
+    private static void EnumerateMonitors()
+    {
+        _monitorCollector = new List<MonitorRect>();
+        EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, MonitorEnumCallback, IntPtr.Zero);
+        _monitors = _monitorCollector.ToArray();
+        _monitorCollector = null;
+    }
+
+    private static bool MonitorEnumCallback(IntPtr hMonitor, IntPtr hdcMonitor, ref RECT lprcMonitor, IntPtr dwData)
+    {
+        var mi = new MONITORINFO { cbSize = Marshal.SizeOf<MONITORINFO>() };
+        if (GetMonitorInfoW(hMonitor, ref mi))
+        {
+            _monitorCollector?.Add(new MonitorRect(
+                mi.rcMonitor.left,
+                mi.rcMonitor.top,
+                mi.rcMonitor.right - mi.rcMonitor.left,
+                mi.rcMonitor.bottom - mi.rcMonitor.top,
+                (mi.dwFlags & MONITORINFOF_PRIMARY) != 0));
+        }
+        return true;
     }
 
     /// <summary>
@@ -70,18 +99,74 @@ internal static class Win32Input
 
     /// <summary>
     /// Convert remote capture coordinates to Win32 absolute coordinates (0-65535).
+    /// When capturing a single monitor on a multi-monitor setup, maps coords to that
+    /// monitor's area rather than stretching across the full virtual desktop.
     /// </summary>
     public static (int AbsX, int AbsY) ConvertToAbsoluteCoordinates(double x, double y, int screenWidth, int screenHeight)
     {
         EnsureInitialized();
 
-        var localX = x * _vsWidth / screenWidth + _vsLeft;
-        var localY = y * _vsHeight / screenHeight + _vsTop;
+        // Determine which area of the virtual desktop the capture represents
+        int targetX = _vsLeft, targetY = _vsTop, targetW = _vsWidth, targetH = _vsHeight;
 
+        // If capture size doesn't match full virtual desktop, find the specific monitor
+        if (screenWidth != _vsWidth || screenHeight != _vsHeight)
+        {
+            var match = FindMonitorByResolution(screenWidth, screenHeight);
+            if (match != null)
+            {
+                targetX = match.Value.X;
+                targetY = match.Value.Y;
+                targetW = match.Value.Width;
+                targetH = match.Value.Height;
+            }
+        }
+
+        // Map capture pixel coords to virtual screen position
+        var localX = targetX + x * targetW / screenWidth;
+        var localY = targetY + y * targetH / screenHeight;
+
+        // Convert to absolute 0-65535 range across full virtual desktop
         var absX = (int)Math.Round((localX - _vsLeft) * 65535.0 / _vsWidth);
         var absY = (int)Math.Round((localY - _vsTop) * 65535.0 / _vsHeight);
 
         return (Math.Clamp(absX, 0, 65535), Math.Clamp(absY, 0, 65535));
+    }
+
+    /// <summary>
+    /// Match capture dimensions to a specific monitor.
+    /// Returns null if capture matches full virtual desktop or no monitor matches.
+    /// </summary>
+    private static MonitorRect? FindMonitorByResolution(int width, int height)
+    {
+        if (_monitors == null || _monitors.Length <= 1) return null;
+
+        MonitorRect? firstMatch = null;
+        var matchCount = 0;
+
+        foreach (var mon in _monitors)
+        {
+            if (mon.Width == width && mon.Height == height)
+            {
+                firstMatch ??= mon;
+                matchCount++;
+            }
+        }
+
+        if (matchCount == 1) return firstMatch;
+
+        // Multiple monitors with same resolution — prefer primary
+        if (matchCount > 1)
+        {
+            foreach (var mon in _monitors)
+            {
+                if (mon.Width == width && mon.Height == height && mon.IsPrimary)
+                    return mon;
+            }
+            return firstMatch; // None is primary, use first match
+        }
+
+        return null; // No match — fall back to full virtual desktop
     }
 
     internal static void InjectMouseMove(double x, double y, int screenWidth, int screenHeight)
@@ -393,6 +478,32 @@ internal static class Win32Input
 
     [DllImport("user32.dll")]
     internal static extern int GetSystemMetrics(int nIndex);
+
+    // Multi-monitor enumeration
+    private const int MONITORINFOF_PRIMARY = 1;
+
+    private delegate bool MonitorEnumDelegate(IntPtr hMonitor, IntPtr hdcMonitor, ref RECT lprcMonitor, IntPtr dwData);
+
+    [DllImport("user32.dll")]
+    private static extern bool EnumDisplayMonitors(IntPtr hdc, IntPtr lprcClip, MonitorEnumDelegate lpfnEnum, IntPtr dwData);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern bool GetMonitorInfoW(IntPtr hMonitor, ref MONITORINFO lpmi);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RECT
+    {
+        public int left, top, right, bottom;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MONITORINFO
+    {
+        public int cbSize;
+        public RECT rcMonitor;
+        public RECT rcWork;
+        public int dwFlags;
+    }
 
     [StructLayout(LayoutKind.Sequential)]
     internal struct INPUT
