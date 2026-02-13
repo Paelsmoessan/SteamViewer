@@ -35,6 +35,11 @@ public partial class App : MauiWinUIApplication
         // This is critical when running from network shares
         ConfigureWebView2UserDataFolder();
 
+        // Auto-select entire screen for getDisplayMedia (remote desktop = always fullscreen)
+        Environment.SetEnvironmentVariable("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+            "--auto-select-desktop-capture-source=\"Entire screen\" " +
+            "--enable-features=GetDisplayMediaSetAutoSelectAllScreens");
+
         // Check dependencies before initializing
         if (!CheckDependencies())
         {

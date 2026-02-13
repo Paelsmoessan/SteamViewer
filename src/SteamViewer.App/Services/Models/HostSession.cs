@@ -268,16 +268,15 @@ public sealed class HostSession : IAsyncDisposable
 
     #region Screen Sharing
 
-    /// <summary>Start sharing screen to the connected viewer.</summary>
-    /// <param name="autoFullScreen">When true, prefer full screen capture (monitor) over window.</param>
-    public async Task<bool> StartScreenShareAsync(bool autoFullScreen = false)
+    /// <summary>Start sharing screen to the connected viewer (always fullscreen).</summary>
+    public async Task<bool> StartScreenShareAsync()
     {
         if (_webrtc == null) return false;
 
         try
         {
-            _logger.LogInformation("Starting screen share (autoFullScreen={Auto})...", autoFullScreen);
-            var success = await _webrtc.StartScreenCaptureAsync(autoFullScreen);
+            _logger.LogInformation("Starting screen share (always fullscreen)...");
+            var success = await _webrtc.StartScreenCaptureAsync();
             if (success)
             {
                 IsSharingScreen = true;
@@ -366,7 +365,7 @@ public sealed class HostSession : IAsyncDisposable
             try
             {
                 _logger.LogInformation("Auto-sharing screen after reboot reconnect");
-                await StartScreenShareAsync(autoFullScreen: true);
+                await StartScreenShareAsync();
             }
             catch (Exception ex)
             {

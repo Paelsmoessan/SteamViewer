@@ -216,12 +216,12 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
 
     /// <summary>
     /// Start screen capture and add video track (for host).
+    /// Always captures primary monitor (no picker).
     /// </summary>
-    /// <param name="autoFullScreen">When true, prefer full screen (monitor) capture over window.</param>
-    public async Task<bool> StartScreenCaptureAsync(bool autoFullScreen = false)
+    public async Task<bool> StartScreenCaptureAsync()
     {
         EnsureInitialized();
-        var success = await _jsRuntime.InvokeAsync<bool>("SteamViewerWebRTC.startScreenCapture", _sessionId, autoFullScreen);
+        var success = await _jsRuntime.InvokeAsync<bool>("SteamViewerWebRTC.startScreenCapture", _sessionId);
         _logger.LogInformation("Screen capture started: {Success}", success);
         return success;
     }

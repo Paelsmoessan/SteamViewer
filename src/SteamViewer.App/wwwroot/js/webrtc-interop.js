@@ -306,14 +306,11 @@ window.SteamViewerWebRTC = {
                 console.error('ICE candidate error:', event.errorCode, event.errorText, event.url);
             };
 
-            // Visibility change fallback — restart sharing when page becomes visible after lock screen
-            const visibilityHandler = async () => {
-                if (document.visibilityState !== 'visible') return;
-                if (!session._sharingLost || session._sharingStoppedByUser || session._restartingShare) return;
-                const pcState = session.peerConnection?.connectionState;
-                if (pcState === 'closed' || pcState === 'failed') return;
-                console.log('Page visible + sharing lost — attempting restart from visibilitychange');
-                await this._tryRestartSharing(sessionId);
+            // Visibility change — just log; restart happens on next user gesture (input lock click)
+            const visibilityHandler = () => {
+                if (document.visibilityState === 'visible' && session._sharingLost && !session._sharingStoppedByUser) {
+                    console.log('Page visible + sharing lost — will restart on next input lock click');
+                }
             };
             document.addEventListener('visibilitychange', visibilityHandler);
             session._visibilityHandler = visibilityHandler;
@@ -710,12 +707,11 @@ window.SteamViewerWebRTC = {
     },
 
     // Start screen capture (for host)
-    // autoFullScreen: when true, prefer full monitor capture (used for post-reboot reconnect)
-    async startScreenCapture(sessionId, autoFullScreen = false) {
+    // Always captures primary monitor — no picker (remote desktop tool, not Teams)
+    async startScreenCapture(sessionId) {
         const session = this._getSession(sessionId);
-        session._autoFullScreen = autoFullScreen;
         session._sharingStoppedByUser = false;
-        console.log(`=== Starting screen capture [${sessionId}] autoFullScreen=${autoFullScreen} ===`);
+        console.log(`=== Starting screen capture [${sessionId}] (always fullscreen) ===`);
         console.log('navigator.mediaDevices:', !!navigator.mediaDevices);
         console.log('getDisplayMedia:', !!navigator.mediaDevices?.getDisplayMedia);
         console.log('peerConnection:', !!session.peerConnection);
@@ -728,24 +724,19 @@ window.SteamViewerWebRTC = {
         }
 
         try {
-            const videoConstraints = {
-                cursor: 'motion',  // Only redraw cursor when moving (reduces capture overhead)
-                width: { ideal: 1920, max: 3840 },
-                height: { ideal: 1080, max: 2160 },
-                frameRate: { ideal: 30, max: 60 }
-            };
-
-            // Prefer full monitor capture for post-reboot reconnect (avoids window picker)
-            if (autoFullScreen) {
-                videoConstraints.displaySurface = 'monitor';
-            }
-
             session.localStream = await navigator.mediaDevices.getDisplayMedia({
-                video: videoConstraints,
+                video: {
+                    displaySurface: 'monitor',
+                    cursor: 'motion',
+                    width: { ideal: 1920, max: 3840 },
+                    height: { ideal: 1080, max: 2160 },
+                    frameRate: { ideal: 30, max: 60 }
+                },
                 audio: false,
                 preferCurrentTab: false,
                 selfBrowserSurface: 'exclude',
-                systemAudio: 'exclude'
+                systemAudio: 'exclude',
+                monitorTypeSurfaces: 'include'
             });
 
             // Add video track to peer connection with encoding parameters
@@ -793,71 +784,11 @@ window.SteamViewerWebRTC = {
                 params.encodings[0].degradationPreference = 'maintain-framerate';
                 sender.setParameters(params).catch(e => console.warn('Could not set encoding params:', e));
 
-                // Handle track ending — auto-restart if unexpected (e.g. lock screen)
-                // Uses retry loop because getDisplayMedia may fail while screen is still locked
-                const restartHandler = async () => {
-                    if (session._sharingStoppedByUser) {
-                        console.log('Screen sharing stopped by user');
-                        return;
-                    }
-                    if (session._restartingShare) {
-                        console.log('Screen share restart already in progress');
-                        return;
-                    }
-                    session._restartingShare = true;
-                    session._sharingLost = false;
-                    const delays = [2000, 3000, 5000, 8000, 12000];
-                    console.log(`Screen sharing track ended unexpectedly — will retry ${delays.length} times`);
-
-                    for (let attempt = 0; attempt < delays.length; attempt++) {
-                        await new Promise(r => setTimeout(r, delays[attempt]));
-                        if (session._sharingStoppedByUser) {
-                            console.log('User stopped sharing during restart — aborting');
-                            session._restartingShare = false;
-                            return;
-                        }
-                        const pcState = session.peerConnection?.connectionState;
-                        if (pcState === 'closed' || pcState === 'failed') {
-                            console.log(`Peer connection ${pcState} — aborting restart`);
-                            session._restartingShare = false;
-                            return;
-                        }
-                        try {
-                            console.log(`Auto-restart attempt ${attempt + 1}/${delays.length}...`);
-                            const newStream = await navigator.mediaDevices.getDisplayMedia({
-                                video: {
-                                    cursor: 'motion',
-                                    width: { ideal: 1920, max: 3840 },
-                                    height: { ideal: 1080, max: 2160 },
-                                    frameRate: { ideal: 30, max: 60 },
-                                    ...(session._autoFullScreen ? { displaySurface: 'monitor' } : {})
-                                },
-                                audio: false,
-                                preferCurrentTab: false,
-                                selfBrowserSurface: 'exclude',
-                                systemAudio: 'exclude'
-                            });
-                            const newTrack = newStream.getVideoTracks()[0];
-                            const videoSender = session.peerConnection.getSenders()
-                                .find(s => s.track?.kind === 'video' || s.track === null);
-                            if (videoSender) {
-                                await videoSender.replaceTrack(newTrack);
-                                console.log(`Screen sharing auto-restarted via replaceTrack (attempt ${attempt + 1})`);
-                            } else {
-                                session.peerConnection.addTrack(newTrack, newStream);
-                                console.log(`Screen sharing restarted via addTrack (attempt ${attempt + 1})`);
-                            }
-                            newTrack.onended = restartHandler;
-                            session.localStream = newStream;
-                            session._sharingLost = false;
-                            session._restartingShare = false;
-                            return; // Success
-                        } catch (err) {
-                            console.warn(`Auto-restart attempt ${attempt + 1}/${delays.length} failed: ${err.name}: ${err.message}`);
-                        }
-                    }
-                    // All retries exhausted
-                    console.error('Screen sharing auto-restart failed after all retries');
+                // Handle track ending — mark as lost, no auto-retry (avoids picker popup)
+                // Restart happens on next user gesture (input lock click) via _restartSharingIfLost
+                const restartHandler = () => {
+                    if (session._sharingStoppedByUser) return;
+                    console.log('Screen sharing track ended unexpectedly — marked as lost');
                     session._sharingLost = true;
                     session._restartingShare = false;
                     if (session.dotNetRef) {
@@ -886,62 +817,11 @@ window.SteamViewerWebRTC = {
     stopScreenCapture(sessionId) {
         const session = this._getSession(sessionId);
         session._sharingStoppedByUser = true;
+        session._sharingLost = false;
         if (session.localStream) {
             session.localStream.getTracks().forEach(track => track.stop());
             session.localStream = null;
             console.log(`[${sessionId}] Screen capture stopped`);
-        }
-    },
-
-    // Attempt to restart screen sharing after it was lost (used by visibilitychange and gesture fallback)
-    async _tryRestartSharing(sessionId) {
-        const session = this._getSession(sessionId);
-        if (!session._sharingLost || session._sharingStoppedByUser || session._restartingShare) return false;
-        const pcState = session.peerConnection?.connectionState;
-        if (pcState === 'closed' || pcState === 'failed') return false;
-
-        session._restartingShare = true;
-        try {
-            const newStream = await navigator.mediaDevices.getDisplayMedia({
-                video: {
-                    cursor: 'motion',
-                    width: { ideal: 1920, max: 3840 },
-                    height: { ideal: 1080, max: 2160 },
-                    frameRate: { ideal: 30, max: 60 },
-                    ...(session._autoFullScreen ? { displaySurface: 'monitor' } : {})
-                },
-                audio: false,
-                preferCurrentTab: false,
-                selfBrowserSurface: 'exclude',
-                systemAudio: 'exclude'
-            });
-            const newTrack = newStream.getVideoTracks()[0];
-            const videoSender = session.peerConnection.getSenders()
-                .find(s => s.track?.kind === 'video' || s.track === null);
-            if (videoSender) {
-                await videoSender.replaceTrack(newTrack);
-                console.log('Screen sharing restarted via _tryRestartSharing (replaceTrack)');
-            } else {
-                session.peerConnection.addTrack(newTrack, newStream);
-                console.log('Screen sharing restarted via _tryRestartSharing (addTrack)');
-            }
-            // Re-attach auto-restart handler on new track
-            newTrack.onended = async () => {
-                if (session._sharingStoppedByUser) return;
-                session._sharingLost = true;
-                console.log('Restarted track ended again — marked as lost for next gesture/visibility');
-                if (session.dotNetRef) {
-                    try { session.dotNetRef.invokeMethodAsync('OnScreenShareLostCallback'); } catch (e) { }
-                }
-            };
-            session.localStream = newStream;
-            session._sharingLost = false;
-            session._restartingShare = false;
-            return true;
-        } catch (err) {
-            console.warn('_tryRestartSharing failed:', err.name, err.message);
-            session._restartingShare = false;
-            return false;
         }
     },
 
@@ -1880,8 +1760,13 @@ window.SteamViewerInput = {
         if (!window.SteamViewerWebRTC) return;
         for (const [sessionId, session] of window.SteamViewerWebRTC.sessions) {
             if (session._sharingLost && !session._sharingStoppedByUser && !session._restartingShare) {
-                console.log(`[${sessionId}] Sharing was lost — restarting with user gesture`);
-                window.SteamViewerWebRTC._tryRestartSharing(sessionId);
+                console.log(`[${sessionId}] Sharing lost — restarting with user gesture (fullscreen)`);
+                session._sharingLost = false;
+                session._restartingShare = true;
+                window.SteamViewerWebRTC.startScreenCapture(sessionId).then(ok => {
+                    session._restartingShare = false;
+                    if (!ok) session._sharingLost = true;
+                }).catch(() => { session._restartingShare = false; session._sharingLost = true; });
                 break; // One at a time
             }
         }
