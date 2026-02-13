@@ -45,6 +45,7 @@ public sealed class HostSession : IAsyncDisposable
     private WebRTCManager? _webrtc;
     private bool _webrtcInitialized;
     private bool _disposed;
+    private bool _elevationDetached;
 
     // Pending SDP/ICE (buffered if received before WebRTC init)
     private string? _pendingSdpOffer;
@@ -126,6 +127,24 @@ public sealed class HostSession : IAsyncDisposable
             _elevationService.OnSecureDesktopStateChanged += HandleSecureDesktopStateChanged;
             _elevationService.OnSystemStateChanged += HandleSystemStateChanged;
         }
+    }
+
+    /// <summary>
+    /// Detach the elevation service so it survives this session's disposal.
+    /// Unsubscribes event handlers but does NOT dispose the service.
+    /// Returns the elevation service reference for reuse in a new session.
+    /// </summary>
+    public IElevationService? DetachElevationService()
+    {
+        if (_elevationService == null || _elevationDetached) return null;
+
+        _elevationDetached = true;
+
+        _elevationService.OnSecureDesktopFrame -= HandleSecureDesktopFrame;
+        _elevationService.OnSecureDesktopStateChanged -= HandleSecureDesktopStateChanged;
+        _elevationService.OnSystemStateChanged -= HandleSystemStateChanged;
+
+        return _elevationService;
     }
 
     /// <summary>
@@ -1129,7 +1148,7 @@ public sealed class HostSession : IAsyncDisposable
         if (_disposed) return;
         _disposed = true;
 
-        if (_elevationService != null)
+        if (_elevationService != null && !_elevationDetached)
         {
             _elevationService.OnSecureDesktopFrame -= HandleSecureDesktopFrame;
             _elevationService.OnSecureDesktopStateChanged -= HandleSecureDesktopStateChanged;

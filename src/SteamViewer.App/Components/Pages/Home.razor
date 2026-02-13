@@ -185,6 +185,7 @@
     private string incomingPeerId = "";
     private string connectedPeerId = "";
     private bool _isReconnect;
+    private IElevationService? _preservedElevationService;
     private ReconnectCredentials.ReconnectResult? _pendingReconnect;
 
     // Join mode state
@@ -587,6 +588,11 @@
                 await _hostSession.DisposeAsync();
                 _hostSession = null;
             }
+            if (_preservedElevationService != null)
+            {
+                await _preservedElevationService.DisposeAsync();
+                _preservedElevationService = null;
+            }
         }
         catch (Exception ex)
         {
@@ -642,8 +648,19 @@
             connectedPeerId = incomingPeerId;
             connectionState = ConnectionState.Connected;
 
-            // Create elevation service (Transient — fresh instance per connection)
-            var elevationService = ServiceProvider.GetService<IElevationService>();
+            // Reuse preserved elevation service on reconnect (helpers stay alive),
+            // otherwise create fresh instance from DI
+            var elevationService = _preservedElevationService;
+            if (elevationService != null)
+            {
+                Logger.LogInformation("Reusing preserved elevation service (admin={Admin}, system={System})",
+                    elevationService.IsAdminConnected, elevationService.IsSystemConnected);
+                _preservedElevationService = null;
+            }
+            else
+            {
+                elevationService = ServiceProvider.GetService<IElevationService>();
+            }
 
             // Create and initialize host session
             _hostSession = new HostSession(
@@ -670,9 +687,14 @@
             {
                 Logger.LogWarning("Host session disconnected: {Reason}. Resetting to accept reconnections.", reason);
 
-                // Clean up old session
+                // Detach elevation service before disposing — keeps helper processes alive
                 if (_hostSession != null)
                 {
+                    _preservedElevationService = _hostSession.DetachElevationService();
+                    if (_preservedElevationService != null)
+                        Logger.LogInformation("Elevation service preserved for reconnect (admin={Admin}, system={System})",
+                            _preservedElevationService.IsAdminConnected, _preservedElevationService.IsSystemConnected);
+
                     await _hostSession.DisposeAsync();
                     _hostSession = null;
                 }
@@ -818,6 +840,13 @@
             _hostSession = null;
         }
 
+        // User-initiated disconnect — fully dispose any preserved elevation
+        if (_preservedElevationService != null)
+        {
+            await _preservedElevationService.DisposeAsync();
+            _preservedElevationService = null;
+        }
+
         connectedPeerId = "";
         _canvasInitialized = false;
 
@@ -888,11 +917,13 @@
                     if (disconnected.PeerId != connectedPeerId) break;
                     if (_hostSession != null)
                     {
+                        _preservedElevationService = _hostSession.DetachElevationService();
                         await _hostSession.DisposeAsync();
                         _hostSession = null;
                     }
                     connectedPeerId = "";
                     _canvasInitialized = false;
+                    _isReconnect = true;
                     connectionState = ConnectionState.Registered;
                     break;
 
@@ -934,6 +965,12 @@
         {
             await _hostSession.DisposeAsync();
             _hostSession = null;
+        }
+
+        if (_preservedElevationService != null)
+        {
+            await _preservedElevationService.DisposeAsync();
+            _preservedElevationService = null;
         }
 
         if (_canvasInitialized)
