@@ -278,6 +278,19 @@ public sealed class SystemHelperClient : IAsyncDisposable
     }
 
     /// <summary>
+    /// Wake the Secure Desktop capture thread for immediate polling.
+    /// Called after LockWorkStation() to reduce SD detection delay.
+    /// </summary>
+    public async Task WakeCaptureAsync()
+    {
+        try
+        {
+            await SendCommandAsync(new { command = "wakeCapture" });
+        }
+        catch { /* best-effort — detection still works via normal polling */ }
+    }
+
+    /// <summary>
     /// Send an input event to the SYSTEM helper for injection (fire-and-forget).
     /// </summary>
     public async Task SendInputEventAsync(string inputJson, int screenWidth, int screenHeight)

@@ -607,9 +607,16 @@ public static class SystemHelperServer
             "sendSAS" => HandleSendSAS(),
             "runAsSystem" => HandleRunAsSystem(doc.RootElement),
             "injectInput" => HandleInjectInput(json, doc.RootElement),
+            "wakeCapture" => HandleWakeCapture(),
             "exit" => HandleExit(),
             _ => JsonSerializer.Serialize(new HelperResponse(false, $"Unknown command: {command}"))
         };
+    }
+
+    private static string HandleWakeCapture()
+    {
+        _capture?.WakePolling();
+        return JsonSerializer.Serialize(new HelperResponse(true, null));
     }
 
     private static string HandleSendSAS()

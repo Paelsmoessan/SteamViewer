@@ -187,22 +187,27 @@ public sealed class WindowsElevationService : IElevationService
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool LockWorkStation();
 
-    public Task<bool> LockWorkStationAsync()
+    public async Task<bool> LockWorkStationAsync()
     {
         try
         {
             if (LockWorkStation())
             {
                 _logger.LogInformation("LockWorkStation() succeeded");
-                return Task.FromResult(true);
+                // Wake the SYSTEM helper's capture thread for immediate Winlogon detection
+                if (_systemHelper?.IsConnected == true)
+                {
+                    _ = _systemHelper.WakeCaptureAsync(); // fire-and-forget
+                }
+                return true;
             }
             _logger.LogWarning("LockWorkStation() failed (error {Error})", Marshal.GetLastWin32Error());
-            return Task.FromResult(false);
+            return false;
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "LockWorkStation() exception");
-            return Task.FromResult(false);
+            return false;
         }
     }
 

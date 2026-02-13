@@ -20,6 +20,7 @@ public sealed class SecureDesktopCapture : IDisposable
     private int _desktopWidth;
     private int _desktopHeight;
     private int _frameCount;
+    private readonly ManualResetEventSlim _wakeSignal = new(false);
 
     // The Winlogon desktop handle held by the capture thread (valid while active)
     private IntPtr _winlogonDesktop;
@@ -90,6 +91,16 @@ public sealed class SecureDesktopCapture : IDisposable
         _captureThread?.Join(5000);
         _captureThread = null;
         DebugLog("Capture thread stopped");
+    }
+
+    /// <summary>
+    /// Wake the polling thread immediately instead of waiting for the 150ms cycle.
+    /// Called when a lock command is sent to reduce detection delay.
+    /// </summary>
+    public void WakePolling()
+    {
+        DebugLog("WakePolling signaled — immediate desktop check");
+        _wakeSignal.Set();
     }
 
     /// <summary>
@@ -225,7 +236,8 @@ public sealed class SecureDesktopCapture : IDisposable
                     if (hDesk == IntPtr.Zero)
                     {
                         // Can't open desktop — might be transitioning, wait and retry
-                        Thread.Sleep(150);
+                        _wakeSignal.Wait(150);
+                        _wakeSignal.Reset();
                         continue;
                     }
 
@@ -248,7 +260,8 @@ public sealed class SecureDesktopCapture : IDisposable
                         {
                             DebugLog($"SetThreadDesktop(winlogon) failed: {Marshal.GetLastWin32Error()}");
                             CloseDesktop(hDesk);
-                            Thread.Sleep(150);
+                            _wakeSignal.Wait(150);
+                            _wakeSignal.Reset();
                             continue;
                         }
 
@@ -354,8 +367,9 @@ public sealed class SecureDesktopCapture : IDisposable
                         CloseDesktop(hDesk);
                     }
 
-                    // 150ms poll when not actively capturing
-                    Thread.Sleep(150);
+                    // 150ms poll when not actively capturing (wake signal can shorten this)
+                    _wakeSignal.Wait(150);
+                    _wakeSignal.Reset();
                 }
                 catch (Exception ex)
                 {
@@ -459,6 +473,7 @@ public sealed class SecureDesktopCapture : IDisposable
     public void Dispose()
     {
         Stop();
+        _wakeSignal.Dispose();
     }
 
     #region Win32 P/Invoke — Desktop API
