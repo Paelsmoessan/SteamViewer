@@ -148,8 +148,7 @@ window.SteamViewerWebRTC = {
             _statsRelay: false,
             // Screen sharing recovery
             _sharingStoppedByUser: false,
-            _autoFullScreen: false,
-            _sharingLost: false,           // true when track ended unexpectedly and auto-restart failed
+            _sharingLost: false,           // true when track ended unexpectedly (restart on next user gesture)
             _restartingShare: false,       // true while restart attempt is in progress (prevents concurrent restarts)
             // Dynamic bitrate adaptation
             _bitrateAdaptEnabled: true,
