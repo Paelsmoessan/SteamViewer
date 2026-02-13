@@ -146,6 +146,9 @@ window.SteamViewerWebRTC = {
             _inputThrottledCount: 0,
             _qualityMode: 'HQ',
             _statsRelay: false,
+            // Screen sharing recovery
+            _sharingStoppedByUser: false,
+            _autoFullScreen: false,
             // Dynamic bitrate adaptation
             _bitrateAdaptEnabled: true,
             _targetBitrate: 3_000_000,
@@ -696,6 +699,8 @@ window.SteamViewerWebRTC = {
     // autoFullScreen: when true, prefer full monitor capture (used for post-reboot reconnect)
     async startScreenCapture(sessionId, autoFullScreen = false) {
         const session = this._getSession(sessionId);
+        session._autoFullScreen = autoFullScreen;
+        session._sharingStoppedByUser = false;
         console.log(`=== Starting screen capture [${sessionId}] autoFullScreen=${autoFullScreen} ===`);
         console.log('navigator.mediaDevices:', !!navigator.mediaDevices);
         console.log('getDisplayMedia:', !!navigator.mediaDevices?.getDisplayMedia);
@@ -774,9 +779,45 @@ window.SteamViewerWebRTC = {
                 params.encodings[0].degradationPreference = 'maintain-framerate';
                 sender.setParameters(params).catch(e => console.warn('Could not set encoding params:', e));
 
-                // Handle track ending (user stops sharing)
-                track.onended = () => {
-                    console.log('Screen sharing stopped by user');
+                // Handle track ending — auto-restart if unexpected (e.g. lock screen)
+                track.onended = async () => {
+                    if (session._sharingStoppedByUser) {
+                        console.log('Screen sharing stopped by user');
+                        return;
+                    }
+                    console.log('Screen sharing track ended unexpectedly — attempting auto-restart');
+                    await new Promise(r => setTimeout(r, 1500));
+                    try {
+                        const newStream = await navigator.mediaDevices.getDisplayMedia({
+                            video: {
+                                cursor: 'motion',
+                                width: { ideal: 1920, max: 3840 },
+                                height: { ideal: 1080, max: 2160 },
+                                frameRate: { ideal: 30, max: 60 },
+                                ...(session._autoFullScreen ? { displaySurface: 'monitor' } : {})
+                            },
+                            audio: false,
+                            preferCurrentTab: false,
+                            selfBrowserSurface: 'exclude',
+                            systemAudio: 'exclude'
+                        });
+                        const newTrack = newStream.getVideoTracks()[0];
+                        const videoSender = session.peerConnection.getSenders()
+                            .find(s => s.track?.kind === 'video' || s.track === null);
+                        if (videoSender) {
+                            await videoSender.replaceTrack(newTrack);
+                            newTrack.onended = track.onended;
+                            session.localStream = newStream;
+                            console.log('Screen sharing auto-restarted via replaceTrack');
+                        } else {
+                            session.peerConnection.addTrack(newTrack, newStream);
+                            newTrack.onended = track.onended;
+                            session.localStream = newStream;
+                            console.log('Screen sharing restarted via addTrack (renegotiation will follow)');
+                        }
+                    } catch (err) {
+                        console.error('Auto-restart screen sharing failed:', err);
+                    }
                 };
             });
 
@@ -798,6 +839,7 @@ window.SteamViewerWebRTC = {
     // Stop screen capture
     stopScreenCapture(sessionId) {
         const session = this._getSession(sessionId);
+        session._sharingStoppedByUser = true;
         if (session.localStream) {
             session.localStream.getTracks().forEach(track => track.stop());
             session.localStream = null;
