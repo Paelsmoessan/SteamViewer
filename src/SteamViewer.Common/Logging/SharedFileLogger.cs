@@ -16,6 +16,9 @@ public class SharedFileLogger : IDisposable
     private readonly Task _writeTask;
     private bool _disposed;
 
+    private const long MaxLogSizeBytes = 1 * 1024 * 1024; // 1 MB
+    private const long KeepTailBytes = 512 * 1024;        // Keep last 512 KB after rotation
+
     public string LogFilePath => _logFilePath;
 
     /// <summary>
@@ -31,6 +34,8 @@ public class SharedFileLogger : IDisposable
         var machineName = Environment.MachineName;
         _logFilePath = Path.Combine(logDir, $"{prefix}-{machineName}.log");
 
+        RotateIfNeeded();
+
         // Write session header
         var header = $"\n=== SteamViewer {prefix} Log - {DateTime.Now:yyyy-MM-dd HH:mm:ss} - {machineName} ===\n";
         File.AppendAllText(_logFilePath, header);
@@ -39,6 +44,42 @@ public class SharedFileLogger : IDisposable
         _writeTask = Task.Run(WriteLoop);
 
         Log("INFO", "SharedFileLogger", $"Logging to: {_logFilePath}");
+    }
+
+    private void RotateIfNeeded()
+    {
+        try
+        {
+            if (!File.Exists(_logFilePath)) return;
+
+            var fileInfo = new FileInfo(_logFilePath);
+            if (fileInfo.Length <= MaxLogSizeBytes) return;
+
+            // Read the last KeepTailBytes and find the first complete line
+            byte[] tail;
+            using (var fs = new FileStream(_logFilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            {
+                var skipBytes = fs.Length - KeepTailBytes;
+                fs.Seek(skipBytes, SeekOrigin.Begin);
+                tail = new byte[fs.Length - skipBytes];
+                fs.ReadExactly(tail);
+            }
+
+            // Find first newline to start on a complete line
+            var text = System.Text.Encoding.UTF8.GetString(tail);
+            var firstNewline = text.IndexOf('\n');
+            if (firstNewline >= 0 && firstNewline < text.Length - 1)
+                text = text[(firstNewline + 1)..];
+
+            var oldPath = _logFilePath + ".old";
+            if (File.Exists(oldPath)) File.Delete(oldPath);
+            File.Move(_logFilePath, oldPath);
+            File.WriteAllText(_logFilePath, $"[Log rotated at {DateTime.Now:yyyy-MM-dd HH:mm:ss} — previous content in .old file]\n{text}");
+        }
+        catch
+        {
+            // Don't let rotation failure prevent logging
+        }
     }
 
     /// <summary>
