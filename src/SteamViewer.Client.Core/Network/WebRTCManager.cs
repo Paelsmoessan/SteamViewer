@@ -61,6 +61,11 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
     /// </summary>
     public event Action<string>? OnStatsUpdated;
 
+    /// <summary>
+    /// Raised when screen sharing was lost and all JS auto-restart attempts failed.
+    /// </summary>
+    public event Action? OnScreenShareLost;
+
     // IWebRTCManager events
     event EventHandler<string>? IWebRTCManager.ConnectionStateChanged
     {
@@ -495,6 +500,13 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
     public void OnStatsUpdate(string json)
     {
         OnStatsUpdated?.Invoke(json);
+    }
+
+    [JSInvokable]
+    public void OnScreenShareLostCallback()
+    {
+        _logger.LogWarning("Screen sharing lost — all JS auto-restart attempts failed");
+        OnScreenShareLost?.Invoke();
     }
 
     #endregion

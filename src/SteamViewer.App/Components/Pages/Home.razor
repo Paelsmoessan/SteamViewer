@@ -706,6 +706,11 @@
                 connectionState = ConnectionState.Registered;
                 StateHasChanged();
             });
+            _hostSession.OnScreenShareLost += () => InvokeAsync(() =>
+            {
+                Logger.LogWarning("Screen sharing lost — user needs to reshare or click canvas to trigger gesture-backed restart");
+                StateHasChanged();
+            });
             _hostSession.OnPeerSharingChanged += sharing => InvokeAsync(() =>
             {
                 _canvasInitialized = false; // Reset canvas when peer sharing changes
@@ -973,17 +978,23 @@
             _preservedElevationService = null;
         }
 
-        if (_canvasInitialized)
+        // JS interop calls can throw if WebView is already torn down during app exit
+        try
         {
-            await CanvasRenderer.DisposeAsync();
-            _canvasInitialized = false;
-        }
+            if (_canvasInitialized)
+            {
+                await CanvasRenderer.DisposeAsync();
+                _canvasInitialized = false;
+            }
 
-        if (_inputCaptureInitialized)
-        {
-            await JSRuntime.InvokeVoidAsync("SteamViewerInput.stop");
-            _inputCaptureInitialized = false;
+            if (_inputCaptureInitialized)
+            {
+                await JSRuntime.InvokeVoidAsync("SteamViewerInput.stop");
+                _inputCaptureInitialized = false;
+            }
         }
+        catch (JSDisconnectedException) { }
+        catch (TaskCanceledException) { }
 
         _inputDotNetRef?.Dispose();
         _loggerDotNetRef?.Dispose();
