@@ -70,6 +70,10 @@ public static class Program
             }
             catch { /* best-effort debug log */ }
 
+            // Winlogon login screen renders at 96 DPI (physical) with no DPI virtualization.
+            // Without this, GetSystemMetrics returns logical dims and BitBlt crops the screen.
+            SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
             try
             {
                 SteamViewer.Platform.Windows.Elevation.SystemHelperServer.Run(sysPipeName, nonce);
@@ -120,4 +124,9 @@ public static class Program
             new App();
         });
     }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool SetProcessDpiAwarenessContext(IntPtr dpiContext);
+
+    private static readonly IntPtr DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = (IntPtr)(-4);
 }
