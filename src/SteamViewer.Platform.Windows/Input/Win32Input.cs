@@ -78,8 +78,8 @@ internal static class Win32Input
         var localX = x * _vsWidth / screenWidth + _vsLeft;
         var localY = y * _vsHeight / screenHeight + _vsTop;
 
-        var absX = (int)((localX - _vsLeft) * 65535 / _vsWidth);
-        var absY = (int)((localY - _vsTop) * 65535 / _vsHeight);
+        var absX = (int)Math.Round((localX - _vsLeft) * 65535.0 / _vsWidth);
+        var absY = (int)Math.Round((localY - _vsTop) * 65535.0 / _vsHeight);
 
         return (Math.Clamp(absX, 0, 65535), Math.Clamp(absY, 0, 65535));
     }
@@ -112,7 +112,7 @@ internal static class Win32Input
     {
         var (absX, absY) = ConvertToAbsoluteCoordinates(x, y, screenWidth, screenHeight);
 
-        uint flags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+        uint flags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
 
         switch (button)
         {

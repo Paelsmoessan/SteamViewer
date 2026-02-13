@@ -85,11 +85,13 @@ public static class MauiProgram
         builder.Services.AddSingleton<IScreenCapture, SteamViewer.Platform.Windows.ScreenCapture.DxgiScreenCapture>();
         builder.Services.AddSingleton<IInputInjector, SteamViewer.Platform.Windows.Input.WindowsInputInjector>();
         builder.Services.AddTransient<IElevationService, SteamViewer.Platform.Windows.Elevation.WindowsElevationService>();
+        builder.Services.AddSingleton<ISystemKeyInterceptor, SteamViewer.Platform.Windows.Input.WindowsSystemKeyInterceptor>();
 #elif MACCATALYST
         builder.Services.AddSingleton<IMonitorEnumerator, SteamViewer.Platform.macOS.MacMonitorEnumerator>();
         builder.Services.AddSingleton<IScreenCapture, SteamViewer.Platform.macOS.ScreenCapture.MacScreenCapture>();
         builder.Services.AddSingleton<IInputInjector, SteamViewer.Platform.macOS.Input.MacInputInjector>();
         builder.Services.AddTransient<IElevationService, SteamViewer.Platform.macOS.Elevation.MacElevationService>();
+        builder.Services.AddSingleton<ISystemKeyInterceptor, SteamViewer.Platform.macOS.Input.MacSystemKeyInterceptor>();
 #endif
 
         var app = builder.Build();

@@ -9,6 +9,7 @@
 @inject CanvasRenderingService CanvasRenderer
 @inject IJSRuntime JSRuntime
 @inject FileLoggerService FileLogger
+@inject SteamViewer.Client.Core.Capture.ISystemKeyInterceptor SystemKeyInterceptor
 @implements IDisposable
 
 <div class="viewer-container" @onclick="CloseMenus" @onclick:stopPropagation="false">
@@ -305,6 +306,9 @@
                 // Initialize JS logger bridge so console output reaches the log file
                 _loggerDotNetRef = DotNetObjectReference.Create(this);
                 await JSRuntime.InvokeVoidAsync("SteamViewerLogger.initialize", _loggerDotNetRef);
+
+                // Subscribe to system key interception (Win, Alt+Tab)
+                SystemKeyInterceptor.SystemKeyIntercepted += OnSystemKeyIntercepted;
             }
             catch (Exception ex)
             {
@@ -649,10 +653,12 @@
         if (_inputLocked)
         {
             await JSRuntime.InvokeVoidAsync("SteamViewerInput.lock");
+            SystemKeyInterceptor.Install();
         }
         else
         {
             await JSRuntime.InvokeVoidAsync("SteamViewerInput.unlock");
+            SystemKeyInterceptor.Uninstall();
         }
         if (ActiveTab != null) ActiveTab.InputLocked = _inputLocked;
         StateHasChanged();
@@ -662,6 +668,10 @@
     public void OnInputLockChanged(bool locked)
     {
         _inputLocked = locked;
+        if (locked)
+            SystemKeyInterceptor.Install();
+        else
+            SystemKeyInterceptor.Uninstall();
         InvokeAsync(StateHasChanged);
     }
 
@@ -1057,6 +1067,20 @@
         return (ctrl, shift, alt);
     }
 
+    /// <summary>
+    /// Called by WH_KEYBOARD_LL hook when a system key (Win, Alt+Tab, Ctrl+Esc) is intercepted.
+    /// Fires on the hook thread — SendInputToActiveSession is fire-and-forget safe.
+    /// </summary>
+    private void OnSystemKeyIntercepted(string key, bool isDown, bool isAltHeld)
+    {
+        var modifiers = new KeyModifiers(Ctrl: false, Shift: false, Alt: isAltHeld, Meta: key == "Meta");
+
+        if (isDown)
+            SendInputToActiveSession(new InputEvent.KeyDown(key, modifiers));
+        else
+            SendInputToActiveSession(new InputEvent.KeyUp(key, modifiers));
+    }
+
     #endregion
 
     #region Reconnect Logic
@@ -1185,6 +1209,10 @@
 
     public void Dispose()
     {
+        // Clean up system key hook
+        SystemKeyInterceptor.SystemKeyIntercepted -= OnSystemKeyIntercepted;
+        SystemKeyInterceptor.Uninstall();
+
         // Clean up reconnect timer
         _reconnectTimer?.Dispose();
         _reconnectTimer = null;

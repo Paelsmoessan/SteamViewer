@@ -1655,6 +1655,7 @@ window.SteamViewerInput = {
     // Track which session the input is associated with (for stats counting)
     _activeSessionId: null,
     _inputEventCount: 0,
+    _lastMouseDownCoords: null,  // Cache coords from mouse_down for identical mouse_up (prevents micro-drag)
     _focusWatchdogId: null,
 
     initialize(canvasId, dotNetReference, options = {}) {
@@ -1899,6 +1900,37 @@ window.SteamViewerInput = {
         };
     },
 
+    // Like getScaledCoords but for any canvas element (used for SD overlay)
+    getScaledCoordsForCanvas(e, canvas) {
+        const rect = canvas.getBoundingClientRect();
+        const canvasAspect = canvas.width / canvas.height;
+        const rectAspect = rect.width / rect.height;
+
+        let renderWidth, renderHeight, offsetX, offsetY;
+
+        if (rectAspect > canvasAspect) {
+            renderHeight = rect.height;
+            renderWidth = rect.height * canvasAspect;
+            offsetX = (rect.width - renderWidth) / 2;
+            offsetY = 0;
+        } else {
+            renderWidth = rect.width;
+            renderHeight = rect.width / canvasAspect;
+            offsetX = 0;
+            offsetY = (rect.height - renderHeight) / 2;
+        }
+
+        const relX = e.clientX - rect.left - offsetX;
+        const relY = e.clientY - rect.top - offsetY;
+        const scaleX = canvas.width / renderWidth;
+        const scaleY = canvas.height / renderHeight;
+
+        return {
+            x: Math.max(0, Math.min(canvas.width, relX * scaleX)),
+            y: Math.max(0, Math.min(canvas.height, relY * scaleY))
+        };
+    },
+
     getModifiers(e) {
         return {
             ctrl: e.ctrlKey,
@@ -1923,20 +1955,44 @@ window.SteamViewerInput = {
             window.SteamViewerWebRTC._incrementInputCount(this._activeSessionId);
         }
         this.ensureCanvas();
-        const coords = this.getScaledCoords(e);
+        // Clear mouse-down cache — mouse moved, so this is a drag, not a click
+        this._lastMouseDownCoords = null;
+
         const sd = window.SteamViewerSecureDesktop;
-        const captureW = (sd?.isActive && sd._width) ? sd._width : this.canvas.width;
-        const captureH = (sd?.isActive && sd._height) ? sd._height : this.canvas.height;
-        // Update SD cursor position for overlay rendering
-        if (sd?.isActive && sd._width && sd._height) {
-            sd._cursorX = (coords.x / this.canvas.width) * sd._width;
-            sd._cursorY = (coords.y / this.canvas.height) * sd._height;
+        const sdActive = sd?.isActive && sd._width && sd._height && sd.canvas;
+        let x, y, captureW, captureH;
+
+        if (sdActive) {
+            const sdCoords = this.getScaledCoordsForCanvas(e, sd.canvas);
+            x = sdCoords.x;
+            y = sdCoords.y;
+            captureW = sd._width;
+            captureH = sd._height;
+            sd._cursorX = sdCoords.x;
+            sd._cursorY = sdCoords.y;
             sd._drawCursor();
+        } else {
+            const coords = this.getScaledCoords(e);
+            x = coords.x;
+            y = coords.y;
+            captureW = this.canvas.width;
+            captureH = this.canvas.height;
         }
+
         try {
-            await this.dotNetRef.invokeMethodAsync('OnMouseMove', coords.x, coords.y,
-                captureW, captureH);
+            await this.dotNetRef.invokeMethodAsync('OnMouseMove', x, y, captureW, captureH);
         } catch (err) { console.error('[Input] OnMouseMove failed:', err); }
+    },
+
+    _getMouseCoords(e) {
+        const sd = window.SteamViewerSecureDesktop;
+        const sdActive = sd?.isActive && sd._width && sd._height && sd.canvas;
+        if (sdActive) {
+            const sdCoords = this.getScaledCoordsForCanvas(e, sd.canvas);
+            return { x: sdCoords.x, y: sdCoords.y, captureW: sd._width, captureH: sd._height };
+        }
+        const coords = this.getScaledCoords(e);
+        return { x: coords.x, y: coords.y, captureW: this.canvas.width, captureH: this.canvas.height };
     },
 
     async handleMouseDown(e) {
@@ -1945,14 +2001,11 @@ window.SteamViewerInput = {
             window.SteamViewerWebRTC._incrementInputCount(this._activeSessionId);
         }
         e.preventDefault();
-        const coords = this.getScaledCoords(e);
+        const { x, y, captureW, captureH } = this._getMouseCoords(e);
         const button = ['left', 'middle', 'right'][e.button] || 'left';
-        const sd = window.SteamViewerSecureDesktop;
-        const captureW = (sd?.isActive && sd._width) ? sd._width : this.canvas.width;
-        const captureH = (sd?.isActive && sd._height) ? sd._height : this.canvas.height;
+        this._lastMouseDownCoords = { x, y, captureW, captureH, button };
         try {
-            await this.dotNetRef.invokeMethodAsync('OnMouseDown', button, coords.x, coords.y,
-                captureW, captureH);
+            await this.dotNetRef.invokeMethodAsync('OnMouseDown', button, x, y, captureW, captureH);
         } catch (err) { console.error('[Input] OnMouseDown failed:', err); }
     },
 
@@ -1962,14 +2015,19 @@ window.SteamViewerInput = {
             window.SteamViewerWebRTC._incrementInputCount(this._activeSessionId);
         }
         e.preventDefault();
-        const coords = this.getScaledCoords(e);
         const button = ['left', 'middle', 'right'][e.button] || 'left';
-        const sd = window.SteamViewerSecureDesktop;
-        const captureW = (sd?.isActive && sd._width) ? sd._width : this.canvas.width;
-        const captureH = (sd?.isActive && sd._height) ? sd._height : this.canvas.height;
+        let x, y, captureW, captureH;
+        const cached = this._lastMouseDownCoords;
+        if (cached && cached.button === button) {
+            // Reuse mouse_down coords for identical click (prevents micro-drag)
+            x = cached.x; y = cached.y;
+            captureW = cached.captureW; captureH = cached.captureH;
+        } else {
+            ({ x, y, captureW, captureH } = this._getMouseCoords(e));
+        }
+        this._lastMouseDownCoords = null;
         try {
-            await this.dotNetRef.invokeMethodAsync('OnMouseUp', button, coords.x, coords.y,
-                captureW, captureH);
+            await this.dotNetRef.invokeMethodAsync('OnMouseUp', button, x, y, captureW, captureH);
         } catch (err) { console.error('[Input] OnMouseUp failed:', err); }
     },
 
