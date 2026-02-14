@@ -2015,7 +2015,14 @@ window.SteamViewerInput = {
         const session = window.SteamViewerWebRTC.sessions.get(this._activeSessionId);
         const lb = session?._letterbox;
         if (!lb || !lb.dw || !lb.videoW) {
-            return { x: 0, y: 0 };
+            // Letterbox not yet computed (video dimensions unknown) — fall back to
+            // getBoundingClientRect computation (same approach as getScaledCoordsForCanvas).
+            // This handles the startup race where mouse events arrive before the first video frame.
+            const video = session?.remoteVideo;
+            const vw = video?.videoWidth || this.canvas.width;
+            const vh = video?.videoHeight || this.canvas.height;
+            if (!vw || !vh) return { x: 0, y: 0 };
+            return this.getScaledCoordsForCanvas(e, this.canvas);
         }
         const rect = this.canvas.getBoundingClientRect();
         const dpr = window.devicePixelRatio || 1;
