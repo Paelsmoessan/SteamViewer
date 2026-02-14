@@ -828,6 +828,15 @@ window.SteamViewerWebRTC = {
                 params.encodings[0].degradationPreference = 'maintain-framerate';
                 sender.setParameters(params).catch(e => console.warn('Could not set encoding params:', e));
 
+                // Report actual capture dimensions to host C# (source of truth for coordinate mapping)
+                if (settings.width && settings.height && session.dotNetRef) {
+                    try {
+                        session.dotNetRef.invokeMethodAsync('OnCaptureStartedCallback', settings.width, settings.height);
+                    } catch (e) {
+                        console.warn('Could not report capture dims:', e);
+                    }
+                }
+
                 // Handle track ending — retry with fullscreen constraints (keeps connection alive during lock screen)
                 const restartHandler = async () => {
                     if (session._sharingStoppedByUser) {
@@ -886,6 +895,15 @@ window.SteamViewerWebRTC = {
                             session.localStream = newStream;
                             session._sharingLost = false;
                             session._restartingShare = false;
+
+                            // Report updated capture dimensions after restart
+                            const restartSettings = newTrack.getSettings();
+                            if (restartSettings.width && restartSettings.height && session.dotNetRef) {
+                                try {
+                                    session.dotNetRef.invokeMethodAsync('OnCaptureStartedCallback',
+                                        restartSettings.width, restartSettings.height);
+                                } catch (e) { }
+                            }
                             return; // Success
                         } catch (err) {
                             console.warn(`Auto-restart attempt ${attempt + 1}/${delays.length} failed: ${err.name}: ${err.message}`);

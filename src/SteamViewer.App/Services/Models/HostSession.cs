@@ -179,6 +179,7 @@ public sealed class HostSession : IAsyncDisposable
         _webrtc.OnDataChannelClose += HandleDataChannelClose;
         _webrtc.OnConnectionStateChange += HandleConnectionStateChange;
         _webrtc.OnScreenShareLost += HandleScreenShareLost;
+        _webrtc.OnCaptureStarted += HandleCaptureStarted;
 
         await _webrtc.InitializeAsync();
         _webrtcInitialized = true;
@@ -1097,6 +1098,16 @@ public sealed class HostSession : IAsyncDisposable
         OnScreenShareLost?.Invoke();
     }
 
+    private void HandleCaptureStarted(int width, int height)
+    {
+        if (width > 0 && height > 0)
+        {
+            _lastCaptureWidth = width;
+            _lastCaptureHeight = height;
+            _logger.LogInformation("Host capture dimensions set: {W}x{H} (from getDisplayMedia)", width, height);
+        }
+    }
+
     #endregion
 
     #region TURN Configuration
@@ -1175,6 +1186,7 @@ public sealed class HostSession : IAsyncDisposable
             _webrtc.OnDataChannelClose -= HandleDataChannelClose;
             _webrtc.OnConnectionStateChange -= HandleConnectionStateChange;
             _webrtc.OnScreenShareLost -= HandleScreenShareLost;
+            _webrtc.OnCaptureStarted -= HandleCaptureStarted;
 
             await _webrtc.DisposeAsync();
             _webrtc = null;

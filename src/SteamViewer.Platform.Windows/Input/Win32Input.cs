@@ -13,26 +13,39 @@ internal static class Win32Input
     private static int _vsLeft, _vsTop, _vsWidth, _vsHeight;
 
     // Multi-monitor support: cached monitor rectangles, re-enumerated when virtual screen changes
-    private record struct MonitorRect(int X, int Y, int Width, int Height, bool IsPrimary);
+    private record struct MonitorRect(int X, int Y, int Width, int Height, bool IsPrimary, string DeviceName);
     private static MonitorRect[]? _monitors;
 
     private static void RefreshDisplayState()
     {
-        var left = GetSystemMetrics(SM_XVIRTUALSCREEN);
-        var top = GetSystemMetrics(SM_YVIRTUALSCREEN);
-        var width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-        var height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-
-        // Re-enumerate monitors only when virtual screen dimensions change (hot-plug, settings change)
-        if (width != _vsWidth || height != _vsHeight || left != _vsLeft || top != _vsTop || _monitors == null)
+        // Switch thread to Per-Monitor DPI Aware V2 so GetSystemMetrics/EnumDisplayMonitors
+        // return physical pixel dimensions. getDisplayMedia captures physical pixels, so monitor
+        // rects must match. Without this, at 125% DPI monitors report 1536x864 logical but
+        // capture is 1920x1080 physical — FindMonitorByResolution fails to match.
+        var prevContext = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        try
         {
-            EnumerateMonitors();
-        }
+            var left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            var top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            var width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+            var height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
 
-        _vsLeft = left;
-        _vsTop = top;
-        _vsWidth = width;
-        _vsHeight = height;
+            // Re-enumerate monitors only when virtual screen dimensions change (hot-plug, settings change)
+            if (width != _vsWidth || height != _vsHeight || left != _vsLeft || top != _vsTop || _monitors == null)
+            {
+                EnumerateMonitors();
+            }
+
+            _vsLeft = left;
+            _vsTop = top;
+            _vsWidth = width;
+            _vsHeight = height;
+        }
+        finally
+        {
+            if (prevContext != IntPtr.Zero)
+                SetThreadDpiAwarenessContext(prevContext);
+        }
     }
 
     private static List<MonitorRect>? _monitorCollector;
@@ -47,7 +60,7 @@ internal static class Win32Input
 
     private static bool MonitorEnumCallback(IntPtr hMonitor, IntPtr hdcMonitor, ref RECT lprcMonitor, IntPtr dwData)
     {
-        var mi = new MONITORINFO { cbSize = Marshal.SizeOf<MONITORINFO>() };
+        var mi = new MONITORINFOEXW { cbSize = Marshal.SizeOf<MONITORINFOEXW>() };
         if (GetMonitorInfoW(hMonitor, ref mi))
         {
             _monitorCollector?.Add(new MonitorRect(
@@ -55,7 +68,8 @@ internal static class Win32Input
                 mi.rcMonitor.top,
                 mi.rcMonitor.right - mi.rcMonitor.left,
                 mi.rcMonitor.bottom - mi.rcMonitor.top,
-                (mi.dwFlags & MONITORINFOF_PRIMARY) != 0));
+                (mi.dwFlags & MONITORINFOF_PRIMARY) != 0,
+                mi.szDevice ?? ""));
         }
         return true;
     }
@@ -67,6 +81,16 @@ internal static class Win32Input
     {
         RefreshDisplayState();
         return (_vsLeft, _vsTop, _vsWidth, _vsHeight);
+    }
+
+    /// <summary>
+    /// Get cached monitor list with physical pixel dimensions.
+    /// </summary>
+    public static IReadOnlyList<(int X, int Y, int Width, int Height, bool IsPrimary, string DeviceName)> GetMonitors()
+    {
+        RefreshDisplayState();
+        if (_monitors == null) return Array.Empty<(int, int, int, int, bool, string)>();
+        return _monitors.Select(m => (m.X, m.Y, m.Width, m.Height, m.IsPrimary, m.DeviceName)).ToArray();
     }
 
     /// <summary>
@@ -490,7 +514,12 @@ internal static class Win32Input
     private static extern bool EnumDisplayMonitors(IntPtr hdc, IntPtr lprcClip, MonitorEnumDelegate lpfnEnum, IntPtr dwData);
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-    private static extern bool GetMonitorInfoW(IntPtr hMonitor, ref MONITORINFO lpmi);
+    private static extern bool GetMonitorInfoW(IntPtr hMonitor, ref MONITORINFOEXW lpmi);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr SetThreadDpiAwarenessContext(IntPtr dpiContext);
+
+    private static readonly IntPtr DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = (IntPtr)(-4);
 
     [StructLayout(LayoutKind.Sequential)]
     private struct RECT
@@ -498,13 +527,15 @@ internal static class Win32Input
         public int left, top, right, bottom;
     }
 
-    [StructLayout(LayoutKind.Sequential)]
-    private struct MONITORINFO
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct MONITORINFOEXW
     {
         public int cbSize;
         public RECT rcMonitor;
         public RECT rcWork;
         public int dwFlags;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+        public string szDevice;
     }
 
     [StructLayout(LayoutKind.Sequential)]

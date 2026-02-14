@@ -32,17 +32,27 @@ public sealed class WindowsInputInjector : IInputInjector
 
         var (left, top, width, height) = Win32Input.GetVirtualScreen();
 
-        _logger.LogInformation("Virtual screen: ({Left},{Top}) {Width}x{Height}",
+        _logger.LogInformation("Virtual screen: ({Left},{Top}) {Width}x{Height} (DPI-aware physical pixels)",
             left, top, width, height);
+
+        var monitors = Win32Input.GetMonitors();
+        foreach (var mon in monitors)
+        {
+            _logger.LogInformation("Monitor: {Device} ({W}x{H}) at ({X},{Y}) Primary={Primary}",
+                mon.DeviceName, mon.Width, mon.Height, mon.X, mon.Y, mon.IsPrimary);
+        }
 
         // Initialize debug log file
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(DebugLogPath)!);
+            var monitorInfo = string.Join("\n", monitors.Select(m =>
+                $"  {m.DeviceName}: {m.Width}x{m.Height} at ({m.X},{m.Y}) Primary={m.IsPrimary}"));
             File.WriteAllText(DebugLogPath,
                 $"=== SteamViewer Input Debug Log - {DateTime.Now:yyyy-MM-dd HH:mm:ss} ===\n" +
                 $"Virtual Screen: left={left}, top={top}, " +
-                $"width={width}, height={height}\n" +
+                $"width={width}, height={height} (DPI-aware physical pixels)\n" +
+                $"Monitors:\n{monitorInfo}\n" +
                 $"Log file: {DebugLogPath}\n\n");
             _logger.LogInformation("Debug log file created at: {Path}", DebugLogPath);
         }
