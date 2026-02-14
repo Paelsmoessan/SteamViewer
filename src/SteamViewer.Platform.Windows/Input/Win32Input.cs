@@ -18,34 +18,57 @@ internal static class Win32Input
 
     private static void RefreshDisplayState()
     {
-        // Switch thread to Per-Monitor DPI Aware V2 so GetSystemMetrics/EnumDisplayMonitors
-        // return physical pixel dimensions. getDisplayMedia captures physical pixels, so monitor
-        // rects must match. Without this, at 125% DPI monitors report 1536x864 logical but
-        // capture is 1920x1080 physical — FindMonitorByResolution fails to match.
-        var prevContext = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-        try
-        {
-            var left = GetSystemMetrics(SM_XVIRTUALSCREEN);
-            var top = GetSystemMetrics(SM_YVIRTUALSCREEN);
-            var width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-            var height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        // Process-level PMv2 DPI awareness is set in Program.Main() — all threads
+        // get physical pixel dimensions from GetSystemMetrics/EnumDisplayMonitors.
+        var left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        var top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        var width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        var height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
 
-            // Re-enumerate monitors only when virtual screen dimensions change (hot-plug, settings change)
-            if (width != _vsWidth || height != _vsHeight || left != _vsLeft || top != _vsTop || _monitors == null)
-            {
-                EnumerateMonitors();
-            }
-
-            _vsLeft = left;
-            _vsTop = top;
-            _vsWidth = width;
-            _vsHeight = height;
-        }
-        finally
+        // Re-enumerate monitors only when virtual screen dimensions change (hot-plug, settings change)
+        if (width != _vsWidth || height != _vsHeight || left != _vsLeft || top != _vsTop || _monitors == null)
         {
-            if (prevContext != IntPtr.Zero)
-                SetThreadDpiAwarenessContext(prevContext);
+            EnumerateMonitors();
         }
+
+        _vsLeft = left;
+        _vsTop = top;
+        _vsWidth = width;
+        _vsHeight = height;
+    }
+
+    // Desktop sync retry: cached desktop handle per thread.
+    // When SendInput fails (returns 0), the thread's desktop may be stale.
+    // Re-open the input desktop and retry. Source: Sunshine, Synergy.
+    [ThreadStatic]
+    private static IntPtr _cachedDesktop;
+
+    /// <summary>
+    /// SendInput with desktop sync retry. If SendInput returns 0, re-opens the
+    /// current input desktop and retries once. Handles desktop transitions
+    /// (UAC return, fast user switch) without requiring the SYSTEM helper.
+    /// </summary>
+    private static uint SendInputWithRetry(uint nInputs, INPUT[] pInputs, int cbSize)
+    {
+        var sent = SendInput(nInputs, pInputs, cbSize);
+        if (sent == nInputs)
+            return sent;
+
+        // SendInput failed — try to re-attach to the current input desktop
+        var hDesk = OpenInputDesktop(0, false, DESKTOP_SWITCHDESKTOP);
+        if (hDesk == IntPtr.Zero)
+            return sent; // Can't open desktop — give up
+
+        if (hDesk != _cachedDesktop)
+        {
+            SetThreadDesktop(hDesk);
+            _cachedDesktop = hDesk;
+            sent = SendInput(nInputs, pInputs, cbSize); // retry
+        }
+
+        // Don't close hDesk — we keep it cached for SetThreadDesktop.
+        // Previous handle is leaked but this only happens on desktop transitions (rare).
+        return sent;
     }
 
     private static List<MonitorRect>? _monitorCollector;
@@ -217,29 +240,17 @@ internal static class Win32Input
             }
         };
 
-        SendInput(1, new[] { input }, Marshal.SizeOf<INPUT>());
+        SendInputWithRetry(1, new[] { input }, Marshal.SizeOf<INPUT>());
     }
 
     internal static void InjectMouseButton(MouseButton button, double x, double y, int screenWidth, int screenHeight, bool isDown)
     {
         var (absX, absY) = ConvertToAbsoluteCoordinates(x, y, screenWidth, screenHeight);
 
-        uint flags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
-
-        switch (button)
-        {
-            case MouseButton.Left:
-                flags |= isDown ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP;
-                break;
-            case MouseButton.Right:
-                flags |= isDown ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_RIGHTUP;
-                break;
-            case MouseButton.Middle:
-                flags |= isDown ? MOUSEEVENTF_MIDDLEDOWN : MOUSEEVENTF_MIDDLEUP;
-                break;
-        }
-
-        var input = new INPUT
+        // Split move + click into separate SendInput calls.
+        // Windows may not process the position before the click if combined.
+        // Source: FreeRDP, Sunshine
+        var moveInput = new INPUT
         {
             type = INPUT_MOUSE,
             union = new InputUnion
@@ -249,14 +260,48 @@ internal static class Win32Input
                     dx = absX,
                     dy = absY,
                     mouseData = 0,
-                    dwFlags = flags,
+                    dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
                     time = 0,
                     dwExtraInfo = IntPtr.Zero
                 }
             }
         };
 
-        SendInput(1, new[] { input }, Marshal.SizeOf<INPUT>());
+        SendInputWithRetry(1, new[] { moveInput }, Marshal.SizeOf<INPUT>());
+
+        // Button event — no MOVE flag, no position. Cursor is already at the right spot.
+        uint buttonFlags = 0;
+        switch (button)
+        {
+            case MouseButton.Left:
+                buttonFlags = isDown ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP;
+                break;
+            case MouseButton.Right:
+                buttonFlags = isDown ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_RIGHTUP;
+                break;
+            case MouseButton.Middle:
+                buttonFlags = isDown ? MOUSEEVENTF_MIDDLEDOWN : MOUSEEVENTF_MIDDLEUP;
+                break;
+        }
+
+        var buttonInput = new INPUT
+        {
+            type = INPUT_MOUSE,
+            union = new InputUnion
+            {
+                mi = new MOUSEINPUT
+                {
+                    dx = 0,
+                    dy = 0,
+                    mouseData = 0,
+                    dwFlags = buttonFlags,
+                    time = 0,
+                    dwExtraInfo = IntPtr.Zero
+                }
+            }
+        };
+
+        SendInputWithRetry(1, new[] { buttonInput }, Marshal.SizeOf<INPUT>());
     }
 
     internal static void InjectMouseWheel(double deltaX, double deltaY)
@@ -305,7 +350,7 @@ internal static class Win32Input
 
         if (inputs.Count > 0)
         {
-            SendInput((uint)inputs.Count, inputs.ToArray(), Marshal.SizeOf<INPUT>());
+            SendInputWithRetry((uint)inputs.Count, inputs.ToArray(), Marshal.SizeOf<INPUT>());
         }
     }
 
@@ -337,7 +382,7 @@ internal static class Win32Input
 
         if (inputs.Count > 0)
         {
-            SendInput((uint)inputs.Count, inputs.ToArray(), Marshal.SizeOf<INPUT>());
+            SendInputWithRetry((uint)inputs.Count, inputs.ToArray(), Marshal.SizeOf<INPUT>());
         }
     }
 
@@ -517,10 +562,14 @@ internal static class Win32Input
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     private static extern bool GetMonitorInfoW(IntPtr hMonitor, ref MONITORINFOEXW lpmi);
 
-    [DllImport("user32.dll", SetLastError = true)]
-    private static extern IntPtr SetThreadDpiAwarenessContext(IntPtr dpiContext);
+    // Desktop sync retry P/Invoke
+    private const uint DESKTOP_SWITCHDESKTOP = 0x0100;
 
-    private static readonly IntPtr DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = (IntPtr)(-4);
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr OpenInputDesktop(uint dwFlags, bool fInherit, uint dwDesiredAccess);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool SetThreadDesktop(IntPtr hDesktop);
 
     [StructLayout(LayoutKind.Sequential)]
     private struct RECT

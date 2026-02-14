@@ -15,6 +15,12 @@ public static class Program
     [STAThread]
     static void Main(string[] args)
     {
+        // Process-level Per-Monitor V2 DPI awareness — set ONCE before anything else.
+        // All modes (main app, elevated helper, system helper, boot relay) get physical pixel
+        // coordinates on all threads. Replaces fragile per-thread DPI switching.
+        // Source: Sunshine (display_base.cpp)
+        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
         // === Intercept lightweight modes BEFORE WinUI3 loads ===
         // At this point NO WinUI3/MAUI DLLs have been loaded.
         // The elevated helper and SAS mode are pure Win32/P/Invoke — no UI needed.
@@ -70,9 +76,7 @@ public static class Program
             }
             catch { /* best-effort debug log */ }
 
-            // Winlogon login screen renders at 96 DPI (physical) with no DPI virtualization.
-            // Without this, GetSystemMetrics returns logical dims and BitBlt crops the screen.
-            SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            // DPI awareness already set at top of Main() — all modes get PMv2.
 
             try
             {
