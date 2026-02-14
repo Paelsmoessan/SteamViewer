@@ -2010,31 +2010,42 @@ window.SteamViewerInput = {
     },
 
     getScaledCoords(e) {
-        // Map CSS mouse position → video pixel coordinates using stored letterbox geometry
-        // This uses the EXACT same values the render loop uses for drawImage — zero drift by construction
+        // Map CSS mouse position → video pixel coordinates.
+        // Uses video element dimensions directly — always correct regardless of _letterbox state.
+        // Computes letterbox from video aspect ratio vs CSS display area.
         const session = window.SteamViewerWebRTC.sessions.get(this._activeSessionId);
-        const lb = session?._letterbox;
-        if (!lb || !lb.dw || !lb.videoW) {
-            // Letterbox not yet computed (video dimensions unknown) — fall back to
-            // getBoundingClientRect computation (same approach as getScaledCoordsForCanvas).
-            // This handles the startup race where mouse events arrive before the first video frame.
-            const video = session?.remoteVideo;
-            const vw = video?.videoWidth || this.canvas.width;
-            const vh = video?.videoHeight || this.canvas.height;
-            if (!vw || !vh) return { x: 0, y: 0 };
-            return this.getScaledCoordsForCanvas(e, this.canvas);
-        }
+        const video = session?.remoteVideo;
+        const videoW = video?.videoWidth || 0;
+        const videoH = video?.videoHeight || 0;
+        if (!videoW || !videoH) return { x: 0, y: 0 };
+
         const rect = this.canvas.getBoundingClientRect();
-        const dpr = window.devicePixelRatio || 1;
-        // Convert CSS mouse position to canvas bitmap coords
-        const canvasX = (e.clientX - rect.left) * dpr;
-        const canvasY = (e.clientY - rect.top) * dpr;
-        // Map from canvas bitmap coords to video coords using letterbox offsets
-        const videoX = (canvasX - lb.dx) / lb.dw * lb.videoW;
-        const videoY = (canvasY - lb.dy) / lb.dh * lb.videoH;
+        const videoAspect = videoW / videoH;
+        const rectAspect = rect.width / rect.height;
+
+        // Compute letterbox from video aspect ratio vs CSS display rect
+        let renderWidth, renderHeight, offsetX, offsetY;
+        if (rectAspect > videoAspect) {
+            // Pillarbox — video narrower than display, bars on sides
+            renderHeight = rect.height;
+            renderWidth = rect.height * videoAspect;
+            offsetX = (rect.width - renderWidth) / 2;
+            offsetY = 0;
+        } else {
+            // Letterbox — video wider than display, bars top/bottom
+            renderWidth = rect.width;
+            renderHeight = rect.width / videoAspect;
+            offsetX = 0;
+            offsetY = (rect.height - renderHeight) / 2;
+        }
+
+        // CSS mouse position → relative to rendered video area → video pixel coords
+        const relX = e.clientX - rect.left - offsetX;
+        const relY = e.clientY - rect.top - offsetY;
+
         return {
-            x: Math.max(0, Math.min(lb.videoW, videoX)),
-            y: Math.max(0, Math.min(lb.videoH, videoY))
+            x: Math.max(0, Math.min(videoW, relX * videoW / renderWidth)),
+            y: Math.max(0, Math.min(videoH, relY * videoH / renderHeight))
         };
     },
 
@@ -2115,10 +2126,11 @@ window.SteamViewerInput = {
             const coords = this.getScaledCoords(e);
             x = coords.x;
             y = coords.y;
-            // Send actual video resolution (not canvas bitmap size which is now display-sized)
+            // Send actual video resolution — getScaledCoords returns coords in video pixel space
             const session = window.SteamViewerWebRTC.sessions.get(this._activeSessionId);
-            captureW = session?._letterbox?.videoW || this.canvas.width;
-            captureH = session?._letterbox?.videoH || this.canvas.height;
+            const video = session?.remoteVideo;
+            captureW = video?.videoWidth || this.canvas.width;
+            captureH = video?.videoHeight || this.canvas.height;
         }
 
         // Throttle data channel sends to ~30 Hz (local cursor is already updated above)
@@ -2163,8 +2175,9 @@ window.SteamViewerInput = {
         }
         const coords = this.getScaledCoords(e);
         const session = window.SteamViewerWebRTC.sessions.get(this._activeSessionId);
-        const captureW = session?._letterbox?.videoW || this.canvas.width;
-        const captureH = session?._letterbox?.videoH || this.canvas.height;
+        const video = session?.remoteVideo;
+        const captureW = video?.videoWidth || this.canvas.width;
+        const captureH = video?.videoHeight || this.canvas.height;
         return { x: coords.x, y: coords.y, captureW, captureH };
     },
 
