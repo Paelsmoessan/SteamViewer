@@ -138,7 +138,8 @@ internal static class Win32Input
         // If capture size doesn't match full virtual desktop, find the specific monitor
         if (screenWidth != _vsWidth || screenHeight != _vsHeight)
         {
-            var match = FindMonitorByResolution(screenWidth, screenHeight);
+            var match = FindMonitorByResolution(screenWidth, screenHeight)
+                        ?? _monitors?.FirstOrDefault(m => m.IsPrimary);
             if (match != null)
             {
                 targetX = match.Value.X;
