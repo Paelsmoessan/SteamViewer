@@ -9,28 +9,30 @@ namespace SteamViewer.Platform.Windows.Input;
 /// </summary>
 internal static class Win32Input
 {
-    // Lazy-init virtual screen dimensions and monitor layout
+    // Virtual screen dimensions — refreshed on every call (sub-microsecond GetSystemMetrics)
     private static int _vsLeft, _vsTop, _vsWidth, _vsHeight;
-    private static bool _initialized;
-    private static readonly object InitLock = new();
 
-    // Multi-monitor support: cached monitor rectangles for coordinate mapping
+    // Multi-monitor support: cached monitor rectangles, re-enumerated when virtual screen changes
     private record struct MonitorRect(int X, int Y, int Width, int Height, bool IsPrimary);
     private static MonitorRect[]? _monitors;
 
-    private static void EnsureInitialized()
+    private static void RefreshDisplayState()
     {
-        if (_initialized) return;
-        lock (InitLock)
+        var left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        var top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        var width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        var height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+
+        // Re-enumerate monitors only when virtual screen dimensions change (hot-plug, settings change)
+        if (width != _vsWidth || height != _vsHeight || left != _vsLeft || top != _vsTop || _monitors == null)
         {
-            if (_initialized) return;
-            _vsLeft = GetSystemMetrics(SM_XVIRTUALSCREEN);
-            _vsTop = GetSystemMetrics(SM_YVIRTUALSCREEN);
-            _vsWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-            _vsHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN);
             EnumerateMonitors();
-            _initialized = true;
         }
+
+        _vsLeft = left;
+        _vsTop = top;
+        _vsWidth = width;
+        _vsHeight = height;
     }
 
     private static List<MonitorRect>? _monitorCollector;
@@ -63,7 +65,7 @@ internal static class Win32Input
     /// </summary>
     public static (int Left, int Top, int Width, int Height) GetVirtualScreen()
     {
-        EnsureInitialized();
+        RefreshDisplayState();
         return (_vsLeft, _vsTop, _vsWidth, _vsHeight);
     }
 
@@ -72,7 +74,7 @@ internal static class Win32Input
     /// </summary>
     public static void InjectInputEvent(InputEvent inputEvent, int screenWidth, int screenHeight)
     {
-        EnsureInitialized();
+        RefreshDisplayState();
 
         switch (inputEvent)
         {
@@ -104,7 +106,7 @@ internal static class Win32Input
     /// </summary>
     public static (int AbsX, int AbsY) ConvertToAbsoluteCoordinates(double x, double y, int screenWidth, int screenHeight)
     {
-        EnsureInitialized();
+        RefreshDisplayState();
 
         // Determine which area of the virtual desktop the capture represents
         int targetX = _vsLeft, targetY = _vsTop, targetW = _vsWidth, targetH = _vsHeight;
