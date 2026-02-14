@@ -1631,7 +1631,7 @@
     .canvas-container canvas {
         width: 100%;
         height: 100%;
-        object-fit: contain;
+        /* No object-fit — we draw letterbox ourselves in JS for pixel-perfect coord mapping */
     }
 
     /* Secure Desktop - dimmed canvas when UAC active */

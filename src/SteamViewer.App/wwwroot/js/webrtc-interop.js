@@ -105,6 +105,28 @@ window.SteamViewerLogger = {
     }
 };
 
+// Compute letterbox/pillarbox geometry for fitting video into canvas
+function computeLetterbox(canvasW, canvasH, videoW, videoH) {
+    if (!videoW || !videoH) return { dx: 0, dy: 0, dw: canvasW, dh: canvasH, videoW: 0, videoH: 0 };
+    const canvasAspect = canvasW / canvasH;
+    const videoAspect = videoW / videoH;
+    let dx, dy, dw, dh;
+    if (canvasAspect > videoAspect) {
+        // Canvas wider than video — pillarbox (bars on sides)
+        dh = canvasH;
+        dw = canvasH * videoAspect;
+        dx = (canvasW - dw) / 2;
+        dy = 0;
+    } else {
+        // Canvas taller than video — letterbox (bars top/bottom)
+        dw = canvasW;
+        dh = canvasW / videoAspect;
+        dx = 0;
+        dy = (canvasH - dh) / 2;
+    }
+    return { dx, dy, dw, dh, videoW, videoH };
+}
+
 window.SteamViewerWebRTC = {
     // Session-keyed Map: sessionId → session state object
     sessions: new Map(),
@@ -140,6 +162,8 @@ window.SteamViewerWebRTC = {
             // Direct rendering (bypasses JPEG relay when canvas is in same JS context)
             _directRenderCanvas: null,
             _directRenderCtx: null,
+            _letterbox: { dx: 0, dy: 0, dw: 0, dh: 0, videoW: 0, videoH: 0 },
+            _resizeObserver: null,
             // Stats overlay
             _statsInterval: null,
             _statsOverlayEl: null,
@@ -428,10 +452,9 @@ window.SteamViewerWebRTC = {
                             canvas.width = width;
                             canvas.height = height;
 
-                            // Sync direct render canvas dimensions if set
-                            if (session._directRenderCanvas) {
-                                session._directRenderCanvas.width = width;
-                                session._directRenderCanvas.height = height;
+                            // Recompute letterbox when video resolution changes
+                            if (session._directRenderCanvas && session._updateCanvasSize) {
+                                session._updateCanvasSize();
                             }
 
                             // Use requestVideoFrameCallback for lower latency (renders when frame arrives, not on monitor refresh)
@@ -450,15 +473,16 @@ window.SteamViewerWebRTC = {
                                 try {
                                     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
-                                    // Direct render: also draw to visible canvas (bypasses JPEG relay)
+                                    // Direct render: draw to visible canvas with letterbox (bypasses JPEG relay)
                                     if (session._directRenderCtx) {
                                         const dc = session._directRenderCanvas;
-                                        // Sync dimensions on resolution change
-                                        if (dc.width !== canvas.width || dc.height !== canvas.height) {
-                                            dc.width = canvas.width;
-                                            dc.height = canvas.height;
+                                        const lb = session._letterbox;
+                                        // Recompute letterbox if video resolution changed
+                                        if (lb.videoW !== video.videoWidth || lb.videoH !== video.videoHeight) {
+                                            if (session._updateCanvasSize) session._updateCanvasSize();
                                         }
-                                        session._directRenderCtx.drawImage(video, 0, 0, dc.width, dc.height);
+                                        session._directRenderCtx.clearRect(0, 0, dc.width, dc.height);
+                                        session._directRenderCtx.drawImage(video, lb.dx, lb.dy, lb.dw, lb.dh);
                                     }
 
                                     frameCount++;
@@ -489,14 +513,15 @@ window.SteamViewerWebRTC = {
                                     try {
                                         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
-                                        // Direct render: also draw to visible canvas
+                                        // Direct render: draw to visible canvas with letterbox
                                         if (session._directRenderCtx) {
                                             const dc = session._directRenderCanvas;
-                                            if (dc.width !== canvas.width || dc.height !== canvas.height) {
-                                                dc.width = canvas.width;
-                                                dc.height = canvas.height;
+                                            const lb = session._letterbox;
+                                            if (lb.videoW !== video.videoWidth || lb.videoH !== video.videoHeight) {
+                                                if (session._updateCanvasSize) session._updateCanvasSize();
                                             }
-                                            session._directRenderCtx.drawImage(video, 0, 0, dc.width, dc.height);
+                                            session._directRenderCtx.clearRect(0, 0, dc.width, dc.height);
+                                            session._directRenderCtx.drawImage(video, lb.dx, lb.dy, lb.dw, lb.dh);
                                         }
 
                                         frameCount++;
@@ -1210,13 +1235,36 @@ window.SteamViewerWebRTC = {
         session._directRenderCanvas = canvas;
         session._directRenderCtx = canvas.getContext('2d');
 
-        // Sync canvas dimensions with video if already loaded
-        if (session.remoteVideo && session.remoteVideo.videoWidth > 0) {
-            canvas.width = session.remoteVideo.videoWidth;
-            canvas.height = session.remoteVideo.videoHeight;
-        }
+        // Size canvas bitmap to CSS display size × devicePixelRatio
+        // We handle letterboxing ourselves in drawImage — no object-fit:contain
+        const updateCanvasSize = () => {
+            const rect = canvas.getBoundingClientRect();
+            const dpr = window.devicePixelRatio || 1;
+            const newW = Math.round(rect.width * dpr);
+            const newH = Math.round(rect.height * dpr);
+            if (canvas.width !== newW || canvas.height !== newH) {
+                canvas.width = newW;
+                canvas.height = newH;
+            }
+            // Recompute letterbox with current video dimensions
+            const videoW = session.remoteVideo?.videoWidth || 0;
+            const videoH = session.remoteVideo?.videoHeight || 0;
+            session._letterbox = computeLetterbox(newW, newH, videoW, videoH);
+        };
 
-        console.log(`[DirectRender] Enabled for session ${sessionId} → canvas '${canvasId}'`);
+        updateCanvasSize();
+
+        // Watch for container resizes (window resize, tab switch, etc.)
+        if (session._resizeObserver) {
+            session._resizeObserver.disconnect();
+        }
+        session._resizeObserver = new ResizeObserver(updateCanvasSize);
+        session._resizeObserver.observe(canvas.parentElement || canvas);
+
+        // Store updater so render loop can call it when video resolution changes
+        session._updateCanvasSize = updateCanvasSize;
+
+        console.log(`[DirectRender] Enabled for session ${sessionId} → canvas '${canvasId}' (${canvas.width}x${canvas.height} bitmap)`);
         return true;
     },
 
@@ -1224,6 +1272,11 @@ window.SteamViewerWebRTC = {
     clearDirectRenderTarget(sessionId) {
         const session = this.sessions.get(sessionId);
         if (!session) return;
+        if (session._resizeObserver) {
+            session._resizeObserver.disconnect();
+            session._resizeObserver = null;
+        }
+        session._updateCanvasSize = null;
         session._directRenderCanvas = null;
         session._directRenderCtx = null;
         console.log(`[DirectRender] Disabled for session ${sessionId}`);
@@ -1957,44 +2010,29 @@ window.SteamViewerInput = {
     },
 
     getScaledCoords(e) {
-        const rect = this.canvas.getBoundingClientRect();
-
-        // Account for object-fit: contain letterboxing
-        // Calculate the actual rendered size of the canvas content
-        const canvasAspect = this.canvas.width / this.canvas.height;
-        const rectAspect = rect.width / rect.height;
-
-        let renderWidth, renderHeight, offsetX, offsetY;
-
-        if (rectAspect > canvasAspect) {
-            // Container is wider than canvas - letterbox on sides
-            renderHeight = rect.height;
-            renderWidth = rect.height * canvasAspect;
-            offsetX = (rect.width - renderWidth) / 2;
-            offsetY = 0;
-        } else {
-            // Container is taller than canvas - letterbox on top/bottom
-            renderWidth = rect.width;
-            renderHeight = rect.width / canvasAspect;
-            offsetX = 0;
-            offsetY = (rect.height - renderHeight) / 2;
+        // Map CSS mouse position → video pixel coordinates using stored letterbox geometry
+        // This uses the EXACT same values the render loop uses for drawImage — zero drift by construction
+        const session = window.SteamViewerWebRTC.sessions.get(this._activeSessionId);
+        const lb = session?._letterbox;
+        if (!lb || !lb.dw || !lb.videoW) {
+            return { x: 0, y: 0 };
         }
-
-        // Calculate position relative to actual content area
-        const relX = e.clientX - rect.left - offsetX;
-        const relY = e.clientY - rect.top - offsetY;
-
-        // Scale to canvas internal coordinates
-        const scaleX = this.canvas.width / renderWidth;
-        const scaleY = this.canvas.height / renderHeight;
-
+        const rect = this.canvas.getBoundingClientRect();
+        const dpr = window.devicePixelRatio || 1;
+        // Convert CSS mouse position to canvas bitmap coords
+        const canvasX = (e.clientX - rect.left) * dpr;
+        const canvasY = (e.clientY - rect.top) * dpr;
+        // Map from canvas bitmap coords to video coords using letterbox offsets
+        const videoX = (canvasX - lb.dx) / lb.dw * lb.videoW;
+        const videoY = (canvasY - lb.dy) / lb.dh * lb.videoH;
         return {
-            x: Math.max(0, Math.min(this.canvas.width, relX * scaleX)),
-            y: Math.max(0, Math.min(this.canvas.height, relY * scaleY))
+            x: Math.max(0, Math.min(lb.videoW, videoX)),
+            y: Math.max(0, Math.min(lb.videoH, videoY))
         };
     },
 
     // Like getScaledCoords but for any canvas element (used for SD overlay)
+    // SD overlay still uses object-fit:contain style, so compute letterbox from CSS
     getScaledCoordsForCanvas(e, canvas) {
         const rect = canvas.getBoundingClientRect();
         const canvasAspect = canvas.width / canvas.height;
@@ -2070,8 +2108,10 @@ window.SteamViewerInput = {
             const coords = this.getScaledCoords(e);
             x = coords.x;
             y = coords.y;
-            captureW = this.canvas.width;
-            captureH = this.canvas.height;
+            // Send actual video resolution (not canvas bitmap size which is now display-sized)
+            const session = window.SteamViewerWebRTC.sessions.get(this._activeSessionId);
+            captureW = session?._letterbox?.videoW || this.canvas.width;
+            captureH = session?._letterbox?.videoH || this.canvas.height;
         }
 
         // Throttle data channel sends to ~30 Hz (local cursor is already updated above)
@@ -2115,7 +2155,10 @@ window.SteamViewerInput = {
             return { x: sdCoords.x, y: sdCoords.y, captureW: sd._width, captureH: sd._height };
         }
         const coords = this.getScaledCoords(e);
-        return { x: coords.x, y: coords.y, captureW: this.canvas.width, captureH: this.canvas.height };
+        const session = window.SteamViewerWebRTC.sessions.get(this._activeSessionId);
+        const captureW = session?._letterbox?.videoW || this.canvas.width;
+        const captureH = session?._letterbox?.videoH || this.canvas.height;
+        return { x: coords.x, y: coords.y, captureW, captureH };
     },
 
     async handleMouseDown(e) {
