@@ -732,6 +732,9 @@
             // Create and initialize host session
             var monitorEnumerator = ServiceProvider.GetService<IMonitorEnumerator>();
             var screenCapture = ServiceProvider.GetService<IScreenCapture>();
+#if WINDOWS
+            var frameBridge = ServiceProvider.GetService<Services.NativeFrameBridge>();
+#endif
             _hostSession = new HostSession(
                 connectedPeerId,
                 JSRuntime,
@@ -742,6 +745,9 @@
                 elevationService: elevationService,
                 monitorEnumerator: monitorEnumerator,
                 screenCapture: screenCapture,
+#if WINDOWS
+                frameBridge: frameBridge,
+#endif
                 hostClientId: clientId,
                 hostPasswordHash: passwordHash);
 

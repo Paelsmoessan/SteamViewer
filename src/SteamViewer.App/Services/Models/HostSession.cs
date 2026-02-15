@@ -42,6 +42,9 @@ public sealed class HostSession : IAsyncDisposable
     private readonly IMonitorEnumerator? _monitorEnumerator;
     private readonly IElevationService? _elevationService;
     private readonly IScreenCapture? _screenCapture;
+#if WINDOWS
+    private readonly Services.NativeFrameBridge? _frameBridge;
+#endif
     private readonly IConfiguration _configuration;
     private readonly Func<SignalingMessage, Task> _sendSignaling;
     private readonly string _hostClientId;
@@ -118,6 +121,9 @@ public sealed class HostSession : IAsyncDisposable
         IElevationService? elevationService = null,
         IMonitorEnumerator? monitorEnumerator = null,
         IScreenCapture? screenCapture = null,
+#if WINDOWS
+        Services.NativeFrameBridge? frameBridge = null,
+#endif
         string hostClientId = "",
         string hostPasswordHash = "")
     {
@@ -129,6 +135,9 @@ public sealed class HostSession : IAsyncDisposable
         _monitorEnumerator = monitorEnumerator;
         _elevationService = elevationService;
         _screenCapture = screenCapture;
+#if WINDOWS
+        _frameBridge = frameBridge;
+#endif
         _configuration = configuration;
         _sendSignaling = sendSignaling;
         _hostClientId = hostClientId;
@@ -305,8 +314,18 @@ public sealed class HostSession : IAsyncDisposable
                     goto fallback;
                 }
 
-                // Subscribe to DXGI frame events → push to JS canvas
-                dxgi.OnFrameCaptured += OnDxgiFrameCaptured;
+                // Subscribe to DXGI frame events — raw BGRA when SharedBuffer available, JPEG fallback
+#if WINDOWS
+                if (_frameBridge?.IsInitialized == true)
+                {
+                    dxgi.OnRawFrameCaptured += OnDxgiRawFrameCaptured;
+                    _logger.LogInformation("Using raw BGRA pipeline (no JPEG encode)");
+                }
+                else
+#endif
+                {
+                    dxgi.OnFrameCaptured += OnDxgiFrameCaptured;
+                }
 
                 // Start DXGI capture loop (fires OnFrameCaptured at ~30 FPS)
                 dxgi.StartCaptureLoop(targetOutput);
@@ -323,6 +342,7 @@ public sealed class HostSession : IAsyncDisposable
             {
                 _logger.LogWarning(ex, "DXGI native capture failed, falling back to getDisplayMedia");
                 // Clean up partial DXGI state
+                try { dxgi.OnRawFrameCaptured -= OnDxgiRawFrameCaptured; } catch { }
                 try { dxgi.OnFrameCaptured -= OnDxgiFrameCaptured; } catch { }
                 try { dxgi.StopCaptureLoop(); } catch { }
                 try { await _webrtc.StopNativeCaptureAsync(); } catch { }
@@ -364,7 +384,8 @@ public sealed class HostSession : IAsyncDisposable
 
             if (_isNativeCapture && _screenCapture is DxgiScreenCapture dxgi)
             {
-                // Stop DXGI capture loop and unsubscribe
+                // Stop DXGI capture loop and unsubscribe from both event paths
+                dxgi.OnRawFrameCaptured -= OnDxgiRawFrameCaptured;
                 dxgi.OnFrameCaptured -= OnDxgiFrameCaptured;
                 dxgi.StopCaptureLoop();
                 await _webrtc.StopNativeCaptureAsync();
@@ -389,15 +410,39 @@ public sealed class HostSession : IAsyncDisposable
     }
 
     /// <summary>
-    /// Relay DXGI captured JPEG frames to JS canvas bridge via JSInterop.
+    /// Relay DXGI captured JPEG frames to JS WebRTC pipeline.
+    /// SharedBuffer path: zero-copy via WebView2 shared memory (preferred).
+    /// Fallback path: base64 + JSInterop (slower, higher latency).
     /// Called from DXGI capture thread — fire-and-forget (don't block capture).
+    /// </summary>
+    /// <summary>
+    /// Raw BGRA path — skip JPEG encode entirely. SharedBuffer sends raw pixels to JS,
+    /// which creates VideoFrame directly. Saves 20-40ms per frame.
+    /// </summary>
+    private void OnDxgiRawFrameCaptured(byte[] bgraData, int width, int height, int stride)
+    {
+        if (_webrtc == null || !_isNativeCapture) return;
+#if WINDOWS
+        _frameBridge!.PushRawFrame(bgraData, width, height, stride, SessionId);
+#endif
+    }
+
+    /// <summary>
+    /// JPEG fallback path — used when SharedBuffer not available.
     /// </summary>
     private void OnDxgiFrameCaptured(byte[] jpegData, int width, int height)
     {
         if (_webrtc == null || !_isNativeCapture) return;
 
+#if WINDOWS
+        if (_frameBridge?.IsInitialized == true)
+        {
+            _frameBridge.PushFrame(jpegData, width, height, SessionId);
+            return;
+        }
+#endif
+
         var base64 = Convert.ToBase64String(jpegData);
-        // Fire-and-forget — don't await on the capture thread
         _ = _webrtc.PushNativeFrameAsync(base64, width, height);
     }
 
@@ -1387,6 +1432,7 @@ public sealed class HostSession : IAsyncDisposable
         // Stop DXGI capture if active
         if (_isNativeCapture && _screenCapture is DxgiScreenCapture dxgi)
         {
+            dxgi.OnRawFrameCaptured -= OnDxgiRawFrameCaptured;
             dxgi.OnFrameCaptured -= OnDxgiFrameCaptured;
             dxgi.StopCaptureLoop();
             _isNativeCapture = false;

@@ -81,6 +81,7 @@ public static class MauiProgram
 
         // Register platform-specific services
 #if WINDOWS
+        builder.Services.AddSingleton<Services.NativeFrameBridge>();
         builder.Services.AddSingleton<IMonitorEnumerator, SteamViewer.Platform.Windows.WindowsMonitorEnumerator>();
         builder.Services.AddSingleton<IScreenCapture, SteamViewer.Platform.Windows.ScreenCapture.DxgiScreenCapture>();
         builder.Services.AddSingleton<IInputInjector, SteamViewer.Platform.Windows.Input.WindowsInputInjector>();

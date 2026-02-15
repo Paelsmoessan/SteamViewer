@@ -32,12 +32,17 @@ public sealed class DxgiScreenCapture : IScreenCapture
     private bool _isCapturing;
     private int _width;
     private int _height;
+    private int _monitorX; // Monitor left edge in virtual desktop coords
+    private int _monitorY; // Monitor top edge in virtual desktop coords
     private string? _monitorId;
 
     // Capture loop fields
     private Thread? _captureThread;
     private volatile bool _stopRequested;
     private uint _currentOutputIndex;
+
+    // Reusable frame buffer — avoids ~8MB allocation per frame (240MB/s GC pressure at 30fps)
+    private byte[]? _frameBuffer;
 
     public DxgiScreenCapture(ILogger<DxgiScreenCapture> logger)
     {
@@ -50,6 +55,9 @@ public sealed class DxgiScreenCapture : IScreenCapture
 
     /// <summary>Raised when a JPEG frame is captured. Parameters: (jpegData, width, height).</summary>
     public event Action<byte[], int, int>? OnFrameCaptured;
+
+    /// <summary>Raised with raw BGRA pixel data (no JPEG encode). Parameters: (bgraData, width, height, stride).</summary>
+    public event Action<byte[], int, int, int>? OnRawFrameCaptured;
 
     #region Capture Loop (high-level API for canvas bridge)
 
@@ -135,11 +143,15 @@ public sealed class DxgiScreenCapture : IScreenCapture
         var jpegStream = new MemoryStream(512 * 1024); // Pre-allocate 512KB, reuse across frames
         var frameCount = 0;
         var consecutiveErrors = 0;
+        const int targetIntervalMs = 33; // ~30 FPS target
+        var sw = System.Diagnostics.Stopwatch.StartNew();
 
         try
         {
             while (!_stopRequested)
             {
+                sw.Restart();
+
                 try
                 {
                     var frame = CaptureFrameAsync().GetAwaiter().GetResult();
@@ -160,8 +172,11 @@ public sealed class DxgiScreenCapture : IScreenCapture
                         EncodeAndFireFrame(frame, jpegEncoder, encoderParams, jpegStream, ref frameCount);
                     }
 
-                    // ~30 FPS target (33ms between frames)
-                    Thread.Sleep(33);
+                    // Adaptive sleep — maintain ~30 FPS regardless of encode time
+                    var elapsed = (int)sw.ElapsedMilliseconds;
+                    var sleepMs = targetIntervalMs - elapsed;
+                    if (sleepMs > 1)
+                        Thread.Sleep(sleepMs);
                 }
                 catch (InvalidOperationException ex) when (
                     ex.Message.Contains("access lost", StringComparison.OrdinalIgnoreCase))
@@ -229,11 +244,29 @@ public sealed class DxgiScreenCapture : IScreenCapture
                 using var bitmap = new Bitmap(frame.Width, frame.Height, frame.Stride,
                     PixelFormat.Format32bppArgb, (IntPtr)ptr);
 
+                // Composite mouse cursor onto frame before encoding
+                DrawCursorOnBitmap(bitmap);
+
+                frameCount++;
+
+                // Raw BGRA path — skip JPEG encode entirely (saves 15-30ms per frame)
+                // Cursor is composited via DrawIconEx which writes directly into frame.Data
+                if (OnRawFrameCaptured != null)
+                {
+                    if (frameCount <= 3 || frameCount % 300 == 0)
+                    {
+                        _logger.LogDebug("DXGI raw frame #{Count}: {Size}b, {W}x{H}, stride={Stride}",
+                            frameCount, frame.Data.Length, frame.Width, frame.Height, frame.Stride);
+                    }
+                    OnRawFrameCaptured.Invoke(frame.Data, frame.Width, frame.Height, frame.Stride);
+                    return;
+                }
+
+                // Fallback: JPEG encode for base64 path
                 jpegStream.SetLength(0);
                 bitmap.Save(jpegStream, jpegEncoder, encoderParams);
                 var jpegData = jpegStream.ToArray();
 
-                frameCount++;
                 if (frameCount <= 3 || frameCount % 300 == 0)
                 {
                     _logger.LogDebug("DXGI frame #{Count}: {Size}b, {W}x{H}",
@@ -381,6 +414,8 @@ public sealed class DxgiScreenCapture : IScreenCapture
         var rect = desc.DesktopCoordinates;
         _width = rect.Right - rect.Left;
         _height = rect.Bottom - rect.Top;
+        _monitorX = rect.Left;
+        _monitorY = rect.Top;
         _monitorId = $"adapter{adapterIndex}_output{outputIndex}";
 
         _logger.LogInformation("Monitor: {Name}, Resolution: {Width}x{Height}",
@@ -458,7 +493,7 @@ public sealed class DxgiScreenCapture : IScreenCapture
             // Try to acquire next frame (0ms timeout for non-blocking)
             var acquireResult = _duplication.AcquireNextFrame(0, out var frameInfo, out var desktopResource);
 
-            if (acquireResult == Result.WaitTimeout)
+            if (acquireResult == Result.WaitTimeout || acquireResult == DxgiErrors.ErrorWaitTimeout)
             {
                 // No new frame available (desktop unchanged)
                 return null;
@@ -491,27 +526,37 @@ public sealed class DxgiScreenCapture : IScreenCapture
                 {
                     var stride = mappedResource.RowPitch;
                     var dataSize = _height * stride;
-                    var frameData = new byte[dataSize];
 
-                    // Copy pixel data row by row (handles different strides)
+                    // Reuse frame buffer across frames — avoids ~8MB alloc per frame
+                    if (_frameBuffer == null || _frameBuffer.Length < dataSize)
+                        _frameBuffer = new byte[dataSize];
+
+                    // Copy pixel data — single block copy when stride matches, row-by-row otherwise
                     unsafe
                     {
                         var srcPtr = (byte*)mappedResource.DataPointer;
-                        for (var y = 0; y < _height; y++)
+                        var expectedStride = _width * 4; // BGRA = 4 bytes per pixel
+                        if (stride == expectedStride)
                         {
-                            Marshal.Copy((IntPtr)(srcPtr + y * stride), frameData, y * stride, stride);
+                            // Stride matches width — single memcpy (fastest)
+                            Marshal.Copy((IntPtr)srcPtr, _frameBuffer, 0, dataSize);
+                        }
+                        else
+                        {
+                            for (var y = 0; y < _height; y++)
+                            {
+                                Marshal.Copy((IntPtr)(srcPtr + y * stride), _frameBuffer, y * stride, stride);
+                            }
                         }
                     }
 
-                    var timestamp = DateTimeOffset.UtcNow;
-
                     return new CapturedFrame
                     {
-                        Data = frameData,
+                        Data = _frameBuffer,
                         Width = _width,
                         Height = _height,
                         Stride = stride,
-                        Timestamp = timestamp
+                        Timestamp = DateTimeOffset.UtcNow
                     };
                 }
                 finally
@@ -559,6 +604,102 @@ public sealed class DxgiScreenCapture : IScreenCapture
 
     #endregion
 
+    #region Cursor Compositing (P/Invoke)
+
+    private const int CURSOR_SHOWING = 0x00000001;
+    private const int DI_NORMAL = 0x0003;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct CURSORINFO
+    {
+        public int cbSize;
+        public int flags;
+        public IntPtr hCursor;
+        public POINT ptScreenPos;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct POINT
+    {
+        public int x;
+        public int y;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ICONINFO
+    {
+        public bool fIcon;
+        public int xHotspot;
+        public int yHotspot;
+        public IntPtr hbmMask;
+        public IntPtr hbmColor;
+    }
+
+    [DllImport("user32.dll")]
+    private static extern bool GetCursorInfo(ref CURSORINFO pci);
+
+    [DllImport("user32.dll")]
+    private static extern bool GetIconInfo(IntPtr hIcon, out ICONINFO piconinfo);
+
+    [DllImport("user32.dll")]
+    private static extern bool DrawIconEx(IntPtr hdc, int xLeft, int yTop, IntPtr hIcon,
+        int cxWidth, int cyHeight, uint istepIfAniCur, IntPtr hbrFlickerFreeDraw, uint diFlags);
+
+    [DllImport("gdi32.dll")]
+    private static extern bool DeleteObject(IntPtr hObject);
+
+    /// <summary>
+    /// Draw the current mouse cursor onto the bitmap at its correct position
+    /// relative to the captured monitor. Uses GDI GetCursorInfo + DrawIconEx
+    /// (simpler and more reliable than parsing DXGI pointer shape types).
+    /// </summary>
+    private void DrawCursorOnBitmap(Bitmap bitmap)
+    {
+        var ci = new CURSORINFO();
+        ci.cbSize = Marshal.SizeOf<CURSORINFO>();
+
+        if (!GetCursorInfo(ref ci))
+            return;
+
+        if ((ci.flags & CURSOR_SHOWING) == 0)
+            return; // Cursor hidden
+
+        // Convert screen coords to monitor-relative coords
+        var cursorX = ci.ptScreenPos.x - _monitorX;
+        var cursorY = ci.ptScreenPos.y - _monitorY;
+
+        // Skip if cursor is outside our captured monitor
+        if (cursorX < -64 || cursorX > _width + 64 || cursorY < -64 || cursorY > _height + 64)
+            return;
+
+        // Get hotspot offset so cursor tip aligns correctly
+        if (GetIconInfo(ci.hCursor, out var iconInfo))
+        {
+            cursorX -= iconInfo.xHotspot;
+            cursorY -= iconInfo.yHotspot;
+
+            // Clean up GDI bitmaps from GetIconInfo
+            if (iconInfo.hbmMask != IntPtr.Zero)
+                DeleteObject(iconInfo.hbmMask);
+            if (iconInfo.hbmColor != IntPtr.Zero)
+                DeleteObject(iconInfo.hbmColor);
+        }
+
+        // Draw cursor onto the bitmap via GDI HDC
+        using var graphics = Graphics.FromImage(bitmap);
+        var hdc = graphics.GetHdc();
+        try
+        {
+            DrawIconEx(hdc, cursorX, cursorY, ci.hCursor, 0, 0, 0, IntPtr.Zero, DI_NORMAL);
+        }
+        finally
+        {
+            graphics.ReleaseHdc(hdc);
+        }
+    }
+
+    #endregion
+
     public void Dispose()
     {
         if (_disposed)
@@ -581,4 +722,5 @@ public sealed class DxgiScreenCapture : IScreenCapture
 internal static class DxgiErrors
 {
     public static readonly Result ErrorAccessLost = new Result(unchecked((int)0x887A0026));
+    public static readonly Result ErrorWaitTimeout = new Result(unchecked((int)0x887A0027));
 }

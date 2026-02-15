@@ -177,11 +177,12 @@ window.SteamViewerWebRTC = {
             _sharingStoppedByUser: false,
             _sharingLost: false,           // true when track ended unexpectedly (restart on next user gesture)
             _restartingShare: false,       // true while restart attempt is in progress (prevents concurrent restarts)
-            // Dynamic bitrate adaptation
-            _bitrateAdaptEnabled: true,
-            _targetBitrate: 3_000_000,
+            // Dynamic bitrate adaptation — disabled, let WebRTC handle rate control natively.
+            // Our adaptation was fighting WebRTC's BWE, capping bitrate at ~3Mbps on LAN.
+            _bitrateAdaptEnabled: false,
+            _targetBitrate: 50_000_000,
             _minBitrate: 500_000,
-            _maxBitrate: 8_000_000,
+            _maxBitrate: 50_000_000,
             _bitrateHistory: [],
             _lastBitrateAdjust: 0
         };
@@ -671,28 +672,44 @@ window.SteamViewerWebRTC = {
     },
 
     // Modify SDP for lower latency (pure function, no session state)
+    // SDP modifications for low-latency remote desktop streaming.
+    // Source: .claude/research/webrtc-latency/research.md (Selkies, Hopp, Neko findings)
     modifySdpForLowLatency(sdp) {
         let modified = sdp;
 
-        // Lower bandwidth for faster encoding
-        if (!modified.includes('b=AS:')) {
-            modified = modified.replace(/m=video.*\r\n/g, '$&b=AS:3000\r\n');
+        // Remove any existing b=AS lines (old 3Mbps cap that was killing bitrate)
+        modified = modified.replace(/b=AS:\d+\r\n/g, '');
+
+        // Set high bandwidth ceiling for LAN use (50 Mbps)
+        modified = modified.replace(/(m=video[^\r\n]*\r\n)/g, '$1b=AS:50000\r\n');
+
+        // Add x-google bitrate params to H264 fmtp lines — fast ramp-up, no slow BWE climb
+        // start=10Mbps (instant quality), min=5Mbps (floor), max=50Mbps (ceiling)
+        modified = modified.replace(
+            /(a=fmtp:\d+ .*profile-level-id=[0-9a-fA-F]+)(?!.*x-google)/g,
+            '$1;x-google-start-bitrate=10000;x-google-min-bitrate=5000;x-google-max-bitrate=50000'
+        );
+
+        // Add playout-delay RTP header extension — tells Chrome "render ASAP, don't buffer"
+        // This is the sender-side hint that Selkies uses to eliminate jitter buffer latency
+        if (!modified.includes('playout-delay')) {
+            const extmapIds = [...modified.matchAll(/a=extmap:(\d+)/g)].map(m => parseInt(m[1]));
+            const nextId = extmapIds.length > 0 ? Math.max(...extmapIds) + 1 : 13;
+            modified = modified.replace(
+                /(m=video[^\r\n]*\r\n(?:[^\r\n]*\r\n)*?)(a=rtpmap)/,
+                `$1a=extmap:${nextId} http://www.webrtc.org/experiments/rtp-hdrext/playout-delay\r\n$2`
+            );
         }
 
-        // Prefer H264 Baseline profile (fastest encoding, most compatible)
-        // Move H264 to top of codec list if present
+        // Prefer H264 Baseline profile (fastest encode/decode, most compatible)
         const lines = modified.split('\r\n');
         let h264PayloadTypes = [];
-
-        // Find H264 payload types
         lines.forEach(line => {
             if (line.includes('a=rtpmap:') && line.toLowerCase().includes('h264')) {
                 const match = line.match(/a=rtpmap:(\d+)/);
                 if (match) h264PayloadTypes.push(match[1]);
             }
         });
-
-        // Reorder m=video line to prefer H264
         if (h264PayloadTypes.length > 0) {
             modified = modified.replace(/(m=video \d+ [^ ]+ )(.+)/, (match, prefix, payloads) => {
                 const payloadList = payloads.split(' ');
@@ -832,7 +849,7 @@ window.SteamViewerWebRTC = {
 
                 // Set content hint for screen sharing (improves encoding for text/UI)
                 if (track.contentHint !== undefined) {
-                    track.contentHint = 'detail'; // Optimizes for sharp text/UI
+                    track.contentHint = 'motion'; // Prioritize frame rate + low latency over text sharpness // Optimizes for sharp text/UI
                 }
 
                 const sender = session.peerConnection.addTrack(track, session.localStream);
@@ -843,7 +860,7 @@ window.SteamViewerWebRTC = {
                 if (!params.encodings) {
                     params.encodings = [{}];
                 }
-                params.encodings[0].maxBitrate = 3000000; // 3 Mbps (lower = less latency)
+                params.encodings[0].maxBitrate = 50_000_000; // 50 Mbps ceiling — WebRTC BWE controls actual rate
                 params.encodings[0].maxFramerate = 30;  // Match getDisplayMedia ideal (24 causes stuttering)
                 params.encodings[0].priority = 'high';
                 params.encodings[0].networkPriority = 'high';
@@ -977,7 +994,8 @@ window.SteamViewerWebRTC = {
     // C# captures via DXGI Desktop Duplication → JPEG → pushNativeFrame() → hidden canvas
     // → captureStream() → MediaStream → WebRTC (browser handles H264 encoding)
 
-    // Start native capture: create hidden canvas, captureStream, add track to peer connection
+    // Start native capture: use MediaStreamTrackGenerator (push-based, no canvas)
+    // Fallback to canvas + captureStream(0) if MediaStreamTrackGenerator unavailable
     startNativeCapture(sessionId, fps) {
         const session = this._getSession(sessionId);
         if (!session.peerConnection) {
@@ -986,33 +1004,46 @@ window.SteamViewerWebRTC = {
         }
 
         fps = fps || 30;
-        console.log(`[${sessionId}] Starting native DXGI capture (canvas bridge, ${fps} FPS)`);
+        let track;
+        let stream;
 
-        // Create hidden canvas for DXGI frame rendering
-        session._nativeCanvas = document.createElement('canvas');
-        session._nativeCtx = session._nativeCanvas.getContext('2d');
+        // Prefer MediaStreamTrackGenerator (push-based, lower latency)
+        if (typeof MediaStreamTrackGenerator !== 'undefined') {
+            console.log(`[${sessionId}] Starting native DXGI capture (MediaStreamTrackGenerator, ${fps} FPS)`);
+            const generator = new MediaStreamTrackGenerator({ kind: 'video' });
+            session._trackGenerator = generator;
+            session._trackWriter = generator.writable.getWriter();
+            session._useTrackGenerator = true;
+            track = generator;
+            stream = new MediaStream([generator]);
+        } else {
+            // Fallback: canvas + captureStream(0) with manual requestFrame
+            console.log(`[${sessionId}] Starting native DXGI capture (canvas fallback, ${fps} FPS)`);
+            session._nativeCanvas = document.createElement('canvas');
+            session._nativeCtx = session._nativeCanvas.getContext('2d');
+            session._nativeStream = session._nativeCanvas.captureStream(0);
+            session._useTrackGenerator = false;
+            track = session._nativeStream.getVideoTracks()[0];
+            stream = session._nativeStream;
 
-        // Create MediaStream from canvas — browser generates video frames from canvas content
-        session._nativeStream = session._nativeCanvas.captureStream(fps);
-        const track = session._nativeStream.getVideoTracks()[0];
-
-        if (!track) {
-            console.error(`[${sessionId}] captureStream produced no video track`);
-            return false;
+            if (!track) {
+                console.error(`[${sessionId}] captureStream produced no video track`);
+                return false;
+            }
         }
 
         // Optimize for screen content (sharp text/UI)
-        track.contentHint = 'detail';
+        track.contentHint = 'motion'; // Prioritize frame rate + low latency over text sharpness
 
-        // Add to peer connection (same encoding setup as getDisplayMedia path)
-        const sender = session.peerConnection.addTrack(track, session._nativeStream);
+        // Add to peer connection
+        const sender = session.peerConnection.addTrack(track, stream);
         console.log(`[${sessionId}] Native capture track added to peer connection`);
 
-        // Configure encoding parameters (matches startScreenCapture settings)
+        // Configure encoding parameters — high ceiling, let WebRTC self-regulate
         const params = sender.getParameters();
         if (!params.encodings) params.encodings = [{}];
-        params.encodings[0].maxBitrate = 3000000;
-        params.encodings[0].maxFramerate = 30;
+        params.encodings[0].maxBitrate = 50_000_000; // 50 Mbps ceiling — WebRTC BWE controls actual rate
+        params.encodings[0].maxFramerate = fps;
         params.encodings[0].priority = 'high';
         params.encodings[0].networkPriority = 'high';
         params.encodings[0].scalabilityMode = 'L1T1';
@@ -1022,36 +1053,53 @@ window.SteamViewerWebRTC = {
         session._nativeCaptureActive = true;
         session._nativeFrameCount = 0;
         session._nativeSender = sender;
+        session._nativeStreamRef = stream;
         console.log(`[${sessionId}] Native DXGI capture ready (waiting for frames from C#)`);
         return true;
     },
 
-    // Receive a JPEG frame from C# DXGI capture and draw to the hidden canvas.
-    // captureStream() automatically picks up canvas changes and feeds them to WebRTC.
+    // Receive a JPEG frame from C# DXGI capture.
+    // MediaStreamTrackGenerator path: JPEG → createImageBitmap → VideoFrame → writer (push-based)
+    // Canvas fallback path: JPEG → createImageBitmap → drawImage → requestFrame()
     pushNativeFrame(sessionId, base64Jpeg, width, height) {
         const session = this.sessions.get(sessionId);
         if (!session || !session._nativeCaptureActive) return;
 
-        const canvas = session._nativeCanvas;
+        // Decode base64 to binary ArrayBuffer
+        const binary = atob(base64Jpeg);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        const blob = new Blob([bytes], { type: 'image/jpeg' });
 
-        // Resize canvas if capture dimensions changed (e.g., monitor switch, resolution change)
-        if (canvas.width !== width || canvas.height !== height) {
-            canvas.width = width;
-            canvas.height = height;
-            console.log(`[${sessionId}] Native capture canvas resized to ${width}x${height}`);
-        }
+        // GPU-accelerated JPEG decode → ImageBitmap
+        createImageBitmap(blob).then(bitmap => {
+            if (!session._nativeCaptureActive) { bitmap.close(); return; }
 
-        // Decode JPEG and draw to canvas
-        // Reuse Image object to avoid GC pressure at 30 FPS
-        if (!session._nativeImg) {
-            session._nativeImg = new Image();
-            session._nativeImg.onload = function() {
-                session._nativeCtx.drawImage(session._nativeImg, 0, 0);
-            };
-        }
-        session._nativeImg.src = 'data:image/jpeg;base64,' + base64Jpeg;
+            if (session._useTrackGenerator && session._trackWriter) {
+                // Push-based: ImageBitmap → VideoFrame → MediaStreamTrackGenerator → WebRTC
+                const frame = new VideoFrame(bitmap, { timestamp: performance.now() * 1000 });
+                bitmap.close();
+                session._trackWriter.write(frame).catch(e => {
+                    // Writer may be closed during shutdown — not an error
+                    if (session._nativeCaptureActive) console.warn('TrackWriter error:', e);
+                });
+            } else if (session._nativeCanvas) {
+                // Canvas fallback: drawImage + manual requestFrame
+                const canvas = session._nativeCanvas;
+                if (canvas.width !== width || canvas.height !== height) {
+                    canvas.width = width;
+                    canvas.height = height;
+                }
+                session._nativeCtx.drawImage(bitmap, 0, 0);
+                bitmap.close();
+                const track = session._nativeStream?.getVideoTracks()[0];
+                if (track?.requestFrame) track.requestFrame();
+            }
+        }).catch(e => {
+            if (session._nativeCaptureActive) console.warn('createImageBitmap error:', e);
+        });
 
-        session._nativeFrameCount++;
+        session._nativeFrameCount = (session._nativeFrameCount || 0) + 1;
 
         // Report capture dimensions to C# on first frame (same as getDisplayMedia path)
         if (session._nativeFrameCount === 1 && session.dotNetRef) {
@@ -1069,9 +1117,24 @@ window.SteamViewerWebRTC = {
         const session = this.sessions.get(sessionId);
         if (!session) return;
 
+        const frameCount = session._nativeFrameCount || 0;
         session._nativeCaptureActive = false;
 
-        // Stop canvas stream tracks
+        // Close MediaStreamTrackGenerator resources
+        if (session._trackWriter) {
+            session._trackWriter.close().catch(() => {});
+            session._trackWriter = null;
+        }
+        if (session._trackGenerator) {
+            session._trackGenerator.stop();
+            session._trackGenerator = null;
+        }
+
+        // Stop stream tracks (canvas fallback or generator stream)
+        if (session._nativeStreamRef) {
+            session._nativeStreamRef.getTracks().forEach(t => t.stop());
+            session._nativeStreamRef = null;
+        }
         if (session._nativeStream) {
             session._nativeStream.getTracks().forEach(t => t.stop());
             session._nativeStream = null;
@@ -1087,12 +1150,12 @@ window.SteamViewerWebRTC = {
             session._nativeSender = null;
         }
 
-        // Clean up canvas resources
+        // Clean up canvas fallback resources
         session._nativeCanvas = null;
         session._nativeCtx = null;
-        session._nativeImg = null;
+        session._useTrackGenerator = false;
 
-        console.log(`[${sessionId}] Native DXGI capture stopped (${session._nativeFrameCount || 0} frames total)`);
+        console.log(`[${sessionId}] Native DXGI capture stopped (${frameCount} frames total)`);
         session._nativeFrameCount = 0;
     },
 
@@ -1650,16 +1713,28 @@ window.SteamViewerWebRTC = {
             if (session._bitrateHistory.length > 5) session._bitrateHistory.shift();
             const avgBandwidth = session._bitrateHistory.reduce((a, b) => a + b, 0) / session._bitrateHistory.length;
 
-            // Target 80% of available bandwidth
-            let newTarget = Math.floor(avgBandwidth * 0.8);
+            // Target 90% of available bandwidth (ramp up aggressively)
+            let newTarget = Math.floor(avgBandwidth * 0.9);
 
-            // Reduce on packet loss
+            // Only reduce below initial bitrate on actual packet loss — never on BWE alone.
+            // BWE starts conservatively and needs high usage to ramp up. Reducing to match
+            // BWE's estimate creates a feedback loop where bitrate gets stuck at ~3Mbps.
             let lossPercent = 0;
             if (packetsReceived + packetsLost > 0) {
                 lossPercent = (packetsLost / (packetsReceived + packetsLost)) * 100;
             }
-            if (lossPercent > 2) newTarget = Math.floor(newTarget * 0.7);
-            else if (lossPercent > 0.5) newTarget = Math.floor(newTarget * 0.9);
+
+            const initialBitrate = 10_000_000; // Must match startNativeCapture / startScreenShare
+            if (lossPercent > 2) {
+                // Significant loss — reduce aggressively, allow going below initial
+                newTarget = Math.floor(newTarget * 0.7);
+            } else if (lossPercent > 0.5) {
+                // Mild loss — reduce gently, allow going below initial
+                newTarget = Math.floor(newTarget * 0.9);
+            } else {
+                // No loss — never reduce below initial, only ramp up
+                newTarget = Math.max(newTarget, initialBitrate);
+            }
 
             // Clamp
             newTarget = Math.max(session._minBitrate, Math.min(session._maxBitrate, newTarget));
@@ -1685,9 +1760,9 @@ window.SteamViewerWebRTC = {
 
             session._targetBitrate = newTarget;
 
-            if (newTarget >= 4_000_000) session._qualityMode = 'HQ';
-            else if (newTarget >= 2_000_000) session._qualityMode = 'MQ';
-            else if (newTarget >= 1_000_000) session._qualityMode = 'LQ';
+            if (newTarget >= 20_000_000) session._qualityMode = 'HQ';
+            else if (newTarget >= 8_000_000) session._qualityMode = 'MQ';
+            else if (newTarget >= 2_000_000) session._qualityMode = 'LQ';
             else session._qualityMode = 'MIN';
         } catch (e) {
             console.warn('[Bitrate] adaptation error:', e);
@@ -1735,6 +1810,11 @@ window.SteamViewerWebRTC = {
                 if (report.frameWidth && report.frameHeight) {
                     resolution = `${report.frameWidth}x${report.frameHeight}`;
                 }
+                // Jitter buffer metrics — track cumulative values for delta calculation
+                if (report.jitterBufferDelay !== undefined && report.jitterBufferEmittedCount) {
+                    session._jbDelay = report.jitterBufferDelay;
+                    session._jbCount = report.jitterBufferEmittedCount;
+                }
             }
             // RTT from candidate pair
             if (report.type === 'candidate-pair' && report.state === 'succeeded') {
@@ -1778,8 +1858,33 @@ window.SteamViewerWebRTC = {
         session._inputEventsCount = 0;
         session._inputThrottledCount = 0;
 
-        // Save for next delta
-        session._statsPrev = { time: now, bytes: currentBytes, frames: currentFrames };
+        // Jitter buffer delta — average JB delay since last poll
+        // Source: .claude/research/webrtc-latency/research.md (Selkies pattern)
+        let jbAvgMs = session._jbAvgMs || 0;
+        if (session._jbDelay !== undefined && session._statsPrev?.jbDelay !== undefined) {
+            const deltaDelay = session._jbDelay - session._statsPrev.jbDelay;
+            const deltaCount = session._jbCount - (session._statsPrev.jbCount || 0);
+            if (deltaCount > 0) {
+                jbAvgMs = (deltaDelay / deltaCount) * 1000; // seconds → ms
+                session._jbAvgMs = jbAvgMs;
+            }
+        }
+
+        // Persistent jitter buffer pressure — Chrome's adaptive algorithm resets our hints,
+        // so re-apply every poll cycle (Selkies pattern: set on interval, not just once)
+        const receivers = session.peerConnection.getReceivers();
+        for (const receiver of receivers) {
+            if (receiver.track?.kind === 'video') {
+                if ('jitterBufferTarget' in receiver) receiver.jitterBufferTarget = 0;
+                if ('playoutDelayHint' in receiver) receiver.playoutDelayHint = 0;
+            }
+        }
+
+        // Save for next delta (include jitter buffer cumulative values)
+        session._statsPrev = {
+            time: now, bytes: currentBytes, frames: currentFrames,
+            jbDelay: session._jbDelay, jbCount: session._jbCount
+        };
 
         // If resolution still unknown, try from canvas/video
         if (resolution === '?') {
@@ -1793,7 +1898,7 @@ window.SteamViewerWebRTC = {
         // Format overlay text
         const lines = [
             `Video: ${videoFps.toFixed(0)} FPS | ${bitrateMbps.toFixed(1)} Mbps | ${resolution}`,
-            `Net:   RTT ${rttMs.toFixed(0)}ms | Loss ${lossPercent.toFixed(1)}%`,
+            `Lat:   JB ${jbAvgMs.toFixed(0)}ms | RTT ${rttMs.toFixed(0)}ms | Loss ${lossPercent.toFixed(1)}%`,
             `Input: ${inputPerSec} evt/s${throttledPerSec > 0 ? ` (${throttledPerSec} throttled)` : ''} | Buf: ${bufferKB.toFixed(0)} KB`,
             `Data:  ${fmtBytes(currentBytes)} video | ${fmtBytes(dataChannelBytes)} ctrl`,
             `Mode:  [${session._qualityMode}] Target: ${(session._targetBitrate / 1_000_000).toFixed(1)} Mbps`
@@ -2656,3 +2761,86 @@ window.SteamViewerSecureDesktop = {
         ctx.fill();
     }
 };
+
+// --- WebView2 SharedBuffer receiver (zero-copy frame transfer from C# DXGI capture) ---
+// Supports two modes:
+//   raw BGRA: VideoFrame directly from pixel data (no JPEG encode/decode — fastest)
+//   JPEG fallback: createImageBitmap → VideoFrame (when raw not available)
+// Source: .claude/research/binary-frame-transfer/research.md
+if (window.chrome?.webview) {
+    window.chrome.webview.addEventListener('sharedbufferreceived', (e) => {
+        try {
+            const meta = e.additionalData; // Already parsed by WebView2 — NOT a string
+            const buf = e.getBuffer();
+
+            const session = window.SteamViewerWebRTC.sessions.get(meta.sid);
+            if (!session?._nativeCaptureActive) {
+                chrome.webview.releaseBuffer(buf);
+                return;
+            }
+
+            if (meta.raw) {
+                // Raw BGRA path — VideoFrame directly from pixel data
+                // No JPEG encode, no JPEG decode, no createImageBitmap. Synchronous.
+                // Must copy bytes out of SharedBuffer before releasing (SharedBuffer
+                // ArrayBuffer may not be accepted by VideoFrame constructor directly)
+                const bgraCopy = new Uint8Array(buf, 0, meta.len).slice();
+                chrome.webview.releaseBuffer(buf);
+                const frame = new VideoFrame(bgraCopy, {
+                    format: 'BGRA',
+                    codedWidth: meta.w,
+                    codedHeight: meta.h,
+                    timestamp: performance.now() * 1000,
+                });
+
+                if (session._useTrackGenerator && session._trackWriter) {
+                    session._trackWriter.write(frame).catch(() => {});
+                } else {
+                    frame.close();
+                }
+            } else {
+                // JPEG fallback path (async — needs createImageBitmap)
+                const jpegBytes = new Uint8Array(buf, 0, meta.len).slice();
+                chrome.webview.releaseBuffer(buf);
+
+                const blob = new Blob([jpegBytes], { type: 'image/jpeg' });
+                createImageBitmap(blob).then(bitmap => {
+                    if (!session._nativeCaptureActive) { bitmap.close(); return; }
+
+                    if (session._useTrackGenerator && session._trackWriter) {
+                        const frame = new VideoFrame(bitmap, { timestamp: performance.now() * 1000 });
+                        bitmap.close();
+                        session._trackWriter.write(frame).catch(() => {});
+                    } else if (session._nativeCanvas) {
+                        const canvas = session._nativeCanvas;
+                        if (canvas.width !== meta.w || canvas.height !== meta.h) {
+                            canvas.width = meta.w;
+                            canvas.height = meta.h;
+                        }
+                        session._nativeCtx.drawImage(bitmap, 0, 0);
+                        bitmap.close();
+                        const track = session._nativeStream?.getVideoTracks()[0];
+                        if (track?.requestFrame) track.requestFrame();
+                    }
+                }).catch(() => {});
+            }
+
+            session._nativeFrameCount = (session._nativeFrameCount || 0) + 1;
+
+            // Report dimensions on first frame
+            if (session._nativeFrameCount === 1 && session.dotNetRef) {
+                try {
+                    session.dotNetRef.invokeMethodAsync('OnCaptureStartedCallback', meta.w, meta.h);
+                    console.log(`[${meta.sid}] SharedBuffer: reported dims ${meta.w}x${meta.h} to C#`);
+                } catch (err) {
+                    console.warn('Could not report SharedBuffer dims:', err);
+                }
+            }
+        } catch (err) {
+            console.warn('SharedBuffer frame error:', err);
+        }
+    });
+    console.log('[SharedBuffer] WebView2 SharedBuffer receiver registered');
+} else {
+    console.log('[SharedBuffer] Not in WebView2 — using JSInterop fallback');
+}
