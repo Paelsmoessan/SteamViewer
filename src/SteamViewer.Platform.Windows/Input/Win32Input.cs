@@ -107,6 +107,16 @@ internal static class Win32Input
     }
 
     /// <summary>
+    /// Get the primary monitor's physical pixel dimensions.
+    /// Uses SM_CXSCREEN/SM_CYSCREEN (always returns primary monitor size).
+    /// Use this instead of hardcoding 1920x1080.
+    /// </summary>
+    public static (int Width, int Height) GetPrimaryMonitorSize()
+    {
+        return (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+    }
+
+    /// <summary>
     /// Get cached monitor list with physical pixel dimensions.
     /// </summary>
     public static IReadOnlyList<(int X, int Y, int Width, int Height, bool IsPrimary, string DeviceName)> GetMonitors()
@@ -494,6 +504,8 @@ internal static class Win32Input
 
     internal const int WHEEL_DELTA = 120;
 
+    internal const int SM_CXSCREEN = 0;
+    internal const int SM_CYSCREEN = 1;
     internal const int SM_XVIRTUALSCREEN = 76;
     internal const int SM_YVIRTUALSCREEN = 77;
     internal const int SM_CXVIRTUALSCREEN = 78;

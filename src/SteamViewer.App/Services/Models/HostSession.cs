@@ -51,9 +51,9 @@ public sealed class HostSession : IAsyncDisposable
     private string? _pendingSdpOffer;
     private readonly List<(string candidate, string? sdpMid, int? sdpMLineIndex)> _pendingIceCandidates = new();
 
-    // Track capture dimensions from viewer's mouse events
-    private int _lastCaptureWidth = 1920;
-    private int _lastCaptureHeight = 1080;
+    // Track capture dimensions from viewer's mouse events (0 = not yet received)
+    private int _lastCaptureWidth;
+    private int _lastCaptureHeight;
 
     /// <summary>Session ID for JS interop — always "host".</summary>
     public string SessionId => "host";
@@ -481,6 +481,9 @@ public sealed class HostSession : IAsyncDisposable
         try
         {
             TrackCaptureDimensions(json);
+
+            // Don't inject until we know real capture dimensions (avoids wrong coordinate mapping)
+            if (_lastCaptureWidth <= 0 || _lastCaptureHeight <= 0) return;
 
             // If an elevated helper is connected, route through the elevation service (async, fire-and-forget)
             if (_elevationService != null && (_elevationService.IsAdminConnected || _elevationService.IsSystemConnected))

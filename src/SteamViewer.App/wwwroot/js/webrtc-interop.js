@@ -1375,9 +1375,9 @@ window.SteamViewerWebRTC = {
 
             if (srcWidth === 0 || srcHeight === 0) return;
 
-            // Downscale large resolutions for encoding (max 1920x1080 for capture)
-            const maxWidth = 1920;
-            const maxHeight = 1080;
+            // Downscale very large resolutions for encoding (max 4K)
+            const maxWidth = 3840;
+            const maxHeight = 2160;
             let destWidth = srcWidth;
             let destHeight = srcHeight;
 
@@ -2362,9 +2362,7 @@ window.SteamViewerVideoDecoder = {
         });
 
         this.decoder.configure({
-            codec: 'avc1.42E01E', // H.264 Baseline Profile
-            width: 1920,
-            height: 1080
+            codec: 'avc1.42E01E' // H.264 Baseline Profile — dimensions come from stream SPS
         });
 
         console.log('WebCodecs VideoDecoder initialized');

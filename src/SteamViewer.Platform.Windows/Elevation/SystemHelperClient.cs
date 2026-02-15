@@ -465,8 +465,8 @@ public sealed class SystemHelperClient : IAsyncDisposable
             switch (notification)
             {
                 case "secureDesktopActive":
-                    _secureDesktopWidth = doc.RootElement.TryGetProperty("width", out var w) ? w.GetInt32() : 1920;
-                    _secureDesktopHeight = doc.RootElement.TryGetProperty("height", out var h) ? h.GetInt32() : 1080;
+                    _secureDesktopWidth = doc.RootElement.TryGetProperty("width", out var w) ? w.GetInt32() : 0;
+                    _secureDesktopHeight = doc.RootElement.TryGetProperty("height", out var h) ? h.GetInt32() : 0;
                     _isSecureDesktopActive = true;
                     _logger.LogInformation("Secure Desktop ACTIVE ({W}x{H})", _secureDesktopWidth, _secureDesktopHeight);
                     OnSecureDesktopStateChanged?.Invoke(true);

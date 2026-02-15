@@ -69,12 +69,16 @@ public sealed class MacMonitorEnumerator : IMonitorEnumerator
 
         if (monitors.Count == 0)
         {
-            _logger.LogWarning("No monitors found, returning placeholder");
+            // Last resort: query main display bounds directly
+            var mainBounds = CGDisplay.GetBounds(CGDisplay.MainDisplayID);
+            var w = (uint)mainBounds.Width;
+            var h = (uint)mainBounds.Height;
+            _logger.LogWarning("No monitors from display list, main display bounds: {W}x{H}", w, h);
             monitors.Add(new MonitorInfo(
                 Id: 0,
                 Name: "Primary Display",
-                Width: 1920,
-                Height: 1080,
+                Width: w > 0 ? w : 1920,
+                Height: h > 0 ? h : 1080,
                 X: 0,
                 Y: 0,
                 IsPrimary: true
