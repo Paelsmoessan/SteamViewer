@@ -972,6 +972,130 @@ window.SteamViewerWebRTC = {
         }
     },
 
+    // --- Native DXGI Capture (canvas bridge) ---
+    // Replaces getDisplayMedia() — no screen picker, programmatic monitor selection.
+    // C# captures via DXGI Desktop Duplication → JPEG → pushNativeFrame() → hidden canvas
+    // → captureStream() → MediaStream → WebRTC (browser handles H264 encoding)
+
+    // Start native capture: create hidden canvas, captureStream, add track to peer connection
+    startNativeCapture(sessionId, fps) {
+        const session = this._getSession(sessionId);
+        if (!session.peerConnection) {
+            console.error(`[${sessionId}] Cannot start native capture - no peer connection`);
+            return false;
+        }
+
+        fps = fps || 30;
+        console.log(`[${sessionId}] Starting native DXGI capture (canvas bridge, ${fps} FPS)`);
+
+        // Create hidden canvas for DXGI frame rendering
+        session._nativeCanvas = document.createElement('canvas');
+        session._nativeCtx = session._nativeCanvas.getContext('2d');
+
+        // Create MediaStream from canvas — browser generates video frames from canvas content
+        session._nativeStream = session._nativeCanvas.captureStream(fps);
+        const track = session._nativeStream.getVideoTracks()[0];
+
+        if (!track) {
+            console.error(`[${sessionId}] captureStream produced no video track`);
+            return false;
+        }
+
+        // Optimize for screen content (sharp text/UI)
+        track.contentHint = 'detail';
+
+        // Add to peer connection (same encoding setup as getDisplayMedia path)
+        const sender = session.peerConnection.addTrack(track, session._nativeStream);
+        console.log(`[${sessionId}] Native capture track added to peer connection`);
+
+        // Configure encoding parameters (matches startScreenCapture settings)
+        const params = sender.getParameters();
+        if (!params.encodings) params.encodings = [{}];
+        params.encodings[0].maxBitrate = 3000000;
+        params.encodings[0].maxFramerate = 30;
+        params.encodings[0].priority = 'high';
+        params.encodings[0].networkPriority = 'high';
+        params.encodings[0].scalabilityMode = 'L1T1';
+        params.encodings[0].degradationPreference = 'maintain-framerate';
+        sender.setParameters(params).catch(e => console.warn('Could not set native capture encoding params:', e));
+
+        session._nativeCaptureActive = true;
+        session._nativeFrameCount = 0;
+        session._nativeSender = sender;
+        console.log(`[${sessionId}] Native DXGI capture ready (waiting for frames from C#)`);
+        return true;
+    },
+
+    // Receive a JPEG frame from C# DXGI capture and draw to the hidden canvas.
+    // captureStream() automatically picks up canvas changes and feeds them to WebRTC.
+    pushNativeFrame(sessionId, base64Jpeg, width, height) {
+        const session = this.sessions.get(sessionId);
+        if (!session || !session._nativeCaptureActive) return;
+
+        const canvas = session._nativeCanvas;
+
+        // Resize canvas if capture dimensions changed (e.g., monitor switch, resolution change)
+        if (canvas.width !== width || canvas.height !== height) {
+            canvas.width = width;
+            canvas.height = height;
+            console.log(`[${sessionId}] Native capture canvas resized to ${width}x${height}`);
+        }
+
+        // Decode JPEG and draw to canvas
+        // Reuse Image object to avoid GC pressure at 30 FPS
+        if (!session._nativeImg) {
+            session._nativeImg = new Image();
+            session._nativeImg.onload = function() {
+                session._nativeCtx.drawImage(session._nativeImg, 0, 0);
+            };
+        }
+        session._nativeImg.src = 'data:image/jpeg;base64,' + base64Jpeg;
+
+        session._nativeFrameCount++;
+
+        // Report capture dimensions to C# on first frame (same as getDisplayMedia path)
+        if (session._nativeFrameCount === 1 && session.dotNetRef) {
+            try {
+                session.dotNetRef.invokeMethodAsync('OnCaptureStartedCallback', width, height);
+                console.log(`[${sessionId}] Native capture: reported dims ${width}x${height} to C#`);
+            } catch (e) {
+                console.warn('Could not report native capture dims:', e);
+            }
+        }
+    },
+
+    // Stop native DXGI capture and clean up
+    stopNativeCapture(sessionId) {
+        const session = this.sessions.get(sessionId);
+        if (!session) return;
+
+        session._nativeCaptureActive = false;
+
+        // Stop canvas stream tracks
+        if (session._nativeStream) {
+            session._nativeStream.getTracks().forEach(t => t.stop());
+            session._nativeStream = null;
+        }
+
+        // Remove sender from peer connection
+        if (session._nativeSender && session.peerConnection) {
+            try {
+                session.peerConnection.removeTrack(session._nativeSender);
+            } catch (e) {
+                console.warn(`[${sessionId}] Could not remove native capture sender:`, e);
+            }
+            session._nativeSender = null;
+        }
+
+        // Clean up canvas resources
+        session._nativeCanvas = null;
+        session._nativeCtx = null;
+        session._nativeImg = null;
+
+        console.log(`[${sessionId}] Native DXGI capture stopped (${session._nativeFrameCount || 0} frames total)`);
+        session._nativeFrameCount = 0;
+    },
+
     // Pause video track sender (frees bandwidth for data channel during Secure Desktop)
     pauseVideoTrack(sessionId) {
         const session = this._getSession(sessionId);

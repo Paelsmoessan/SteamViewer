@@ -242,6 +242,37 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
     }
 
     /// <summary>
+    /// Start native DXGI capture via canvas bridge (no screen picker).
+    /// Creates hidden canvas + captureStream → MediaStream → addTrack.
+    /// </summary>
+    public async Task<bool> StartNativeCaptureAsync(int fps = 30)
+    {
+        EnsureInitialized();
+        var success = await _jsRuntime.InvokeAsync<bool>("SteamViewerWebRTC.startNativeCapture", _sessionId, fps);
+        _logger.LogInformation("Native DXGI capture started: {Success}", success);
+        return success;
+    }
+
+    /// <summary>
+    /// Push a JPEG frame from DXGI capture to the JS canvas bridge.
+    /// Fire-and-forget from capture thread — do not await on hot path.
+    /// </summary>
+    public ValueTask PushNativeFrameAsync(string base64Jpeg, int width, int height)
+    {
+        return _jsRuntime.InvokeVoidAsync("SteamViewerWebRTC.pushNativeFrame", _sessionId, base64Jpeg, width, height);
+    }
+
+    /// <summary>
+    /// Stop native DXGI capture and clean up canvas bridge.
+    /// </summary>
+    public async Task StopNativeCaptureAsync()
+    {
+        EnsureInitialized();
+        await _jsRuntime.InvokeVoidAsync("SteamViewerWebRTC.stopNativeCapture", _sessionId);
+        _logger.LogInformation("Native DXGI capture stopped");
+    }
+
+    /// <summary>
     /// Pause video track sender (frees bandwidth for data channel during Secure Desktop).
     /// </summary>
     public async Task PauseVideoTrackAsync()
