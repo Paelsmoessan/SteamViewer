@@ -500,10 +500,11 @@ public static class BootRelayService
                 case "mouse_wheel":
                 case "key_down":
                 case "key_up":
+                    var (defaultW, defaultH) = Win32Input.GetPrimaryMonitorSize();
                     var sw = root.TryGetProperty("sw", out var swP) ? swP.GetInt32() :
-                             root.TryGetProperty("captureWidth", out var cwP) ? cwP.GetInt32() : 1920;
+                             root.TryGetProperty("captureWidth", out var cwP) ? cwP.GetInt32() : defaultW;
                     var sh = root.TryGetProperty("sh", out var shP) ? shP.GetInt32() :
-                             root.TryGetProperty("captureHeight", out var chP) ? chP.GetInt32() : 1080;
+                             root.TryGetProperty("captureHeight", out var chP) ? chP.GetInt32() : defaultH;
                     _inputQueue?.TryAdd((json, sw, sh));
                     break;
             }

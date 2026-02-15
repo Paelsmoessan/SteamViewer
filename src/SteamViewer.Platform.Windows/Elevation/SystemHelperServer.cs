@@ -869,8 +869,9 @@ public static class SystemHelperServer
     {
         try
         {
-            var sw = root.TryGetProperty("sw", out var swProp) ? swProp.GetInt32() : 1920;
-            var sh = root.TryGetProperty("sh", out var shProp) ? shProp.GetInt32() : 1080;
+            var (defaultW, defaultH) = Win32Input.GetPrimaryMonitorSize();
+            var sw = root.TryGetProperty("sw", out var swProp) ? swProp.GetInt32() : defaultW;
+            var sh = root.TryGetProperty("sh", out var shProp) ? shProp.GetInt32() : defaultH;
 
             // Always enqueue — the input thread handles both Default and Secure Desktop
             // by switching desktops dynamically (clean thread, no prior user32 calls)

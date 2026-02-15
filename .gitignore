@@ -2,6 +2,8 @@
 misc/.AI.md
 .claude/settings.local.json
 .claude/ClaudeToClaude-communication.md
+.claude/test-findings-gist.md
+.claude/lessons-learned-gist.md
 .claude/test-notes.md
 .claude/session-memory.md
 .claude/scripts/

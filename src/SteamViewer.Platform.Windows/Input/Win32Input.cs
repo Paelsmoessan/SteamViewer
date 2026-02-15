@@ -9,24 +9,98 @@ namespace SteamViewer.Platform.Windows.Input;
 /// </summary>
 internal static class Win32Input
 {
-    // Lazy-init virtual screen dimensions
+    // Virtual screen dimensions — refreshed on every call (sub-microsecond GetSystemMetrics)
     private static int _vsLeft, _vsTop, _vsWidth, _vsHeight;
-    private static bool _initialized;
-    private static readonly object InitLock = new();
 
+    // Multi-monitor support: cached monitor rectangles, re-enumerated when virtual screen changes
+    private record struct MonitorRect(int X, int Y, int Width, int Height, bool IsPrimary, string DeviceName);
+    private static MonitorRect[]? _monitors;
 
-    private static void EnsureInitialized()
+    // Cached captured monitor bounds — set once at capture start, used as fast-path in ConvertToAbsoluteCoordinates.
+    // Source: Sunshine — match once at capture start, reuse stored bounds. (.claude/research/mouse-input/research.md)
+    private static int _cachedCaptureW, _cachedCaptureH;
+    private static MonitorRect? _cachedTarget;
+
+    private static void RefreshDisplayState()
     {
-        if (_initialized) return;
-        lock (InitLock)
+        // Process-level PMv2 DPI awareness is set in Program.Main() — all threads
+        // get physical pixel dimensions from GetSystemMetrics/EnumDisplayMonitors.
+        var left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        var top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        var width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        var height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+
+        // Re-enumerate monitors only when virtual screen dimensions change (hot-plug, settings change)
+        if (width != _vsWidth || height != _vsHeight || left != _vsLeft || top != _vsTop || _monitors == null)
         {
-            if (_initialized) return;
-            _vsLeft = GetSystemMetrics(SM_XVIRTUALSCREEN);
-            _vsTop = GetSystemMetrics(SM_YVIRTUALSCREEN);
-            _vsWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-            _vsHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-            _initialized = true;
+            EnumerateMonitors();
         }
+
+        _vsLeft = left;
+        _vsTop = top;
+        _vsWidth = width;
+        _vsHeight = height;
+    }
+
+    // Desktop sync retry: last-known desktop handle per thread (value only, for comparison).
+    // When SendInput fails (returns 0), the thread's desktop may be stale.
+    // Re-open the input desktop and retry. Source: Sunshine send_input() + syncThreadDesktop().
+    [ThreadStatic]
+    private static IntPtr _lastKnownDesktop;
+
+    /// <summary>
+    /// SendInput with desktop sync retry. If SendInput returns 0, re-opens the
+    /// current input desktop and retries once. Handles desktop transitions
+    /// (UAC return, fast user switch) without requiring the SYSTEM helper.
+    /// </summary>
+    private static uint SendInputWithRetry(uint nInputs, INPUT[] pInputs, int cbSize)
+    {
+        var sent = SendInput(nInputs, pInputs, cbSize);
+        if (sent == nInputs)
+            return sent;
+
+        // SendInput failed — try to re-attach to the current input desktop
+        var hDesk = OpenInputDesktop(0, false, DESKTOP_SWITCHDESKTOP);
+        if (hDesk == IntPtr.Zero)
+            return sent; // Can't open desktop — give up
+
+        if (hDesk != _lastKnownDesktop)
+        {
+            SetThreadDesktop(hDesk);
+            _lastKnownDesktop = hDesk;
+            sent = SendInput(nInputs, pInputs, cbSize); // retry
+        }
+
+        // Close our handle — SetThreadDesktop already gave the thread its own reference.
+        // We keep _lastKnownDesktop as a stale sentinel for change detection (Sunshine pattern).
+        CloseDesktop(hDesk);
+        return sent;
+    }
+
+    private static List<MonitorRect>? _monitorCollector;
+
+    private static void EnumerateMonitors()
+    {
+        _monitorCollector = new List<MonitorRect>();
+        EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, MonitorEnumCallback, IntPtr.Zero);
+        _monitors = _monitorCollector.ToArray();
+        _monitorCollector = null;
+    }
+
+    private static bool MonitorEnumCallback(IntPtr hMonitor, IntPtr hdcMonitor, ref RECT lprcMonitor, IntPtr dwData)
+    {
+        var mi = new MONITORINFOEXW { cbSize = Marshal.SizeOf<MONITORINFOEXW>() };
+        if (GetMonitorInfoW(hMonitor, ref mi))
+        {
+            _monitorCollector?.Add(new MonitorRect(
+                mi.rcMonitor.left,
+                mi.rcMonitor.top,
+                mi.rcMonitor.right - mi.rcMonitor.left,
+                mi.rcMonitor.bottom - mi.rcMonitor.top,
+                (mi.dwFlags & MONITORINFOF_PRIMARY) != 0,
+                mi.szDevice ?? ""));
+        }
+        return true;
     }
 
     /// <summary>
@@ -34,8 +108,72 @@ internal static class Win32Input
     /// </summary>
     public static (int Left, int Top, int Width, int Height) GetVirtualScreen()
     {
-        EnsureInitialized();
+        RefreshDisplayState();
         return (_vsLeft, _vsTop, _vsWidth, _vsHeight);
+    }
+
+    /// <summary>
+    /// Get the primary monitor's physical pixel dimensions.
+    /// Uses SM_CXSCREEN/SM_CYSCREEN (always returns primary monitor size).
+    /// Use this instead of hardcoding 1920x1080.
+    /// </summary>
+    public static (int Width, int Height) GetPrimaryMonitorSize()
+    {
+        return (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+    }
+
+    /// <summary>
+    /// Get cached monitor list with physical pixel dimensions.
+    /// </summary>
+    public static IReadOnlyList<(int X, int Y, int Width, int Height, bool IsPrimary, string DeviceName)> GetMonitors()
+    {
+        RefreshDisplayState();
+        if (_monitors == null) return Array.Empty<(int, int, int, int, bool, string)>();
+        return _monitors.Select(m => (m.X, m.Y, m.Width, m.Height, m.IsPrimary, m.DeviceName)).ToArray();
+    }
+
+    /// <summary>
+    /// Cache the target monitor bounds for the current capture session.
+    /// Called once when screen sharing starts. Matches capture dimensions to a monitor.
+    /// If capture matches full virtual desktop, clears the cache (no offset needed).
+    /// Source: Sunshine — match once, use stored bounds.
+    /// </summary>
+    public static void SetCapturedMonitor(int captureWidth, int captureHeight)
+    {
+        RefreshDisplayState();
+        _cachedCaptureW = captureWidth;
+        _cachedCaptureH = captureHeight;
+
+        if (captureWidth == _vsWidth && captureHeight == _vsHeight)
+        {
+            _cachedTarget = null; // Full virtual desktop — no offset needed
+        }
+        else
+        {
+            _cachedTarget = FindMonitorByResolution(captureWidth, captureHeight)
+                           ?? _monitors?.FirstOrDefault(m => m.IsPrimary);
+        }
+    }
+
+    /// <summary>
+    /// Explicitly set the target monitor bounds (when monitor identity is known, e.g., from picker UI).
+    /// Bypasses resolution matching entirely — no ambiguity possible.
+    /// </summary>
+    public static void SetCapturedMonitorExplicit(int x, int y, int w, int h)
+    {
+        _cachedTarget = new MonitorRect(x, y, w, h, false, "");
+        _cachedCaptureW = w;
+        _cachedCaptureH = h;
+    }
+
+    /// <summary>
+    /// Clear the cached target monitor (call when capture stops).
+    /// </summary>
+    public static void ClearCapturedMonitor()
+    {
+        _cachedTarget = null;
+        _cachedCaptureW = 0;
+        _cachedCaptureH = 0;
     }
 
     /// <summary>
@@ -43,7 +181,7 @@ internal static class Win32Input
     /// </summary>
     public static void InjectInputEvent(InputEvent inputEvent, int screenWidth, int screenHeight)
     {
-        EnsureInitialized();
+        RefreshDisplayState();
 
         switch (inputEvent)
         {
@@ -70,18 +208,84 @@ internal static class Win32Input
 
     /// <summary>
     /// Convert remote capture coordinates to Win32 absolute coordinates (0-65535).
+    /// When capturing a single monitor on a multi-monitor setup, maps coords to that
+    /// monitor's area rather than stretching across the full virtual desktop.
+    /// Uses cached monitor bounds (set via SetCapturedMonitor) as fast path.
     /// </summary>
     public static (int AbsX, int AbsY) ConvertToAbsoluteCoordinates(double x, double y, int screenWidth, int screenHeight)
     {
-        EnsureInitialized();
+        RefreshDisplayState();
 
-        var localX = x * _vsWidth / screenWidth + _vsLeft;
-        var localY = y * _vsHeight / screenHeight + _vsTop;
+        // Determine which area of the virtual desktop the capture represents
+        int targetX = _vsLeft, targetY = _vsTop, targetW = _vsWidth, targetH = _vsHeight;
 
+        // Fast path: use cached target if capture dimensions match what was cached
+        if (_cachedTarget != null && screenWidth == _cachedCaptureW && screenHeight == _cachedCaptureH)
+        {
+            targetX = _cachedTarget.Value.X;
+            targetY = _cachedTarget.Value.Y;
+            targetW = _cachedTarget.Value.Width;
+            targetH = _cachedTarget.Value.Height;
+        }
+        // Slow path: capture dims changed (rare) or cache not set — re-match
+        else if (screenWidth != _vsWidth || screenHeight != _vsHeight)
+        {
+            var match = FindMonitorByResolution(screenWidth, screenHeight)
+                        ?? _monitors?.FirstOrDefault(m => m.IsPrimary);
+            if (match != null)
+            {
+                targetX = match.Value.X;
+                targetY = match.Value.Y;
+                targetW = match.Value.Width;
+                targetH = match.Value.Height;
+            }
+        }
+
+        // Map capture pixel coords to virtual screen position
+        var localX = targetX + x * targetW / screenWidth;
+        var localY = targetY + y * targetH / screenHeight;
+
+        // Convert to absolute 0-65535 range across full virtual desktop
         var absX = (int)Math.Round((localX - _vsLeft) * 65535.0 / _vsWidth);
         var absY = (int)Math.Round((localY - _vsTop) * 65535.0 / _vsHeight);
 
         return (Math.Clamp(absX, 0, 65535), Math.Clamp(absY, 0, 65535));
+    }
+
+    /// <summary>
+    /// Match capture dimensions to a specific monitor.
+    /// Returns null if capture matches full virtual desktop or no monitor matches.
+    /// </summary>
+    private static MonitorRect? FindMonitorByResolution(int width, int height)
+    {
+        if (_monitors == null || _monitors.Length <= 1) return null;
+
+        MonitorRect? firstMatch = null;
+        var matchCount = 0;
+
+        foreach (var mon in _monitors)
+        {
+            if (mon.Width == width && mon.Height == height)
+            {
+                firstMatch ??= mon;
+                matchCount++;
+            }
+        }
+
+        if (matchCount == 1) return firstMatch;
+
+        // Multiple monitors with same resolution — prefer primary
+        if (matchCount > 1)
+        {
+            foreach (var mon in _monitors)
+            {
+                if (mon.Width == width && mon.Height == height && mon.IsPrimary)
+                    return mon;
+            }
+            return firstMatch; // None is primary, use first match
+        }
+
+        return null; // No match — fall back to full virtual desktop
     }
 
     internal static void InjectMouseMove(double x, double y, int screenWidth, int screenHeight)
@@ -105,29 +309,17 @@ internal static class Win32Input
             }
         };
 
-        SendInput(1, new[] { input }, Marshal.SizeOf<INPUT>());
+        SendInputWithRetry(1, new[] { input }, Marshal.SizeOf<INPUT>());
     }
 
     internal static void InjectMouseButton(MouseButton button, double x, double y, int screenWidth, int screenHeight, bool isDown)
     {
         var (absX, absY) = ConvertToAbsoluteCoordinates(x, y, screenWidth, screenHeight);
 
-        uint flags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
-
-        switch (button)
-        {
-            case MouseButton.Left:
-                flags |= isDown ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP;
-                break;
-            case MouseButton.Right:
-                flags |= isDown ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_RIGHTUP;
-                break;
-            case MouseButton.Middle:
-                flags |= isDown ? MOUSEEVENTF_MIDDLEDOWN : MOUSEEVENTF_MIDDLEUP;
-                break;
-        }
-
-        var input = new INPUT
+        // Split move + click into separate SendInput calls.
+        // Windows may not process the position before the click if combined.
+        // Source: FreeRDP, Sunshine
+        var moveInput = new INPUT
         {
             type = INPUT_MOUSE,
             union = new InputUnion
@@ -137,64 +329,110 @@ internal static class Win32Input
                     dx = absX,
                     dy = absY,
                     mouseData = 0,
-                    dwFlags = flags,
+                    dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
                     time = 0,
                     dwExtraInfo = IntPtr.Zero
                 }
             }
         };
 
-        SendInput(1, new[] { input }, Marshal.SizeOf<INPUT>());
+        SendInputWithRetry(1, new[] { moveInput }, Marshal.SizeOf<INPUT>());
+
+        // Button event — no MOVE flag, no position. Cursor is already at the right spot.
+        // Source: Sunshine button_mouse() (research.md lines 1183-1195)
+        uint buttonFlags = 0;
+        uint mouseData = 0;
+        switch (button)
+        {
+            case MouseButton.Left:
+                buttonFlags = isDown ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP;
+                break;
+            case MouseButton.Right:
+                buttonFlags = isDown ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_RIGHTUP;
+                break;
+            case MouseButton.Middle:
+                buttonFlags = isDown ? MOUSEEVENTF_MIDDLEDOWN : MOUSEEVENTF_MIDDLEUP;
+                break;
+            case MouseButton.XButton1:
+                buttonFlags = isDown ? MOUSEEVENTF_XDOWN : MOUSEEVENTF_XUP;
+                mouseData = XBUTTON1;
+                break;
+            case MouseButton.XButton2:
+                buttonFlags = isDown ? MOUSEEVENTF_XDOWN : MOUSEEVENTF_XUP;
+                mouseData = XBUTTON2;
+                break;
+        }
+
+        var buttonInput = new INPUT
+        {
+            type = INPUT_MOUSE,
+            union = new InputUnion
+            {
+                mi = new MOUSEINPUT
+                {
+                    dx = 0,
+                    dy = 0,
+                    mouseData = mouseData,
+                    dwFlags = buttonFlags,
+                    time = 0,
+                    dwExtraInfo = IntPtr.Zero
+                }
+            }
+        };
+
+        SendInputWithRetry(1, new[] { buttonInput }, Marshal.SizeOf<INPUT>());
     }
+
+    // Scroll accumulation — accumulates sub-tick deltas, only sends full WHEEL_DELTA (120) multiples.
+    // Prevents phantom scroll events from high-precision trackpads.
+    // Source: Sunshine high-resolution scroll accumulation (research.md lines 1124-1139)
+    private static int _accumulatedVScroll;
+    private static int _accumulatedHScroll;
 
     internal static void InjectMouseWheel(double deltaX, double deltaY)
     {
+        _accumulatedVScroll += (int)(-deltaY * WHEEL_DELTA / 100.0);
+        _accumulatedHScroll += (int)(deltaX * WHEEL_DELTA / 100.0);
+
         var inputs = new List<INPUT>();
 
-        if (Math.Abs(deltaY) > 0.001)
+        var vTicks = _accumulatedVScroll / WHEEL_DELTA;
+        if (vTicks != 0)
         {
-            var wheelDelta = (int)(-deltaY * WHEEL_DELTA / 100.0);
-            inputs.Add(new INPUT
-            {
-                type = INPUT_MOUSE,
-                union = new InputUnion
-                {
-                    mi = new MOUSEINPUT
-                    {
-                        dx = 0, dy = 0,
-                        mouseData = (uint)wheelDelta,
-                        dwFlags = MOUSEEVENTF_WHEEL,
-                        time = 0,
-                        dwExtraInfo = IntPtr.Zero
-                    }
-                }
-            });
+            inputs.Add(MakeWheelInput(MOUSEEVENTF_WHEEL, vTicks * WHEEL_DELTA));
+            _accumulatedVScroll -= vTicks * WHEEL_DELTA;
         }
 
-        if (Math.Abs(deltaX) > 0.001)
+        var hTicks = _accumulatedHScroll / WHEEL_DELTA;
+        if (hTicks != 0)
         {
-            var wheelDelta = (int)(deltaX * WHEEL_DELTA / 100.0);
-            inputs.Add(new INPUT
-            {
-                type = INPUT_MOUSE,
-                union = new InputUnion
-                {
-                    mi = new MOUSEINPUT
-                    {
-                        dx = 0, dy = 0,
-                        mouseData = (uint)wheelDelta,
-                        dwFlags = MOUSEEVENTF_HWHEEL,
-                        time = 0,
-                        dwExtraInfo = IntPtr.Zero
-                    }
-                }
-            });
+            inputs.Add(MakeWheelInput(MOUSEEVENTF_HWHEEL, hTicks * WHEEL_DELTA));
+            _accumulatedHScroll -= hTicks * WHEEL_DELTA;
         }
 
         if (inputs.Count > 0)
         {
-            SendInput((uint)inputs.Count, inputs.ToArray(), Marshal.SizeOf<INPUT>());
+            SendInputWithRetry((uint)inputs.Count, inputs.ToArray(), Marshal.SizeOf<INPUT>());
         }
+    }
+
+    private static INPUT MakeWheelInput(uint flags, int wheelDelta)
+    {
+        return new INPUT
+        {
+            type = INPUT_MOUSE,
+            union = new InputUnion
+            {
+                mi = new MOUSEINPUT
+                {
+                    dx = 0, dy = 0,
+                    mouseData = (uint)wheelDelta,
+                    dwFlags = flags,
+                    time = 0,
+                    dwExtraInfo = IntPtr.Zero
+                }
+            }
+        };
     }
 
     internal static void InjectKey(string key, KeyModifiers modifiers, bool isDown)
@@ -225,7 +463,7 @@ internal static class Win32Input
 
         if (inputs.Count > 0)
         {
-            SendInput((uint)inputs.Count, inputs.ToArray(), Marshal.SizeOf<INPUT>());
+            SendInputWithRetry((uint)inputs.Count, inputs.ToArray(), Marshal.SizeOf<INPUT>());
         }
     }
 
@@ -328,6 +566,8 @@ internal static class Win32Input
     internal const uint MOUSEEVENTF_RIGHTUP = 0x0010;
     internal const uint MOUSEEVENTF_MIDDLEDOWN = 0x0020;
     internal const uint MOUSEEVENTF_MIDDLEUP = 0x0040;
+    internal const uint MOUSEEVENTF_XDOWN = 0x0080;
+    internal const uint MOUSEEVENTF_XUP = 0x0100;
     internal const uint MOUSEEVENTF_WHEEL = 0x0800;
     internal const uint MOUSEEVENTF_HWHEEL = 0x1000;
     internal const uint MOUSEEVENTF_ABSOLUTE = 0x8000;
@@ -336,7 +576,11 @@ internal static class Win32Input
     internal const uint KEYEVENTF_KEYUP = 0x0002;
 
     internal const int WHEEL_DELTA = 120;
+    internal const uint XBUTTON1 = 0x0001;
+    internal const uint XBUTTON2 = 0x0002;
 
+    internal const int SM_CXSCREEN = 0;
+    internal const int SM_CYSCREEN = 1;
     internal const int SM_XVIRTUALSCREEN = 76;
     internal const int SM_YVIRTUALSCREEN = 77;
     internal const int SM_CXVIRTUALSCREEN = 78;
@@ -393,6 +637,46 @@ internal static class Win32Input
 
     [DllImport("user32.dll")]
     internal static extern int GetSystemMetrics(int nIndex);
+
+    // Multi-monitor enumeration
+    private const int MONITORINFOF_PRIMARY = 1;
+
+    private delegate bool MonitorEnumDelegate(IntPtr hMonitor, IntPtr hdcMonitor, ref RECT lprcMonitor, IntPtr dwData);
+
+    [DllImport("user32.dll")]
+    private static extern bool EnumDisplayMonitors(IntPtr hdc, IntPtr lprcClip, MonitorEnumDelegate lpfnEnum, IntPtr dwData);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern bool GetMonitorInfoW(IntPtr hMonitor, ref MONITORINFOEXW lpmi);
+
+    // Desktop sync retry P/Invoke
+    private const uint DESKTOP_SWITCHDESKTOP = 0x0100;
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr OpenInputDesktop(uint dwFlags, bool fInherit, uint dwDesiredAccess);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool SetThreadDesktop(IntPtr hDesktop);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool CloseDesktop(IntPtr hDesktop);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RECT
+    {
+        public int left, top, right, bottom;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct MONITORINFOEXW
+    {
+        public int cbSize;
+        public RECT rcMonitor;
+        public RECT rcWork;
+        public int dwFlags;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+        public string szDevice;
+    }
 
     [StructLayout(LayoutKind.Sequential)]
     internal struct INPUT

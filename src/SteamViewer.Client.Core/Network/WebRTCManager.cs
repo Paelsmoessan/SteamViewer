@@ -66,6 +66,11 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
     /// </summary>
     public event Action? OnScreenShareLost;
 
+    /// <summary>
+    /// Raised when screen capture starts, reporting actual physical capture dimensions.
+    /// </summary>
+    public event Action<int, int>? OnCaptureStarted;
+
     // IWebRTCManager events
     event EventHandler<string>? IWebRTCManager.ConnectionStateChanged
     {
@@ -507,6 +512,13 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
     {
         _logger.LogWarning("Screen sharing lost — all JS auto-restart attempts failed");
         OnScreenShareLost?.Invoke();
+    }
+
+    [JSInvokable]
+    public void OnCaptureStartedCallback(int width, int height)
+    {
+        _logger.LogInformation("Capture started: {Width}x{Height} (physical pixels)", width, height);
+        OnCaptureStarted?.Invoke(width, height);
     }
 
     #endregion

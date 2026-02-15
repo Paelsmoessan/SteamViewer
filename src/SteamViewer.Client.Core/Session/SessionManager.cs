@@ -426,7 +426,9 @@ public sealed class SessionManager : IAsyncDisposable
             return;
         }
 
-        var (width, height) = _screenCapture?.Resolution ?? (1920, 1080);
+        if (_screenCapture == null) return; // Can't inject without knowing capture dimensions
+
+        var (width, height) = _screenCapture.Resolution;
 
         // Use the unified InjectInput method
         _inputInjector.InjectInput(inputEvent, width, height);

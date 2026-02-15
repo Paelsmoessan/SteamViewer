@@ -342,8 +342,9 @@ public static class ElevatedHelperServer
     {
         try
         {
-            var sw = root.TryGetProperty("sw", out var swProp) ? swProp.GetInt32() : 1920;
-            var sh = root.TryGetProperty("sh", out var shProp) ? shProp.GetInt32() : 1080;
+            var (defaultW, defaultH) = Win32Input.GetPrimaryMonitorSize();
+            var sw = root.TryGetProperty("sw", out var swProp) ? swProp.GetInt32() : defaultW;
+            var sh = root.TryGetProperty("sh", out var shProp) ? shProp.GetInt32() : defaultH;
             var type = root.GetProperty("type").GetString();
 
             // Extract fields directly from JSON — avoids InputEvent polymorphic deserialization

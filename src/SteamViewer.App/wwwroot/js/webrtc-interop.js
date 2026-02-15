@@ -105,6 +105,28 @@ window.SteamViewerLogger = {
     }
 };
 
+// Compute letterbox/pillarbox geometry for fitting video into canvas
+function computeLetterbox(canvasW, canvasH, videoW, videoH) {
+    if (!videoW || !videoH) return { dx: 0, dy: 0, dw: canvasW, dh: canvasH, videoW: 0, videoH: 0 };
+    const canvasAspect = canvasW / canvasH;
+    const videoAspect = videoW / videoH;
+    let dx, dy, dw, dh;
+    if (canvasAspect > videoAspect) {
+        // Canvas wider than video — pillarbox (bars on sides)
+        dh = canvasH;
+        dw = canvasH * videoAspect;
+        dx = (canvasW - dw) / 2;
+        dy = 0;
+    } else {
+        // Canvas taller than video — letterbox (bars top/bottom)
+        dw = canvasW;
+        dh = canvasW / videoAspect;
+        dx = 0;
+        dy = (canvasH - dh) / 2;
+    }
+    return { dx, dy, dw, dh, videoW, videoH };
+}
+
 window.SteamViewerWebRTC = {
     // Session-keyed Map: sessionId → session state object
     sessions: new Map(),
@@ -134,9 +156,14 @@ window.SteamViewerWebRTC = {
             frameCaptureEnabled: false,
             frameCaptureAnimationId: null,
             lastFrameTime: 0,
-            frameInterval: 50, // ~20fps
+            frameInterval: 33, // ~30fps (match WebRTC source)
             captureCanvas: null,
             captureCtx: null,
+            // Direct rendering (bypasses JPEG relay when canvas is in same JS context)
+            _directRenderCanvas: null,
+            _directRenderCtx: null,
+            _letterbox: { dx: 0, dy: 0, dw: 0, dh: 0, videoW: 0, videoH: 0 },
+            _resizeObserver: null,
             // Stats overlay
             _statsInterval: null,
             _statsOverlayEl: null,
@@ -425,6 +452,11 @@ window.SteamViewerWebRTC = {
                             canvas.width = width;
                             canvas.height = height;
 
+                            // Recompute letterbox when video resolution changes
+                            if (session._directRenderCanvas && session._updateCanvasSize) {
+                                session._updateCanvasSize();
+                            }
+
                             // Use requestVideoFrameCallback for lower latency (renders when frame arrives, not on monitor refresh)
                             const renderFrameRVFC = (now, metadata) => {
                                 if (video.paused || video.ended) {
@@ -440,12 +472,26 @@ window.SteamViewerWebRTC = {
 
                                 try {
                                     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+                                    // Direct render: draw to visible canvas with letterbox (bypasses JPEG relay)
+                                    if (session._directRenderCtx) {
+                                        const dc = session._directRenderCanvas;
+                                        const lb = session._letterbox;
+                                        // Recompute letterbox if video resolution changed
+                                        if (lb.videoW !== video.videoWidth || lb.videoH !== video.videoHeight) {
+                                            if (session._updateCanvasSize) session._updateCanvasSize();
+                                        }
+                                        session._directRenderCtx.clearRect(0, 0, dc.width, dc.height);
+                                        session._directRenderCtx.drawImage(video, lb.dx, lb.dy, lb.dw, lb.dh);
+                                    }
+
                                     frameCount++;
 
                                     // Log frame rate every 2 seconds
                                     if (now - lastFrameTime > 2000) {
                                         const fps = frameCount / ((now - lastFrameTime) / 1000);
-                                        console.log(`Video rendering (RVFC): ${fps.toFixed(1)} FPS, ${frameCount} frames`);
+                                        const mode = session._directRenderCtx ? 'DIRECT' : 'RVFC';
+                                        console.log(`Video rendering (${mode}): ${fps.toFixed(1)} FPS, ${frameCount} frames`);
                                         frameCount = 0;
                                         lastFrameTime = now;
                                     }
@@ -466,6 +512,18 @@ window.SteamViewerWebRTC = {
                                 if (video.readyState >= 2) {
                                     try {
                                         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+                                        // Direct render: draw to visible canvas with letterbox
+                                        if (session._directRenderCtx) {
+                                            const dc = session._directRenderCanvas;
+                                            const lb = session._letterbox;
+                                            if (lb.videoW !== video.videoWidth || lb.videoH !== video.videoHeight) {
+                                                if (session._updateCanvasSize) session._updateCanvasSize();
+                                            }
+                                            session._directRenderCtx.clearRect(0, 0, dc.width, dc.height);
+                                            session._directRenderCtx.drawImage(video, lb.dx, lb.dy, lb.dw, lb.dh);
+                                        }
+
                                         frameCount++;
 
                                         // Log frame rate every 2 seconds
@@ -795,6 +853,15 @@ window.SteamViewerWebRTC = {
                 params.encodings[0].degradationPreference = 'maintain-framerate';
                 sender.setParameters(params).catch(e => console.warn('Could not set encoding params:', e));
 
+                // Report actual capture dimensions to host C# (source of truth for coordinate mapping)
+                if (settings.width && settings.height && session.dotNetRef) {
+                    try {
+                        session.dotNetRef.invokeMethodAsync('OnCaptureStartedCallback', settings.width, settings.height);
+                    } catch (e) {
+                        console.warn('Could not report capture dims:', e);
+                    }
+                }
+
                 // Handle track ending — retry with fullscreen constraints (keeps connection alive during lock screen)
                 const restartHandler = async () => {
                     if (session._sharingStoppedByUser) {
@@ -853,6 +920,15 @@ window.SteamViewerWebRTC = {
                             session.localStream = newStream;
                             session._sharingLost = false;
                             session._restartingShare = false;
+
+                            // Report updated capture dimensions after restart
+                            const restartSettings = newTrack.getSettings();
+                            if (restartSettings.width && restartSettings.height && session.dotNetRef) {
+                                try {
+                                    session.dotNetRef.invokeMethodAsync('OnCaptureStartedCallback',
+                                        restartSettings.width, restartSettings.height);
+                                } catch (e) { }
+                            }
                             return; // Success
                         } catch (err) {
                             console.warn(`Auto-restart attempt ${attempt + 1}/${delays.length} failed: ${err.name}: ${err.message}`);
@@ -1141,6 +1217,71 @@ window.SteamViewerWebRTC = {
                session.remoteVideo.readyState >= 2;
     },
 
+    // Enable direct rendering to a visible canvas (bypasses JPEG relay)
+    // Only works when PeerConnection is in the same JS context as the canvas
+    setDirectRenderTarget(sessionId, canvasId) {
+        const session = this.sessions.get(sessionId);
+        if (!session) {
+            console.warn(`[DirectRender] No session: ${sessionId}`);
+            return false;
+        }
+
+        const canvas = document.getElementById(canvasId);
+        if (!canvas) {
+            console.warn(`[DirectRender] Canvas '${canvasId}' not found`);
+            return false;
+        }
+
+        session._directRenderCanvas = canvas;
+        session._directRenderCtx = canvas.getContext('2d');
+
+        // Size canvas bitmap to CSS display size × devicePixelRatio
+        // We handle letterboxing ourselves in drawImage — no object-fit:contain
+        const updateCanvasSize = () => {
+            const rect = canvas.getBoundingClientRect();
+            const dpr = window.devicePixelRatio || 1;
+            const newW = Math.round(rect.width * dpr);
+            const newH = Math.round(rect.height * dpr);
+            if (canvas.width !== newW || canvas.height !== newH) {
+                canvas.width = newW;
+                canvas.height = newH;
+            }
+            // Recompute letterbox with current video dimensions
+            const videoW = session.remoteVideo?.videoWidth || 0;
+            const videoH = session.remoteVideo?.videoHeight || 0;
+            session._letterbox = computeLetterbox(newW, newH, videoW, videoH);
+        };
+
+        updateCanvasSize();
+
+        // Watch for container resizes (window resize, tab switch, etc.)
+        if (session._resizeObserver) {
+            session._resizeObserver.disconnect();
+        }
+        session._resizeObserver = new ResizeObserver(updateCanvasSize);
+        session._resizeObserver.observe(canvas.parentElement || canvas);
+
+        // Store updater so render loop can call it when video resolution changes
+        session._updateCanvasSize = updateCanvasSize;
+
+        console.log(`[DirectRender] Enabled for session ${sessionId} → canvas '${canvasId}' (${canvas.width}x${canvas.height} bitmap)`);
+        return true;
+    },
+
+    // Disable direct rendering (falls back to JPEG relay)
+    clearDirectRenderTarget(sessionId) {
+        const session = this.sessions.get(sessionId);
+        if (!session) return;
+        if (session._resizeObserver) {
+            session._resizeObserver.disconnect();
+            session._resizeObserver = null;
+        }
+        session._updateCanvasSize = null;
+        session._directRenderCanvas = null;
+        session._directRenderCtx = null;
+        console.log(`[DirectRender] Disabled for session ${sessionId}`);
+    },
+
     // Enable frame capture to relay to viewer window
     async startFrameCapture(sessionId, dotNetRef) {
         const session = this._getSession(sessionId);
@@ -1234,9 +1375,9 @@ window.SteamViewerWebRTC = {
 
             if (srcWidth === 0 || srcHeight === 0) return;
 
-            // Downscale large resolutions for encoding (max 1920x1080 for capture)
-            const maxWidth = 1920;
-            const maxHeight = 1080;
+            // Downscale very large resolutions for encoding (max 4K)
+            const maxWidth = 3840;
+            const maxHeight = 2160;
             let destWidth = srcWidth;
             let destHeight = srcHeight;
 
@@ -1257,8 +1398,8 @@ window.SteamViewerWebRTC = {
             // Draw downscaled frame
             session.captureCtx.drawImage(session.remoteCanvas, 0, 0, destWidth, destHeight);
 
-            // Convert to JPEG (0.85 quality balances size/quality/CPU)
-            const dataUrl = session.captureCanvas.toDataURL('image/jpeg', 0.85);
+            // Convert to JPEG (0.65 quality — faster encode/decode, smaller payload for relay path)
+            const dataUrl = session.captureCanvas.toDataURL('image/jpeg', 0.65);
 
             // Send to C# - use original dimensions for coordinate scaling
             const base64Data = dataUrl.replace(/^data:image\/jpeg;base64,/, '');
@@ -1657,6 +1798,12 @@ window.SteamViewerInput = {
     _inputEventCount: 0,
     _lastMouseDownCoords: null,  // Cache coords from mouse_down for identical mouse_up (prevents micro-drag)
     _focusWatchdogId: null,
+    // Mouse throttle — send at 30 Hz max, draw local cursor on every move
+    _lastMouseSendTime: 0,
+    _mouseSendInterval: 33, // ms (~30 Hz)
+    _pendingMouseCoords: null, // Buffered coords for trailing send
+    _pendingMouseTimer: null,
+
 
     initialize(canvasId, dotNetReference, options = {}) {
         const { showLockIndicator = true } = options;
@@ -1862,45 +2009,46 @@ window.SteamViewerInput = {
         }
     },
 
+    _coordLogCount: 0,
+    _frameLetterbox: null, // Set by SteamViewerViewer.renderJpegFrame (JPEG relay path)
     getScaledCoords(e) {
-        const rect = this.canvas.getBoundingClientRect();
+        // Map CSS mouse position → video pixel coordinates.
+        // Source 1: session._letterbox (direct rendering — same JS context)
+        // Source 2: _frameLetterbox (JPEG relay — cross-window, set by SteamViewerViewer)
+        const session = window.SteamViewerWebRTC.sessions.get(this._activeSessionId);
+        const lb = (session?._letterbox?.videoW > 0 ? session._letterbox : null)
+                || (this._frameLetterbox?.videoW > 0 ? this._frameLetterbox : null);
 
-        // Account for object-fit: contain letterboxing
-        // Calculate the actual rendered size of the canvas content
-        const canvasAspect = this.canvas.width / this.canvas.height;
-        const rectAspect = rect.width / rect.height;
-
-        let renderWidth, renderHeight, offsetX, offsetY;
-
-        if (rectAspect > canvasAspect) {
-            // Container is wider than canvas - letterbox on sides
-            renderHeight = rect.height;
-            renderWidth = rect.height * canvasAspect;
-            offsetX = (rect.width - renderWidth) / 2;
-            offsetY = 0;
-        } else {
-            // Container is taller than canvas - letterbox on top/bottom
-            renderWidth = rect.width;
-            renderHeight = rect.width / canvasAspect;
-            offsetX = 0;
-            offsetY = (rect.height - renderHeight) / 2;
+        if (!lb) {
+            if (this._coordLogCount < 5) {
+                this._coordLogCount++;
+                console.warn(`[Input] getScaledCoords: no letterbox source, using canvas fallback`);
+            }
+            return this.getScaledCoordsForCanvas(e, this.canvas);
         }
 
-        // Calculate position relative to actual content area
-        const relX = e.clientX - rect.left - offsetX;
-        const relY = e.clientY - rect.top - offsetY;
+        const rect = this.canvas.getBoundingClientRect();
+        const dpr = window.devicePixelRatio || 1;
+        // Convert CSS mouse position to canvas bitmap coords (matching _letterbox space)
+        const bitmapX = (e.clientX - rect.left) * dpr;
+        const bitmapY = (e.clientY - rect.top) * dpr;
+        // Subtract letterbox offset, scale to video pixel coords
+        const relX = bitmapX - lb.dx;
+        const relY = bitmapY - lb.dy;
 
-        // Scale to canvas internal coordinates
-        const scaleX = this.canvas.width / renderWidth;
-        const scaleY = this.canvas.height / renderHeight;
+        if (this._coordLogCount < 5) {
+            this._coordLogCount++;
+            console.log(`[Input] getScaledCoords: lb=${JSON.stringify(lb)}, dpr=${dpr}, bitmap=(${bitmapX.toFixed(0)},${bitmapY.toFixed(0)}), rel=(${relX.toFixed(0)},${relY.toFixed(0)})`);
+        }
 
         return {
-            x: Math.max(0, Math.min(this.canvas.width, relX * scaleX)),
-            y: Math.max(0, Math.min(this.canvas.height, relY * scaleY))
+            x: Math.max(0, Math.min(lb.videoW, relX * lb.videoW / lb.dw)),
+            y: Math.max(0, Math.min(lb.videoH, relY * lb.videoH / lb.dh))
         };
     },
 
     // Like getScaledCoords but for any canvas element (used for SD overlay)
+    // SD overlay still uses object-fit:contain style, so compute letterbox from CSS
     getScaledCoordsForCanvas(e, canvas) {
         const rect = canvas.getBoundingClientRect();
         const canvasAspect = canvas.width / canvas.height;
@@ -1947,6 +2095,7 @@ window.SteamViewerInput = {
             console.log(`[Input] raw #${this._rawEventCount}: capturing=${this.isCapturing}, locked=${this.isLocked}, dotNetRef=${!!this.dotNetRef}`);
         }
         if (!this.isCapturing || !this.isLocked || !this.dotNetRef) return;
+
         this._inputEventCount++;
         if (this._inputEventCount <= 3) {
             console.log(`[Input] event #${this._inputEventCount}: capturing=${this.isCapturing}, locked=${this.isLocked}, dotNetRef=${!!this.dotNetRef}, session=${this._activeSessionId}`);
@@ -1975,13 +2124,45 @@ window.SteamViewerInput = {
             const coords = this.getScaledCoords(e);
             x = coords.x;
             y = coords.y;
-            captureW = this.canvas.width;
-            captureH = this.canvas.height;
+            // Use letterbox video dims for captureW/captureH (matches getScaledCoords space)
+            const session = window.SteamViewerWebRTC.sessions.get(this._activeSessionId);
+            const lb = (session?._letterbox?.videoW > 0 ? session._letterbox : null)
+                    || (this._frameLetterbox?.videoW > 0 ? this._frameLetterbox : null);
+            captureW = lb ? lb.videoW : this.canvas.width;
+            captureH = lb ? lb.videoH : this.canvas.height;
         }
 
-        try {
-            await this.dotNetRef.invokeMethodAsync('OnMouseMove', x, y, captureW, captureH);
-        } catch (err) { console.error('[Input] OnMouseMove failed:', err); }
+        // Throttle data channel sends to ~30 Hz (local cursor is already updated above)
+        const now = performance.now();
+        const elapsed = now - this._lastMouseSendTime;
+
+        if (elapsed >= this._mouseSendInterval) {
+            // Enough time passed — send immediately
+            this._lastMouseSendTime = now;
+            if (this._pendingMouseTimer) {
+                clearTimeout(this._pendingMouseTimer);
+                this._pendingMouseTimer = null;
+            }
+            try {
+                await this.dotNetRef.invokeMethodAsync('OnMouseMove', x, y, captureW, captureH);
+            } catch (err) { console.error('[Input] OnMouseMove failed:', err); }
+        } else {
+            // Buffer coords for trailing send (ensures final position is always sent)
+            this._pendingMouseCoords = { x, y, captureW, captureH };
+            if (!this._pendingMouseTimer) {
+                this._pendingMouseTimer = setTimeout(async () => {
+                    this._pendingMouseTimer = null;
+                    const c = this._pendingMouseCoords;
+                    if (c && this.dotNetRef && this.isLocked) {
+                        this._lastMouseSendTime = performance.now();
+                        this._pendingMouseCoords = null;
+                        try {
+                            await this.dotNetRef.invokeMethodAsync('OnMouseMove', c.x, c.y, c.captureW, c.captureH);
+                        } catch (err) { /* ignore trailing send errors */ }
+                    }
+                }, this._mouseSendInterval - elapsed);
+            }
+        }
     },
 
     _getMouseCoords(e) {
@@ -1992,7 +2173,12 @@ window.SteamViewerInput = {
             return { x: sdCoords.x, y: sdCoords.y, captureW: sd._width, captureH: sd._height };
         }
         const coords = this.getScaledCoords(e);
-        return { x: coords.x, y: coords.y, captureW: this.canvas.width, captureH: this.canvas.height };
+        const session = window.SteamViewerWebRTC.sessions.get(this._activeSessionId);
+        const lb = (session?._letterbox?.videoW > 0 ? session._letterbox : null)
+                || (this._frameLetterbox?.videoW > 0 ? this._frameLetterbox : null);
+        const captureW = lb ? lb.videoW : this.canvas.width;
+        const captureH = lb ? lb.videoH : this.canvas.height;
+        return { x: coords.x, y: coords.y, captureW, captureH };
     },
 
     async handleMouseDown(e) {
@@ -2002,7 +2188,7 @@ window.SteamViewerInput = {
         }
         e.preventDefault();
         const { x, y, captureW, captureH } = this._getMouseCoords(e);
-        const button = ['left', 'middle', 'right'][e.button] || 'left';
+        const button = ['left', 'middle', 'right', 'XButton1', 'XButton2'][e.button] || 'left';
         this._lastMouseDownCoords = { x, y, captureW, captureH, button };
         try {
             await this.dotNetRef.invokeMethodAsync('OnMouseDown', button, x, y, captureW, captureH);
@@ -2015,7 +2201,7 @@ window.SteamViewerInput = {
             window.SteamViewerWebRTC._incrementInputCount(this._activeSessionId);
         }
         e.preventDefault();
-        const button = ['left', 'middle', 'right'][e.button] || 'left';
+        const button = ['left', 'middle', 'right', 'XButton1', 'XButton2'][e.button] || 'left';
         let x, y, captureW, captureH;
         const cached = this._lastMouseDownCoords;
         if (cached && cached.button === button) {
@@ -2078,6 +2264,12 @@ window.SteamViewerInput = {
             this.lockIndicator = null;
         }
 
+        // Clear throttle timers
+        if (this._pendingMouseTimer) {
+            clearTimeout(this._pendingMouseTimer);
+            this._pendingMouseTimer = null;
+        }
+
         // Remove event listeners from canvas
         if (this.canvas) {
             this.canvas.removeEventListener('mousemove', this._boundMouseMove);
@@ -2100,8 +2292,10 @@ window.SteamViewerViewer = {
     canvas: null,
     ctx: null,
     img: null,
+    _lastFrameW: 0,
+    _lastFrameH: 0,
 
-    // Render a JPEG frame to the viewer canvas
+    // Render a JPEG frame to the viewer canvas with proper letterboxing
     renderJpegFrame(canvasId, base64Data, width, height) {
         // Get or create canvas context
         if (!this.canvas || this.canvas.id !== canvasId) {
@@ -2113,18 +2307,41 @@ window.SteamViewerViewer = {
             this.ctx = this.canvas.getContext('2d');
         }
 
-        // Update canvas size if needed
-        if (this.canvas.width !== width || this.canvas.height !== height) {
-            this.canvas.width = width;
-            this.canvas.height = height;
+        // Size canvas bitmap to CSS display size × DPR (not video resolution)
+        const rect = this.canvas.getBoundingClientRect();
+        const dpr = window.devicePixelRatio || 1;
+        const canvasW = Math.round(rect.width * dpr);
+        const canvasH = Math.round(rect.height * dpr);
+        if (this.canvas.width !== canvasW || this.canvas.height !== canvasH) {
+            this.canvas.width = canvasW;
+            this.canvas.height = canvasH;
         }
 
-        // Create image and draw to canvas
+        // Compute letterbox and publish to SteamViewerInput for coordinate mapping
+        const lb = computeLetterbox(canvasW, canvasH, width, height);
+        this._lastFrameW = width;
+        this._lastFrameH = height;
+
+        // Publish letterbox to input system (cross-namespace, same JS context)
+        if (window.SteamViewerInput) {
+            window.SteamViewerInput._frameLetterbox = lb;
+        }
+
+        // Create image and draw to canvas with letterboxing
         if (!this.img) {
             this.img = new Image();
             this.img.onload = () => {
-                if (this.ctx) {
-                    this.ctx.drawImage(this.img, 0, 0, this.canvas.width, this.canvas.height);
+                if (this.ctx && this.canvas) {
+                    // Clear black bars
+                    this.ctx.fillStyle = '#000';
+                    this.ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
+                    // Draw frame in letterbox area
+                    const lb = window.SteamViewerInput?._frameLetterbox;
+                    if (lb) {
+                        this.ctx.drawImage(this.img, lb.dx, lb.dy, lb.dw, lb.dh);
+                    } else {
+                        this.ctx.drawImage(this.img, 0, 0, this.canvas.width, this.canvas.height);
+                    }
                 }
             };
         }
@@ -2170,9 +2387,7 @@ window.SteamViewerVideoDecoder = {
         });
 
         this.decoder.configure({
-            codec: 'avc1.42E01E', // H.264 Baseline Profile
-            width: 1920,
-            height: 1080
+            codec: 'avc1.42E01E' // H.264 Baseline Profile — dimensions come from stream SPS
         });
 
         console.log('WebCodecs VideoDecoder initialized');
