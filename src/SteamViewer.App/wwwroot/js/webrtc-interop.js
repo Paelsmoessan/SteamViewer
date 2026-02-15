@@ -2009,43 +2009,41 @@ window.SteamViewerInput = {
         }
     },
 
+    _coordLogCount: 0,
+    _frameLetterbox: null, // Set by SteamViewerViewer.renderJpegFrame (JPEG relay path)
     getScaledCoords(e) {
         // Map CSS mouse position → video pixel coordinates.
-        // Uses video element dimensions directly — always correct regardless of _letterbox state.
-        // Computes letterbox from video aspect ratio vs CSS display area.
+        // Source 1: session._letterbox (direct rendering — same JS context)
+        // Source 2: _frameLetterbox (JPEG relay — cross-window, set by SteamViewerViewer)
         const session = window.SteamViewerWebRTC.sessions.get(this._activeSessionId);
-        const video = session?.remoteVideo;
-        const videoW = video?.videoWidth || 0;
-        const videoH = video?.videoHeight || 0;
-        if (!videoW || !videoH) return { x: 0, y: 0 };
+        const lb = (session?._letterbox?.videoW > 0 ? session._letterbox : null)
+                || (this._frameLetterbox?.videoW > 0 ? this._frameLetterbox : null);
 
-        const rect = this.canvas.getBoundingClientRect();
-        const videoAspect = videoW / videoH;
-        const rectAspect = rect.width / rect.height;
-
-        // Compute letterbox from video aspect ratio vs CSS display rect
-        let renderWidth, renderHeight, offsetX, offsetY;
-        if (rectAspect > videoAspect) {
-            // Pillarbox — video narrower than display, bars on sides
-            renderHeight = rect.height;
-            renderWidth = rect.height * videoAspect;
-            offsetX = (rect.width - renderWidth) / 2;
-            offsetY = 0;
-        } else {
-            // Letterbox — video wider than display, bars top/bottom
-            renderWidth = rect.width;
-            renderHeight = rect.width / videoAspect;
-            offsetX = 0;
-            offsetY = (rect.height - renderHeight) / 2;
+        if (!lb) {
+            if (this._coordLogCount < 5) {
+                this._coordLogCount++;
+                console.warn(`[Input] getScaledCoords: no letterbox source, using canvas fallback`);
+            }
+            return this.getScaledCoordsForCanvas(e, this.canvas);
         }
 
-        // CSS mouse position → relative to rendered video area → video pixel coords
-        const relX = e.clientX - rect.left - offsetX;
-        const relY = e.clientY - rect.top - offsetY;
+        const rect = this.canvas.getBoundingClientRect();
+        const dpr = window.devicePixelRatio || 1;
+        // Convert CSS mouse position to canvas bitmap coords (matching _letterbox space)
+        const bitmapX = (e.clientX - rect.left) * dpr;
+        const bitmapY = (e.clientY - rect.top) * dpr;
+        // Subtract letterbox offset, scale to video pixel coords
+        const relX = bitmapX - lb.dx;
+        const relY = bitmapY - lb.dy;
+
+        if (this._coordLogCount < 5) {
+            this._coordLogCount++;
+            console.log(`[Input] getScaledCoords: lb=${JSON.stringify(lb)}, dpr=${dpr}, bitmap=(${bitmapX.toFixed(0)},${bitmapY.toFixed(0)}), rel=(${relX.toFixed(0)},${relY.toFixed(0)})`);
+        }
 
         return {
-            x: Math.max(0, Math.min(videoW, relX * videoW / renderWidth)),
-            y: Math.max(0, Math.min(videoH, relY * videoH / renderHeight))
+            x: Math.max(0, Math.min(lb.videoW, relX * lb.videoW / lb.dw)),
+            y: Math.max(0, Math.min(lb.videoH, relY * lb.videoH / lb.dh))
         };
     },
 
@@ -2126,11 +2124,12 @@ window.SteamViewerInput = {
             const coords = this.getScaledCoords(e);
             x = coords.x;
             y = coords.y;
-            // Send actual video resolution — getScaledCoords returns coords in video pixel space
+            // Use letterbox video dims for captureW/captureH (matches getScaledCoords space)
             const session = window.SteamViewerWebRTC.sessions.get(this._activeSessionId);
-            const video = session?.remoteVideo;
-            captureW = video?.videoWidth || this.canvas.width;
-            captureH = video?.videoHeight || this.canvas.height;
+            const lb = (session?._letterbox?.videoW > 0 ? session._letterbox : null)
+                    || (this._frameLetterbox?.videoW > 0 ? this._frameLetterbox : null);
+            captureW = lb ? lb.videoW : this.canvas.width;
+            captureH = lb ? lb.videoH : this.canvas.height;
         }
 
         // Throttle data channel sends to ~30 Hz (local cursor is already updated above)
@@ -2175,9 +2174,10 @@ window.SteamViewerInput = {
         }
         const coords = this.getScaledCoords(e);
         const session = window.SteamViewerWebRTC.sessions.get(this._activeSessionId);
-        const video = session?.remoteVideo;
-        const captureW = video?.videoWidth || this.canvas.width;
-        const captureH = video?.videoHeight || this.canvas.height;
+        const lb = (session?._letterbox?.videoW > 0 ? session._letterbox : null)
+                || (this._frameLetterbox?.videoW > 0 ? this._frameLetterbox : null);
+        const captureW = lb ? lb.videoW : this.canvas.width;
+        const captureH = lb ? lb.videoH : this.canvas.height;
         return { x: coords.x, y: coords.y, captureW, captureH };
     },
 
@@ -2292,8 +2292,10 @@ window.SteamViewerViewer = {
     canvas: null,
     ctx: null,
     img: null,
+    _lastFrameW: 0,
+    _lastFrameH: 0,
 
-    // Render a JPEG frame to the viewer canvas
+    // Render a JPEG frame to the viewer canvas with proper letterboxing
     renderJpegFrame(canvasId, base64Data, width, height) {
         // Get or create canvas context
         if (!this.canvas || this.canvas.id !== canvasId) {
@@ -2305,18 +2307,41 @@ window.SteamViewerViewer = {
             this.ctx = this.canvas.getContext('2d');
         }
 
-        // Update canvas size if needed
-        if (this.canvas.width !== width || this.canvas.height !== height) {
-            this.canvas.width = width;
-            this.canvas.height = height;
+        // Size canvas bitmap to CSS display size × DPR (not video resolution)
+        const rect = this.canvas.getBoundingClientRect();
+        const dpr = window.devicePixelRatio || 1;
+        const canvasW = Math.round(rect.width * dpr);
+        const canvasH = Math.round(rect.height * dpr);
+        if (this.canvas.width !== canvasW || this.canvas.height !== canvasH) {
+            this.canvas.width = canvasW;
+            this.canvas.height = canvasH;
         }
 
-        // Create image and draw to canvas
+        // Compute letterbox and publish to SteamViewerInput for coordinate mapping
+        const lb = computeLetterbox(canvasW, canvasH, width, height);
+        this._lastFrameW = width;
+        this._lastFrameH = height;
+
+        // Publish letterbox to input system (cross-namespace, same JS context)
+        if (window.SteamViewerInput) {
+            window.SteamViewerInput._frameLetterbox = lb;
+        }
+
+        // Create image and draw to canvas with letterboxing
         if (!this.img) {
             this.img = new Image();
             this.img.onload = () => {
-                if (this.ctx) {
-                    this.ctx.drawImage(this.img, 0, 0, this.canvas.width, this.canvas.height);
+                if (this.ctx && this.canvas) {
+                    // Clear black bars
+                    this.ctx.fillStyle = '#000';
+                    this.ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
+                    // Draw frame in letterbox area
+                    const lb = window.SteamViewerInput?._frameLetterbox;
+                    if (lb) {
+                        this.ctx.drawImage(this.img, lb.dx, lb.dy, lb.dw, lb.dh);
+                    } else {
+                        this.ctx.drawImage(this.img, 0, 0, this.canvas.width, this.canvas.height);
+                    }
                 }
             };
         }
