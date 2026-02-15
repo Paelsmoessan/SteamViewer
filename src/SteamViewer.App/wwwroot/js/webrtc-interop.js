@@ -2188,7 +2188,7 @@ window.SteamViewerInput = {
         }
         e.preventDefault();
         const { x, y, captureW, captureH } = this._getMouseCoords(e);
-        const button = ['left', 'middle', 'right'][e.button] || 'left';
+        const button = ['left', 'middle', 'right', 'XButton1', 'XButton2'][e.button] || 'left';
         this._lastMouseDownCoords = { x, y, captureW, captureH, button };
         try {
             await this.dotNetRef.invokeMethodAsync('OnMouseDown', button, x, y, captureW, captureH);
@@ -2201,7 +2201,7 @@ window.SteamViewerInput = {
             window.SteamViewerWebRTC._incrementInputCount(this._activeSessionId);
         }
         e.preventDefault();
-        const button = ['left', 'middle', 'right'][e.button] || 'left';
+        const button = ['left', 'middle', 'right', 'XButton1', 'XButton2'][e.button] || 'left';
         let x, y, captureW, captureH;
         const cached = this._lastMouseDownCoords;
         if (cached && cached.button === button) {

@@ -160,6 +160,18 @@ public sealed class WindowsInputInjector : IInputInjector
         }
     }
 
+    public void SetCapturedMonitor(int captureWidth, int captureHeight)
+    {
+        Win32Input.SetCapturedMonitor(captureWidth, captureHeight);
+        _logger.LogInformation("Cached target monitor for capture {W}x{H}", captureWidth, captureHeight);
+    }
+
+    public void ClearCapturedMonitor()
+    {
+        Win32Input.ClearCapturedMonitor();
+        _logger.LogInformation("Cleared cached target monitor");
+    }
+
     public void InjectInput(InputEvent inputEvent, int screenWidth, int screenHeight)
     {
         if (_disposed)

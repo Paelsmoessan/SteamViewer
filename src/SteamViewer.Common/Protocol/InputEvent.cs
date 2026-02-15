@@ -61,7 +61,9 @@ public enum MouseButton
 {
     Left,
     Right,
-    Middle
+    Middle,
+    XButton1,  // Back (browser back, mouse button 4)
+    XButton2   // Forward (browser forward, mouse button 5)
 }
 
 /// <summary>

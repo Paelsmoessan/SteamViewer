@@ -109,6 +109,27 @@
                             <span>Fullscreen</span>
                             <span class="menu-shortcut">F11</span>
                         </button>
+                        @if (_hostMonitors?.Count > 1)
+                        {
+                            <div class="menu-divider"></div>
+                            <div class="menu-section">
+                                <span class="menu-section-title">Displays</span>
+                                @foreach (var mon in _hostMonitors)
+                                {
+                                    var isActive = (int)mon.Id == _activeMonitorId;
+                                    <button class="menu-item @(isActive ? "monitor-active" : "")"
+                                            @onclick="() => SwitchMonitor((int)mon.Id)"
+                                            title="@(mon.Name) (@(mon.Width)x@(mon.Height))">
+                                        <span class="menu-icon">@(mon.IsPrimary ? "★" : "🖥️")</span>
+                                        <span>@(mon.Name) (@(mon.Width)x@(mon.Height))</span>
+                                        @if (isActive)
+                                        {
+                                            <span class="menu-shortcut">●</span>
+                                        }
+                                    </button>
+                                }
+                            </div>
+                        }
                     </div>
                 }
             </div>
@@ -252,6 +273,8 @@
     private bool _hasReceivedFrame;
     private bool _secureDesktopActive;
     private bool _secureDesktopFrameReceived;
+    private List<MonitorInfo>? _hostMonitors;
+    private int _activeMonitorId;
 
     protected override void OnInitialized()
     {
@@ -402,6 +425,7 @@
             _activeSession.OnClipboardReceived -= HandleClipboardReceived;
             _activeSession.OnSecureDesktopStateChanged -= HandleSecureDesktopStateChanged;
             _activeSession.OnSecureDesktopFrame -= HandleSecureDesktopFrame;
+            _activeSession.OnMonitorLayoutReceived -= HandleMonitorLayoutReceived;
             if (_statsVisible) _ = _activeSession.DisableStatsRelayAsync();
             _ = JSRuntime.InvokeVoidAsync("SteamViewerWebRTC.pauseFrameCapture", oldSessionId);
         }
@@ -433,6 +457,11 @@
                 _activeSession.OnClipboardReceived += HandleClipboardReceived;
                 _activeSession.OnSecureDesktopStateChanged += HandleSecureDesktopStateChanged;
                 _activeSession.OnSecureDesktopFrame += HandleSecureDesktopFrame;
+                _activeSession.OnMonitorLayoutReceived += HandleMonitorLayoutReceived;
+
+                // Restore cached monitor layout from session (survives tab switches)
+                _hostMonitors = _activeSession.HostMonitors;
+                _activeMonitorId = _activeSession.ActiveMonitorId;
 
                 // Try direct rendering first (zero-latency, bypasses JPEG relay)
                 // Falls back to JPEG frame capture if JSRuntime doesn't match
@@ -940,6 +969,38 @@
 
     #endregion
 
+    #region Monitor Layout
+
+    private void HandleMonitorLayoutReceived(List<MonitorInfo> monitors, int activeId)
+    {
+        InvokeAsync(() =>
+        {
+            _hostMonitors = monitors;
+            _activeMonitorId = activeId;
+            StateHasChanged();
+        });
+    }
+
+    private async Task OnMonitorSelected(ChangeEventArgs e)
+    {
+        if (_activeSession == null || e.Value == null) return;
+        if (int.TryParse(e.Value.ToString(), out var monitorId) && monitorId != _activeMonitorId)
+        {
+            await SwitchMonitor(monitorId);
+        }
+    }
+
+    private async Task SwitchMonitor(int monitorId)
+    {
+        if (_activeSession == null || monitorId == _activeMonitorId) return;
+        Console.WriteLine($"User selected monitor {monitorId}");
+        CloseMenus();
+        await _activeSession.SendSwitchDisplayAsync(monitorId);
+        ShowToast("Switching display — host will see screen picker...");
+    }
+
+    #endregion
+
     private async Task ToggleFullscreen()
     {
         // Check if currently in fullscreen and toggle
@@ -1030,28 +1091,26 @@
     [JSInvokable]
     public void OnMouseDown(string button, double x, double y, int captureWidth = 0, int captureHeight = 0)
     {
-        var mouseButton = button.ToLowerInvariant() switch
-        {
-            "left" => MouseButton.Left,
-            "right" => MouseButton.Right,
-            "middle" => MouseButton.Middle,
-            _ => MouseButton.Left
-        };
+        var mouseButton = ParseMouseButton(button);
         SendInputToActiveSession(new InputEvent.MouseDown(mouseButton, x, y, captureWidth, captureHeight));
     }
 
     [JSInvokable]
     public void OnMouseUp(string button, double x, double y, int captureWidth = 0, int captureHeight = 0)
     {
-        var mouseButton = button.ToLowerInvariant() switch
-        {
-            "left" => MouseButton.Left,
-            "right" => MouseButton.Right,
-            "middle" => MouseButton.Middle,
-            _ => MouseButton.Left
-        };
+        var mouseButton = ParseMouseButton(button);
         SendInputToActiveSession(new InputEvent.MouseUp(mouseButton, x, y, captureWidth, captureHeight));
     }
+
+    private static MouseButton ParseMouseButton(string button) => button.ToLowerInvariant() switch
+    {
+        "left" => MouseButton.Left,
+        "right" => MouseButton.Right,
+        "middle" => MouseButton.Middle,
+        "xbutton1" => MouseButton.XButton1,
+        "xbutton2" => MouseButton.XButton2,
+        _ => MouseButton.Left
+    };
 
     [JSInvokable]
     public void OnMouseWheel(double deltaX, double deltaY)
@@ -1168,6 +1227,7 @@
                 _activeSession.OnClipboardReceived -= HandleClipboardReceived;
                 _activeSession.OnSecureDesktopStateChanged -= HandleSecureDesktopStateChanged;
                 _activeSession.OnSecureDesktopFrame -= HandleSecureDesktopFrame;
+                _activeSession.OnMonitorLayoutReceived -= HandleMonitorLayoutReceived;
 
                 // Update references (session ID stays the same for tab tracking)
                 _activeSessionId = newSession.SessionId;
@@ -1181,9 +1241,14 @@
                 _activeSession.OnClipboardReceived += HandleClipboardReceived;
                 _activeSession.OnSecureDesktopStateChanged += HandleSecureDesktopStateChanged;
                 _activeSession.OnSecureDesktopFrame += HandleSecureDesktopFrame;
+                _activeSession.OnMonitorLayoutReceived += HandleMonitorLayoutReceived;
 
                 // Update JS input routing
                 await JSRuntime.InvokeVoidAsync("SteamViewerInput.setActiveSession", newSession.SessionId);
+
+                // Reset monitor layout (host will resend on new capture)
+                _hostMonitors = null;
+                _activeMonitorId = 0;
 
                 // Hide reconnect overlay, show "waiting for host screen"
                 _showReconnectOverlay = false;
@@ -1255,6 +1320,7 @@
             _activeSession.OnClipboardReceived -= HandleClipboardReceived;
             _activeSession.OnSecureDesktopStateChanged -= HandleSecureDesktopStateChanged;
             _activeSession.OnSecureDesktopFrame -= HandleSecureDesktopFrame;
+            _activeSession.OnMonitorLayoutReceived -= HandleMonitorLayoutReceived;
         }
 
         _dotNetRef?.Dispose();
@@ -1404,6 +1470,14 @@
         font-size: 10px;
         color: #f38ba8;
         font-style: italic;
+    }
+
+    .menu-item.monitor-active {
+        background: rgba(137, 180, 250, 0.15);
+    }
+
+    .menu-item.monitor-active span:last-child {
+        color: #89b4fa;
     }
 
     .toolbar-icons {

@@ -7,6 +7,7 @@ using SteamViewer.Client.Core.Capture;
 using SteamViewer.Client.Core.Elevation;
 using SteamViewer.Client.Core.Network;
 using SteamViewer.Common.Protocol;
+using System.Text.Json.Serialization;
 
 namespace SteamViewer.App.Services.Models;
 
@@ -37,6 +38,7 @@ public sealed class HostSession : IAsyncDisposable
     private readonly ILogger _logger;
     private readonly ILoggerFactory _loggerFactory;
     private readonly IInputInjector _inputInjector;
+    private readonly IMonitorEnumerator? _monitorEnumerator;
     private readonly IElevationService? _elevationService;
     private readonly IConfiguration _configuration;
     private readonly Func<SignalingMessage, Task> _sendSignaling;
@@ -109,6 +111,7 @@ public sealed class HostSession : IAsyncDisposable
         IConfiguration configuration,
         Func<SignalingMessage, Task> sendSignaling,
         IElevationService? elevationService = null,
+        IMonitorEnumerator? monitorEnumerator = null,
         string hostClientId = "",
         string hostPasswordHash = "")
     {
@@ -117,6 +120,7 @@ public sealed class HostSession : IAsyncDisposable
         _logger = loggerFactory.CreateLogger<HostSession>();
         _loggerFactory = loggerFactory;
         _inputInjector = inputInjector;
+        _monitorEnumerator = monitorEnumerator;
         _elevationService = elevationService;
         _configuration = configuration;
         _sendSignaling = sendSignaling;
@@ -314,6 +318,7 @@ public sealed class HostSession : IAsyncDisposable
             _logger.LogInformation("Stopping screen share...");
             await _webrtc.StopScreenCaptureAsync();
             IsSharingScreen = false;
+            _inputInjector.ClearCapturedMonitor();
             await _webrtc.SendDataAsync(
                 JsonSerializer.Serialize(new { type = "screenShareStopped" }));
             _logger.LogInformation("Screen sharing stopped");
@@ -358,6 +363,9 @@ public sealed class HostSession : IAsyncDisposable
         {
             _logger.LogWarning(ex, "Failed to send elevation status");
         }
+
+        // Send monitor layout to viewer (so they see the monitor picker)
+        await SendMonitorLayoutAsync();
 
         // Auto-start full screen sharing on reconnect after reboot
         if (AutoShareOnReady)
@@ -437,6 +445,12 @@ public sealed class HostSession : IAsyncDisposable
                         await HandleClipboardSetAsync(root);
                         return;
 
+                    case "switchDisplay":
+                        var monitorId = root.TryGetProperty("monitorId", out var midProp) ? midProp.GetInt32() : -1;
+                        if (monitorId >= 0)
+                            await HandleSwitchDisplayAsync(monitorId);
+                        return;
+
                     case "screenShareStarted":
                         _logger.LogInformation("Peer started sharing their screen");
                         IsPeerSharingScreen = true;
@@ -464,6 +478,103 @@ public sealed class HostSession : IAsyncDisposable
             _logger.LogWarning(ex, "Failed to handle data channel message");
         }
     }
+
+    #endregion
+
+    #region Monitor Layout
+
+    /// <summary>
+    /// Send the host's monitor layout to the viewer via data channel.
+    /// Includes monitor positions, sizes, names, and which one is actively captured.
+    /// </summary>
+    private async Task SendMonitorLayoutAsync(int? activeMonitorId = null)
+    {
+        if (_webrtc == null || !IsDataChannelReady || _monitorEnumerator == null) return;
+
+        try
+        {
+            var monitors = _monitorEnumerator.GetMonitors();
+            if (monitors.Count == 0) return;
+
+            var layout = new
+            {
+                type = "monitorLayout",
+                monitors = monitors.Select(m => new
+                {
+                    id = (int)m.Id,
+                    name = m.Name,
+                    width = (int)m.Width,
+                    height = (int)m.Height,
+                    x = m.X,
+                    y = m.Y,
+                    isPrimary = m.IsPrimary
+                }),
+                activeMonitorId = activeMonitorId
+                    ?? (int)(monitors.FirstOrDefault(m => m.IsPrimary)?.Id ?? monitors[0].Id)
+            };
+
+            var json = JsonSerializer.Serialize(layout);
+            await _webrtc.SendDataAsync(json);
+            _logger.LogInformation("Sent monitor layout to viewer: {Count} monitors, active={Active}",
+                monitors.Count, layout.activeMonitorId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to send monitor layout");
+        }
+    }
+
+    /// <summary>
+    /// Match capture dimensions to a monitor in the enumerated list.
+    /// Returns the monitor ID, or null if no match.
+    /// </summary>
+    private int? MatchCaptureToMonitor(int captureWidth, int captureHeight)
+    {
+        if (_monitorEnumerator == null) return null;
+
+        var monitors = _monitorEnumerator.GetMonitors();
+
+        // Exact match — unique resolution
+        MonitorInfo? firstMatch = null;
+        var matchCount = 0;
+        foreach (var m in monitors)
+        {
+            if (m.Width == captureWidth && m.Height == captureHeight)
+            {
+                firstMatch ??= m;
+                matchCount++;
+            }
+        }
+
+        if (matchCount == 1) return (int)firstMatch!.Id;
+
+        // Multiple matches — prefer primary
+        if (matchCount > 1)
+        {
+            var primary = monitors.FirstOrDefault(m => m.Width == captureWidth && m.Height == captureHeight && m.IsPrimary);
+            return (int)(primary?.Id ?? firstMatch!.Id);
+        }
+
+        return null; // No match (downscaled capture or full desktop)
+    }
+
+    /// <summary>
+    /// Handle viewer's request to switch which monitor is being captured.
+    /// Stops current capture, restarts (browser picker appears on host).
+    /// </summary>
+    private async Task HandleSwitchDisplayAsync(int monitorId)
+    {
+        _requestedMonitorId = monitorId;
+        var monitor = _monitorEnumerator?.GetMonitors().FirstOrDefault(m => m.Id == (uint)monitorId);
+        var name = monitor?.Name ?? $"Display {monitorId}";
+        _logger.LogInformation("Viewer requested switch to {Monitor} (id={Id})", name, monitorId);
+
+        // Stop current capture, restart (shows browser picker on host)
+        await StopScreenShareAsync();
+        await StartScreenShareAsync();
+    }
+
+    private int? _requestedMonitorId;
 
     #endregion
 
@@ -1107,7 +1218,12 @@ public sealed class HostSession : IAsyncDisposable
         {
             _lastCaptureWidth = width;
             _lastCaptureHeight = height;
-            _logger.LogInformation("Host capture dimensions set: {W}x{H} (from getDisplayMedia)", width, height);
+            _inputInjector.SetCapturedMonitor(width, height);
+            _logger.LogInformation("Host capture dimensions set: {W}x{H} (from getDisplayMedia), monitor cached", width, height);
+
+            // Send updated monitor layout with the matched active monitor
+            var matchedId = MatchCaptureToMonitor(width, height);
+            _ = SendMonitorLayoutAsync(matchedId);
         }
     }
 

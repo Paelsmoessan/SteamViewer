@@ -663,6 +663,7 @@
             }
 
             // Create and initialize host session
+            var monitorEnumerator = ServiceProvider.GetService<IMonitorEnumerator>();
             _hostSession = new HostSession(
                 connectedPeerId,
                 JSRuntime,
@@ -671,6 +672,7 @@
                 Configuration,
                 msg => SignalingClient.SendAsync(msg),
                 elevationService: elevationService,
+                monitorEnumerator: monitorEnumerator,
                 hostClientId: clientId,
                 hostPasswordHash: passwordHash);
 
@@ -754,29 +756,25 @@
     public async Task OnMouseDown(string button, double x, double y, int captureWidth = 0, int captureHeight = 0)
     {
         if (_hostSession == null || !_hostSession.IsDataChannelReady) return;
-        var mouseButton = button.ToLowerInvariant() switch
-        {
-            "left" => MouseButton.Left,
-            "right" => MouseButton.Right,
-            "middle" => MouseButton.Middle,
-            _ => MouseButton.Left
-        };
-        await SendInputEventAsync(new InputEvent.MouseDown(mouseButton, x, y, captureWidth, captureHeight));
+        await SendInputEventAsync(new InputEvent.MouseDown(ParseMouseButton(button), x, y, captureWidth, captureHeight));
     }
 
     [JSInvokable]
     public async Task OnMouseUp(string button, double x, double y, int captureWidth = 0, int captureHeight = 0)
     {
         if (_hostSession == null || !_hostSession.IsDataChannelReady) return;
-        var mouseButton = button.ToLowerInvariant() switch
-        {
-            "left" => MouseButton.Left,
-            "right" => MouseButton.Right,
-            "middle" => MouseButton.Middle,
-            _ => MouseButton.Left
-        };
-        await SendInputEventAsync(new InputEvent.MouseUp(mouseButton, x, y, captureWidth, captureHeight));
+        await SendInputEventAsync(new InputEvent.MouseUp(ParseMouseButton(button), x, y, captureWidth, captureHeight));
     }
+
+    private static MouseButton ParseMouseButton(string button) => button.ToLowerInvariant() switch
+    {
+        "left" => MouseButton.Left,
+        "right" => MouseButton.Right,
+        "middle" => MouseButton.Middle,
+        "xbutton1" => MouseButton.XButton1,
+        "xbutton2" => MouseButton.XButton2,
+        _ => MouseButton.Left
+    };
 
     [JSInvokable]
     public async Task OnMouseWheel(double deltaX, double deltaY)

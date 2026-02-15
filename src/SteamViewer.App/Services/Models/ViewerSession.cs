@@ -95,6 +95,12 @@ public sealed class ViewerSession : IAsyncDisposable
     public event Action<string, string>? OnClipboardReceived;
 
     /// <summary>
+    /// Raised when the host sends its monitor layout.
+    /// Parameters: (monitors list, active monitor ID).
+    /// </summary>
+    public event Action<List<MonitorInfo>, int>? OnMonitorLayoutReceived;
+
+    /// <summary>
     /// Raised when the Secure Desktop state changes on the host.
     /// Parameter: true = active (UAC prompt visible), false = inactive.
     /// </summary>
@@ -110,6 +116,16 @@ public sealed class ViewerSession : IAsyncDisposable
     /// Whether the Secure Desktop is currently active on the host.
     /// </summary>
     public bool IsSecureDesktopActive { get; private set; }
+
+    /// <summary>
+    /// The host's monitor layout (populated on connect and capture start).
+    /// </summary>
+    public List<MonitorInfo>? HostMonitors { get; private set; }
+
+    /// <summary>
+    /// Which monitor the host is actively capturing.
+    /// </summary>
+    public int ActiveMonitorId { get; private set; }
 
     /// <summary>
     /// Whether the host is running elevated (as admin).
@@ -321,6 +337,61 @@ public sealed class ViewerSession : IAsyncDisposable
         OnDisconnected?.Invoke(null);
     }
 
+    private void HandleMonitorLayout(JsonElement root)
+    {
+        try
+        {
+            var monitors = new List<MonitorInfo>();
+            if (root.TryGetProperty("monitors", out var monArr) && monArr.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var m in monArr.EnumerateArray())
+                {
+                    var id = m.TryGetProperty("id", out var idP) ? (uint)idP.GetInt32() : 0u;
+                    var name = m.TryGetProperty("name", out var nP) ? nP.GetString() ?? "" : "";
+                    var width = m.TryGetProperty("width", out var wP) ? (uint)wP.GetInt32() : 0u;
+                    var height = m.TryGetProperty("height", out var hP) ? (uint)hP.GetInt32() : 0u;
+                    var x = m.TryGetProperty("x", out var xP) ? xP.GetInt32() : 0;
+                    var y = m.TryGetProperty("y", out var yP) ? yP.GetInt32() : 0;
+                    var isPrimary = m.TryGetProperty("isPrimary", out var pP) && pP.GetBoolean();
+                    monitors.Add(new MonitorInfo(id, name, width, height, x, y, isPrimary));
+                }
+            }
+
+            var activeId = root.TryGetProperty("activeMonitorId", out var aProp) ? aProp.GetInt32() : 0;
+
+            HostMonitors = monitors;
+            ActiveMonitorId = activeId;
+
+            _logger.LogInformation("Session {SessionId}: Received monitor layout: {Count} monitors, active={Active}",
+                SessionId, monitors.Count, activeId);
+
+            OnMonitorLayoutReceived?.Invoke(monitors, activeId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Session {SessionId}: Failed to parse monitor layout", SessionId);
+        }
+    }
+
+    /// <summary>
+    /// Request the host to switch which display is being captured.
+    /// </summary>
+    public async Task SendSwitchDisplayAsync(int monitorId)
+    {
+        if (_webrtc == null || !_webrtc.IsDataChannelOpen) return;
+
+        try
+        {
+            var json = JsonSerializer.Serialize(new { type = "switchDisplay", monitorId });
+            await _webrtc.SendDataAsync(json);
+            _logger.LogInformation("Session {SessionId}: Requested switch to display {MonitorId}", SessionId, monitorId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Session {SessionId}: Failed to send switch display request", SessionId);
+        }
+    }
+
     private async Task HandleIceCandidate(string candidateJson)
     {
         try
@@ -388,6 +459,10 @@ public sealed class ViewerSession : IAsyncDisposable
                         IsHostSystemLevel = systemLevel;
                         _logger.LogInformation("Session {SessionId}: Host elevated={Elevated}, systemLevel={SystemLevel}", SessionId, elevated, systemLevel);
                         OnControlMessage?.Invoke(type, null);
+                        break;
+
+                    case "monitorLayout":
+                        HandleMonitorLayout(root);
                         break;
 
                     case "ctrlAltDelFailed":

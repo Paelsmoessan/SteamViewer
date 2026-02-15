@@ -21,6 +21,17 @@ public interface IInputInjector : IDisposable
     bool IsAvailable { get; }
 
     /// <summary>
+    /// Cache the target monitor bounds for the current capture session.
+    /// Called once when screen sharing starts. Avoids per-event monitor matching.
+    /// </summary>
+    void SetCapturedMonitor(int captureWidth, int captureHeight) { }
+
+    /// <summary>
+    /// Clear the cached target monitor (call when capture stops).
+    /// </summary>
+    void ClearCapturedMonitor() { }
+
+    /// <summary>
     /// Send the Secure Attention Sequence (Ctrl+Alt+Del).
     /// Returns true if successful, false if elevated privileges are required.
     /// </summary>
