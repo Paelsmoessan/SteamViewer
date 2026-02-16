@@ -258,11 +258,7 @@ public sealed class ViewerSession : IAsyncDisposable
         try
         {
             var json = JsonSerializer.Serialize(inputEvent);
-            // Mouse moves use unreliable channel (no head-of-line blocking behind keyboard/commands)
-            if (inputEvent is InputEvent.MouseMove)
-                await _webrtc.SendMouseDataAsync(json);
-            else
-                await _webrtc.SendDataAsync(json);
+            await _webrtc.SendDataAsync(json);
         }
         catch (Exception ex)
         {
