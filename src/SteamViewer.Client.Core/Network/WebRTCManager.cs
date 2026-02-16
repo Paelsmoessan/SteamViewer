@@ -300,6 +300,16 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
     }
 
     /// <summary>
+    /// Send mouse data via unreliable channel (no head-of-line blocking).
+    /// Falls back to reliable data channel if mouse channel not available.
+    /// </summary>
+    public async Task<bool> SendMouseDataAsync(string data)
+    {
+        EnsureInitialized();
+        return await _jsRuntime.InvokeAsync<bool>("SteamViewerWebRTC.sendMouseData", _sessionId, data);
+    }
+
+    /// <summary>
     /// Send binary data over the data channel.
     /// </summary>
     public async Task<bool> SendBinaryDataAsync(byte[] data)

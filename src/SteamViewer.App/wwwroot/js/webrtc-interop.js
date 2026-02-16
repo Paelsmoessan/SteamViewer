@@ -141,11 +141,32 @@ window.SteamViewerWebRTC = {
         return s;
     },
 
+    // Renegotiate SDP (queues if signaling state isn't stable)
+    async _doRenegotiate(sessionId, session) {
+        try {
+            if (session.peerConnection?.signalingState === 'stable') {
+                session._renegotiationPending = false;
+                const offer = await session.peerConnection.createOffer();
+                offer.sdp = this.modifySdpForLowLatency(offer.sdp, { removeFec: session._isLan });
+                await session.peerConnection.setLocalDescription(offer);
+                console.log(`[${sessionId}] Renegotiation offer created, sending to peer...`);
+                if (session.dotNetRef) await session.dotNetRef.invokeMethodAsync('OnRenegotiationNeededCallback', JSON.stringify(offer));
+            } else {
+                session._renegotiationPending = true;
+                console.log(`[${sessionId}] Queued renegotiation — signaling state: ${session.peerConnection?.signalingState}`);
+            }
+        } catch (err) {
+            console.error(`[${sessionId}] Renegotiation failed:`, err);
+            session._renegotiationPending = false;
+        }
+    },
+
     // Create a new session state object with all per-session fields
     _createSessionState(dotNetRef) {
         return {
             peerConnection: null,
             dataChannel: null,
+            mouseChannel: null,
             dotNetRef: dotNetRef,
             localStream: null,
             remoteVideo: null,
@@ -177,6 +198,11 @@ window.SteamViewerWebRTC = {
             _sharingStoppedByUser: false,
             _sharingLost: false,           // true when track ended unexpectedly (restart on next user gesture)
             _restartingShare: false,       // true while restart attempt is in progress (prevents concurrent restarts)
+            // Silent audio track (separate MSID from video — prevents Chrome A/V sync)
+            _silentAudioCtx: null,
+            // LAN detection — FEC removal only applied after ICE confirms direct host-to-host connection
+            _isLan: false,
+            _fecRemoved: false,
             // Dynamic bitrate adaptation — disabled, let WebRTC handle rate control natively.
             // Our adaptation was fighting WebRTC's BWE, capping bitrate at ~3Mbps on LAN.
             _bitrateAdaptEnabled: false,
@@ -315,11 +341,39 @@ window.SteamViewerWebRTC = {
                 if (session.dotNetRef) await session.dotNetRef.invokeMethodAsync('OnConnectionStateChangeCallback', state);
             };
 
-            // Handle ICE connection state for more debugging
+            // Handle ICE connection state — detect LAN for FEC optimization
             session.peerConnection.oniceconnectionstatechange = () => {
-                console.log(`[${sessionId}] ICE connection state:`, session.peerConnection.iceConnectionState);
-                if (session.peerConnection.iceConnectionState === 'failed') {
+                const iceState = session.peerConnection.iceConnectionState;
+                console.log(`[${sessionId}] ICE connection state: ${iceState}`);
+                if (iceState === 'failed') {
                     console.error('ICE CONNECTION FAILED');
+                }
+                // Detect LAN vs WAN after ICE connects — remove FEC only on direct LAN connections
+                if (iceState === 'connected' && !session._fecRemoved) {
+                    session.peerConnection.getStats().then(stats => {
+                        let localType = null, remoteType = null;
+                        let localCandidateId = null, remoteCandidateId = null;
+                        stats.forEach(report => {
+                            if (report.type === 'candidate-pair' && report.state === 'succeeded') {
+                                localCandidateId = report.localCandidateId;
+                                remoteCandidateId = report.remoteCandidateId;
+                            }
+                        });
+                        if (localCandidateId && remoteCandidateId) {
+                            stats.forEach(report => {
+                                if (report.id === localCandidateId) localType = report.candidateType;
+                                if (report.id === remoteCandidateId) remoteType = report.candidateType;
+                            });
+                        }
+                        const isLan = localType === 'host' && remoteType === 'host';
+                        session._isLan = isLan;
+                        console.log(`[${sessionId}] ICE candidates: local=${localType}, remote=${remoteType} → ${isLan ? 'LAN' : 'WAN'}`);
+                        if (isLan) {
+                            session._fecRemoved = true;
+                            console.log(`[${sessionId}] LAN detected — renegotiating to remove FEC`);
+                            this._doRenegotiate(sessionId, session);
+                        }
+                    }).catch(err => console.warn(`[${sessionId}] Failed to detect LAN/WAN:`, err));
                 }
             };
 
@@ -355,27 +409,30 @@ window.SteamViewerWebRTC = {
             session._visibilityHandler = visibilityHandler;
 
             // Handle renegotiation needed (when tracks are added after connection)
+            session._renegotiationPending = false;
             session.peerConnection.onnegotiationneeded = async () => {
                 console.log(`=== NEGOTIATION NEEDED [${sessionId}] (track added post-connection) ===`);
-                try {
-                    // Only renegotiate if we're in a stable state
-                    if (session.peerConnection.signalingState === 'stable') {
-                        const offer = await session.peerConnection.createOffer();
-                        offer.sdp = this.modifySdpForLowLatency(offer.sdp);
-                        await session.peerConnection.setLocalDescription(offer);
-                        console.log('Renegotiation offer created, sending to peer...');
-                        if (session.dotNetRef) await session.dotNetRef.invokeMethodAsync('OnRenegotiationNeededCallback', JSON.stringify(offer));
-                    } else {
-                        console.log('Skipping renegotiation, signaling state:', session.peerConnection.signalingState);
-                    }
-                } catch (err) {
-                    console.error('Renegotiation failed:', err);
+                await this._doRenegotiate(sessionId, session);
+            };
+
+            // Retry queued renegotiation when signaling state returns to stable
+            session.peerConnection.onsignalingstatechange = async () => {
+                const state = session.peerConnection?.signalingState;
+                console.log(`[${sessionId}] Signaling state: ${state}`);
+                if (state === 'stable' && session._renegotiationPending) {
+                    console.log(`[${sessionId}] Retrying queued renegotiation now that state is stable`);
+                    await this._doRenegotiate(sessionId, session);
                 }
             };
 
-            // Handle incoming data channels
+            // Handle incoming data channels (control + mouse)
             session.peerConnection.ondatachannel = (event) => {
-                this._setupDataChannel(sessionId, event.channel);
+                const ch = event.channel;
+                if (ch.label === 'mouse') {
+                    this._setupMouseChannel(sessionId, ch);
+                } else {
+                    this._setupDataChannel(sessionId, ch);
+                }
             };
 
             // Handle incoming video track
@@ -622,7 +679,14 @@ window.SteamViewerWebRTC = {
             ordered: true
         });
         this._setupDataChannel(sessionId, session.dataChannel);
-        console.log(`[${sessionId}] Data channel '${name}' created`);
+
+        // Unreliable mouse channel — late mouse positions are useless, don't block control messages
+        session.mouseChannel = session.peerConnection.createDataChannel('mouse', {
+            ordered: false,
+            maxRetransmits: 0
+        });
+        this._setupMouseChannel(sessionId, session.mouseChannel);
+        console.log(`[${sessionId}] Data channels created: '${name}' (reliable) + 'mouse' (unreliable)`);
     },
 
     _setupDataChannel(sessionId, channel) {
@@ -669,9 +733,50 @@ window.SteamViewerWebRTC = {
         };
     },
 
+    // Set up unreliable mouse data channel (unordered, no retransmit)
+    // Mouse moves route here — late positions are useless, don't block control messages
+    _setupMouseChannel(sessionId, channel) {
+        const session = this._getSession(sessionId);
+        session.mouseChannel = channel;
+        channel.binaryType = 'arraybuffer';
+
+        channel.onopen = () => {
+            console.log(`[${sessionId}] Mouse channel opened (unordered, maxRetransmits=0)`);
+        };
+        channel.onclose = () => {
+            console.log(`[${sessionId}] Mouse channel closed`);
+            if (session.mouseChannel === channel) session.mouseChannel = null;
+        };
+        // Host receives mouse events here — forward to same C# handler as control channel
+        channel.onmessage = async (event) => {
+            if (typeof event.data === 'string') {
+                if (session.dotNetRef) await session.dotNetRef.invokeMethodAsync('OnDataChannelMessageCallback', event.data);
+            }
+        };
+        channel.onerror = (error) => {
+            console.error(`[${sessionId}] Mouse channel error:`, error);
+        };
+    },
+
     // Send string data over data channel
     sendData(sessionId, data) {
         const session = this._getSession(sessionId);
+        if (session.dataChannel && session.dataChannel.readyState === 'open') {
+            session.dataChannel.send(data);
+            return true;
+        }
+        return false;
+    },
+
+    // Send mouse data via unreliable channel (no head-of-line blocking behind keyboard/commands)
+    // Falls back to reliable data channel if mouse channel not available
+    sendMouseData(sessionId, data) {
+        const session = this._getSession(sessionId);
+        if (session.mouseChannel && session.mouseChannel.readyState === 'open') {
+            session.mouseChannel.send(data);
+            return true;
+        }
+        // Fallback to reliable channel
         if (session.dataChannel && session.dataChannel.readyState === 'open') {
             session.dataChannel.send(data);
             return true;
@@ -694,7 +799,7 @@ window.SteamViewerWebRTC = {
     // Modify SDP for lower latency (pure function, no session state)
     // SDP modifications for low-latency remote desktop streaming.
     // Source: .claude/research/webrtc-latency/research.md (Selkies, Hopp, Neko findings)
-    modifySdpForLowLatency(sdp) {
+    modifySdpForLowLatency(sdp, { removeFec = false } = {}) {
         let modified = sdp;
 
         // Remove any existing b=AS lines (old 3Mbps cap that was killing bitrate)
@@ -719,6 +824,33 @@ window.SteamViewerWebRTC = {
                 /(m=video[^\r\n]*\r\n(?:[^\r\n]*\r\n)*?)(a=rtpmap)/,
                 `$1a=extmap:${nextId} http://www.webrtc.org/experiments/rtp-hdrext/playout-delay\r\n$2`
             );
+        }
+
+        // Remove FEC codecs only on LAN — NACK retransmission is sufficient with <5ms RTT.
+        // On WAN, FEC helps recover from packet loss without waiting for retransmission.
+        // Applied via renegotiation after ICE confirms direct host-to-host connection.
+        if (removeFec) {
+            const fecPayloads = [];
+            modified.split('\r\n').forEach(line => {
+                const m = line.match(/^a=rtpmap:(\d+)\s+(flexfec|ulpfec|red)\//i);
+                if (m) fecPayloads.push(m[1]);
+            });
+            if (fecPayloads.length > 0) {
+                const fecSet = new Set(fecPayloads);
+                // Remove rtpmap, fmtp, rtcp-fb lines for FEC payload types
+                modified = modified.split('\r\n')
+                    .filter(line => {
+                        const ptMatch = line.match(/^a=(?:rtpmap|fmtp|rtcp-fb):(\d+)/);
+                        return !(ptMatch && fecSet.has(ptMatch[1]));
+                    })
+                    .join('\r\n');
+                // Remove FEC payload types from m=video line
+                modified = modified.replace(/(m=video \d+ [^ ]+ )(.+)/, (match, prefix, payloads) => {
+                    const filtered = payloads.split(' ').filter(p => !fecSet.has(p));
+                    return prefix + filtered.join(' ');
+                });
+                console.log(`Removed FEC codecs (payload types: ${fecPayloads.join(', ')})`);
+            }
         }
 
         // Prefer H264 Baseline profile (fastest encode/decode, most compatible)
@@ -750,7 +882,7 @@ window.SteamViewerWebRTC = {
 
         const offer = await session.peerConnection.createOffer({
             offerToReceiveVideo: true,
-            offerToReceiveAudio: false
+            offerToReceiveAudio: true  // Accept audio — host sends silent track with separate MSID to prevent Chrome A/V sync
         });
 
         // Modify SDP for lower latency
@@ -886,8 +1018,10 @@ window.SteamViewerWebRTC = {
                 params.encodings[0].networkPriority = 'high';
                 // Disable scalability for lower latency
                 params.encodings[0].scalabilityMode = 'L1T1';
-                // Maintain frame rate even if quality has to drop (better for responsiveness)
-                params.encodings[0].degradationPreference = 'maintain-framerate';
+                // Maintain resolution even if FPS has to drop — remote desktop needs sharp text, not smooth video.
+                // On WAN, BWE starts low. maintain-framerate drops to 420p immediately. maintain-resolution
+                // keeps full res at 15-20 FPS during ramp-up, which is usable for desktop work.
+                params.encodings[0].degradationPreference = 'maintain-resolution';
                 sender.setParameters(params).catch(e => console.warn('Could not set encoding params:', e));
 
                 // Report actual capture dimensions to host C# (source of truth for coordinate mapping)
@@ -896,6 +1030,27 @@ window.SteamViewerWebRTC = {
                         session.dotNetRef.invokeMethodAsync('OnCaptureStartedCallback', settings.width, settings.height);
                     } catch (e) {
                         console.warn('Could not report capture dims:', e);
+                    }
+                }
+
+                // Add silent audio track with SEPARATE MediaStream (different MSID from video).
+                // This prevents Chrome's RtpStreamsSynchronizer from applying A/V sync to desktop video.
+                // Source: Neko project — separate streams can reduce latency 150-200ms → 10-20ms.
+                if (!session._silentAudioCtx) {
+                    try {
+                        const audioCtx = new AudioContext();
+                        const oscillator = audioCtx.createOscillator();
+                        const dest = audioCtx.createMediaStreamDestination();
+                        oscillator.connect(dest);
+                        oscillator.start();
+                        const silentTrack = dest.stream.getAudioTracks()[0];
+                        silentTrack.enabled = false; // Muted — zero bandwidth
+                        const audioStream = new MediaStream([silentTrack]);
+                        session.peerConnection.addTrack(silentTrack, audioStream); // Different MSID from video
+                        session._silentAudioCtx = audioCtx;
+                        console.log('Silent audio track added (separate MSID — A/V sync disabled)');
+                    } catch (e) {
+                        console.warn('Could not add silent audio track:', e);
                     }
                 }
 
@@ -1067,8 +1222,29 @@ window.SteamViewerWebRTC = {
         params.encodings[0].priority = 'high';
         params.encodings[0].networkPriority = 'high';
         params.encodings[0].scalabilityMode = 'L1T1';
-        params.encodings[0].degradationPreference = 'maintain-framerate';
+        // Maintain resolution even if FPS has to drop — remote desktop needs sharp text, not smooth video.
+        params.encodings[0].degradationPreference = 'maintain-resolution';
         sender.setParameters(params).catch(e => console.warn('Could not set native capture encoding params:', e));
+
+        // Add silent audio track with SEPARATE MediaStream (different MSID from video).
+        // Prevents Chrome's RtpStreamsSynchronizer from applying A/V sync to desktop video.
+        if (!session._silentAudioCtx) {
+            try {
+                const audioCtx = new AudioContext();
+                const oscillator = audioCtx.createOscillator();
+                const dest = audioCtx.createMediaStreamDestination();
+                oscillator.connect(dest);
+                oscillator.start();
+                const silentTrack = dest.stream.getAudioTracks()[0];
+                silentTrack.enabled = false;
+                const audioStream = new MediaStream([silentTrack]);
+                session.peerConnection.addTrack(silentTrack, audioStream);
+                session._silentAudioCtx = audioCtx;
+                console.log(`[${sessionId}] Silent audio track added (separate MSID — A/V sync disabled)`);
+            } catch (e) {
+                console.warn(`[${sessionId}] Could not add silent audio track:`, e);
+            }
+        }
 
         session._nativeCaptureActive = true;
         session._nativeFrameCount = 0;
@@ -1990,6 +2166,17 @@ window.SteamViewerWebRTC = {
         session.remoteCanvas = null;
         session.remoteCtx = null;
 
+        // Close silent audio context
+        if (session._silentAudioCtx) {
+            session._silentAudioCtx.close().catch(() => {});
+            session._silentAudioCtx = null;
+        }
+
+        if (session.mouseChannel) {
+            session.mouseChannel.close();
+            session.mouseChannel = null;
+        }
+
         if (session.dataChannel) {
             session.dataChannel.close();
             session.dataChannel = null;
@@ -2355,7 +2542,7 @@ window.SteamViewerInput = {
     },
 
     _rawEventCount: 0,
-    async handleMouseMove(e) {
+    handleMouseMove(e) {
         this._rawEventCount++;
         if (this._rawEventCount <= 5 || this._rawEventCount % 500 === 0) {
             console.log(`[Input] raw #${this._rawEventCount}: capturing=${this.isCapturing}, locked=${this.isLocked}, dotNetRef=${!!this.dotNetRef}`);
@@ -2398,7 +2585,7 @@ window.SteamViewerInput = {
             captureH = lb ? lb.videoH : this.canvas.height;
         }
 
-        // Throttle data channel sends to ~30 Hz (local cursor is already updated above)
+        // Throttle data channel sends to ~30 Hz
         const now = performance.now();
         const elapsed = now - this._lastMouseSendTime;
 
@@ -2410,20 +2597,20 @@ window.SteamViewerInput = {
                 this._pendingMouseTimer = null;
             }
             try {
-                await this.dotNetRef.invokeMethodAsync('OnMouseMove', x, y, captureW, captureH);
+                this.dotNetRef.invokeMethodAsync('OnMouseMove', x, y, captureW, captureH);
             } catch (err) { console.error('[Input] OnMouseMove failed:', err); }
         } else {
             // Buffer coords for trailing send (ensures final position is always sent)
             this._pendingMouseCoords = { x, y, captureW, captureH };
             if (!this._pendingMouseTimer) {
-                this._pendingMouseTimer = setTimeout(async () => {
+                this._pendingMouseTimer = setTimeout(() => {
                     this._pendingMouseTimer = null;
                     const c = this._pendingMouseCoords;
                     if (c && this.dotNetRef && this.isLocked) {
                         this._lastMouseSendTime = performance.now();
                         this._pendingMouseCoords = null;
                         try {
-                            await this.dotNetRef.invokeMethodAsync('OnMouseMove', c.x, c.y, c.captureW, c.captureH);
+                            this.dotNetRef.invokeMethodAsync('OnMouseMove', c.x, c.y, c.captureW, c.captureH);
                         } catch (err) { /* ignore trailing send errors */ }
                     }
                 }, this._mouseSendInterval - elapsed);
