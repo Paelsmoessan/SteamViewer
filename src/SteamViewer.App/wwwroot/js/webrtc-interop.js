@@ -402,6 +402,26 @@ window.SteamViewerWebRTC = {
                         }
                     }
 
+                    // Persistent jitter buffer pressure at 15ms interval (Selkies pattern).
+                    // Chrome's adaptive algorithm regrows the buffer — 1s polling was too slow.
+                    // Source: .claude/research/external-research (Selkies v1.6.0 uses 15ms)
+                    if (!session._jbPressureInterval) {
+                        session._jbPressureInterval = setInterval(() => {
+                            if (!session.peerConnection) {
+                                clearInterval(session._jbPressureInterval);
+                                session._jbPressureInterval = null;
+                                return;
+                            }
+                            const receivers = session.peerConnection.getReceivers();
+                            for (const r of receivers) {
+                                if (r.track?.kind === 'video') {
+                                    if ('jitterBufferTarget' in r) r.jitterBufferTarget = 0;
+                                    if ('playoutDelayHint' in r) r.playoutDelayHint = 0;
+                                }
+                            }
+                        }, 15);
+                    }
+
                     const video = document.createElement('video');
                     video.srcObject = event.streams[0];
                     video.autoplay = true;
@@ -1211,6 +1231,24 @@ window.SteamViewerWebRTC = {
                 console.log('Manual setup: Set jitterBufferTarget to 0');
             }
 
+            // Start 15ms JB pressure interval if not already running
+            if (!session._jbPressureInterval) {
+                session._jbPressureInterval = setInterval(() => {
+                    if (!session.peerConnection) {
+                        clearInterval(session._jbPressureInterval);
+                        session._jbPressureInterval = null;
+                        return;
+                    }
+                    const recvs = session.peerConnection.getReceivers();
+                    for (const r of recvs) {
+                        if (r.track?.kind === 'video') {
+                            if ('jitterBufferTarget' in r) r.jitterBufferTarget = 0;
+                            if ('playoutDelayHint' in r) r.playoutDelayHint = 0;
+                        }
+                    }
+                }, 15);
+            }
+
             // Set up the video track (same logic as ontrack)
             console.log('Setting up video track manually');
             const stream = new MediaStream([track]);
@@ -1870,15 +1908,8 @@ window.SteamViewerWebRTC = {
             }
         }
 
-        // Persistent jitter buffer pressure — Chrome's adaptive algorithm resets our hints,
-        // so re-apply every poll cycle (Selkies pattern: set on interval, not just once)
-        const receivers = session.peerConnection.getReceivers();
-        for (const receiver of receivers) {
-            if (receiver.track?.kind === 'video') {
-                if ('jitterBufferTarget' in receiver) receiver.jitterBufferTarget = 0;
-                if ('playoutDelayHint' in receiver) receiver.playoutDelayHint = 0;
-            }
-        }
+        // JB pressure moved to dedicated 15ms interval (_jbPressureInterval)
+        // — 1000ms was too slow, Chrome's adaptive algorithm regrows buffer between polls
 
         // Save for next delta (include jitter buffer cumulative values)
         session._statsPrev = {
@@ -1915,7 +1946,7 @@ window.SteamViewerWebRTC = {
             try {
                 session.dotNetRef.invokeMethodAsync('OnStatsUpdate', JSON.stringify({
                     videoFps, bitrateMbps, resolution,
-                    rttMs, lossPercent,
+                    rttMs, lossPercent, jbAvgMs,
                     inputPerSec, throttledPerSec, bufferKB,
                     currentBytes, dataChannelBytes,
                     qualityMode: session._qualityMode
@@ -1934,6 +1965,12 @@ window.SteamViewerWebRTC = {
     close(sessionId) {
         const session = this.sessions.get(sessionId);
         if (!session) return;
+
+        // Stop JB pressure interval
+        if (session._jbPressureInterval) {
+            clearInterval(session._jbPressureInterval);
+            session._jbPressureInterval = null;
+        }
 
         this._stopStatsPolling(sessionId);
         this._removeStatsOverlay(sessionId);
