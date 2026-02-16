@@ -184,7 +184,9 @@ window.SteamViewerWebRTC = {
             _minBitrate: 500_000,
             _maxBitrate: 50_000_000,
             _bitrateHistory: [],
-            _lastBitrateAdjust: 0
+            _lastBitrateAdjust: 0,
+            // Silent audio track (separate MSID to bypass Chrome A/V sync)
+            _silentAudioCtx: null
         };
     },
 
@@ -750,7 +752,7 @@ window.SteamViewerWebRTC = {
 
         const offer = await session.peerConnection.createOffer({
             offerToReceiveVideo: true,
-            offerToReceiveAudio: false
+            offerToReceiveAudio: true
         });
 
         // Modify SDP for lower latency
@@ -897,6 +899,26 @@ window.SteamViewerWebRTC = {
                     } catch (e) {
                         console.warn('Could not report capture dims:', e);
                     }
+                }
+
+                // Add silent audio track with SEPARATE MediaStream (different MSID)
+                // This bypasses Chrome's RtpStreamsSynchronizer which adds A/V sync delay to video
+                try {
+                    const audioCtx = new AudioContext();
+                    const oscillator = audioCtx.createOscillator();
+                    const gain = audioCtx.createGain();
+                    gain.gain.value = 0; // silent
+                    oscillator.connect(gain);
+                    const dest = audioCtx.createMediaStreamDestination();
+                    gain.connect(dest);
+                    oscillator.start();
+                    const audioTrack = dest.stream.getAudioTracks()[0];
+                    // Key: new MediaStream([audioTrack]) = different MSID than video stream
+                    session.peerConnection.addTrack(audioTrack, new MediaStream([audioTrack]));
+                    session._silentAudioCtx = audioCtx;
+                    console.log('Silent audio track added (separate MSID for A/V sync bypass)');
+                } catch (e) {
+                    console.warn('Could not add silent audio track:', e);
                 }
 
                 // Handle track ending — retry with fullscreen constraints (keeps connection alive during lock screen)
@@ -1069,6 +1091,25 @@ window.SteamViewerWebRTC = {
         params.encodings[0].scalabilityMode = 'L1T1';
         params.encodings[0].degradationPreference = 'maintain-framerate';
         sender.setParameters(params).catch(e => console.warn('Could not set native capture encoding params:', e));
+
+        // Add silent audio track with SEPARATE MediaStream (different MSID)
+        // This bypasses Chrome's RtpStreamsSynchronizer which adds A/V sync delay to video
+        try {
+            const audioCtx = new AudioContext();
+            const oscillator = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            gain.gain.value = 0; // silent
+            oscillator.connect(gain);
+            const dest = audioCtx.createMediaStreamDestination();
+            gain.connect(dest);
+            oscillator.start();
+            const audioTrack = dest.stream.getAudioTracks()[0];
+            session.peerConnection.addTrack(audioTrack, new MediaStream([audioTrack]));
+            session._silentAudioCtx = audioCtx;
+            console.log(`[${sessionId}] Silent audio track added (separate MSID for A/V sync bypass)`);
+        } catch (e) {
+            console.warn(`[${sessionId}] Could not add silent audio track:`, e);
+        }
 
         session._nativeCaptureActive = true;
         session._nativeFrameCount = 0;
@@ -2009,6 +2050,12 @@ window.SteamViewerWebRTC = {
         if (session._visibilityHandler) {
             document.removeEventListener('visibilitychange', session._visibilityHandler);
             session._visibilityHandler = null;
+        }
+
+        // Close silent audio context
+        if (session._silentAudioCtx) {
+            session._silentAudioCtx.close().catch(() => {});
+            session._silentAudioCtx = null;
         }
 
         session.dotNetRef = null;

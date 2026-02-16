@@ -25,6 +25,12 @@ public partial class App : Application
             Height = 720
         };
 
+        // Kill entire process tree on main window close (prevents orphaned WebView2 processes)
+        mainWindow.Destroying += (s, e) =>
+        {
+            Environment.Exit(0);
+        };
+
         // Subscribe to viewer service after services are available
         if (!_initialized)
         {
