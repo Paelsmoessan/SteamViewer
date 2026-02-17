@@ -189,7 +189,9 @@ window.SteamViewerWebRTC = {
             _silentAudioCtx: null,
             // LAN detection + FEC state
             _isLan: false,
-            _fecRemoved: false
+            _fecRemoved: false,
+            // Dual data channels: control (reliable) + mouse (unreliable)
+            mouseChannel: null
         };
     },
 
@@ -409,9 +411,13 @@ window.SteamViewerWebRTC = {
                 }
             };
 
-            // Handle incoming data channels
+            // Handle incoming data channels (viewer receives host-created channels)
             session.peerConnection.ondatachannel = (event) => {
-                this._setupDataChannel(sessionId, event.channel);
+                if (event.channel.label === 'mouse') {
+                    this._setupMouseChannel(sessionId, event.channel);
+                } else {
+                    this._setupDataChannel(sessionId, event.channel);
+                }
             };
 
             // Handle incoming video track
@@ -646,7 +652,7 @@ window.SteamViewerWebRTC = {
         }
     },
 
-    // Create data channel (for host)
+    // Create data channel (for host) — legacy single-channel
     createDataChannel(sessionId, name) {
         const session = this._getSession(sessionId);
         if (!session.peerConnection) {
@@ -659,6 +665,30 @@ window.SteamViewerWebRTC = {
         });
         this._setupDataChannel(sessionId, session.dataChannel);
         console.log(`[${sessionId}] Data channel '${name}' created`);
+    },
+
+    // Create dual data channels (for host): control (reliable) + mouse (unreliable)
+    createDataChannels(sessionId) {
+        const session = this._getSession(sessionId);
+        if (!session.peerConnection) {
+            console.error('PeerConnection not initialized');
+            return;
+        }
+
+        // Control channel: ordered, reliable — keyboard, commands, clipboard, files, SD frames
+        session.dataChannel = session.peerConnection.createDataChannel('control', {
+            ordered: true
+        });
+        this._setupDataChannel(sessionId, session.dataChannel);
+
+        // Mouse channel: unordered, unreliable — mouse moves only, eliminates head-of-line blocking
+        session.mouseChannel = session.peerConnection.createDataChannel('mouse', {
+            ordered: false,
+            maxRetransmits: 0
+        });
+        this._setupMouseChannel(sessionId, session.mouseChannel);
+
+        console.log(`[${sessionId}] Dual data channels created (control + mouse)`);
     },
 
     _setupDataChannel(sessionId, channel) {
@@ -705,7 +735,32 @@ window.SteamViewerWebRTC = {
         };
     },
 
-    // Send string data over data channel
+    // Set up unreliable mouse channel (lightweight — no binary, messages route to same C# callback)
+    _setupMouseChannel(sessionId, channel) {
+        const session = this._getSession(sessionId);
+        session.mouseChannel = channel;
+
+        channel.onopen = () => {
+            console.log(`[${sessionId}] Mouse channel opened`);
+        };
+
+        channel.onclose = () => {
+            console.log(`[${sessionId}] Mouse channel closed`);
+        };
+
+        // Host receives mouse input through same C# callback as control channel
+        channel.onmessage = async (event) => {
+            if (typeof event.data === 'string' && session.dotNetRef) {
+                await session.dotNetRef.invokeMethodAsync('OnDataChannelMessageCallback', event.data);
+            }
+        };
+
+        channel.onerror = (error) => {
+            console.error(`[${sessionId}] Mouse channel error:`, error);
+        };
+    },
+
+    // Send string data over data channel (control channel)
     sendData(sessionId, data) {
         const session = this._getSession(sessionId);
         if (session.dataChannel && session.dataChannel.readyState === 'open') {
@@ -724,6 +779,22 @@ window.SteamViewerWebRTC = {
             return true;
         }
         console.warn(`[${sessionId}] Data channel not open`);
+        return false;
+    },
+
+    // Send mouse data over unreliable mouse channel (falls back to control channel)
+    sendMouseData(sessionId, data) {
+        const session = this._getSession(sessionId);
+        // Prefer mouse channel (unordered, unreliable — no head-of-line blocking)
+        if (session.mouseChannel && session.mouseChannel.readyState === 'open') {
+            session.mouseChannel.send(data);
+            return true;
+        }
+        // Fallback to control channel if mouse channel not yet open
+        if (session.dataChannel && session.dataChannel.readyState === 'open') {
+            session.dataChannel.send(data);
+            return true;
+        }
         return false;
     },
 
@@ -2072,6 +2143,11 @@ window.SteamViewerWebRTC = {
 
         session.remoteCanvas = null;
         session.remoteCtx = null;
+
+        if (session.mouseChannel) {
+            session.mouseChannel.close();
+            session.mouseChannel = null;
+        }
 
         if (session.dataChannel) {
             session.dataChannel.close();

@@ -250,6 +250,8 @@ public sealed class ViewerSession : IAsyncDisposable
 
     /// <summary>
     /// Send an input event to the remote peer.
+    /// MouseMove goes over the unreliable mouse channel (no head-of-line blocking).
+    /// All other input goes over the reliable control channel.
     /// </summary>
     public async Task SendInputAsync(InputEvent inputEvent)
     {
@@ -258,7 +260,14 @@ public sealed class ViewerSession : IAsyncDisposable
         try
         {
             var json = JsonSerializer.Serialize(inputEvent);
-            await _webrtc.SendDataAsync(json);
+            if (inputEvent is InputEvent.MouseMove)
+            {
+                await _webrtc.SendMouseDataAsync(json);
+            }
+            else
+            {
+                await _webrtc.SendDataAsync(json);
+            }
         }
         catch (Exception ex)
         {

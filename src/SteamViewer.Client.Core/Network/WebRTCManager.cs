@@ -178,6 +178,16 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
     }
 
     /// <summary>
+    /// Create dual data channels: control (reliable) + mouse (unreliable).
+    /// </summary>
+    public async Task CreateDataChannelsAsync()
+    {
+        EnsureInitialized();
+        await _jsRuntime.InvokeVoidAsync("SteamViewerWebRTC.createDataChannels", _sessionId);
+        _logger.LogDebug("Dual data channels created (control + mouse)");
+    }
+
+    /// <summary>
     /// Create an SDP offer (for viewer initiating connection).
     /// </summary>
     public async Task<string> CreateOfferAsync()
@@ -291,12 +301,21 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
     }
 
     /// <summary>
-    /// Send string data over the data channel.
+    /// Send string data over the control data channel.
     /// </summary>
     public async Task<bool> SendDataAsync(string data)
     {
         EnsureInitialized();
         return await _jsRuntime.InvokeAsync<bool>("SteamViewerWebRTC.sendData", _sessionId, data);
+    }
+
+    /// <summary>
+    /// Send mouse data over the unreliable mouse channel (falls back to control channel).
+    /// </summary>
+    public async Task<bool> SendMouseDataAsync(string data)
+    {
+        EnsureInitialized();
+        return await _jsRuntime.InvokeAsync<bool>("SteamViewerWebRTC.sendMouseData", _sessionId, data);
     }
 
     /// <summary>
@@ -322,9 +341,8 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
             await InitializeAsync();
         }
 
-        // Create data channels for video and input
-        await CreateDataChannelAsync("video");
-        await CreateDataChannelAsync("input");
+        // Create dual data channels: control (reliable) + mouse (unreliable)
+        await CreateDataChannelsAsync();
 
         // Create offer
         var offer = await CreateOfferAsync();
