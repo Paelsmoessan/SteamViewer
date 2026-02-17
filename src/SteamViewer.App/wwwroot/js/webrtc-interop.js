@@ -186,7 +186,10 @@ window.SteamViewerWebRTC = {
             _bitrateHistory: [],
             _lastBitrateAdjust: 0,
             // Silent audio track (separate MSID to bypass Chrome A/V sync)
-            _silentAudioCtx: null
+            _silentAudioCtx: null,
+            // LAN detection + FEC state
+            _isLan: false,
+            _fecRemoved: false
         };
     },
 
@@ -318,10 +321,41 @@ window.SteamViewerWebRTC = {
             };
 
             // Handle ICE connection state for more debugging
-            session.peerConnection.oniceconnectionstatechange = () => {
-                console.log(`[${sessionId}] ICE connection state:`, session.peerConnection.iceConnectionState);
-                if (session.peerConnection.iceConnectionState === 'failed') {
+            session.peerConnection.oniceconnectionstatechange = async () => {
+                const state = session.peerConnection?.iceConnectionState;
+                console.log(`[${sessionId}] ICE connection state:`, state);
+                if (state === 'failed') {
                     console.error('ICE CONNECTION FAILED');
+                }
+                // LAN detection: when connected, check if both candidates are host type (direct LAN)
+                if (state === 'connected' && !session._isLan && !session._fecRemoved) {
+                    try {
+                        const stats = await session.peerConnection.getStats();
+                        for (const [, report] of stats) {
+                            if (report.type === 'candidate-pair' && report.state === 'succeeded') {
+                                let localType = '', remoteType = '';
+                                for (const [, r] of stats) {
+                                    if (r.id === report.localCandidateId) localType = r.candidateType;
+                                    if (r.id === report.remoteCandidateId) remoteType = r.candidateType;
+                                }
+                                session._isLan = (localType === 'host' && remoteType === 'host');
+                                console.log(`[${sessionId}] ICE candidates: local=${localType}, remote=${remoteType} → ${session._isLan ? 'LAN' : 'WAN'}`);
+                                if (session._isLan && session.peerConnection?.signalingState === 'stable') {
+                                    console.log(`[${sessionId}] LAN detected — renegotiating to remove FEC`);
+                                    const offer = await session.peerConnection.createOffer();
+                                    offer.sdp = this.modifySdpForLowLatency(offer.sdp, { removeFec: true });
+                                    await session.peerConnection.setLocalDescription(offer);
+                                    session._fecRemoved = true;
+                                    if (session.dotNetRef) {
+                                        await session.dotNetRef.invokeMethodAsync('OnRenegotiationNeededCallback', JSON.stringify(offer));
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    } catch (e) {
+                        console.warn(`[${sessionId}] LAN detection failed:`, e);
+                    }
                 }
             };
 
@@ -696,7 +730,7 @@ window.SteamViewerWebRTC = {
     // Modify SDP for lower latency (pure function, no session state)
     // SDP modifications for low-latency remote desktop streaming.
     // Source: .claude/research/webrtc-latency/research.md (Selkies, Hopp, Neko findings)
-    modifySdpForLowLatency(sdp) {
+    modifySdpForLowLatency(sdp, { removeFec = false } = {}) {
         let modified = sdp;
 
         // Remove any existing b=AS lines (old 3Mbps cap that was killing bitrate)
@@ -738,6 +772,14 @@ window.SteamViewerWebRTC = {
                 const reordered = [...h264PayloadTypes, ...payloadList.filter(p => !h264PayloadTypes.includes(p))];
                 return prefix + reordered.join(' ');
             });
+        }
+
+        // Remove FEC codecs on LAN (saves bandwidth + latency, not needed with 0% loss)
+        if (removeFec) {
+            modified = modified.replace(/a=rtpmap:\d+ flexfec.*\r\n/g, '');
+            modified = modified.replace(/a=rtpmap:\d+ ulpfec.*\r\n/g, '');
+            modified = modified.replace(/a=rtpmap:\d+ red\/90000.*\r\n/g, '');
+            modified = modified.replace(/a=fmtp:\d+ apt=\d+.*\r\n/g, '');
         }
 
         return modified;
@@ -889,7 +931,7 @@ window.SteamViewerWebRTC = {
                 // Disable scalability for lower latency
                 params.encodings[0].scalabilityMode = 'L1T1';
                 // Maintain frame rate even if quality has to drop (better for responsiveness)
-                params.encodings[0].degradationPreference = 'maintain-framerate';
+                params.encodings[0].degradationPreference = 'maintain-resolution';
                 sender.setParameters(params).catch(e => console.warn('Could not set encoding params:', e));
 
                 // Report actual capture dimensions to host C# (source of truth for coordinate mapping)
@@ -1089,7 +1131,7 @@ window.SteamViewerWebRTC = {
         params.encodings[0].priority = 'high';
         params.encodings[0].networkPriority = 'high';
         params.encodings[0].scalabilityMode = 'L1T1';
-        params.encodings[0].degradationPreference = 'maintain-framerate';
+        params.encodings[0].degradationPreference = 'maintain-resolution';
         sender.setParameters(params).catch(e => console.warn('Could not set native capture encoding params:', e));
 
         // Add silent audio track with SEPARATE MediaStream (different MSID)
