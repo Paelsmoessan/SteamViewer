@@ -159,6 +159,8 @@ window.SteamViewerWebRTC = {
             frameInterval: 33, // ~30fps (match WebRTC source)
             captureCanvas: null,
             captureCtx: null,
+            // MJPEG mode (DataChannel bypass)
+            _mjpegActive: false,
             // Direct rendering (bypasses JPEG relay when canvas is in same JS context)
             _directRenderCanvas: null,
             _directRenderCtx: null,
@@ -527,6 +529,12 @@ window.SteamViewerWebRTC = {
                                     return;
                                 }
 
+                                // Skip drawing during MJPEG mode (keep loop alive for resume)
+                                if (session._mjpegActive) {
+                                    video.requestVideoFrameCallback(renderFrameRVFC);
+                                    return;
+                                }
+
                                 // Skip drawing if video not ready yet (avoids errors during startup)
                                 if (video.readyState < 2) {
                                     video.requestVideoFrameCallback(renderFrameRVFC);
@@ -569,6 +577,12 @@ window.SteamViewerWebRTC = {
                             const renderFrameRAF = () => {
                                 if (video.paused || video.ended) {
                                     console.log('Video paused/ended, stopping render');
+                                    return;
+                                }
+
+                                // Skip drawing during MJPEG mode (keep loop alive)
+                                if (session._mjpegActive) {
+                                    requestAnimationFrame(renderFrameRAF);
                                     return;
                                 }
 
@@ -708,21 +722,39 @@ window.SteamViewerWebRTC = {
 
         channel.onmessage = async (event) => {
             if (typeof event.data === 'string') {
-                // Check if this is a relayed log message from peer
+                // Check if this is a relayed log message or mode change from peer
                 try {
                     const parsed = JSON.parse(event.data);
                     if (parsed._logRelay) {
-                        // This is a log relay message - handle it specially
                         window.SteamViewerLogger?.handleRelayedLog(parsed.level, parsed.message, parsed.from);
-                        return; // Don't forward to C# as regular message
+                        return;
+                    }
+                    // Intercept videoModeChanged to manage MJPEG/WebRTC frame capture switching
+                    if (parsed.type === 'videoModeChanged' && parsed.mode === 'webrtc') {
+                        session._mjpegActive = false;
+                        this.resumeFrameCapture(sessionId);
+                        console.log(`[${sessionId}] MJPEG→WebRTC: resumed frame capture`);
                     }
                 } catch (e) {
-                    // Not JSON or not a log relay - continue normally
+                    // Not JSON - continue normally
                 }
 
                 console.log(`[${sessionId}] Data channel message received:`, event.data?.substring?.(0, 50));
                 if (session.dotNetRef) await session.dotNetRef.invokeMethodAsync('OnDataChannelMessageCallback', event.data);
             } else if (event.data instanceof ArrayBuffer) {
+                // Check for MJPEG frame: header [4 bytes "MJPG"][4 bytes width][4 bytes height][JPEG data]
+                if (event.data.byteLength > 12) {
+                    const hdr = new Uint8Array(event.data, 0, 4);
+                    if (hdr[0] === 0x4D && hdr[1] === 0x4A && hdr[2] === 0x50 && hdr[3] === 0x47) {
+                        // MJPEG frame — render directly to canvas (bypasses WebRTC video pipeline)
+                        const view = new DataView(event.data);
+                        const w = view.getInt32(4, true);
+                        const h = view.getInt32(8, true);
+                        const jpegBytes = new Uint8Array(event.data, 12);
+                        this._renderMjpegFrame(sessionId, session, jpegBytes, w, h);
+                        return;
+                    }
+                }
                 console.log(`[${sessionId}] Data channel binary message received:`, event.data.byteLength, 'bytes');
                 const uint8Array = new Uint8Array(event.data);
                 if (session.dotNetRef) await session.dotNetRef.invokeMethodAsync('OnDataChannelBinaryMessageCallback', Array.from(uint8Array));
@@ -760,6 +792,58 @@ window.SteamViewerWebRTC = {
         };
     },
 
+    // Render MJPEG frame received via data channel directly to canvas
+    _mjpegFrameCount: 0,
+    async _renderMjpegFrame(sessionId, session, jpegBytes, width, height) {
+        try {
+            this._mjpegFrameCount++;
+
+            // On first MJPEG frame: pause normal frame capture to prevent stale-frame competition
+            if (!session._mjpegActive) {
+                session._mjpegActive = true;
+                this.pauseFrameCapture(sessionId);
+                console.log(`[${sessionId}] MJPEG active — paused WebRTC frame capture`);
+            }
+
+            if (this._mjpegFrameCount <= 3 || this._mjpegFrameCount % 300 === 0) {
+                console.log(`[${sessionId}] MJPEG frame #${this._mjpegFrameCount}: ${width}x${height}, ${jpegBytes.length} bytes`);
+            }
+
+            const blob = new Blob([jpegBytes], { type: 'image/jpeg' });
+            const bitmap = await createImageBitmap(blob);
+
+            // Render to direct canvas (same JS context) or relay via C# JPEG path
+            const canvas = session._directRenderCanvas;
+            const ctx = session._directRenderCtx;
+            if (canvas && ctx) {
+                if (session._updateCanvasSize) session._updateCanvasSize();
+                const lb = computeLetterbox(canvas.width, canvas.height, width, height);
+                session._letterbox = lb;
+                ctx.fillStyle = '#000';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                ctx.drawImage(bitmap, lb.dx, lb.dy, lb.dw, lb.dh);
+            } else if (session.frameCaptureDotNetRef) {
+                // Relay to viewer window via ViewerSession.OnFrameCaptured
+                const reader = new FileReader();
+                reader.onload = () => {
+                    const base64 = reader.result.split(',')[1];
+                    session.frameCaptureDotNetRef.invokeMethodAsync('OnFrameCaptured', base64, width, height);
+                };
+                reader.readAsDataURL(blob);
+            } else {
+                if (this._mjpegFrameCount <= 3) {
+                    console.warn(`[${sessionId}] MJPEG: no render target (no direct canvas, no frameCaptureDotNetRef)`);
+                }
+            }
+
+            bitmap.close();
+        } catch (e) {
+            if (this._mjpegFrameCount <= 5) {
+                console.error(`[${sessionId}] MJPEG render error:`, e);
+            }
+        }
+    },
+
     // Send string data over data channel (control channel)
     sendData(sessionId, data) {
         const session = this._getSession(sessionId);
@@ -780,6 +864,60 @@ window.SteamViewerWebRTC = {
         }
         console.warn(`[${sessionId}] Data channel not open`);
         return false;
+    },
+
+    // Send MJPEG frame as binary over data channel (bypasses WebRTC video track)
+    // Header: [4 bytes "MJPG"][4 bytes width LE][4 bytes height LE][JPEG bytes]
+    _mjpegSendCount: 0,
+    _mjpegSkipCount: 0,
+    sendMjpegFrame(sessionId, base64Jpeg, width, height) {
+        try {
+            const session = this._getSession(sessionId);
+            const ch = session.dataChannel;
+            if (!ch || ch.readyState !== 'open') return;
+
+            // Backpressure: skip frame if send buffer is backlogged (>512KB queued)
+            if (ch.bufferedAmount > 524288) {
+                this._mjpegSkipCount++;
+                if (this._mjpegSkipCount <= 3 || this._mjpegSkipCount % 100 === 0) {
+                    console.warn(`[${sessionId}] MJPEG backpressure: skipped ${this._mjpegSkipCount} frames (buffered: ${ch.bufferedAmount})`);
+                }
+                return;
+            }
+
+            // Decode base64 to binary using Uint8Array.from (faster than byte loop)
+            const binaryStr = atob(base64Jpeg);
+            const jpegLen = binaryStr.length;
+            const headerSize = 12;
+            const buffer = new ArrayBuffer(headerSize + jpegLen);
+            const view = new DataView(buffer);
+
+            // Header: "MJPG" magic + width + height (little-endian)
+            view.setUint8(0, 0x4D); // M
+            view.setUint8(1, 0x4A); // J
+            view.setUint8(2, 0x50); // P
+            view.setUint8(3, 0x47); // G
+            view.setInt32(4, width, true);
+            view.setInt32(8, height, true);
+
+            // Copy JPEG data after header
+            const bytes = new Uint8Array(buffer, headerSize);
+            for (let i = 0; i < jpegLen; i++) {
+                bytes[i] = binaryStr.charCodeAt(i);
+            }
+
+            ch.send(buffer);
+
+            this._mjpegSendCount++;
+            if (this._mjpegSendCount <= 3 || this._mjpegSendCount % 300 === 0) {
+                console.log(`[${sessionId}] MJPEG sent #${this._mjpegSendCount}: ${width}x${height}, ${jpegLen} bytes, buffered: ${ch.bufferedAmount}`);
+            }
+        } catch (e) {
+            this._mjpegSendCount++;
+            if (this._mjpegSendCount <= 5) {
+                console.error(`[${sessionId}] MJPEG send error #${this._mjpegSendCount}:`, e);
+            }
+        }
     },
 
     // Send mouse data over unreliable mouse channel (falls back to control channel)
@@ -1340,7 +1478,7 @@ window.SteamViewerWebRTC = {
         session.peerConnection.getSenders().forEach(s => {
             if (s.track?.kind === 'video') {
                 s.track.enabled = false;
-                console.log(`[${sessionId}] Video track paused (Secure Desktop active)`);
+                console.log(`[${sessionId}] Video track paused`);
             }
         });
     },
@@ -1352,7 +1490,7 @@ window.SteamViewerWebRTC = {
         session.peerConnection.getSenders().forEach(s => {
             if (s.track?.kind === 'video') {
                 s.track.enabled = true;
-                console.log(`[${sessionId}] Video track resumed (Secure Desktop inactive)`);
+                console.log(`[${sessionId}] Video track resumed`);
             }
         });
     },
@@ -2158,6 +2296,10 @@ window.SteamViewerWebRTC = {
             session.peerConnection.close();
             session.peerConnection = null;
         }
+
+        // Reset MJPEG state
+        session._mjpegActive = false;
+        this._mjpegFrameCount = 0;
 
         // Reset input lock state on disconnect (fix: input lock persists after disconnect)
         if (window.SteamViewerInput && window.SteamViewerInput.isLocked) {

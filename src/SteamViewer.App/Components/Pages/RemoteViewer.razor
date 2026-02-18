@@ -556,6 +556,9 @@
                 case "runAsSystemFailed":
                     ShowToast(message ?? "Run as SYSTEM failed");
                     break;
+                case "videoModeChanged":
+                    ShowToast(message == "mjpeg" ? "MJPEG mode ON (data channel)" : "WebRTC video mode ON");
+                    break;
             }
         });
     }
@@ -1131,6 +1134,17 @@
             return;
         }
 
+        // Ctrl+M → Toggle MJPEG DataChannel experiment
+        if (key == "m" && ctrl && !shift && !alt)
+        {
+            if (_activeSession != null)
+            {
+                _ = _activeSession.SendToggleMjpegAsync();
+                ShowToast("Toggling MJPEG mode...");
+            }
+            return;
+        }
+
         SendInputToActiveSession(new InputEvent.KeyDown(key, new KeyModifiers(ctrl, shift, alt, false)));
     }
 
@@ -1139,6 +1153,7 @@
     {
         var (ctrl, shift, alt) = ParseModifiers(modifiers);
         if (key == "End" && ctrl && alt) return;
+        if (key == "m" && ctrl && !shift && !alt) return;
 
         SendInputToActiveSession(new InputEvent.KeyUp(key, new KeyModifiers(ctrl, shift, alt, false)));
     }

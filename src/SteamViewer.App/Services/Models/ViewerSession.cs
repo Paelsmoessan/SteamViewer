@@ -383,6 +383,25 @@ public sealed class ViewerSession : IAsyncDisposable
     }
 
     /// <summary>
+    /// Toggle MJPEG DataChannel mode on the host (experimental latency test).
+    /// </summary>
+    public async Task SendToggleMjpegAsync()
+    {
+        if (_webrtc == null || !_webrtc.IsDataChannelOpen) return;
+
+        try
+        {
+            var json = JsonSerializer.Serialize(new { type = "toggleMjpeg" });
+            await _webrtc.SendDataAsync(json);
+            _logger.LogInformation("Session {SessionId}: Sent toggleMjpeg", SessionId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Session {SessionId}: Failed to send toggleMjpeg", SessionId);
+        }
+    }
+
+    /// <summary>
     /// Request the host to switch which display is being captured.
     /// </summary>
     public async Task SendSwitchDisplayAsync(int monitorId)
@@ -495,6 +514,12 @@ public sealed class ViewerSession : IAsyncDisposable
                         var sysMessage = root.TryGetProperty("message", out var sysMsgProp) ? sysMsgProp.GetString() : null;
                         _logger.LogInformation("Session {SessionId}: {Type}: {Message}", SessionId, type, sysMessage);
                         OnControlMessage?.Invoke(type, sysMessage);
+                        break;
+
+                    case "videoModeChanged":
+                        var videoMode = root.TryGetProperty("mode", out var vmProp) ? vmProp.GetString() : "unknown";
+                        _logger.LogInformation("Session {SessionId}: Video mode changed to {Mode}", SessionId, videoMode);
+                        OnControlMessage?.Invoke(type, videoMode);
                         break;
 
                     case "clipboard_data":

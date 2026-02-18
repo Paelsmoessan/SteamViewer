@@ -64,6 +64,10 @@ public sealed class HostSession : IAsyncDisposable
 
     // Native DXGI capture state
     private bool _isNativeCapture;
+    private bool _mjpegMode;
+    private int _mjpegFrameSkip;
+    private bool _mjpegFirstFrame;
+    private DxgiScreenCapture? _activeDxgi;
 
     /// <summary>Session ID for JS interop — always "host".</summary>
     public string SessionId => "host";
@@ -331,6 +335,7 @@ public sealed class HostSession : IAsyncDisposable
                 dxgi.StartCaptureLoop(targetOutput);
 
                 _isNativeCapture = true;
+                _activeDxgi = dxgi;
                 IsSharingScreen = true;
                 _logger.LogInformation("DXGI native capture started on output {Output} — no picker!", targetOutput);
 
@@ -428,11 +433,44 @@ public sealed class HostSession : IAsyncDisposable
     }
 
     /// <summary>
-    /// JPEG fallback path — used when SharedBuffer not available.
+    /// JPEG fallback path — used when SharedBuffer not available, AND MJPEG experiment path.
     /// </summary>
     private void OnDxgiFrameCaptured(byte[] jpegData, int width, int height)
     {
         if (_webrtc == null || !_isNativeCapture) return;
+
+        // MJPEG experiment: send JPEG directly over data channel (bypasses WebRTC video track)
+        if (_mjpegMode)
+        {
+            // Throttle to ~15 FPS (skip every other frame from 30 FPS DXGI)
+            _mjpegFrameSkip++;
+            if (_mjpegFrameSkip % 2 != 0) return;
+
+            var base64 = Convert.ToBase64String(jpegData);
+
+            if (_mjpegFirstFrame)
+            {
+                // Await first frame to catch JS interop errors (session not found, etc.)
+                _mjpegFirstFrame = false;
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await _jsRuntime.InvokeVoidAsync("SteamViewerWebRTC.sendMjpegFrame", SessionId, base64, width, height);
+                        _logger.LogInformation("MJPEG first frame sent OK ({Size} bytes JPEG, {Base64} base64)", jpegData.Length, base64.Length);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "MJPEG first frame FAILED — JS interop error");
+                    }
+                });
+            }
+            else
+            {
+                _ = _jsRuntime.InvokeVoidAsync("SteamViewerWebRTC.sendMjpegFrame", SessionId, base64, width, height);
+            }
+            return;
+        }
 
 #if WINDOWS
         if (_frameBridge?.IsInitialized == true)
@@ -442,8 +480,55 @@ public sealed class HostSession : IAsyncDisposable
         }
 #endif
 
-        var base64 = Convert.ToBase64String(jpegData);
-        _ = _webrtc.PushNativeFrameAsync(base64, width, height);
+        var base64Normal = Convert.ToBase64String(jpegData);
+        _ = _webrtc.PushNativeFrameAsync(base64Normal, width, height);
+    }
+
+    /// <summary>
+    /// Toggle MJPEG DataChannel experiment: sends JPEG frames over data channel
+    /// instead of through the WebRTC video track pipeline.
+    /// Eliminates H264 encode/decode + jitter buffer from the path.
+    /// </summary>
+    private async Task HandleToggleMjpegAsync()
+    {
+        _mjpegMode = !_mjpegMode;
+        _mjpegFrameSkip = 0;
+        _mjpegFirstFrame = _mjpegMode;
+        _logger.LogInformation("MJPEG DataChannel mode: {Mode}", _mjpegMode ? "ON" : "OFF");
+
+        if (_activeDxgi != null && _isNativeCapture)
+        {
+            if (_mjpegMode)
+            {
+                // Switch from raw BGRA (SharedBuffer) to JPEG path (for data channel send)
+                _activeDxgi.OnRawFrameCaptured -= OnDxgiRawFrameCaptured;
+                _activeDxgi.OnFrameCaptured += OnDxgiFrameCaptured;
+                // Pause WebRTC video track (no point encoding H264 when we're sending JPEG)
+                try { await _webrtc!.PauseVideoTrackAsync(); }
+                catch (Exception ex) { _logger.LogWarning(ex, "Failed to pause video track"); }
+            }
+            else
+            {
+                // Switch back to raw BGRA (SharedBuffer) path
+                _activeDxgi.OnFrameCaptured -= OnDxgiFrameCaptured;
+#if WINDOWS
+                if (_frameBridge?.IsInitialized == true)
+                    _activeDxgi.OnRawFrameCaptured += OnDxgiRawFrameCaptured;
+                else
+#endif
+                    _activeDxgi.OnFrameCaptured += OnDxgiFrameCaptured;
+                // Resume WebRTC video track
+                try { await _webrtc!.ResumeVideoTrackAsync(); }
+                catch (Exception ex) { _logger.LogWarning(ex, "Failed to resume video track"); }
+            }
+        }
+
+        // Confirm to viewer
+        await _webrtc!.SendDataAsync(JsonSerializer.Serialize(new
+        {
+            type = "videoModeChanged",
+            mode = _mjpegMode ? "mjpeg" : "webrtc"
+        }));
     }
 
     private async Task NotifyScreenShareStarted()
@@ -580,6 +665,10 @@ public sealed class HostSession : IAsyncDisposable
                         var monitorId = root.TryGetProperty("monitorId", out var midProp) ? midProp.GetInt32() : -1;
                         if (monitorId >= 0)
                             await HandleSwitchDisplayAsync(monitorId);
+                        return;
+
+                    case "toggleMjpeg":
+                        await HandleToggleMjpegAsync();
                         return;
 
                     case "screenShareStarted":
