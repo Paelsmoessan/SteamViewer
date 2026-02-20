@@ -2302,6 +2302,18 @@ window.SteamViewerInput = {
         this.canvas.addEventListener('wheel', this._boundWheel, { passive: false });
         this.canvas.addEventListener('contextmenu', (e) => e.preventDefault());
 
+        // Local cursor overlay — hide/show on mouse leave/enter
+        this._boundMouseLeave = () => {
+            const c = document.getElementById('localCursorOverlay');
+            if (c) c.style.display = 'none';
+        };
+        this._boundMouseEnter = () => {
+            const c = document.getElementById('localCursorOverlay');
+            if (c && this.isLocked) c.style.display = 'block';
+        };
+        this.canvas.addEventListener('mouseleave', this._boundMouseLeave);
+        this.canvas.addEventListener('mouseenter', this._boundMouseEnter);
+
         // Make canvas focusable for keyboard events
         this.canvas.tabIndex = 0;
         this.canvas.style.outline = 'none';
@@ -2434,6 +2446,10 @@ window.SteamViewerInput = {
         this._restartSharingIfLost();
         // Start mouse regulation interval timer (sweep mode sends)
         this._startRegulationTimer();
+        // Local cursor overlay — hide system cursor, show prominent overlay
+        this.canvas.style.cursor = 'none';
+        const cursorEl = document.getElementById('localCursorOverlay');
+        if (cursorEl) cursorEl.style.display = 'block';
         console.log('Input LOCKED - sending inputs to host');
     },
 
@@ -2459,6 +2475,10 @@ window.SteamViewerInput = {
         this.updateLockIndicator();
         this.notifyLockChange();
         this._stopRegulationTimer();
+        // Local cursor overlay — restore system cursor, hide overlay
+        if (this.canvas) this.canvas.style.cursor = '';
+        const cursorEl = document.getElementById('localCursorOverlay');
+        if (cursorEl) cursorEl.style.display = 'none';
         console.log('Input UNLOCKED');
     },
 
@@ -2602,6 +2622,23 @@ window.SteamViewerInput = {
         }
         if (!this.isCapturing || !this.isLocked || !this.dotNetRef) return;
 
+        // LOCAL CURSOR OVERLAY — instant, every event, before PID
+        const cursorEl = document.getElementById('localCursorOverlay');
+        const sd = window.SteamViewerSecureDesktop;
+        const sdActive = sd?.isActive && sd._width && sd._height && sd.canvas;
+        if (cursorEl) {
+            if (sdActive) {
+                // SD has its own crosshair cursor — hide overlay
+                cursorEl.style.display = 'none';
+            } else {
+                cursorEl.style.display = 'block';
+                const rect = this.canvas.getBoundingClientRect();
+                const cx = e.clientX - rect.left - 2;  // -2 = hotspot offset (arrow tip)
+                const cy = e.clientY - rect.top - 2;
+                cursorEl.style.transform = `translate(${cx}px, ${cy}px)`;
+            }
+        }
+
         this._inputEventCount++;
         if (this._inputEventCount <= 3) {
             console.log(`[Input] event #${this._inputEventCount}: capturing=${this.isCapturing}, locked=${this.isLocked}, dotNetRef=${!!this.dotNetRef}, session=${this._activeSessionId}`);
@@ -2613,8 +2650,6 @@ window.SteamViewerInput = {
         // Clear mouse-down cache — mouse moved, so this is a drag, not a click
         this._lastMouseDownCoords = null;
 
-        const sd = window.SteamViewerSecureDesktop;
-        const sdActive = sd?.isActive && sd._width && sd._height && sd.canvas;
         let x, y, captureW, captureH;
 
         if (sdActive) {
@@ -2776,6 +2811,15 @@ window.SteamViewerInput = {
 
         // Clear regulation timer
         this._stopRegulationTimer();
+
+        // Clean up local cursor overlay
+        if (this.canvas) this.canvas.style.cursor = '';
+        const cursorEl = document.getElementById('localCursorOverlay');
+        if (cursorEl) cursorEl.style.display = 'none';
+        if (this._boundMouseLeave) {
+            this.canvas?.removeEventListener('mouseleave', this._boundMouseLeave);
+            this.canvas?.removeEventListener('mouseenter', this._boundMouseEnter);
+        }
 
         // Remove event listeners from canvas
         if (this.canvas) {
