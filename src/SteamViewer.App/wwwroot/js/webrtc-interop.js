@@ -2240,11 +2240,26 @@ window.SteamViewerInput = {
     _inputEventCount: 0,
     _lastMouseDownCoords: null,  // Cache coords from mouse_down for identical mouse_up (prevents micro-drag)
     _focusWatchdogId: null,
-    // Mouse regulation — velocity-based: precision (small moves) sends every event,
-    // sweep (large moves) buffers and sends at interval rate
-    _mouseRegulationThreshold: 30,  // pixels — below = precision, above = sweep
-    _mouseRegulationInterval: 33,   // ms — sweep mode send rate (~30 Hz)
-    _sweepFrameDistance: 0,         // pixels — force send every N px during sweeps (0 = disabled)
+    // PID mouse regulation — sends every event at low velocity (precision/hover),
+    // suppresses during sweeps, sends immediately on deceleration (arrival detection)
+    _pidAlpha: 0.3,           // EMA smoothing factor for velocity (0-1, lower = smoother)
+    _pidKp: 1.0,              // Proportional gain (velocity weight)
+    _pidKi: 0.5,              // Integral gain (accumulated movement weight)
+    _pidKd: 2.0,              // Derivative gain (acceleration/deceleration weight)
+    _pidSendThreshold: 0.8,   // Score above this = suppress (buffer for interval)
+    _pidIDecay: 0.95,         // Integral decay per event (anti-windup via EMA)
+    _pidIMax: 5.0,            // Integral clamp (anti-windup hard limit)
+    // Dynamic cooldown — timer send rate scales with velocity
+    _pidMinCooldown: 50,      // ms — fastest timer rate during sweeps (~20 FPS)
+    _pidMaxCooldown: 200,     // ms — slowest timer rate for fast sweeps (~5 FPS)
+    _pidVelocityCap: 2.0,     // px/ms — velocity at which cooldown maxes out
+    // PID internal state
+    _pidVelocity: 0,          // EMA-smoothed velocity (px/ms)
+    _pidIntegral: 0,          // Accumulated velocity integral (with decay)
+    _pidLastVelocity: 0,      // Previous smoothed velocity (for D term)
+    _pidLastEventTime: 0,     // Timestamp of previous mousemove
+    // Regulation plumbing
+    _lastTimerSendTime: 0,    // Timestamp of last timer-initiated send
     _lastSentX: 0,
     _lastSentY: 0,
     _bufferedMouseCoords: null,     // Latest coords waiting for interval send
@@ -2449,17 +2464,31 @@ window.SteamViewerInput = {
 
     _startRegulationTimer() {
         this._stopRegulationTimer();
+        this._pidVelocity = 0;
+        this._pidIntegral = 0;
+        this._pidLastVelocity = 0;
+        this._pidLastEventTime = 0;
+        this._lastTimerSendTime = 0;
         this._regulationTimer = setInterval(async () => {
             const c = this._bufferedMouseCoords;
-            if (c && this.dotNetRef && this.isLocked) {
-                this._lastSentX = c.x;
-                this._lastSentY = c.y;
-                this._bufferedMouseCoords = null;
-                try {
-                    await this.dotNetRef.invokeMethodAsync('OnMouseMove', c.x, c.y, c.captureW, c.captureH);
-                } catch (err) { /* ignore sweep send errors */ }
-            }
-        }, this._mouseRegulationInterval);
+            if (!c || !this.dotNetRef || !this.isLocked) return;
+
+            const now = performance.now();
+            const elapsed = now - this._lastTimerSendTime;
+            // Dynamic cooldown: scales linearly with velocity
+            const t = Math.min(this._pidVelocity / this._pidVelocityCap, 1);
+            const cooldown = this._pidMinCooldown + (this._pidMaxCooldown - this._pidMinCooldown) * t;
+
+            if (elapsed < cooldown) return; // not enough time since last send
+
+            this._lastSentX = c.x;
+            this._lastSentY = c.y;
+            this._bufferedMouseCoords = null;
+            this._lastTimerSendTime = now;
+            try {
+                await this.dotNetRef.invokeMethodAsync('OnMouseMove', c.x, c.y, c.captureW, c.captureH);
+            } catch (err) { /* ignore sweep send errors */ }
+        }, 16); // Poll at 60Hz, actual send rate governed by dynamic cooldown
     },
 
     _stopRegulationTimer() {
@@ -2468,6 +2497,11 @@ window.SteamViewerInput = {
             this._regulationTimer = null;
         }
         this._bufferedMouseCoords = null;
+        this._pidVelocity = 0;
+        this._pidIntegral = 0;
+        this._pidLastVelocity = 0;
+        this._pidLastEventTime = 0;
+        this._lastTimerSendTime = 0;
     },
 
     notifyLockChange() {
@@ -2604,13 +2638,31 @@ window.SteamViewerInput = {
             captureH = lb ? lb.videoH : this.canvas.height;
         }
 
-        // Velocity-based mouse regulation:
-        // Precision mode (small moves) → send immediately for hover accuracy
-        // Sweep mode (large moves) → buffer, let interval timer send at fixed rate
-        const distance = Math.hypot(x - this._lastSentX, y - this._lastSentY);
+        // PID mouse regulation:
+        // Low score (slow/decelerating/arriving) → send immediately
+        // High score (fast/sustained/accelerating) → buffer, interval timer flushes
+        const now = performance.now();
+        let dt = now - this._pidLastEventTime;
+        if (dt <= 0) dt = 1; // guard against same-timestamp events
 
-        if (distance <= this._mouseRegulationThreshold) {
-            // Precision/hover — send every coordinate for button highlights, text selection
+        const rawVelocity = Math.hypot(e.movementX, e.movementY) / dt; // px/ms
+        const velocity = this._pidAlpha * rawVelocity + (1 - this._pidAlpha) * this._pidVelocity;
+
+        // PID terms
+        const P = this._pidKp * velocity;
+        this._pidIntegral = Math.min(this._pidIntegral * this._pidIDecay + velocity * dt, this._pidIMax);
+        const I = this._pidKi * this._pidIntegral;
+        const D = this._pidKd * (velocity - this._pidLastVelocity) / dt;
+
+        const score = P + I + D;
+
+        // Update state before send (so first event after lock works)
+        this._pidLastVelocity = velocity;
+        this._pidVelocity = velocity;
+        this._pidLastEventTime = now;
+
+        if (score < this._pidSendThreshold) {
+            // Precision / arrival — send immediately
             this._lastSentX = x;
             this._lastSentY = y;
             this._bufferedMouseCoords = null;
@@ -2618,17 +2670,8 @@ window.SteamViewerInput = {
                 await this.dotNetRef.invokeMethodAsync('OnMouseMove', x, y, captureW, captureH);
             } catch (err) { console.error('[Input] OnMouseMove failed:', err); }
         } else {
-            // Sweep — buffer latest position, interval timer will send it
+            // Sweep or decelerating (not yet arrived) — buffer, interval timer will flush
             this._bufferedMouseCoords = { x, y, captureW, captureH };
-            // Optional: force send if moved far enough (smooth window drags)
-            if (this._sweepFrameDistance > 0 && distance >= this._sweepFrameDistance) {
-                this._lastSentX = x;
-                this._lastSentY = y;
-                this._bufferedMouseCoords = null;
-                try {
-                    await this.dotNetRef.invokeMethodAsync('OnMouseMove', x, y, captureW, captureH);
-                } catch (err) { console.error('[Input] OnMouseMove failed:', err); }
-            }
         }
     },
 
