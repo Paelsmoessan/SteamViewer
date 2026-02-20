@@ -207,7 +207,7 @@ public sealed class HostSession : IAsyncDisposable
 
         await _webrtc.InitializeAsync();
         _webrtcInitialized = true;
-        await _webrtc.CreateDataChannelAsync("data");
+        await _webrtc.CreateDataChannelsAsync();
 
         // Create and send initial SDP offer
         var offer = await _webrtc.CreateOfferAsync();
@@ -602,6 +602,8 @@ public sealed class HostSession : IAsyncDisposable
     private async Task HandleDataChannelClose()
     {
         _logger.LogWarning("Host: Data channel closed");
+        // Kill MJPEG immediately — prevents DXGI thread from flooding UI thread with InvokeVoidAsync calls
+        _mjpegMode = false;
         if (State == HostSessionState.Connected)
         {
             SetState(HostSessionState.Disconnected);

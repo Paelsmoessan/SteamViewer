@@ -133,8 +133,10 @@ public sealed class ViewerSessionManager : IAsyncDisposable
         session.OnDisconnected += reason => HandleSessionDisconnected(sessionId, reason);
         session.OnIceCandidate += (candidate, sdpMid, sdpMLineIndex) =>
             _signalingClient.SendIceCandidateAsync(peerId, candidate, sdpMid, sdpMLineIndex);
-        session.OnSdpMessage += (targetPeerId, sdp) =>
-            _signalingClient.SendSdpAnswerAsync(targetPeerId, sdp);
+        session.OnSdpMessage += (targetPeerId, sdpJson) =>
+            sdpJson.Contains("\"type\":\"offer\"")
+                ? _signalingClient.SendSdpOfferAsync(targetPeerId, sdpJson)
+                : _signalingClient.SendSdpAnswerAsync(targetPeerId, sdpJson);
 
         _sessions[sessionId] = session;
         _peerToSession[peerId] = sessionId;
@@ -253,8 +255,10 @@ public sealed class ViewerSessionManager : IAsyncDisposable
         session.OnDisconnected += reason => HandleSessionDisconnected(sessionId, reason);
         session.OnIceCandidate += (candidate, sdpMid, sdpMLineIndex) =>
             _signalingClient.SendIceCandidateAsync(peerId, candidate, sdpMid, sdpMLineIndex);
-        session.OnSdpMessage += (targetPeerId, sdp) =>
-            _signalingClient.SendSdpAnswerAsync(targetPeerId, sdp);
+        session.OnSdpMessage += (targetPeerId, sdpJson) =>
+            sdpJson.Contains("\"type\":\"offer\"")
+                ? _signalingClient.SendSdpOfferAsync(targetPeerId, sdpJson)
+                : _signalingClient.SendSdpAnswerAsync(targetPeerId, sdpJson);
 
         _sessions[sessionId] = session;
         _peerToSession[peerId] = sessionId;

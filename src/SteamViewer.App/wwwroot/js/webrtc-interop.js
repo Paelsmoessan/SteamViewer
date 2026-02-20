@@ -189,9 +189,8 @@ window.SteamViewerWebRTC = {
             _lastBitrateAdjust: 0,
             // Silent audio track (separate MSID to bypass Chrome A/V sync)
             _silentAudioCtx: null,
-            // LAN detection + FEC state
+            // LAN detection (observation only — no renegotiation)
             _isLan: false,
-            _fecRemoved: false,
             // Dual data channels: control (reliable) + mouse (unreliable)
             mouseChannel: null
         };
@@ -331,8 +330,8 @@ window.SteamViewerWebRTC = {
                 if (state === 'failed') {
                     console.error('ICE CONNECTION FAILED');
                 }
-                // LAN detection: when connected, check if both candidates are host type (direct LAN)
-                if (state === 'connected' && !session._isLan && !session._fecRemoved) {
+                // LAN detection: observe candidate types for stats (no renegotiation — FEC removed in initial SDP)
+                if (state === 'connected' && !session._isLan) {
                     try {
                         const stats = await session.peerConnection.getStats();
                         for (const [, report] of stats) {
@@ -344,16 +343,6 @@ window.SteamViewerWebRTC = {
                                 }
                                 session._isLan = (localType === 'host' && remoteType === 'host');
                                 console.log(`[${sessionId}] ICE candidates: local=${localType}, remote=${remoteType} → ${session._isLan ? 'LAN' : 'WAN'}`);
-                                if (session._isLan && session.peerConnection?.signalingState === 'stable') {
-                                    console.log(`[${sessionId}] LAN detected — renegotiating to remove FEC`);
-                                    const offer = await session.peerConnection.createOffer();
-                                    offer.sdp = this.modifySdpForLowLatency(offer.sdp, { removeFec: true });
-                                    await session.peerConnection.setLocalDescription(offer);
-                                    session._fecRemoved = true;
-                                    if (session.dotNetRef) {
-                                        await session.dotNetRef.invokeMethodAsync('OnRenegotiationNeededCallback', JSON.stringify(offer));
-                                    }
-                                }
                                 break;
                             }
                         }
@@ -761,9 +750,11 @@ window.SteamViewerWebRTC = {
             }
         };
 
-        channel.onerror = (error) => {
-            console.error(`[${sessionId}] Data channel error:`, error);
-            window.SteamViewerLogger?.log('error', `Data channel error: ${JSON.stringify(error)}`);
+        channel.onerror = (event) => {
+            const err = event.error;
+            const detail = err ? `errorDetail=${err.errorDetail}, message=${err.message}, sctpCauseCode=${err.sctpCauseCode}, receivedAlert=${err.receivedAlert}, sentAlert=${err.sentAlert}` : 'no error object';
+            console.error(`[${sessionId}] Data channel error: ${detail}`, event);
+            window.SteamViewerLogger?.log('error', `Data channel error: ${detail}`);
         };
     },
 
@@ -787,8 +778,11 @@ window.SteamViewerWebRTC = {
             }
         };
 
-        channel.onerror = (error) => {
-            console.error(`[${sessionId}] Mouse channel error:`, error);
+        channel.onerror = (event) => {
+            const err = event.error;
+            const detail = err ? `errorDetail=${err.errorDetail}, message=${err.message}, sctpCauseCode=${err.sctpCauseCode}` : 'no error object';
+            console.error(`[${sessionId}] Mouse channel error: ${detail}`, event);
+            window.SteamViewerLogger?.log('error', `Mouse channel error: ${detail}`);
         };
     },
 
@@ -983,12 +977,30 @@ window.SteamViewerWebRTC = {
             });
         }
 
-        // Remove FEC codecs on LAN (saves bandwidth + latency, not needed with 0% loss)
+        // Remove FEC codecs (saves bandwidth + latency, not needed with 0% loss on LAN)
         if (removeFec) {
-            modified = modified.replace(/a=rtpmap:\d+ flexfec.*\r\n/g, '');
-            modified = modified.replace(/a=rtpmap:\d+ ulpfec.*\r\n/g, '');
-            modified = modified.replace(/a=rtpmap:\d+ red\/90000.*\r\n/g, '');
-            modified = modified.replace(/a=fmtp:\d+ apt=\d+.*\r\n/g, '');
+            // Collect payload types for FEC codecs before removing them
+            const fecPTs = [];
+            for (const m of modified.matchAll(/a=rtpmap:(\d+) (?:flexfec|ulpfec|red\/90000)/g)) {
+                fecPTs.push(m[1]);
+            }
+            // Also collect RTX/apt payload types that reference FEC codecs
+            for (const m of modified.matchAll(/a=fmtp:(\d+) apt=(\d+)/g)) {
+                if (fecPTs.includes(m[2])) fecPTs.push(m[1]);
+            }
+            if (fecPTs.length > 0) {
+                // Remove FEC payload types from m=video line
+                modified = modified.replace(/(m=video \d+ [^ ]+) ([^\r\n]+)/, (match, prefix, payloads) => {
+                    const filtered = payloads.split(' ').filter(pt => !fecPTs.includes(pt));
+                    return prefix + ' ' + filtered.join(' ');
+                });
+                // Remove rtpmap, fmtp, and rtcp-fb lines for FEC payload types
+                for (const pt of fecPTs) {
+                    modified = modified.replace(new RegExp(`a=rtpmap:${pt} [^\\r\\n]*\\r\\n`, 'g'), '');
+                    modified = modified.replace(new RegExp(`a=fmtp:${pt} [^\\r\\n]*\\r\\n`, 'g'), '');
+                    modified = modified.replace(new RegExp(`a=rtcp-fb:${pt} [^\\r\\n]*\\r\\n`, 'g'), '');
+                }
+            }
         }
 
         return modified;
@@ -1006,8 +1018,8 @@ window.SteamViewerWebRTC = {
             offerToReceiveAudio: true
         });
 
-        // Modify SDP for lower latency
-        offer.sdp = this.modifySdpForLowLatency(offer.sdp);
+        // Modify SDP for lower latency — removeFec in initial offer (no renegotiation needed)
+        offer.sdp = this.modifySdpForLowLatency(offer.sdp, { removeFec: true });
 
         await session.peerConnection.setLocalDescription(offer);
         console.log(`=== SDP OFFER CREATED [${sessionId}] ===`);
@@ -1027,8 +1039,8 @@ window.SteamViewerWebRTC = {
 
         const answer = await session.peerConnection.createAnswer();
 
-        // Modify SDP for lower latency
-        answer.sdp = this.modifySdpForLowLatency(answer.sdp);
+        // Modify SDP for lower latency — removeFec in initial answer (no renegotiation needed)
+        answer.sdp = this.modifySdpForLowLatency(answer.sdp, { removeFec: true });
 
         await session.peerConnection.setLocalDescription(answer);
         console.log(`[${sessionId}] SDP answer created`);
