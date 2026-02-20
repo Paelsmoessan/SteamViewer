@@ -157,6 +157,7 @@
             <button class="icon-btn @(_inputLocked ? "locked" : "")" @onclick="ToggleInputLock" title="@(_inputLocked ? "Unlock input" : "Lock input")">
                 @(_inputLocked ? "🔒" : "🔓")
             </button>
+            <button class="icon-btn @(_hostCursorVisible ? "active-toggle" : "")" @onclick="ToggleHostCursor" title="Toggle host cursor">🖱️</button>
             <button class="icon-btn @(_statsVisible ? "active-toggle" : "")" @onclick="ToggleStatsOverlay" title="Toggle stats overlay">📊</button>
             <button class="icon-btn" @onclick="ToggleFullscreen" title="Fullscreen (F11)">⛶</button>
             <button class="icon-btn close-btn" @onclick="CloseWindow" title="Close window">×</button>
@@ -266,6 +267,7 @@
     private System.Threading.Timer? _reconnectTimer;
     private int _reconnectAttempts;
     private bool _statsVisible;
+    private bool _hostCursorVisible = true;
     private string? _statsText;
     private string? _toastMessage;
     private bool? _hostElevated;
@@ -556,8 +558,9 @@
                 case "runAsSystemFailed":
                     ShowToast(message ?? "Run as SYSTEM failed");
                     break;
-                case "videoModeChanged":
-                    ShowToast(message == "mjpeg" ? "MJPEG mode ON (data channel)" : "WebRTC video mode ON");
+                case "cursorVisibilityChanged":
+                    _hostCursorVisible = message == "True";
+                    StateHasChanged();
                     break;
             }
         });
@@ -685,6 +688,12 @@
         _showConnectionDialog = false;
         RefreshTabs();
         StateHasChanged();
+    }
+
+    private async Task ToggleHostCursor()
+    {
+        if (_activeSession != null)
+            await _activeSession.SendToggleCursorAsync();
     }
 
     private async Task ToggleStatsOverlay()
@@ -1134,16 +1143,6 @@
             return;
         }
 
-        // Ctrl+M → Toggle MJPEG DataChannel experiment
-        if (key == "m" && ctrl && !shift && !alt)
-        {
-            if (_activeSession != null)
-            {
-                _ = _activeSession.SendToggleMjpegAsync();
-                ShowToast("Toggling MJPEG mode...");
-            }
-            return;
-        }
 
         SendInputToActiveSession(new InputEvent.KeyDown(key, new KeyModifiers(ctrl, shift, alt, false)));
     }

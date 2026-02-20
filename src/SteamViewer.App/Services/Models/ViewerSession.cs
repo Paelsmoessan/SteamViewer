@@ -383,21 +383,21 @@ public sealed class ViewerSession : IAsyncDisposable
     }
 
     /// <summary>
-    /// Toggle MJPEG DataChannel mode on the host (experimental latency test).
+    /// Toggle host cursor visibility in the captured video stream.
     /// </summary>
-    public async Task SendToggleMjpegAsync()
+    public async Task SendToggleCursorAsync()
     {
         if (_webrtc == null || !_webrtc.IsDataChannelOpen) return;
 
         try
         {
-            var json = JsonSerializer.Serialize(new { type = "toggleMjpeg" });
+            var json = JsonSerializer.Serialize(new { type = "toggleCursor" });
             await _webrtc.SendDataAsync(json);
-            _logger.LogInformation("Session {SessionId}: Sent toggleMjpeg", SessionId);
+            _logger.LogInformation("Session {SessionId}: Sent toggleCursor", SessionId);
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Session {SessionId}: Failed to send toggleMjpeg", SessionId);
+            _logger.LogWarning(ex, "Session {SessionId}: Failed to send toggleCursor", SessionId);
         }
     }
 
@@ -516,10 +516,10 @@ public sealed class ViewerSession : IAsyncDisposable
                         OnControlMessage?.Invoke(type, sysMessage);
                         break;
 
-                    case "videoModeChanged":
-                        var videoMode = root.TryGetProperty("mode", out var vmProp) ? vmProp.GetString() : "unknown";
-                        _logger.LogInformation("Session {SessionId}: Video mode changed to {Mode}", SessionId, videoMode);
-                        OnControlMessage?.Invoke(type, videoMode);
+                    case "cursorVisibilityChanged":
+                        var visible = root.TryGetProperty("visible", out var visProp) && visProp.GetBoolean();
+                        _logger.LogInformation("Session {SessionId}: Host cursor visibility: {Visible}", SessionId, visible);
+                        OnControlMessage?.Invoke(type, visible.ToString());
                         break;
 
                     case "clipboard_data":

@@ -159,8 +159,6 @@ window.SteamViewerWebRTC = {
             frameInterval: 33, // ~30fps (match WebRTC source)
             captureCanvas: null,
             captureCtx: null,
-            // MJPEG mode (DataChannel bypass)
-            _mjpegActive: false,
             // Direct rendering (bypasses JPEG relay when canvas is in same JS context)
             _directRenderCanvas: null,
             _directRenderCtx: null,
@@ -518,12 +516,6 @@ window.SteamViewerWebRTC = {
                                     return;
                                 }
 
-                                // Skip drawing during MJPEG mode (keep loop alive for resume)
-                                if (session._mjpegActive) {
-                                    video.requestVideoFrameCallback(renderFrameRVFC);
-                                    return;
-                                }
-
                                 // Skip drawing if video not ready yet (avoids errors during startup)
                                 if (video.readyState < 2) {
                                     video.requestVideoFrameCallback(renderFrameRVFC);
@@ -566,12 +558,6 @@ window.SteamViewerWebRTC = {
                             const renderFrameRAF = () => {
                                 if (video.paused || video.ended) {
                                     console.log('Video paused/ended, stopping render');
-                                    return;
-                                }
-
-                                // Skip drawing during MJPEG mode (keep loop alive)
-                                if (session._mjpegActive) {
-                                    requestAnimationFrame(renderFrameRAF);
                                     return;
                                 }
 
@@ -718,12 +704,6 @@ window.SteamViewerWebRTC = {
                         window.SteamViewerLogger?.handleRelayedLog(parsed.level, parsed.message, parsed.from);
                         return;
                     }
-                    // Intercept videoModeChanged to manage MJPEG/WebRTC frame capture switching
-                    if (parsed.type === 'videoModeChanged' && parsed.mode === 'webrtc') {
-                        session._mjpegActive = false;
-                        this.resumeFrameCapture(sessionId);
-                        console.log(`[${sessionId}] MJPEG→WebRTC: resumed frame capture`);
-                    }
                 } catch (e) {
                     // Not JSON - continue normally
                 }
@@ -731,19 +711,6 @@ window.SteamViewerWebRTC = {
                 console.log(`[${sessionId}] Data channel message received:`, event.data?.substring?.(0, 50));
                 if (session.dotNetRef) await session.dotNetRef.invokeMethodAsync('OnDataChannelMessageCallback', event.data);
             } else if (event.data instanceof ArrayBuffer) {
-                // Check for MJPEG frame: header [4 bytes "MJPG"][4 bytes width][4 bytes height][JPEG data]
-                if (event.data.byteLength > 12) {
-                    const hdr = new Uint8Array(event.data, 0, 4);
-                    if (hdr[0] === 0x4D && hdr[1] === 0x4A && hdr[2] === 0x50 && hdr[3] === 0x47) {
-                        // MJPEG frame — render directly to canvas (bypasses WebRTC video pipeline)
-                        const view = new DataView(event.data);
-                        const w = view.getInt32(4, true);
-                        const h = view.getInt32(8, true);
-                        const jpegBytes = new Uint8Array(event.data, 12);
-                        this._renderMjpegFrame(sessionId, session, jpegBytes, w, h);
-                        return;
-                    }
-                }
                 console.log(`[${sessionId}] Data channel binary message received:`, event.data.byteLength, 'bytes');
                 const uint8Array = new Uint8Array(event.data);
                 if (session.dotNetRef) await session.dotNetRef.invokeMethodAsync('OnDataChannelBinaryMessageCallback', Array.from(uint8Array));
@@ -786,58 +753,6 @@ window.SteamViewerWebRTC = {
         };
     },
 
-    // Render MJPEG frame received via data channel directly to canvas
-    _mjpegFrameCount: 0,
-    async _renderMjpegFrame(sessionId, session, jpegBytes, width, height) {
-        try {
-            this._mjpegFrameCount++;
-
-            // On first MJPEG frame: pause normal frame capture to prevent stale-frame competition
-            if (!session._mjpegActive) {
-                session._mjpegActive = true;
-                this.pauseFrameCapture(sessionId);
-                console.log(`[${sessionId}] MJPEG active — paused WebRTC frame capture`);
-            }
-
-            if (this._mjpegFrameCount <= 3 || this._mjpegFrameCount % 300 === 0) {
-                console.log(`[${sessionId}] MJPEG frame #${this._mjpegFrameCount}: ${width}x${height}, ${jpegBytes.length} bytes`);
-            }
-
-            const blob = new Blob([jpegBytes], { type: 'image/jpeg' });
-            const bitmap = await createImageBitmap(blob);
-
-            // Render to direct canvas (same JS context) or relay via C# JPEG path
-            const canvas = session._directRenderCanvas;
-            const ctx = session._directRenderCtx;
-            if (canvas && ctx) {
-                if (session._updateCanvasSize) session._updateCanvasSize();
-                const lb = computeLetterbox(canvas.width, canvas.height, width, height);
-                session._letterbox = lb;
-                ctx.fillStyle = '#000';
-                ctx.fillRect(0, 0, canvas.width, canvas.height);
-                ctx.drawImage(bitmap, lb.dx, lb.dy, lb.dw, lb.dh);
-            } else if (session.frameCaptureDotNetRef) {
-                // Relay to viewer window via ViewerSession.OnFrameCaptured
-                const reader = new FileReader();
-                reader.onload = () => {
-                    const base64 = reader.result.split(',')[1];
-                    session.frameCaptureDotNetRef.invokeMethodAsync('OnFrameCaptured', base64, width, height);
-                };
-                reader.readAsDataURL(blob);
-            } else {
-                if (this._mjpegFrameCount <= 3) {
-                    console.warn(`[${sessionId}] MJPEG: no render target (no direct canvas, no frameCaptureDotNetRef)`);
-                }
-            }
-
-            bitmap.close();
-        } catch (e) {
-            if (this._mjpegFrameCount <= 5) {
-                console.error(`[${sessionId}] MJPEG render error:`, e);
-            }
-        }
-    },
-
     // Send string data over data channel (control channel)
     sendData(sessionId, data) {
         const session = this._getSession(sessionId);
@@ -858,60 +773,6 @@ window.SteamViewerWebRTC = {
         }
         console.warn(`[${sessionId}] Data channel not open`);
         return false;
-    },
-
-    // Send MJPEG frame as binary over data channel (bypasses WebRTC video track)
-    // Header: [4 bytes "MJPG"][4 bytes width LE][4 bytes height LE][JPEG bytes]
-    _mjpegSendCount: 0,
-    _mjpegSkipCount: 0,
-    sendMjpegFrame(sessionId, base64Jpeg, width, height) {
-        try {
-            const session = this._getSession(sessionId);
-            const ch = session.dataChannel;
-            if (!ch || ch.readyState !== 'open') return;
-
-            // Backpressure: skip frame if send buffer is backlogged (>512KB queued)
-            if (ch.bufferedAmount > 524288) {
-                this._mjpegSkipCount++;
-                if (this._mjpegSkipCount <= 3 || this._mjpegSkipCount % 100 === 0) {
-                    console.warn(`[${sessionId}] MJPEG backpressure: skipped ${this._mjpegSkipCount} frames (buffered: ${ch.bufferedAmount})`);
-                }
-                return;
-            }
-
-            // Decode base64 to binary using Uint8Array.from (faster than byte loop)
-            const binaryStr = atob(base64Jpeg);
-            const jpegLen = binaryStr.length;
-            const headerSize = 12;
-            const buffer = new ArrayBuffer(headerSize + jpegLen);
-            const view = new DataView(buffer);
-
-            // Header: "MJPG" magic + width + height (little-endian)
-            view.setUint8(0, 0x4D); // M
-            view.setUint8(1, 0x4A); // J
-            view.setUint8(2, 0x50); // P
-            view.setUint8(3, 0x47); // G
-            view.setInt32(4, width, true);
-            view.setInt32(8, height, true);
-
-            // Copy JPEG data after header
-            const bytes = new Uint8Array(buffer, headerSize);
-            for (let i = 0; i < jpegLen; i++) {
-                bytes[i] = binaryStr.charCodeAt(i);
-            }
-
-            ch.send(buffer);
-
-            this._mjpegSendCount++;
-            if (this._mjpegSendCount <= 3 || this._mjpegSendCount % 300 === 0) {
-                console.log(`[${sessionId}] MJPEG sent #${this._mjpegSendCount}: ${width}x${height}, ${jpegLen} bytes, buffered: ${ch.bufferedAmount}`);
-            }
-        } catch (e) {
-            this._mjpegSendCount++;
-            if (this._mjpegSendCount <= 5) {
-                console.error(`[${sessionId}] MJPEG send error #${this._mjpegSendCount}:`, e);
-            }
-        }
     },
 
     // Send mouse data over unreliable mouse channel (falls back to control channel)
@@ -2309,10 +2170,6 @@ window.SteamViewerWebRTC = {
             session.peerConnection = null;
         }
 
-        // Reset MJPEG state
-        session._mjpegActive = false;
-        this._mjpegFrameCount = 0;
-
         // Reset input lock state on disconnect (fix: input lock persists after disconnect)
         if (window.SteamViewerInput && window.SteamViewerInput.isLocked) {
             window.SteamViewerInput.unlock();
@@ -2383,11 +2240,15 @@ window.SteamViewerInput = {
     _inputEventCount: 0,
     _lastMouseDownCoords: null,  // Cache coords from mouse_down for identical mouse_up (prevents micro-drag)
     _focusWatchdogId: null,
-    // Mouse throttle — send at 30 Hz max, draw local cursor on every move
-    _lastMouseSendTime: 0,
-    _mouseSendInterval: 33, // ms (~30 Hz)
-    _pendingMouseCoords: null, // Buffered coords for trailing send
-    _pendingMouseTimer: null,
+    // Mouse regulation — velocity-based: precision (small moves) sends every event,
+    // sweep (large moves) buffers and sends at interval rate
+    _mouseRegulationThreshold: 30,  // pixels — below = precision, above = sweep
+    _mouseRegulationInterval: 33,   // ms — sweep mode send rate (~30 Hz)
+    _sweepFrameDistance: 0,         // pixels — force send every N px during sweeps (0 = disabled)
+    _lastSentX: 0,
+    _lastSentY: 0,
+    _bufferedMouseCoords: null,     // Latest coords waiting for interval send
+    _regulationTimer: null,         // setInterval for sweep mode sends
 
 
     initialize(canvasId, dotNetReference, options = {}) {
@@ -2556,6 +2417,8 @@ window.SteamViewerInput = {
         this.canvas.focus();
         // Gesture-backed restart: user click to lock = user gesture for getDisplayMedia
         this._restartSharingIfLost();
+        // Start mouse regulation interval timer (sweep mode sends)
+        this._startRegulationTimer();
         console.log('Input LOCKED - sending inputs to host');
     },
 
@@ -2580,7 +2443,31 @@ window.SteamViewerInput = {
         this.isLocked = false;
         this.updateLockIndicator();
         this.notifyLockChange();
+        this._stopRegulationTimer();
         console.log('Input UNLOCKED');
+    },
+
+    _startRegulationTimer() {
+        this._stopRegulationTimer();
+        this._regulationTimer = setInterval(async () => {
+            const c = this._bufferedMouseCoords;
+            if (c && this.dotNetRef && this.isLocked) {
+                this._lastSentX = c.x;
+                this._lastSentY = c.y;
+                this._bufferedMouseCoords = null;
+                try {
+                    await this.dotNetRef.invokeMethodAsync('OnMouseMove', c.x, c.y, c.captureW, c.captureH);
+                } catch (err) { /* ignore sweep send errors */ }
+            }
+        }, this._mouseRegulationInterval);
+    },
+
+    _stopRegulationTimer() {
+        if (this._regulationTimer) {
+            clearInterval(this._regulationTimer);
+            this._regulationTimer = null;
+        }
+        this._bufferedMouseCoords = null;
     },
 
     notifyLockChange() {
@@ -2717,35 +2604,30 @@ window.SteamViewerInput = {
             captureH = lb ? lb.videoH : this.canvas.height;
         }
 
-        // Throttle data channel sends to ~30 Hz (local cursor is already updated above)
-        const now = performance.now();
-        const elapsed = now - this._lastMouseSendTime;
+        // Velocity-based mouse regulation:
+        // Precision mode (small moves) → send immediately for hover accuracy
+        // Sweep mode (large moves) → buffer, let interval timer send at fixed rate
+        const distance = Math.hypot(x - this._lastSentX, y - this._lastSentY);
 
-        if (elapsed >= this._mouseSendInterval) {
-            // Enough time passed — send immediately
-            this._lastMouseSendTime = now;
-            if (this._pendingMouseTimer) {
-                clearTimeout(this._pendingMouseTimer);
-                this._pendingMouseTimer = null;
-            }
+        if (distance <= this._mouseRegulationThreshold) {
+            // Precision/hover — send every coordinate for button highlights, text selection
+            this._lastSentX = x;
+            this._lastSentY = y;
+            this._bufferedMouseCoords = null;
             try {
                 await this.dotNetRef.invokeMethodAsync('OnMouseMove', x, y, captureW, captureH);
             } catch (err) { console.error('[Input] OnMouseMove failed:', err); }
         } else {
-            // Buffer coords for trailing send (ensures final position is always sent)
-            this._pendingMouseCoords = { x, y, captureW, captureH };
-            if (!this._pendingMouseTimer) {
-                this._pendingMouseTimer = setTimeout(async () => {
-                    this._pendingMouseTimer = null;
-                    const c = this._pendingMouseCoords;
-                    if (c && this.dotNetRef && this.isLocked) {
-                        this._lastMouseSendTime = performance.now();
-                        this._pendingMouseCoords = null;
-                        try {
-                            await this.dotNetRef.invokeMethodAsync('OnMouseMove', c.x, c.y, c.captureW, c.captureH);
-                        } catch (err) { /* ignore trailing send errors */ }
-                    }
-                }, this._mouseSendInterval - elapsed);
+            // Sweep — buffer latest position, interval timer will send it
+            this._bufferedMouseCoords = { x, y, captureW, captureH };
+            // Optional: force send if moved far enough (smooth window drags)
+            if (this._sweepFrameDistance > 0 && distance >= this._sweepFrameDistance) {
+                this._lastSentX = x;
+                this._lastSentY = y;
+                this._bufferedMouseCoords = null;
+                try {
+                    await this.dotNetRef.invokeMethodAsync('OnMouseMove', x, y, captureW, captureH);
+                } catch (err) { console.error('[Input] OnMouseMove failed:', err); }
             }
         }
     },
@@ -2849,11 +2731,8 @@ window.SteamViewerInput = {
             this.lockIndicator = null;
         }
 
-        // Clear throttle timers
-        if (this._pendingMouseTimer) {
-            clearTimeout(this._pendingMouseTimer);
-            this._pendingMouseTimer = null;
-        }
+        // Clear regulation timer
+        this._stopRegulationTimer();
 
         // Remove event listeners from canvas
         if (this.canvas) {

@@ -53,6 +53,9 @@ public sealed class DxgiScreenCapture : IScreenCapture
 
     public bool IsCapturing => _isCapturing;
 
+    /// <summary>Whether to composite the host cursor onto captured frames. Default true.</summary>
+    public bool ShowCursor { get; set; } = true;
+
     /// <summary>Raised when a JPEG frame is captured. Parameters: (jpegData, width, height).</summary>
     public event Action<byte[], int, int>? OnFrameCaptured;
 
@@ -245,7 +248,8 @@ public sealed class DxgiScreenCapture : IScreenCapture
                     PixelFormat.Format32bppArgb, (IntPtr)ptr);
 
                 // Composite mouse cursor onto frame before encoding
-                DrawCursorOnBitmap(bitmap);
+                if (ShowCursor)
+                    DrawCursorOnBitmap(bitmap);
 
                 frameCount++;
 
