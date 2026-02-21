@@ -385,6 +385,26 @@ public sealed class ViewerSession : IAsyncDisposable
     }
 
     /// <summary>
+    /// Send clipboard data to the host and trigger a paste (Ctrl+V) on the host side.
+    /// </summary>
+    public async Task SendClipboardPasteAsync(string format, string data)
+    {
+        if (_webrtc == null || !_webrtc.IsDataChannelOpen) return;
+
+        try
+        {
+            var json = JsonSerializer.Serialize<ClipboardMessage>(new ClipboardMessage.Paste(format, data));
+            await _webrtc.SendDataAsync(json);
+            _logger.LogDebug("Session {SessionId}: Sent clipboard paste ({Format}, {Length} chars)",
+                SessionId, format, data.Length);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to send clipboard paste for session {SessionId}", SessionId);
+        }
+    }
+
+    /// <summary>
     /// Enable stats relay polling in JS for this session.
     /// </summary>
     public async Task EnableStatsRelayAsync()

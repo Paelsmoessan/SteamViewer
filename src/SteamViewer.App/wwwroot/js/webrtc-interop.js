@@ -724,6 +724,16 @@ window.SteamViewerWebRTC = {
                         }
                         return;
                     }
+                    // Clipboard data from host — write directly to viewer clipboard (no C# round-trip)
+                    if (parsed.type === 'clipboard_data' && parsed.data) {
+                        try {
+                            await navigator.clipboard.writeText(parsed.data);
+                            console.log(`[${sessionId}] Clipboard synced from host: ${parsed.data.length} chars`);
+                        } catch (clipErr) {
+                            console.warn(`[${sessionId}] Failed to write clipboard:`, clipErr);
+                        }
+                        // Still forward to C# for toast notification
+                    }
                 } catch (e) {
                     // Not JSON - continue normally
                 }
@@ -2786,6 +2796,40 @@ window.SteamViewerInput = {
     async handleKeyDown(e) {
         if (!this.isCapturing || !this.isLocked || !this.dotNetRef) return;
         e.preventDefault();
+
+        // Clipboard interception — Ctrl+V: route through C# which has clipboard permission
+        // (WebView2 blocks navigator.clipboard.readText() in JS keydown context)
+        if (e.ctrlKey && !e.altKey && !e.metaKey && (e.key === 'v' || e.key === 'V')) {
+            try {
+                console.log('[Input] Ctrl+V detected — routing clipboard paste through C#');
+                await this.dotNetRef.invokeMethodAsync('OnClipboardPaste');
+            } catch (err) {
+                console.warn('[Input] OnClipboardPaste failed, forwarding Ctrl+V keystroke:', err);
+                try {
+                    await this.dotNetRef.invokeMethodAsync('OnKeyDown', e.key, this.getModifiers(e));
+                } catch (e2) { console.error('[Input] OnKeyDown failed:', e2); }
+            }
+            return;
+        }
+
+        // Clipboard interception — Ctrl+C/X: forward keystroke, then request host clipboard
+        if (e.ctrlKey && !e.altKey && !e.metaKey && (e.key === 'c' || e.key === 'x')) {
+            try {
+                // Send the keystroke to host first (host app copies/cuts)
+                await this.dotNetRef.invokeMethodAsync('OnKeyDown', e.key, this.getModifiers(e));
+                // After a delay, request the host's clipboard
+                if (this._activeSessionId) {
+                    const sid = this._activeSessionId;
+                    setTimeout(() => {
+                        const msg = JSON.stringify({ type: 'clipboard_request' });
+                        window.SteamViewerWebRTC.sendData(sid, msg);
+                        console.log(`[Input] Clipboard request sent after Ctrl+${e.key.toUpperCase()}`);
+                    }, 150);
+                }
+            } catch (err) { console.error('[Input] OnKeyDown failed:', err); }
+            return;
+        }
+
         try {
             await this.dotNetRef.invokeMethodAsync('OnKeyDown', e.key, this.getModifiers(e));
         } catch (err) { console.error('[Input] OnKeyDown failed:', err); }

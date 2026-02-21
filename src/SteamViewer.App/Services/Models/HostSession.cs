@@ -616,6 +616,10 @@ public sealed class HostSession : IAsyncDisposable
                         await HandleClipboardSetAsync(root);
                         return;
 
+                    case "clipboard_paste":
+                        await HandleClipboardPasteAsync(root);
+                        return;
+
                     case "switchDisplay":
                         var monitorId = root.TryGetProperty("monitorId", out var midProp) ? midProp.GetInt32() : -1;
                         if (monitorId >= 0)
@@ -945,20 +949,28 @@ public sealed class HostSession : IAsyncDisposable
     private async Task HandleClipboardRequestAsync()
     {
         if (_webrtc == null) return;
+
+        string? text = null;
+        // Try browser API first
         try
         {
-            var text = await _jsRuntime.InvokeAsync<string>("navigator.clipboard.readText");
-            if (!string.IsNullOrEmpty(text))
-            {
-                var response = JsonSerializer.Serialize<ClipboardMessage>(
-                    new ClipboardMessage.Response("text", text));
-                await _webrtc.SendDataAsync(response);
-                _logger.LogDebug("Sent clipboard to viewer: {Length} chars", text.Length);
-            }
+            text = await _jsRuntime.InvokeAsync<string>("navigator.clipboard.readText");
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Failed to read clipboard for viewer request");
+            _logger.LogWarning(ex, "Browser clipboard.readText failed — trying native Win32");
+        }
+
+        // Fall back to native Win32
+        if (string.IsNullOrEmpty(text))
+            text = TryGetClipboardNative();
+
+        if (!string.IsNullOrEmpty(text))
+        {
+            var response = JsonSerializer.Serialize<ClipboardMessage>(
+                new ClipboardMessage.Response("text", text));
+            await _webrtc.SendDataAsync(response);
+            _logger.LogDebug("Sent clipboard to viewer: {Length} chars", text.Length);
         }
     }
 
@@ -976,6 +988,170 @@ public sealed class HostSession : IAsyncDisposable
             _logger.LogWarning(ex, "Failed to set clipboard from viewer");
         }
     }
+
+    private async Task HandleClipboardPasteAsync(JsonElement root)
+    {
+        var data = root.TryGetProperty("data", out var d) ? d.GetString() : null;
+        if (data == null) return;
+
+        // Step 1: Set host clipboard — try browser API first, fall back to native Win32
+        bool clipboardSet = false;
+        try
+        {
+            await _jsRuntime.InvokeVoidAsync("navigator.clipboard.writeText", data);
+            clipboardSet = true;
+            _logger.LogDebug("Clipboard paste: set via browser API ({Length} chars)", data.Length);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Browser clipboard.writeText failed — trying native Win32");
+        }
+
+        if (!clipboardSet)
+        {
+            clipboardSet = TrySetClipboardNative(data);
+            if (clipboardSet)
+                _logger.LogDebug("Clipboard paste: set via Win32 ({Length} chars)", data.Length);
+            else
+                _logger.LogWarning("Failed to set clipboard via both browser API and Win32");
+        }
+
+        if (!clipboardSet) return; // Don't inject Ctrl+V if clipboard wasn't set
+
+        // Step 2: Inject Ctrl+V to paste from the clipboard we just set
+        try
+        {
+            var ctrlMod = new KeyModifiers(Ctrl: true);
+            var noMod = KeyModifiers.None;
+            InputEvent[] keystrokes =
+            [
+                new InputEvent.KeyDown("Control", ctrlMod),
+                new InputEvent.KeyDown("v", ctrlMod),
+                new InputEvent.KeyUp("v", ctrlMod),
+                new InputEvent.KeyUp("Control", noMod),
+            ];
+
+            foreach (var keystroke in keystrokes)
+            {
+                var json = JsonSerializer.Serialize(keystroke);
+                if (_elevationService != null && (_elevationService.IsAdminConnected || _elevationService.IsSystemConnected))
+                {
+                    await _elevationService.InjectInputAsync(json, _lastCaptureWidth, _lastCaptureHeight);
+                }
+                else
+                {
+                    _inputInjector.InjectInput(keystroke, _lastCaptureWidth, _lastCaptureHeight);
+                }
+            }
+            _logger.LogDebug("Clipboard paste: Ctrl+V injected");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to inject Ctrl+V for clipboard paste");
+        }
+    }
+
+    /// <summary>
+    /// Native Win32 clipboard read — works without WebView focus.
+    /// </summary>
+    private static string? TryGetClipboardNative()
+    {
+        if (!OperatingSystem.IsWindows()) return null;
+        try
+        {
+            if (!OpenClipboard(IntPtr.Zero)) return null;
+            try
+            {
+                var hData = GetClipboardData(CF_UNICODETEXT);
+                if (hData == IntPtr.Zero) return null;
+
+                var pData = GlobalLock(hData);
+                if (pData == IntPtr.Zero) return null;
+                try
+                {
+                    return System.Runtime.InteropServices.Marshal.PtrToStringUni(pData);
+                }
+                finally { GlobalUnlock(hData); }
+            }
+            finally { CloseClipboard(); }
+        }
+        catch { return null; }
+    }
+
+    /// <summary>
+    /// Native Win32 clipboard write — works without WebView focus.
+    /// </summary>
+    private static bool TrySetClipboardNative(string text)
+    {
+        if (!OperatingSystem.IsWindows()) return false;
+        try
+        {
+            if (!OpenClipboard(IntPtr.Zero)) return false;
+            try
+            {
+                EmptyClipboard();
+                // Clipboard requires GlobalAlloc(GMEM_MOVEABLE) — NOT Marshal.StringToHGlobal
+                int byteCount = (text.Length + 1) * 2; // UTF-16 + null terminator
+                var hGlobal = GlobalAlloc(GMEM_MOVEABLE, (UIntPtr)byteCount);
+                if (hGlobal == IntPtr.Zero) return false;
+
+                var pGlobal = GlobalLock(hGlobal);
+                if (pGlobal == IntPtr.Zero) { GlobalFree(hGlobal); return false; }
+                try
+                {
+                    System.Runtime.InteropServices.Marshal.Copy(text.ToCharArray(), 0, pGlobal, text.Length);
+                    // Write null terminator
+                    System.Runtime.InteropServices.Marshal.WriteInt16(pGlobal + text.Length * 2, 0);
+                }
+                finally { GlobalUnlock(hGlobal); }
+
+                if (SetClipboardData(CF_UNICODETEXT, hGlobal) == IntPtr.Zero)
+                {
+                    GlobalFree(hGlobal);
+                    return false;
+                }
+                // SetClipboardData takes ownership of hGlobal — do NOT free it
+                return true;
+            }
+            finally
+            {
+                CloseClipboard();
+            }
+        }
+        catch { return false; }
+    }
+
+    private const uint CF_UNICODETEXT = 13;
+    private const uint GMEM_MOVEABLE = 0x0002;
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+    private static extern bool OpenClipboard(IntPtr hWndNewOwner);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+    private static extern bool CloseClipboard();
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+    private static extern bool EmptyClipboard();
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr SetClipboardData(uint uFormat, IntPtr hMem);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr GetClipboardData(uint uFormat);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr GlobalAlloc(uint uFlags, UIntPtr dwBytes);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr GlobalLock(IntPtr hMem);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+    private static extern bool GlobalUnlock(IntPtr hMem);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr GlobalFree(IntPtr hMem);
+
 
     #endregion
 
