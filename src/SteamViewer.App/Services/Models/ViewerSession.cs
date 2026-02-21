@@ -453,6 +453,25 @@ public sealed class ViewerSession : IAsyncDisposable
     }
 
     /// <summary>
+    /// Notify the host that viewer input lock state changed.
+    /// Host hides cursor in video when locked (local overlay takes over).
+    /// </summary>
+    public async Task SendInputLockStateAsync(bool locked)
+    {
+        if (_webrtc == null || !_webrtc.IsDataChannelOpen) return;
+
+        try
+        {
+            var json = JsonSerializer.Serialize(new { type = "inputLockChanged", locked });
+            await _webrtc.SendDataAsync(json);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Session {SessionId}: Failed to send inputLockChanged", SessionId);
+        }
+    }
+
+    /// <summary>
     /// Toggle host cursor visibility in the captured video stream.
     /// </summary>
     public async Task SendToggleCursorAsync()

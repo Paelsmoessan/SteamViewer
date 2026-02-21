@@ -62,6 +62,13 @@ public sealed class DxgiScreenCapture : IScreenCapture
     /// <summary>Raised with raw BGRA pixel data (no JPEG encode). Parameters: (bgraData, width, height, stride).</summary>
     public event Action<byte[], int, int, int>? OnRawFrameCaptured;
 
+    /// <summary>Raised when the host cursor shape changes. Parameter: CSS cursor value (e.g. "default", "text", "pointer").</summary>
+    public event Action<string>? OnCursorShapeChanged;
+
+    // Cursor shape tracking
+    private IntPtr _lastCursorHandle;
+    private Dictionary<IntPtr, string>? _standardCursors;
+
     #region Capture Loop (high-level API for canvas bridge)
 
     /// <summary>
@@ -154,6 +161,9 @@ public sealed class DxgiScreenCapture : IScreenCapture
         byte[]? lastRawData = null;
         int lastRawStride = 0;
 
+        // Build HCURSOR → CSS cursor lookup table (once)
+        InitCursorShapeTable();
+
         try
         {
             while (!_stopRequested)
@@ -166,6 +176,9 @@ public sealed class DxgiScreenCapture : IScreenCapture
 
                     if (frame == null)
                     {
+                        // Cursor shape can change even when screen is static (hovering over UI)
+                        DetectCursorShapeChange();
+
                         // Desktop unchanged — re-fire last frame at ~30fps to keep WebRTC JB calibrated
                         if (idleSw.ElapsedMilliseconds >= targetIntervalMs)
                         {
@@ -192,6 +205,9 @@ public sealed class DxgiScreenCapture : IScreenCapture
                     }
 
                     consecutiveErrors = 0;
+
+                    // Detect cursor shape changes (fires event only when HCURSOR changes)
+                    DetectCursorShapeChange();
 
                     // JPEG encode BGRA frame and fire event
                     using (frame)
@@ -687,6 +703,9 @@ public sealed class DxgiScreenCapture : IScreenCapture
     private static extern bool DrawIconEx(IntPtr hdc, int xLeft, int yTop, IntPtr hIcon,
         int cxWidth, int cyHeight, uint istepIfAniCur, IntPtr hbrFlickerFreeDraw, uint diFlags);
 
+    [DllImport("user32.dll")]
+    private static extern IntPtr LoadCursor(IntPtr hInstance, int lpCursorName);
+
     [DllImport("gdi32.dll")]
     private static extern bool DeleteObject(IntPtr hObject);
 
@@ -738,6 +757,66 @@ public sealed class DxgiScreenCapture : IScreenCapture
         {
             graphics.ReleaseHdc(hdc);
         }
+    }
+
+    /// <summary>
+    /// Build the HCURSOR handle → CSS cursor name lookup table.
+    /// Called once on first capture frame. LoadCursor with NULL hInstance
+    /// returns the same handle for the process lifetime.
+    /// </summary>
+    private void InitCursorShapeTable()
+    {
+        _standardCursors = new Dictionary<IntPtr, string>();
+
+        // IDC_ constants → CSS cursor values
+        var mapping = new (int idcConstant, string cssValue)[]
+        {
+            (32512, "default"),      // IDC_ARROW
+            (32513, "text"),         // IDC_IBEAM
+            (32514, "wait"),         // IDC_WAIT
+            (32515, "crosshair"),    // IDC_CROSS
+            (32516, "default"),      // IDC_UPARROW (no CSS equivalent)
+            (32642, "nwse-resize"),  // IDC_SIZENWSE
+            (32643, "nesw-resize"),  // IDC_SIZENESW
+            (32644, "ew-resize"),    // IDC_SIZEWE
+            (32645, "ns-resize"),    // IDC_SIZENS
+            (32646, "move"),         // IDC_SIZEALL
+            (32648, "not-allowed"),  // IDC_NO
+            (32649, "pointer"),      // IDC_HAND
+            (32650, "progress"),     // IDC_APPSTARTING
+            (32651, "help"),         // IDC_HELP
+        };
+
+        foreach (var (idc, css) in mapping)
+        {
+            var handle = LoadCursor(IntPtr.Zero, idc);
+            if (handle != IntPtr.Zero)
+                _standardCursors[handle] = css;
+        }
+
+        _logger.LogInformation("Cursor shape table initialized: {Count} standard cursors mapped", _standardCursors.Count);
+    }
+
+    /// <summary>
+    /// Detect cursor shape changes and fire OnCursorShapeChanged.
+    /// Called from the capture loop on every frame — only fires the event
+    /// when the HCURSOR handle actually changes (typically a few times/sec).
+    /// </summary>
+    private void DetectCursorShapeChange()
+    {
+        if (OnCursorShapeChanged == null) return;
+
+        var ci = new CURSORINFO();
+        ci.cbSize = Marshal.SizeOf<CURSORINFO>();
+        if (!GetCursorInfo(ref ci)) return;
+
+        if (ci.hCursor == _lastCursorHandle) return;
+        _lastCursorHandle = ci.hCursor;
+
+        if (_standardCursors == null) return;
+
+        var cssValue = _standardCursors.TryGetValue(ci.hCursor, out var name) ? name : "default";
+        OnCursorShapeChanged.Invoke(cssValue);
     }
 
     #endregion

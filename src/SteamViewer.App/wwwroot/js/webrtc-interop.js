@@ -716,6 +716,14 @@ window.SteamViewerWebRTC = {
                         window.SteamViewerLogger?.handleRelayedLog(parsed.level, parsed.message, parsed.from);
                         return;
                     }
+                    // Cursor shape sync — apply CSS cursor directly in JS (no C# round-trip)
+                    if (parsed.type === 'cursorShape' && parsed.cursor) {
+                        window.SteamViewerInput._remoteCursorShape = parsed.cursor;
+                        if (window.SteamViewerInput.isLocked && window.SteamViewerInput.canvas) {
+                            window.SteamViewerInput.canvas.style.cursor = parsed.cursor;
+                        }
+                        return;
+                    }
                 } catch (e) {
                     // Not JSON - continue normally
                 }
@@ -2440,12 +2448,17 @@ window.SteamViewerInput = {
         }
     },
 
+    // Remote cursor shape from host (set via cursorShape data channel message)
+    _remoteCursorShape: 'default',
+
     lock() {
         this.ensureCanvas();
         this.isLocked = true;
         this.updateLockIndicator();
         this.notifyLockChange();
         this.canvas.focus();
+        // Apply remote cursor shape — shows the host's current cursor type locally
+        this.canvas.style.cursor = this._remoteCursorShape || 'default';
         // Gesture-backed restart: user click to lock = user gesture for getDisplayMedia
         this._restartSharingIfLost();
         // Start mouse regulation interval timer (sweep mode sends)
@@ -2475,6 +2488,8 @@ window.SteamViewerInput = {
         this.updateLockIndicator();
         this.notifyLockChange();
         this._stopRegulationTimer();
+        // Restore default cursor (no longer mirroring host cursor shape)
+        if (this.canvas) this.canvas.style.cursor = '';
         console.log('Input UNLOCKED');
     },
 

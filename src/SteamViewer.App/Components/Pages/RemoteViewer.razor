@@ -759,6 +759,11 @@
             SystemKeyInterceptor.Uninstall();
         }
         if (ActiveTab != null) ActiveTab.InputLocked = _inputLocked;
+
+        // Notify host so it can hide/show cursor in video stream
+        if (_activeSession != null)
+            _ = _activeSession.SendInputLockStateAsync(_inputLocked);
+
         StateHasChanged();
     }
 
@@ -770,6 +775,11 @@
             SystemKeyInterceptor.Install();
         else
             SystemKeyInterceptor.Uninstall();
+
+        // Notify host so it can hide/show cursor in video stream
+        if (_activeSession != null)
+            _ = _activeSession.SendInputLockStateAsync(locked);
+
         InvokeAsync(StateHasChanged);
     }
 

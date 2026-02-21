@@ -328,6 +328,9 @@ public sealed class HostSession : IAsyncDisposable
                     dxgi.OnFrameCaptured += OnDxgiFrameCaptured;
                 }
 
+                // Subscribe to cursor shape changes for local overlay on viewer
+                dxgi.OnCursorShapeChanged += OnCursorShapeChanged;
+
                 // Start DXGI capture loop (fires OnFrameCaptured at ~30 FPS)
                 dxgi.StartCaptureLoop(targetOutput);
 
@@ -346,6 +349,7 @@ public sealed class HostSession : IAsyncDisposable
                 // Clean up partial DXGI state
                 try { dxgi.OnRawFrameCaptured -= OnDxgiRawFrameCaptured; } catch { }
                 try { dxgi.OnFrameCaptured -= OnDxgiFrameCaptured; } catch { }
+                try { dxgi.OnCursorShapeChanged -= OnCursorShapeChanged; } catch { }
                 try { dxgi.StopCaptureLoop(); } catch { }
                 try { await _webrtc.StopNativeCaptureAsync(); } catch { }
                 _isNativeCapture = false;
@@ -446,6 +450,25 @@ public sealed class HostSession : IAsyncDisposable
 
         var base64Normal = Convert.ToBase64String(jpegData);
         _ = _webrtc.PushNativeFrameAsync(base64Normal, width, height);
+    }
+
+    private string? _lastSentCursorShape;
+
+    private void OnCursorShapeChanged(string cssValue)
+    {
+        // Deduplicate (already checked by HCURSOR handle, but guard against rapid re-fires)
+        if (cssValue == _lastSentCursorShape) return;
+        _lastSentCursorShape = cssValue;
+
+        // Fire-and-forget over data channel — cursor shape is transient, loss is OK
+        if (_webrtc?.IsDataChannelOpen == true)
+        {
+            _ = _webrtc.SendDataAsync(JsonSerializer.Serialize(new
+            {
+                type = "cursorShape",
+                cursor = cssValue
+            }));
+        }
     }
 
     private async Task HandleToggleCursorAsync()
@@ -601,6 +624,16 @@ public sealed class HostSession : IAsyncDisposable
 
                     case "toggleCursor":
                         await HandleToggleCursorAsync();
+                        return;
+
+                    case "inputLockChanged":
+                        var locked = root.TryGetProperty("locked", out var lockedProp) && lockedProp.GetBoolean();
+                        if (_activeDxgi != null)
+                        {
+                            // Hide host cursor in video when viewer is controlling (local overlay replaces it)
+                            _activeDxgi.ShowCursor = !locked;
+                            _logger.LogInformation("Viewer input lock: {Locked} → host cursor in video: {Visible}", locked, !locked);
+                        }
                         return;
 
                     case "screenShareStarted":
