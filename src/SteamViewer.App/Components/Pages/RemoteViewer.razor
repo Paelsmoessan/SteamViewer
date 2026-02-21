@@ -186,7 +186,6 @@
         </div>
         <div class="canvas-container" id="canvasContainer">
             <canvas id="viewerCanvas" class="@(_secureDesktopActive ? "canvas-dimmed" : "")"></canvas>
-            <div id="localCursorOverlay" class="local-cursor-overlay"></div>
             <canvas id="secureDesktopOverlay" class="secure-desktop-overlay" style="display: @(_secureDesktopActive ? "block" : "none")"></canvas>
             @if (_secureDesktopActive)
             {
@@ -1728,23 +1727,6 @@
     .canvas-dimmed {
         filter: brightness(0.3);
         transition: filter 0.3s ease;
-    }
-
-    /* Local cursor overlay — instant feedback, compositor-accelerated */
-    .local-cursor-overlay {
-        position: absolute;
-        top: 0;
-        left: 0;
-        width: 24px;
-        height: 24px;
-        pointer-events: none;
-        z-index: 5;
-        display: none;
-        will-change: transform;
-        background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'%3E%3Cpath d='M2 2L2 20L7 15L12 22L15 20L10 13L17 13Z' fill='white' stroke='black' stroke-width='1.5' stroke-linejoin='round'/%3E%3C/svg%3E");
-        background-size: contain;
-        background-repeat: no-repeat;
-        filter: drop-shadow(0 1px 2px rgba(0,0,0,0.5));
     }
 
     /* Secure Desktop overlay */

@@ -328,9 +328,6 @@ public sealed class HostSession : IAsyncDisposable
                     dxgi.OnFrameCaptured += OnDxgiFrameCaptured;
                 }
 
-                // Local cursor overlay replaces host cursor — don't composite into frames
-                dxgi.ShowCursor = false;
-
                 // Start DXGI capture loop (fires OnFrameCaptured at ~30 FPS)
                 dxgi.StartCaptureLoop(targetOutput);
 
