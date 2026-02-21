@@ -535,6 +535,12 @@ window.SteamViewerWebRTC = {
                                         }
                                         session._directRenderCtx.clearRect(0, 0, dc.width, dc.height);
                                         session._directRenderCtx.drawImage(video, lb.dx, lb.dy, lb.dw, lb.dh);
+
+                                        // Notify C# about first direct-render frame (dismisses "Waiting for host screen" overlay)
+                                        if (!session._firstDirectFrameNotified && session.dotNetRef) {
+                                            session._firstDirectFrameNotified = true;
+                                            session.dotNetRef.invokeMethodAsync('OnVideoStartedCallback');
+                                        }
                                     }
 
                                     frameCount++;
@@ -574,6 +580,12 @@ window.SteamViewerWebRTC = {
                                             }
                                             session._directRenderCtx.clearRect(0, 0, dc.width, dc.height);
                                             session._directRenderCtx.drawImage(video, lb.dx, lb.dy, lb.dw, lb.dh);
+
+                                            // Notify C# about first direct-render frame
+                                            if (!session._firstDirectFrameNotified && session.dotNetRef) {
+                                                session._firstDirectFrameNotified = true;
+                                                session.dotNetRef.invokeMethodAsync('OnVideoStartedCallback');
+                                            }
                                         }
 
                                         frameCount++;
@@ -1662,6 +1674,7 @@ window.SteamViewerWebRTC = {
     clearDirectRenderTarget(sessionId) {
         const session = this.sessions.get(sessionId);
         if (!session) return;
+        session._firstDirectFrameNotified = false;
         if (session._resizeObserver) {
             session._resizeObserver.disconnect();
             session._resizeObserver = null;
@@ -2249,9 +2262,12 @@ window.SteamViewerInput = {
     _pidSendThreshold: 0.8,   // Score above this = suppress (buffer for interval)
     _pidIDecay: 0.95,         // Integral decay per event (anti-windup via EMA)
     _pidIMax: 5.0,            // Integral clamp (anti-windup hard limit)
+    _pidIdleThresholdMs: 100, // ms idle before triggering cold start burst
+    _pidColdStartBurst: 5,    // Number of events to force-send after idle
+    _pidColdStartRemaining: 0, // Counter for remaining burst events
     // Dynamic cooldown — timer send rate scales with velocity
-    _pidMinCooldown: 50,      // ms — fastest timer rate during sweeps (~20 FPS)
-    _pidMaxCooldown: 200,     // ms — slowest timer rate for fast sweeps (~5 FPS)
+    _pidMinCooldown: 16,      // ms — fastest timer rate during sweeps (~60 FPS)
+    _pidMaxCooldown: 100,     // ms — slowest timer rate for fast sweeps (~10 FPS)
     _pidVelocityCap: 2.0,     // px/ms — velocity at which cooldown maxes out
     // PID internal state
     _pidVelocity: 0,          // EMA-smoothed velocity (px/ms)
@@ -2469,6 +2485,7 @@ window.SteamViewerInput = {
         this._pidLastVelocity = 0;
         this._pidLastEventTime = 0;
         this._lastTimerSendTime = 0;
+        this._pidColdStartRemaining = 0;
         this._regulationTimer = setInterval(async () => {
             const c = this._bufferedMouseCoords;
             if (!c || !this.dotNetRef || !this.isLocked) return;
@@ -2645,6 +2662,11 @@ window.SteamViewerInput = {
         let dt = now - this._pidLastEventTime;
         if (dt <= 0) dt = 1; // guard against same-timestamp events
 
+        // Cold start burst — detect idle→movement transition, force-send first N events
+        if (dt > this._pidIdleThresholdMs) {
+            this._pidColdStartRemaining = this._pidColdStartBurst;
+        }
+
         const rawVelocity = Math.hypot(e.movementX, e.movementY) / dt; // px/ms
         const velocity = this._pidAlpha * rawVelocity + (1 - this._pidAlpha) * this._pidVelocity;
 
@@ -2661,7 +2683,11 @@ window.SteamViewerInput = {
         this._pidVelocity = velocity;
         this._pidLastEventTime = now;
 
-        if (score < this._pidSendThreshold) {
+        // Cold start burst bypasses PID — always send immediately after idle
+        const coldStart = this._pidColdStartRemaining > 0;
+        if (coldStart) this._pidColdStartRemaining--;
+
+        if (coldStart || score < this._pidSendThreshold) {
             // Precision / arrival — send immediately
             this._lastSentX = x;
             this._lastSentY = y;

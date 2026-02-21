@@ -3,6 +3,7 @@ using Microsoft.JSInterop;
 using SteamViewer.App.Services;
 using SteamViewer.Client.Core.Network;
 using SteamViewer.Common.Protocol;
+using System.Collections.Concurrent;
 using System.Text.Json;
 
 namespace SteamViewer.App.Services.Models;
@@ -13,7 +14,7 @@ namespace SteamViewer.App.Services.Models;
 /// </summary>
 public sealed class ViewerSession : IAsyncDisposable
 {
-    private readonly IJSRuntime _jsRuntime;
+    private IJSRuntime _jsRuntime;
     private readonly ILogger _logger;
     private readonly ILoggerFactory _loggerFactory;
     private readonly Func<SignalingMessage, Task> _sendSignaling;
@@ -22,6 +23,8 @@ public sealed class ViewerSession : IAsyncDisposable
     private DotNetObjectReference<ViewerSession>? _dotNetRef;
     private bool _frameCaptureStarted;
     private bool _disposed;
+    private bool _directRenderBound;
+    private readonly ConcurrentQueue<Func<Task>> _pendingSignaling = new();
 
     /// <summary>
     /// Unique identifier for this session.
@@ -54,9 +57,15 @@ public sealed class ViewerSession : IAsyncDisposable
     public bool IsPeerSharing { get; private set; }
 
     /// <summary>
-    /// Raised when a JPEG video frame is received.
+    /// Raised when a JPEG video frame is received (JPEG relay path).
     /// </summary>
     public event Action<JpegFrame>? OnFrame;
+
+    /// <summary>
+    /// Raised when the first video frame is rendered via direct rendering.
+    /// Used to dismiss the "Waiting for host screen" overlay.
+    /// </summary>
+    public event Action? OnVideoStarted;
 
     /// <summary>
     /// Raised when the session state changes.
@@ -143,6 +152,11 @@ public sealed class ViewerSession : IAsyncDisposable
     public string? StoredPassword { get; set; }
 
     /// <summary>
+    /// TURN server config to apply when binding to viewer JS context.
+    /// </summary>
+    public (string[] Urls, string Username, string Credential)? TurnConfig { get; set; }
+
+    /// <summary>
     /// Raised when an ICE candidate needs to be sent via signaling.
     /// </summary>
     public event Func<string, string?, ushort?, Task>? OnIceCandidate;
@@ -190,6 +204,7 @@ public sealed class ViewerSession : IAsyncDisposable
         _webrtc.OnRenegotiationNeeded += HandleRenegotiationNeeded;
         _webrtc.OnConnectionStateChange += HandleConnectionStateChange;
         _webrtc.OnStatsUpdated += json => OnStatsUpdated?.Invoke(json);
+        _webrtc.OnVideoStarted += () => OnVideoStarted?.Invoke();
 
         await _webrtc.InitializeAsync();
 
@@ -197,11 +212,57 @@ public sealed class ViewerSession : IAsyncDisposable
     }
 
     /// <summary>
+    /// Bind the session to a viewer window's JSRuntime and initialize WebRTC there.
+    /// Called by RemoteViewer when a tab is activated — creates the PeerConnection
+    /// in the viewer's JS context so direct rendering works (same window = same DOM).
+    /// Processes any signaling messages (SDP/ICE) that arrived before binding.
+    /// </summary>
+    public async Task BindToViewerAsync(IJSRuntime viewerJsRuntime)
+    {
+        if (_webrtc != null)
+        {
+            if (ReferenceEquals(_jsRuntime, viewerJsRuntime))
+            {
+                // Already initialized in the correct JS context (e.g., ConnectionDialog path or tab re-activation)
+                _directRenderBound = true;
+                return;
+            }
+
+            // PeerConnection exists in a different window — can't migrate (tab-detach edge case)
+            _logger.LogWarning("Session {SessionId}: BindToViewer skipped — WebRTC already initialized in different JS context", SessionId);
+            return;
+        }
+
+        _logger.LogInformation("Session {SessionId}: Binding to viewer JSRuntime", SessionId);
+        _jsRuntime = viewerJsRuntime;
+        _directRenderBound = true;
+
+        // Configure TURN server in the viewer's JS context before creating PeerConnection
+        if (TurnConfig is var (urls, username, credential))
+        {
+            await _jsRuntime.InvokeVoidAsync("SteamViewerWebRTC.setTurnConfig", urls, username, credential);
+        }
+
+        await InitializeAsync();
+
+        // Process queued signaling messages (SDP offers/answers, ICE candidates)
+        while (_pendingSignaling.TryDequeue(out var action))
+        {
+            await action();
+        }
+    }
+
+    /// <summary>
     /// Handle incoming SDP offer from the host.
     /// </summary>
     public async Task HandleSdpOfferAsync(string sdp)
     {
-        if (_webrtc == null) return;
+        if (_webrtc == null)
+        {
+            _logger.LogInformation("Session {SessionId}: Queuing SDP offer (waiting for viewer bind)", SessionId);
+            _pendingSignaling.Enqueue(() => HandleSdpOfferAsync(sdp));
+            return;
+        }
 
         _logger.LogInformation("Session {SessionId}: Received SDP offer", SessionId);
         await _webrtc.SetRemoteDescriptionAsync(sdp);
@@ -216,7 +277,12 @@ public sealed class ViewerSession : IAsyncDisposable
     /// </summary>
     public async Task HandleSdpAnswerAsync(string sdp)
     {
-        if (_webrtc == null) return;
+        if (_webrtc == null)
+        {
+            _logger.LogInformation("Session {SessionId}: Queuing SDP answer (waiting for viewer bind)", SessionId);
+            _pendingSignaling.Enqueue(() => HandleSdpAnswerAsync(sdp));
+            return;
+        }
 
         _logger.LogInformation("Session {SessionId}: Received SDP answer", SessionId);
         await _webrtc.SetRemoteDescriptionAsync(sdp);
@@ -227,7 +293,11 @@ public sealed class ViewerSession : IAsyncDisposable
     /// </summary>
     public async Task HandleIceCandidateAsync(string candidate, string? sdpMid, int? sdpMLineIndex)
     {
-        if (_webrtc == null) return;
+        if (_webrtc == null)
+        {
+            _pendingSignaling.Enqueue(() => HandleIceCandidateAsync(candidate, sdpMid, sdpMLineIndex));
+            return;
+        }
 
         var candidateJson = JsonSerializer.Serialize(new
         {
@@ -438,10 +508,16 @@ public sealed class ViewerSession : IAsyncDisposable
 
     private async Task HandleDataChannelOpen()
     {
-        _logger.LogInformation("Session {SessionId}: Data channel opened", SessionId);
+        _logger.LogInformation("Session {SessionId}: Data channel opened (directRender={DirectRender})", SessionId, _directRenderBound);
         SetState(ViewerSessionState.Connected);
         OnReady?.Invoke();
-        await StartFrameCaptureAsync();
+
+        // Skip JPEG relay frame capture when direct rendering is active
+        // (PeerConnection is in the viewer's JS context — renders directly to canvas)
+        if (!_directRenderBound)
+        {
+            await StartFrameCaptureAsync();
+        }
     }
 
     private async Task HandleDataChannelClose()
@@ -590,7 +666,8 @@ public sealed class ViewerSession : IAsyncDisposable
             case "connected":
                 SetState(ViewerSessionState.Connected);
                 // Restart frame capture if it was stopped by a previous disconnect
-                if (_frameCaptureStarted)
+                // (only needed for JPEG relay path — skip when direct rendering is active)
+                if (_frameCaptureStarted && !_directRenderBound)
                 {
                     _logger.LogInformation("Session {SessionId}: Connection recovered, restarting frame capture", SessionId);
                     _frameCaptureStarted = false;

@@ -62,6 +62,12 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
     public event Action<string>? OnStatsUpdated;
 
     /// <summary>
+    /// Raised when the first video frame is rendered via direct rendering.
+    /// Used by RemoteViewer to dismiss the "Waiting for host screen" overlay.
+    /// </summary>
+    public event Action? OnVideoStarted;
+
+    /// <summary>
     /// Raised when screen sharing was lost and all JS auto-restart attempts failed.
     /// </summary>
     public event Action? OnScreenShareLost;
@@ -568,6 +574,13 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
     {
         _logger.LogInformation("Capture started: {Width}x{Height} (physical pixels)", width, height);
         OnCaptureStarted?.Invoke(width, height);
+    }
+
+    [JSInvokable]
+    public void OnVideoStartedCallback()
+    {
+        _logger.LogInformation("First video frame rendered via direct rendering");
+        OnVideoStarted?.Invoke();
     }
 
     #endregion

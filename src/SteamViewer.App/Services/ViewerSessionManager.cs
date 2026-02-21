@@ -143,11 +143,13 @@ public sealed class ViewerSessionManager : IAsyncDisposable
 
         _logger.LogInformation("Created session {SessionId} for peer {PeerId}", sessionId, peerId);
 
-        // Initialize WebRTC
-        await session.InitializeAsync();
+        // WebRTC initialization is DEFERRED — RemoteViewer calls session.BindToViewerAsync()
+        // when the tab activates, creating the PeerConnection in the viewer window's JS context.
+        // This enables direct rendering (zero-copy video → canvas) instead of JPEG relay.
+        // Incoming SDP/ICE messages are queued in ViewerSession until binding completes.
 
-        // Configure TURN server
-        await ConfigureTurnServerAsync(jsRuntime);
+        // Store TURN config for the session to apply when binding to viewer JS context
+        StoreTurnConfig(session);
 
         // Request connection via signaling
         await _signalingClient.RequestConnectionAsync(peerId, password);
@@ -263,11 +265,10 @@ public sealed class ViewerSessionManager : IAsyncDisposable
         _sessions[sessionId] = session;
         _peerToSession[peerId] = sessionId;
 
-        // Initialize WebRTC
-        await session.InitializeAsync();
+        // WebRTC initialization is DEFERRED — RemoteViewer binds after reconnect
 
-        // Configure TURN server
-        await ConfigureTurnServerAsync(jsRuntime);
+        // Store TURN config for the session to apply when binding
+        StoreTurnConfig(session);
 
         // Request connection via signaling
         await _signalingClient.RequestConnectionAsync(peerId, password);
@@ -417,6 +418,21 @@ public sealed class ViewerSessionManager : IAsyncDisposable
     private async Task SendSignalingMessage(SignalingMessage message)
     {
         await _signalingClient.SendAsync(message);
+    }
+
+    private void StoreTurnConfig(ViewerSession session)
+    {
+        var turnEnabled = _configuration.GetValue<bool>("TurnServer:Enabled");
+        if (!turnEnabled) return;
+
+        var urls = _configuration.GetSection("TurnServer:Urls").Get<string[]>();
+        var username = _configuration["TurnServer:Username"];
+        var credential = _configuration["TurnServer:Credential"];
+
+        if (urls == null || urls.Length == 0 || string.IsNullOrEmpty(username)) return;
+        if (urls[0].Contains("YOUR_TURN_SERVER")) return;
+
+        session.TurnConfig = (urls, username, credential!);
     }
 
     private async Task ConfigureTurnServerAsync(IJSRuntime jsRuntime)

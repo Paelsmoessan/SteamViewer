@@ -273,6 +273,7 @@
     private bool? _hostElevated;
     private bool? _hostSystemLevel;
     private bool _hasReceivedFrame;
+    private bool _directRenderingActive;
     private bool _secureDesktopActive;
     private bool _secureDesktopFrameReceived;
     private List<MonitorInfo>? _hostMonitors;
@@ -416,11 +417,12 @@
             oldTab.InputLocked = _inputLocked;
         }
 
-        // Pause frame capture and unsubscribe from previous session
+        // Clean up and unsubscribe from previous session
         if (_activeSession != null)
         {
             var oldSessionId = _activeSession.SessionId;
             _activeSession.OnFrame -= HandleSessionFrame;
+            _activeSession.OnVideoStarted -= HandleVideoStarted;
             _activeSession.OnDisconnected -= HandleSessionDisconnected;
             _activeSession.OnStatsUpdated -= HandleStatsUpdate;
             _activeSession.OnControlMessage -= HandleControlMessage;
@@ -429,7 +431,11 @@
             _activeSession.OnSecureDesktopFrame -= HandleSecureDesktopFrame;
             _activeSession.OnMonitorLayoutReceived -= HandleMonitorLayoutReceived;
             if (_statsVisible) _ = _activeSession.DisableStatsRelayAsync();
-            _ = JSRuntime.InvokeVoidAsync("SteamViewerWebRTC.pauseFrameCapture", oldSessionId);
+            if (_directRenderingActive)
+                _ = JSRuntime.InvokeVoidAsync("SteamViewerWebRTC.clearDirectRenderTarget", oldSessionId);
+            else
+                _ = JSRuntime.InvokeVoidAsync("SteamViewerWebRTC.pauseFrameCapture", oldSessionId);
+            _directRenderingActive = false;
         }
 
         _activeSessionId = sessionId;
@@ -453,6 +459,7 @@
             if (_activeSession != null)
             {
                 _activeSession.OnFrame += HandleSessionFrame;
+                _activeSession.OnVideoStarted += HandleVideoStarted;
                 _activeSession.OnDisconnected += HandleSessionDisconnected;
                 _activeSession.OnStatsUpdated += HandleStatsUpdate;
                 _activeSession.OnControlMessage += HandleControlMessage;
@@ -465,11 +472,9 @@
                 _hostMonitors = _activeSession.HostMonitors;
                 _activeMonitorId = _activeSession.ActiveMonitorId;
 
-                // Try direct rendering first (zero-latency, bypasses JPEG relay)
-                // Falls back to JPEG frame capture if JSRuntime doesn't match
-                _ = TryEnableDirectRenderingAsync(sessionId);
-
-                _ = JSRuntime.InvokeVoidAsync("SteamViewerWebRTC.resumeFrameCapture", sessionId);
+                // Bind WebRTC to this viewer window's JS context and enable direct rendering.
+                // PeerConnection is created in OUR window → video renders directly to canvas.
+                _ = BindAndEnableDirectRenderAsync(sessionId);
 
                 // Show reconnect overlay if session is already disconnected
                 if (_activeSession.State == ViewerSessionState.Disconnected)
@@ -566,6 +571,16 @@
         });
     }
 
+    private void HandleVideoStarted()
+    {
+        // First video frame rendered via direct rendering — dismiss "Waiting for host screen"
+        if (!_hasReceivedFrame)
+        {
+            _hasReceivedFrame = true;
+            _ = InvokeAsync(StateHasChanged);
+        }
+    }
+
     private void HandleSessionFrame(JpegFrame frame)
     {
         if (!_hasReceivedFrame)
@@ -574,7 +589,11 @@
             _ = InvokeAsync(StateHasChanged);
         }
 
-        // Frames from multi-session manager
+        // Skip JPEG relay rendering when direct rendering is active
+        // (video renders directly to canvas via requestVideoFrameCallback in JS)
+        if (_directRenderingActive) return;
+
+        // JPEG relay fallback — frames from multi-session manager
         if (_canvasInitialized)
         {
             _ = InvokeAsync(async () =>
@@ -609,24 +628,37 @@
         });
     }
 
-    private async Task TryEnableDirectRenderingAsync(string sessionId)
+    private async Task BindAndEnableDirectRenderAsync(string sessionId)
     {
         try
         {
-            // Wait briefly for canvas and video to be ready
+            // Wait briefly for canvas DOM to be ready
             await Task.Delay(200);
             var session = SessionManager.GetSession(sessionId);
             if (session == null) return;
 
+            // Bind WebRTC to this viewer window's JS context
+            // (creates PeerConnection here, processes queued SDP/ICE)
+            await session.BindToViewerAsync(JSRuntime);
+
+            // Enable direct rendering — PeerConnection is now in our window
             var enabled = await session.TryEnableDirectRenderingAsync("viewerCanvas", JSRuntime);
+            _directRenderingActive = enabled;
+
             if (enabled)
             {
-                Console.WriteLine($"[DirectRender] Session {sessionId}: direct rendering active");
+                Console.WriteLine($"[DirectRender] Session {sessionId}: direct rendering active (JPEG relay bypassed)");
+            }
+            else
+            {
+                // Fallback: direct rendering failed, use JPEG relay
+                Console.WriteLine($"[DirectRender] Session {sessionId}: direct rendering failed, falling back to JPEG relay");
+                _ = JSRuntime.InvokeVoidAsync("SteamViewerWebRTC.resumeFrameCapture", sessionId);
             }
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[DirectRender] Failed: {ex.Message}");
+            Console.WriteLine($"[BindAndRender] Failed: {ex.Message}");
         }
     }
 
@@ -1236,6 +1268,7 @@
             {
                 // Unsubscribe from old session events
                 _activeSession.OnFrame -= HandleSessionFrame;
+                _activeSession.OnVideoStarted -= HandleVideoStarted;
                 _activeSession.OnDisconnected -= HandleSessionDisconnected;
                 _activeSession.OnStatsUpdated -= HandleStatsUpdate;
                 _activeSession.OnControlMessage -= HandleControlMessage;
@@ -1250,6 +1283,7 @@
 
                 // Subscribe to new session events
                 _activeSession.OnFrame += HandleSessionFrame;
+                _activeSession.OnVideoStarted += HandleVideoStarted;
                 _activeSession.OnDisconnected += HandleSessionDisconnected;
                 _activeSession.OnStatsUpdated += HandleStatsUpdate;
                 _activeSession.OnControlMessage += HandleControlMessage;
@@ -1260,6 +1294,9 @@
 
                 // Update JS input routing
                 await JSRuntime.InvokeVoidAsync("SteamViewerInput.setActiveSession", newSession.SessionId);
+
+                // Bind new session's WebRTC to this viewer window and enable direct rendering
+                _ = BindAndEnableDirectRenderAsync(newSession.SessionId);
 
                 // Reset monitor layout (host will resend on new capture)
                 _hostMonitors = null;
@@ -1329,6 +1366,7 @@
         if (_activeSession != null)
         {
             _activeSession.OnFrame -= HandleSessionFrame;
+            _activeSession.OnVideoStarted -= HandleVideoStarted;
             _activeSession.OnDisconnected -= HandleSessionDisconnected;
             _activeSession.OnStatsUpdated -= HandleStatsUpdate;
             _activeSession.OnControlMessage -= HandleControlMessage;

@@ -148,6 +148,11 @@ public sealed class DxgiScreenCapture : IScreenCapture
         var consecutiveErrors = 0;
         const int targetIntervalMs = 33; // ~30 FPS target
         var sw = System.Diagnostics.Stopwatch.StartNew();
+        var idleSw = System.Diagnostics.Stopwatch.StartNew(); // Tracks time since last frame fired
+        byte[]? lastJpegData = null;
+        int lastWidth = 0, lastHeight = 0;
+        byte[]? lastRawData = null;
+        int lastRawStride = 0;
 
         try
         {
@@ -161,9 +166,28 @@ public sealed class DxgiScreenCapture : IScreenCapture
 
                     if (frame == null)
                     {
-                        // Desktop unchanged since last frame — brief sleep and retry
-                        // DXGI returns null when no pixels changed (efficient)
-                        Thread.Sleep(5);
+                        // Desktop unchanged — re-fire last frame at ~30fps to keep WebRTC JB calibrated
+                        if (idleSw.ElapsedMilliseconds >= targetIntervalMs)
+                        {
+                            if (OnRawFrameCaptured != null && lastRawData != null)
+                            {
+                                OnRawFrameCaptured.Invoke(lastRawData, lastWidth, lastHeight, lastRawStride);
+                                idleSw.Restart();
+                            }
+                            else if (OnFrameCaptured != null && lastJpegData != null)
+                            {
+                                OnFrameCaptured.Invoke(lastJpegData, lastWidth, lastHeight);
+                                idleSw.Restart();
+                            }
+                            else
+                            {
+                                Thread.Sleep(5);
+                            }
+                        }
+                        else
+                        {
+                            Thread.Sleep(5);
+                        }
                         continue;
                     }
 
@@ -173,7 +197,21 @@ public sealed class DxgiScreenCapture : IScreenCapture
                     using (frame)
                     {
                         EncodeAndFireFrame(frame, jpegEncoder, encoderParams, jpegStream, ref frameCount);
+
+                        // Cache last frame for idle keepalive re-fires
+                        lastWidth = frame.Width;
+                        lastHeight = frame.Height;
+                        if (OnRawFrameCaptured != null)
+                        {
+                            lastRawData = frame.Data; // frame.Data is a byte[] we can hold
+                            lastRawStride = frame.Stride;
+                        }
+                        else if (OnFrameCaptured != null)
+                        {
+                            lastJpegData = jpegStream.ToArray();
+                        }
                     }
+                    idleSw.Restart();
 
                     // Adaptive sleep — maintain ~30 FPS regardless of encode time
                     var elapsed = (int)sw.ElapsedMilliseconds;
