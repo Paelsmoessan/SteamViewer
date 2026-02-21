@@ -13,6 +13,8 @@
 @using Microsoft.Extensions.Configuration
 @using Microsoft.Extensions.DependencyInjection
 @using SteamViewer.Client.Core.Elevation
+@using SteamViewer.Platform.Windows.ScreenCapture
+@using SteamViewer.Common.Protocol
 @implements IAsyncDisposable
 @inject IServiceProvider ServiceProvider
 @inject SignalingClient SignalingClient
@@ -218,6 +220,11 @@
     private FileTransferDialog.DialogMode _fileDialogMode;
     private FileTransferState? _pendingFileTransfer;
 
+    // Monitor picker state (DXGI native capture — no browser picker)
+    private bool _showMonitorPicker;
+    private List<MonitorInfo>? _availableMonitors;
+    private uint _selectedMonitorId;
+
     // UI helper properties that delegate to HostSession
     private bool _isSharingScreen => _hostSession?.IsSharingScreen ?? false;
     private bool _peerIsSharingScreen => _hostSession?.IsPeerSharingScreen ?? false;
@@ -238,6 +245,27 @@
                         <span>Stop Sharing</span>
                     </button>
                     <p class="share-status">You are sharing your screen</p>
+                }
+                else if (_showMonitorPicker && _availableMonitors != null)
+                {
+                    @* Monitor picker — shown when 2+ monitors detected *@
+                    <div class="monitor-picker">
+                        <p class="picker-label">Select monitor to share:</p>
+                        <div class="monitor-options">
+                            @foreach (var mon in _availableMonitors)
+                            {
+                                <button class="monitor-option @(mon.Id == _selectedMonitorId ? "selected" : "")"
+                                        @onclick="() => SelectAndShareMonitor(mon.Id)">
+                                    <span class="monitor-name">@mon.Name</span>
+                                    <span class="monitor-res">@(mon.Width)x@(mon.Height)</span>
+                                    @if (mon.IsPrimary) { <span class="monitor-primary">Primary</span> }
+                                </button>
+                            }
+                        </div>
+                        <button class="share-btn cancel" @onclick="() => { _showMonitorPicker = false; StateHasChanged(); }">
+                            <span>Cancel</span>
+                        </button>
+                    </div>
                 }
                 else
                 {
@@ -468,7 +496,45 @@
     {
         if (_hostSession == null) return;
 
-        var success = await _hostSession.StartScreenShareAsync();
+        // Enumerate DXGI monitors to decide: auto-start or show picker
+        try
+        {
+            _availableMonitors = DxgiScreenCapture.EnumerateMonitors(Logger);
+        }
+        catch
+        {
+            _availableMonitors = null;
+        }
+
+        if (_availableMonitors != null && _availableMonitors.Count > 1)
+        {
+            // Multiple monitors — show picker (no browser picker!)
+            _selectedMonitorId = _availableMonitors.FirstOrDefault(m => m.IsPrimary)?.Id
+                ?? _availableMonitors[0].Id;
+            _showMonitorPicker = true;
+            StateHasChanged();
+            return;
+        }
+
+        // Single monitor (or enumeration failed) — start directly
+        var outputIndex = _availableMonitors?.FirstOrDefault()?.Id;
+        var success = await _hostSession.StartScreenShareAsync(outputIndex);
+        if (!success)
+        {
+            errorMessage = "Failed to start screen capture";
+        }
+        _showMonitorPicker = false;
+        StateHasChanged();
+    }
+
+    private async Task SelectAndShareMonitor(uint monitorId)
+    {
+        if (_hostSession == null) return;
+
+        _showMonitorPicker = false;
+        StateHasChanged();
+
+        var success = await _hostSession.StartScreenShareAsync(outputIndex: monitorId);
         if (!success)
         {
             errorMessage = "Failed to start screen capture";
@@ -481,6 +547,7 @@
         if (_hostSession == null) return;
 
         await _hostSession.StopScreenShareAsync();
+        _showMonitorPicker = false;
         StateHasChanged();
     }
 
@@ -664,6 +731,10 @@
 
             // Create and initialize host session
             var monitorEnumerator = ServiceProvider.GetService<IMonitorEnumerator>();
+            var screenCapture = ServiceProvider.GetService<IScreenCapture>();
+#if WINDOWS
+            var frameBridge = ServiceProvider.GetService<Services.NativeFrameBridge>();
+#endif
             _hostSession = new HostSession(
                 connectedPeerId,
                 JSRuntime,
@@ -673,6 +744,10 @@
                 msg => SignalingClient.SendAsync(msg),
                 elevationService: elevationService,
                 monitorEnumerator: monitorEnumerator,
+                screenCapture: screenCapture,
+#if WINDOWS
+                frameBridge: frameBridge,
+#endif
                 hostClientId: clientId,
                 hostPasswordHash: passwordHash);
 
@@ -1397,6 +1472,75 @@
     .share-btn:disabled {
         opacity: 0.5;
         cursor: not-allowed;
+    }
+
+    .share-btn.cancel {
+        background: #45475a;
+        margin-top: 0.5rem;
+    }
+
+    .share-btn.cancel:hover {
+        background: #585b70;
+    }
+
+    .monitor-picker {
+        text-align: center;
+    }
+
+    .picker-label {
+        color: #cdd6f4;
+        margin-bottom: 0.75rem;
+        font-size: 0.9rem;
+    }
+
+    .monitor-options {
+        display: flex;
+        flex-direction: column;
+        gap: 0.5rem;
+        margin-bottom: 0.75rem;
+    }
+
+    .monitor-option {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        padding: 0.75rem 1rem;
+        background: #313244;
+        border: 2px solid #45475a;
+        border-radius: 8px;
+        color: #cdd6f4;
+        cursor: pointer;
+        transition: all 0.15s;
+    }
+
+    .monitor-option:hover {
+        border-color: #89b4fa;
+        background: #45475a;
+    }
+
+    .monitor-option.selected {
+        border-color: #89b4fa;
+        background: #45475a;
+    }
+
+    .monitor-name {
+        font-weight: 600;
+        flex: 1;
+        text-align: left;
+    }
+
+    .monitor-res {
+        color: #a6adc8;
+        font-size: 0.85rem;
+    }
+
+    .monitor-primary {
+        background: #89b4fa;
+        color: #1e1e2e;
+        padding: 0.15rem 0.5rem;
+        border-radius: 4px;
+        font-size: 0.75rem;
+        font-weight: 600;
     }
 
     .session-toolbar {

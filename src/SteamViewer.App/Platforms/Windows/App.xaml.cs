@@ -36,9 +36,12 @@ public partial class App : MauiWinUIApplication
         ConfigureWebView2UserDataFolder();
 
         // Auto-select entire screen for getDisplayMedia (remote desktop = always fullscreen)
+        // Disable mDNS obfuscation so ICE candidates use real local IPs for reliable LAN P2P
+        // Without this, Chromium replaces IPs with .local mDNS names that fail intermittently
         Environment.SetEnvironmentVariable("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
             "--auto-select-desktop-capture-source=\"Entire screen\" " +
-            "--enable-features=GetDisplayMediaSetAutoSelectAllScreens");
+            "--enable-features=GetDisplayMediaSetAutoSelectAllScreens " +
+            "--disable-features=WebRtcHideLocalIpsWithMdns");
 
         // Check dependencies before initializing
         if (!CheckDependencies())

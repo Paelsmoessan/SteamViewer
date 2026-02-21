@@ -8,6 +8,7 @@ using SteamViewer.Client.Core.Elevation;
 using SteamViewer.Client.Core.Network;
 using SteamViewer.Common.Protocol;
 using System.Text.Json.Serialization;
+using SteamViewer.Platform.Windows.ScreenCapture;
 
 namespace SteamViewer.App.Services.Models;
 
@@ -40,6 +41,10 @@ public sealed class HostSession : IAsyncDisposable
     private readonly IInputInjector _inputInjector;
     private readonly IMonitorEnumerator? _monitorEnumerator;
     private readonly IElevationService? _elevationService;
+    private readonly IScreenCapture? _screenCapture;
+#if WINDOWS
+    private readonly Services.NativeFrameBridge? _frameBridge;
+#endif
     private readonly IConfiguration _configuration;
     private readonly Func<SignalingMessage, Task> _sendSignaling;
     private readonly string _hostClientId;
@@ -56,6 +61,10 @@ public sealed class HostSession : IAsyncDisposable
     // Track capture dimensions from viewer's mouse events (0 = not yet received)
     private int _lastCaptureWidth;
     private int _lastCaptureHeight;
+
+    // Native DXGI capture state
+    private bool _isNativeCapture;
+    private DxgiScreenCapture? _activeDxgi;
 
     /// <summary>Session ID for JS interop — always "host".</summary>
     public string SessionId => "host";
@@ -112,6 +121,10 @@ public sealed class HostSession : IAsyncDisposable
         Func<SignalingMessage, Task> sendSignaling,
         IElevationService? elevationService = null,
         IMonitorEnumerator? monitorEnumerator = null,
+        IScreenCapture? screenCapture = null,
+#if WINDOWS
+        Services.NativeFrameBridge? frameBridge = null,
+#endif
         string hostClientId = "",
         string hostPasswordHash = "")
     {
@@ -122,6 +135,10 @@ public sealed class HostSession : IAsyncDisposable
         _inputInjector = inputInjector;
         _monitorEnumerator = monitorEnumerator;
         _elevationService = elevationService;
+        _screenCapture = screenCapture;
+#if WINDOWS
+        _frameBridge = frameBridge;
+#endif
         _configuration = configuration;
         _sendSignaling = sendSignaling;
         _hostClientId = hostClientId;
@@ -187,7 +204,7 @@ public sealed class HostSession : IAsyncDisposable
 
         await _webrtc.InitializeAsync();
         _webrtcInitialized = true;
-        await _webrtc.CreateDataChannelAsync("data");
+        await _webrtc.CreateDataChannelsAsync();
 
         // Create and send initial SDP offer
         var offer = await _webrtc.CreateOfferAsync();
@@ -273,30 +290,84 @@ public sealed class HostSession : IAsyncDisposable
 
     #region Screen Sharing
 
-    /// <summary>Start sharing screen to the connected viewer (always fullscreen).</summary>
-    public async Task<bool> StartScreenShareAsync()
+    /// <summary>
+    /// Start sharing screen to the connected viewer.
+    /// Tries DXGI native capture first (no picker!), falls back to getDisplayMedia.
+    /// </summary>
+    /// <param name="outputIndex">DXGI output index to capture (null = auto-select primary)</param>
+    public async Task<bool> StartScreenShareAsync(uint? outputIndex = null)
     {
         if (_webrtc == null) return false;
 
+        // Try DXGI native capture first (Windows only, no screen picker)
+        if (_screenCapture is DxgiScreenCapture dxgi)
+        {
+            try
+            {
+                var targetOutput = outputIndex ?? 0; // Default to primary monitor
+                _logger.LogInformation("Trying DXGI native capture on output {Output} (no picker)...", targetOutput);
+
+                // Set up JS canvas bridge first
+                var bridgeOk = await _webrtc.StartNativeCaptureAsync(30);
+                if (!bridgeOk)
+                {
+                    _logger.LogWarning("JS canvas bridge setup failed, falling back to getDisplayMedia");
+                    goto fallback;
+                }
+
+                // Subscribe to DXGI frame events — raw BGRA when SharedBuffer available, JPEG fallback
+#if WINDOWS
+                if (_frameBridge?.IsInitialized == true)
+                {
+                    dxgi.OnRawFrameCaptured += OnDxgiRawFrameCaptured;
+                    _logger.LogInformation("Using raw BGRA pipeline (no JPEG encode)");
+                }
+                else
+#endif
+                {
+                    dxgi.OnFrameCaptured += OnDxgiFrameCaptured;
+                }
+
+                // Subscribe to cursor shape changes for local overlay on viewer
+                dxgi.OnCursorShapeChanged += OnCursorShapeChanged;
+
+                // Start DXGI capture loop (fires OnFrameCaptured at ~30 FPS)
+                dxgi.StartCaptureLoop(targetOutput);
+
+                _isNativeCapture = true;
+                _activeDxgi = dxgi;
+                IsSharingScreen = true;
+                _logger.LogInformation("DXGI native capture started on output {Output} — no picker!", targetOutput);
+
+                // Notify peer
+                await NotifyScreenShareStarted();
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "DXGI native capture failed, falling back to getDisplayMedia");
+                // Clean up partial DXGI state
+                try { dxgi.OnRawFrameCaptured -= OnDxgiRawFrameCaptured; } catch { }
+                try { dxgi.OnFrameCaptured -= OnDxgiFrameCaptured; } catch { }
+                try { dxgi.OnCursorShapeChanged -= OnCursorShapeChanged; } catch { }
+                try { dxgi.StopCaptureLoop(); } catch { }
+                try { await _webrtc.StopNativeCaptureAsync(); } catch { }
+                _isNativeCapture = false;
+            }
+        }
+
+        fallback:
+        // Fallback: browser getDisplayMedia (shows picker)
         try
         {
-            _logger.LogInformation("Starting screen share (always fullscreen)...");
+            _logger.LogInformation("Starting screen share via getDisplayMedia (browser picker)...");
             var success = await _webrtc.StartScreenCaptureAsync();
             if (success)
             {
+                _isNativeCapture = false;
                 IsSharingScreen = true;
-                _logger.LogInformation("Screen sharing started, notifying peer...");
-
-                // Wait for track to propagate, then notify peer
-                await Task.Delay(500);
-                for (int i = 0; i < 3; i++)
-                {
-                    var sent = await _webrtc.SendDataAsync(
-                        JsonSerializer.Serialize(new { type = "screenShareStarted" }));
-                    _logger.LogInformation("screenShareStarted message sent: {Sent}", sent);
-                    if (sent) break;
-                    await Task.Delay(200);
-                }
+                _logger.LogInformation("Screen sharing started via getDisplayMedia");
+                await NotifyScreenShareStarted();
                 return true;
             }
             return false;
@@ -308,15 +379,30 @@ public sealed class HostSession : IAsyncDisposable
         }
     }
 
-    /// <summary>Stop sharing screen.</summary>
+    /// <summary>Stop sharing screen (handles both DXGI native and getDisplayMedia paths).</summary>
     public async Task StopScreenShareAsync()
     {
         if (_webrtc == null) return;
 
         try
         {
-            _logger.LogInformation("Stopping screen share...");
-            await _webrtc.StopScreenCaptureAsync();
+            _logger.LogInformation("Stopping screen share (native={IsNative})...", _isNativeCapture);
+
+            if (_isNativeCapture && _screenCapture is DxgiScreenCapture dxgi)
+            {
+                // Stop DXGI capture loop and unsubscribe from both event paths
+                dxgi.OnRawFrameCaptured -= OnDxgiRawFrameCaptured;
+                dxgi.OnFrameCaptured -= OnDxgiFrameCaptured;
+                dxgi.StopCaptureLoop();
+                await _webrtc.StopNativeCaptureAsync();
+                _isNativeCapture = false;
+            }
+            else
+            {
+                // Stop browser getDisplayMedia capture
+                await _webrtc.StopScreenCaptureAsync();
+            }
+
             IsSharingScreen = false;
             _inputInjector.ClearCapturedMonitor();
             await _webrtc.SendDataAsync(
@@ -326,6 +412,91 @@ public sealed class HostSession : IAsyncDisposable
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to stop screen sharing");
+        }
+    }
+
+    /// <summary>
+    /// Relay DXGI captured JPEG frames to JS WebRTC pipeline.
+    /// SharedBuffer path: zero-copy via WebView2 shared memory (preferred).
+    /// Fallback path: base64 + JSInterop (slower, higher latency).
+    /// Called from DXGI capture thread — fire-and-forget (don't block capture).
+    /// </summary>
+    /// <summary>
+    /// Raw BGRA path — skip JPEG encode entirely. SharedBuffer sends raw pixels to JS,
+    /// which creates VideoFrame directly. Saves 20-40ms per frame.
+    /// </summary>
+    private void OnDxgiRawFrameCaptured(byte[] bgraData, int width, int height, int stride)
+    {
+        if (_webrtc == null || !_isNativeCapture) return;
+#if WINDOWS
+        _frameBridge!.PushRawFrame(bgraData, width, height, stride, SessionId);
+#endif
+    }
+
+    /// <summary>
+    /// JPEG fallback path — used when SharedBuffer not available.
+    /// </summary>
+    private void OnDxgiFrameCaptured(byte[] jpegData, int width, int height)
+    {
+        if (_webrtc == null || !_isNativeCapture) return;
+
+#if WINDOWS
+        if (_frameBridge?.IsInitialized == true)
+        {
+            _frameBridge.PushFrame(jpegData, width, height, SessionId);
+            return;
+        }
+#endif
+
+        var base64Normal = Convert.ToBase64String(jpegData);
+        _ = _webrtc.PushNativeFrameAsync(base64Normal, width, height);
+    }
+
+    private string? _lastSentCursorShape;
+
+    private void OnCursorShapeChanged(string cssValue)
+    {
+        // Deduplicate (already checked by HCURSOR handle, but guard against rapid re-fires)
+        if (cssValue == _lastSentCursorShape) return;
+        _lastSentCursorShape = cssValue;
+
+        // Fire-and-forget over data channel — cursor shape is transient, loss is OK
+        if (_webrtc?.IsDataChannelOpen == true)
+        {
+            _ = _webrtc.SendDataAsync(JsonSerializer.Serialize(new
+            {
+                type = "cursorShape",
+                cursor = cssValue
+            }));
+        }
+    }
+
+    private async Task HandleToggleCursorAsync()
+    {
+        if (_activeDxgi != null)
+        {
+            _activeDxgi.ShowCursor = !_activeDxgi.ShowCursor;
+            _logger.LogInformation("Host cursor visibility: {Visible}", _activeDxgi.ShowCursor);
+
+            await _webrtc!.SendDataAsync(JsonSerializer.Serialize(new
+            {
+                type = "cursorVisibilityChanged",
+                visible = _activeDxgi.ShowCursor
+            }));
+        }
+    }
+
+    private async Task NotifyScreenShareStarted()
+    {
+        // Wait for track to propagate, then notify peer
+        await Task.Delay(500);
+        for (int i = 0; i < 3; i++)
+        {
+            var sent = await _webrtc!.SendDataAsync(
+                JsonSerializer.Serialize(new { type = "screenShareStarted" }));
+            _logger.LogInformation("screenShareStarted message sent: {Sent}", sent);
+            if (sent) break;
+            await Task.Delay(200);
         }
     }
 
@@ -451,6 +622,20 @@ public sealed class HostSession : IAsyncDisposable
                             await HandleSwitchDisplayAsync(monitorId);
                         return;
 
+                    case "toggleCursor":
+                        await HandleToggleCursorAsync();
+                        return;
+
+                    case "inputLockChanged":
+                        var locked = root.TryGetProperty("locked", out var lockedProp) && lockedProp.GetBoolean();
+                        if (_activeDxgi != null)
+                        {
+                            // Hide host cursor in video when viewer is controlling (local overlay replaces it)
+                            _activeDxgi.ShowCursor = !locked;
+                            _logger.LogInformation("Viewer input lock: {Locked} → host cursor in video: {Visible}", locked, !locked);
+                        }
+                        return;
+
                     case "screenShareStarted":
                         _logger.LogInformation("Peer started sharing their screen");
                         IsPeerSharingScreen = true;
@@ -560,7 +745,8 @@ public sealed class HostSession : IAsyncDisposable
 
     /// <summary>
     /// Handle viewer's request to switch which monitor is being captured.
-    /// Stops current capture, restarts (browser picker appears on host).
+    /// With DXGI native capture: programmatic switch, no picker.
+    /// With getDisplayMedia: stops and restarts (browser picker appears).
     /// </summary>
     private async Task HandleSwitchDisplayAsync(int monitorId)
     {
@@ -569,9 +755,9 @@ public sealed class HostSession : IAsyncDisposable
         var name = monitor?.Name ?? $"Display {monitorId}";
         _logger.LogInformation("Viewer requested switch to {Monitor} (id={Id})", name, monitorId);
 
-        // Stop current capture, restart (shows browser picker on host)
+        // Stop current capture, restart on requested monitor
         await StopScreenShareAsync();
-        await StartScreenShareAsync();
+        await StartScreenShareAsync(outputIndex: (uint)monitorId);
     }
 
     private int? _requestedMonitorId;
@@ -1219,7 +1405,8 @@ public sealed class HostSession : IAsyncDisposable
             _lastCaptureWidth = width;
             _lastCaptureHeight = height;
             _inputInjector.SetCapturedMonitor(width, height);
-            _logger.LogInformation("Host capture dimensions set: {W}x{H} (from getDisplayMedia), monitor cached", width, height);
+            var source = _isNativeCapture ? "DXGI native" : "getDisplayMedia";
+            _logger.LogInformation("Host capture dimensions set: {W}x{H} (from {Source}), monitor cached", width, height, source);
 
             // Send updated monitor layout with the matched active monitor
             var matchedId = MatchCaptureToMonitor(width, height);
@@ -1294,6 +1481,15 @@ public sealed class HostSession : IAsyncDisposable
             _elevationService.OnSecureDesktopStateChanged -= HandleSecureDesktopStateChanged;
             _elevationService.OnSystemStateChanged -= HandleSystemStateChanged;
             await _elevationService.DisposeAsync();
+        }
+
+        // Stop DXGI capture if active
+        if (_isNativeCapture && _screenCapture is DxgiScreenCapture dxgi)
+        {
+            dxgi.OnRawFrameCaptured -= OnDxgiRawFrameCaptured;
+            dxgi.OnFrameCaptured -= OnDxgiFrameCaptured;
+            dxgi.StopCaptureLoop();
+            _isNativeCapture = false;
         }
 
         if (_webrtc != null)

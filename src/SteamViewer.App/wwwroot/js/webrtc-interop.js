@@ -177,13 +177,20 @@ window.SteamViewerWebRTC = {
             _sharingStoppedByUser: false,
             _sharingLost: false,           // true when track ended unexpectedly (restart on next user gesture)
             _restartingShare: false,       // true while restart attempt is in progress (prevents concurrent restarts)
-            // Dynamic bitrate adaptation
-            _bitrateAdaptEnabled: true,
-            _targetBitrate: 3_000_000,
+            // Dynamic bitrate adaptation — disabled, let WebRTC handle rate control natively.
+            // Our adaptation was fighting WebRTC's BWE, capping bitrate at ~3Mbps on LAN.
+            _bitrateAdaptEnabled: false,
+            _targetBitrate: 50_000_000,
             _minBitrate: 500_000,
-            _maxBitrate: 8_000_000,
+            _maxBitrate: 50_000_000,
             _bitrateHistory: [],
-            _lastBitrateAdjust: 0
+            _lastBitrateAdjust: 0,
+            // Silent audio track (separate MSID to bypass Chrome A/V sync)
+            _silentAudioCtx: null,
+            // LAN detection (observation only — no renegotiation)
+            _isLan: false,
+            // Dual data channels: control (reliable) + mouse (unreliable)
+            mouseChannel: null
         };
     },
 
@@ -315,10 +322,31 @@ window.SteamViewerWebRTC = {
             };
 
             // Handle ICE connection state for more debugging
-            session.peerConnection.oniceconnectionstatechange = () => {
-                console.log(`[${sessionId}] ICE connection state:`, session.peerConnection.iceConnectionState);
-                if (session.peerConnection.iceConnectionState === 'failed') {
+            session.peerConnection.oniceconnectionstatechange = async () => {
+                const state = session.peerConnection?.iceConnectionState;
+                console.log(`[${sessionId}] ICE connection state:`, state);
+                if (state === 'failed') {
                     console.error('ICE CONNECTION FAILED');
+                }
+                // LAN detection: observe candidate types for stats (no renegotiation — FEC removed in initial SDP)
+                if (state === 'connected' && !session._isLan) {
+                    try {
+                        const stats = await session.peerConnection.getStats();
+                        for (const [, report] of stats) {
+                            if (report.type === 'candidate-pair' && report.state === 'succeeded') {
+                                let localType = '', remoteType = '';
+                                for (const [, r] of stats) {
+                                    if (r.id === report.localCandidateId) localType = r.candidateType;
+                                    if (r.id === report.remoteCandidateId) remoteType = r.candidateType;
+                                }
+                                session._isLan = (localType === 'host' && remoteType === 'host');
+                                console.log(`[${sessionId}] ICE candidates: local=${localType}, remote=${remoteType} → ${session._isLan ? 'LAN' : 'WAN'}`);
+                                break;
+                            }
+                        }
+                    } catch (e) {
+                        console.warn(`[${sessionId}] LAN detection failed:`, e);
+                    }
                 }
             };
 
@@ -372,9 +400,13 @@ window.SteamViewerWebRTC = {
                 }
             };
 
-            // Handle incoming data channels
+            // Handle incoming data channels (viewer receives host-created channels)
             session.peerConnection.ondatachannel = (event) => {
-                this._setupDataChannel(sessionId, event.channel);
+                if (event.channel.label === 'mouse') {
+                    this._setupMouseChannel(sessionId, event.channel);
+                } else {
+                    this._setupDataChannel(sessionId, event.channel);
+                }
             };
 
             // Handle incoming video track
@@ -399,6 +431,26 @@ window.SteamViewerWebRTC = {
                             receiver.jitterBufferTarget = 0;  // Request minimal jitter buffer
                             console.log('Set jitterBufferTarget to 0');
                         }
+                    }
+
+                    // Persistent jitter buffer pressure at 15ms interval (Selkies pattern).
+                    // Chrome's adaptive algorithm regrows the buffer — 1s polling was too slow.
+                    // Source: .claude/research/external-research (Selkies v1.6.0 uses 15ms)
+                    if (!session._jbPressureInterval) {
+                        session._jbPressureInterval = setInterval(() => {
+                            if (!session.peerConnection) {
+                                clearInterval(session._jbPressureInterval);
+                                session._jbPressureInterval = null;
+                                return;
+                            }
+                            const receivers = session.peerConnection.getReceivers();
+                            for (const r of receivers) {
+                                if (r.track?.kind === 'video') {
+                                    if ('jitterBufferTarget' in r) r.jitterBufferTarget = 0;
+                                    if ('playoutDelayHint' in r) r.playoutDelayHint = 0;
+                                }
+                            }
+                        }, 15);
                     }
 
                     const video = document.createElement('video');
@@ -483,6 +535,12 @@ window.SteamViewerWebRTC = {
                                         }
                                         session._directRenderCtx.clearRect(0, 0, dc.width, dc.height);
                                         session._directRenderCtx.drawImage(video, lb.dx, lb.dy, lb.dw, lb.dh);
+
+                                        // Notify C# about first direct-render frame (dismisses "Waiting for host screen" overlay)
+                                        if (!session._firstDirectFrameNotified && session.dotNetRef) {
+                                            session._firstDirectFrameNotified = true;
+                                            session.dotNetRef.invokeMethodAsync('OnVideoStartedCallback');
+                                        }
                                     }
 
                                     frameCount++;
@@ -522,6 +580,12 @@ window.SteamViewerWebRTC = {
                                             }
                                             session._directRenderCtx.clearRect(0, 0, dc.width, dc.height);
                                             session._directRenderCtx.drawImage(video, lb.dx, lb.dy, lb.dw, lb.dh);
+
+                                            // Notify C# about first direct-render frame
+                                            if (!session._firstDirectFrameNotified && session.dotNetRef) {
+                                                session._firstDirectFrameNotified = true;
+                                                session.dotNetRef.invokeMethodAsync('OnVideoStartedCallback');
+                                            }
                                         }
 
                                         frameCount++;
@@ -589,7 +653,7 @@ window.SteamViewerWebRTC = {
         }
     },
 
-    // Create data channel (for host)
+    // Create data channel (for host) — legacy single-channel
     createDataChannel(sessionId, name) {
         const session = this._getSession(sessionId);
         if (!session.peerConnection) {
@@ -602,6 +666,30 @@ window.SteamViewerWebRTC = {
         });
         this._setupDataChannel(sessionId, session.dataChannel);
         console.log(`[${sessionId}] Data channel '${name}' created`);
+    },
+
+    // Create dual data channels (for host): control (reliable) + mouse (unreliable)
+    createDataChannels(sessionId) {
+        const session = this._getSession(sessionId);
+        if (!session.peerConnection) {
+            console.error('PeerConnection not initialized');
+            return;
+        }
+
+        // Control channel: ordered, reliable — keyboard, commands, clipboard, files, SD frames
+        session.dataChannel = session.peerConnection.createDataChannel('control', {
+            ordered: true
+        });
+        this._setupDataChannel(sessionId, session.dataChannel);
+
+        // Mouse channel: unordered, unreliable — mouse moves only, eliminates head-of-line blocking
+        session.mouseChannel = session.peerConnection.createDataChannel('mouse', {
+            ordered: false,
+            maxRetransmits: 0
+        });
+        this._setupMouseChannel(sessionId, session.mouseChannel);
+
+        console.log(`[${sessionId}] Dual data channels created (control + mouse)`);
     },
 
     _setupDataChannel(sessionId, channel) {
@@ -621,16 +709,23 @@ window.SteamViewerWebRTC = {
 
         channel.onmessage = async (event) => {
             if (typeof event.data === 'string') {
-                // Check if this is a relayed log message from peer
+                // Check if this is a relayed log message or mode change from peer
                 try {
                     const parsed = JSON.parse(event.data);
                     if (parsed._logRelay) {
-                        // This is a log relay message - handle it specially
                         window.SteamViewerLogger?.handleRelayedLog(parsed.level, parsed.message, parsed.from);
-                        return; // Don't forward to C# as regular message
+                        return;
+                    }
+                    // Cursor shape sync — apply CSS cursor directly in JS (no C# round-trip)
+                    if (parsed.type === 'cursorShape' && parsed.cursor) {
+                        window.SteamViewerInput._remoteCursorShape = parsed.cursor;
+                        if (window.SteamViewerInput.isLocked && window.SteamViewerInput.canvas) {
+                            window.SteamViewerInput.canvas.style.cursor = parsed.cursor;
+                        }
+                        return;
                     }
                 } catch (e) {
-                    // Not JSON or not a log relay - continue normally
+                    // Not JSON - continue normally
                 }
 
                 console.log(`[${sessionId}] Data channel message received:`, event.data?.substring?.(0, 50));
@@ -642,13 +737,43 @@ window.SteamViewerWebRTC = {
             }
         };
 
-        channel.onerror = (error) => {
-            console.error(`[${sessionId}] Data channel error:`, error);
-            window.SteamViewerLogger?.log('error', `Data channel error: ${JSON.stringify(error)}`);
+        channel.onerror = (event) => {
+            const err = event.error;
+            const detail = err ? `errorDetail=${err.errorDetail}, message=${err.message}, sctpCauseCode=${err.sctpCauseCode}, receivedAlert=${err.receivedAlert}, sentAlert=${err.sentAlert}` : 'no error object';
+            console.error(`[${sessionId}] Data channel error: ${detail}`, event);
+            window.SteamViewerLogger?.log('error', `Data channel error: ${detail}`);
         };
     },
 
-    // Send string data over data channel
+    // Set up unreliable mouse channel (lightweight — no binary, messages route to same C# callback)
+    _setupMouseChannel(sessionId, channel) {
+        const session = this._getSession(sessionId);
+        session.mouseChannel = channel;
+
+        channel.onopen = () => {
+            console.log(`[${sessionId}] Mouse channel opened`);
+        };
+
+        channel.onclose = () => {
+            console.log(`[${sessionId}] Mouse channel closed`);
+        };
+
+        // Host receives mouse input through same C# callback as control channel
+        channel.onmessage = async (event) => {
+            if (typeof event.data === 'string' && session.dotNetRef) {
+                await session.dotNetRef.invokeMethodAsync('OnDataChannelMessageCallback', event.data);
+            }
+        };
+
+        channel.onerror = (event) => {
+            const err = event.error;
+            const detail = err ? `errorDetail=${err.errorDetail}, message=${err.message}, sctpCauseCode=${err.sctpCauseCode}` : 'no error object';
+            console.error(`[${sessionId}] Mouse channel error: ${detail}`, event);
+            window.SteamViewerLogger?.log('error', `Mouse channel error: ${detail}`);
+        };
+    },
+
+    // Send string data over data channel (control channel)
     sendData(sessionId, data) {
         const session = this._getSession(sessionId);
         if (session.dataChannel && session.dataChannel.readyState === 'open') {
@@ -670,35 +795,93 @@ window.SteamViewerWebRTC = {
         return false;
     },
 
+    // Send mouse data over unreliable mouse channel (falls back to control channel)
+    sendMouseData(sessionId, data) {
+        const session = this._getSession(sessionId);
+        // Prefer mouse channel (unordered, unreliable — no head-of-line blocking)
+        if (session.mouseChannel && session.mouseChannel.readyState === 'open') {
+            session.mouseChannel.send(data);
+            return true;
+        }
+        // Fallback to control channel if mouse channel not yet open
+        if (session.dataChannel && session.dataChannel.readyState === 'open') {
+            session.dataChannel.send(data);
+            return true;
+        }
+        return false;
+    },
+
     // Modify SDP for lower latency (pure function, no session state)
-    modifySdpForLowLatency(sdp) {
+    // SDP modifications for low-latency remote desktop streaming.
+    // Source: .claude/research/webrtc-latency/research.md (Selkies, Hopp, Neko findings)
+    modifySdpForLowLatency(sdp, { removeFec = false } = {}) {
         let modified = sdp;
 
-        // Lower bandwidth for faster encoding
-        if (!modified.includes('b=AS:')) {
-            modified = modified.replace(/m=video.*\r\n/g, '$&b=AS:3000\r\n');
+        // Remove any existing b=AS lines (old 3Mbps cap that was killing bitrate)
+        modified = modified.replace(/b=AS:\d+\r\n/g, '');
+
+        // Set high bandwidth ceiling for LAN use (50 Mbps)
+        modified = modified.replace(/(m=video[^\r\n]*\r\n)/g, '$1b=AS:50000\r\n');
+
+        // Add x-google bitrate params to H264 fmtp lines — fast ramp-up, no slow BWE climb
+        // start=10Mbps (instant quality), min=5Mbps (floor), max=50Mbps (ceiling)
+        modified = modified.replace(
+            /(a=fmtp:\d+ .*profile-level-id=[0-9a-fA-F]+)(?!.*x-google)/g,
+            '$1;x-google-start-bitrate=10000;x-google-min-bitrate=5000;x-google-max-bitrate=50000'
+        );
+
+        // Add playout-delay RTP header extension — tells Chrome "render ASAP, don't buffer"
+        // This is the sender-side hint that Selkies uses to eliminate jitter buffer latency
+        if (!modified.includes('playout-delay')) {
+            const extmapIds = [...modified.matchAll(/a=extmap:(\d+)/g)].map(m => parseInt(m[1]));
+            const nextId = extmapIds.length > 0 ? Math.max(...extmapIds) + 1 : 13;
+            modified = modified.replace(
+                /(m=video[^\r\n]*\r\n(?:[^\r\n]*\r\n)*?)(a=rtpmap)/,
+                `$1a=extmap:${nextId} http://www.webrtc.org/experiments/rtp-hdrext/playout-delay\r\n$2`
+            );
         }
 
-        // Prefer H264 Baseline profile (fastest encoding, most compatible)
-        // Move H264 to top of codec list if present
+        // Prefer H264 Baseline profile (fastest encode/decode, most compatible)
         const lines = modified.split('\r\n');
         let h264PayloadTypes = [];
-
-        // Find H264 payload types
         lines.forEach(line => {
             if (line.includes('a=rtpmap:') && line.toLowerCase().includes('h264')) {
                 const match = line.match(/a=rtpmap:(\d+)/);
                 if (match) h264PayloadTypes.push(match[1]);
             }
         });
-
-        // Reorder m=video line to prefer H264
         if (h264PayloadTypes.length > 0) {
             modified = modified.replace(/(m=video \d+ [^ ]+ )(.+)/, (match, prefix, payloads) => {
                 const payloadList = payloads.split(' ');
                 const reordered = [...h264PayloadTypes, ...payloadList.filter(p => !h264PayloadTypes.includes(p))];
                 return prefix + reordered.join(' ');
             });
+        }
+
+        // Remove FEC codecs (saves bandwidth + latency, not needed with 0% loss on LAN)
+        if (removeFec) {
+            // Collect payload types for FEC codecs before removing them
+            const fecPTs = [];
+            for (const m of modified.matchAll(/a=rtpmap:(\d+) (?:flexfec|ulpfec|red\/90000)/g)) {
+                fecPTs.push(m[1]);
+            }
+            // Also collect RTX/apt payload types that reference FEC codecs
+            for (const m of modified.matchAll(/a=fmtp:(\d+) apt=(\d+)/g)) {
+                if (fecPTs.includes(m[2])) fecPTs.push(m[1]);
+            }
+            if (fecPTs.length > 0) {
+                // Remove FEC payload types from m=video line
+                modified = modified.replace(/(m=video \d+ [^ ]+) ([^\r\n]+)/, (match, prefix, payloads) => {
+                    const filtered = payloads.split(' ').filter(pt => !fecPTs.includes(pt));
+                    return prefix + ' ' + filtered.join(' ');
+                });
+                // Remove rtpmap, fmtp, and rtcp-fb lines for FEC payload types
+                for (const pt of fecPTs) {
+                    modified = modified.replace(new RegExp(`a=rtpmap:${pt} [^\\r\\n]*\\r\\n`, 'g'), '');
+                    modified = modified.replace(new RegExp(`a=fmtp:${pt} [^\\r\\n]*\\r\\n`, 'g'), '');
+                    modified = modified.replace(new RegExp(`a=rtcp-fb:${pt} [^\\r\\n]*\\r\\n`, 'g'), '');
+                }
+            }
         }
 
         return modified;
@@ -713,11 +896,11 @@ window.SteamViewerWebRTC = {
 
         const offer = await session.peerConnection.createOffer({
             offerToReceiveVideo: true,
-            offerToReceiveAudio: false
+            offerToReceiveAudio: true
         });
 
-        // Modify SDP for lower latency
-        offer.sdp = this.modifySdpForLowLatency(offer.sdp);
+        // Modify SDP for lower latency — removeFec in initial offer (no renegotiation needed)
+        offer.sdp = this.modifySdpForLowLatency(offer.sdp, { removeFec: true });
 
         await session.peerConnection.setLocalDescription(offer);
         console.log(`=== SDP OFFER CREATED [${sessionId}] ===`);
@@ -737,8 +920,8 @@ window.SteamViewerWebRTC = {
 
         const answer = await session.peerConnection.createAnswer();
 
-        // Modify SDP for lower latency
-        answer.sdp = this.modifySdpForLowLatency(answer.sdp);
+        // Modify SDP for lower latency — removeFec in initial answer (no renegotiation needed)
+        answer.sdp = this.modifySdpForLowLatency(answer.sdp, { removeFec: true });
 
         await session.peerConnection.setLocalDescription(answer);
         console.log(`[${sessionId}] SDP answer created`);
@@ -832,7 +1015,7 @@ window.SteamViewerWebRTC = {
 
                 // Set content hint for screen sharing (improves encoding for text/UI)
                 if (track.contentHint !== undefined) {
-                    track.contentHint = 'detail'; // Optimizes for sharp text/UI
+                    track.contentHint = 'motion'; // Prioritize frame rate + low latency over text sharpness // Optimizes for sharp text/UI
                 }
 
                 const sender = session.peerConnection.addTrack(track, session.localStream);
@@ -843,14 +1026,14 @@ window.SteamViewerWebRTC = {
                 if (!params.encodings) {
                     params.encodings = [{}];
                 }
-                params.encodings[0].maxBitrate = 3000000; // 3 Mbps (lower = less latency)
+                params.encodings[0].maxBitrate = 50_000_000; // 50 Mbps ceiling — WebRTC BWE controls actual rate
                 params.encodings[0].maxFramerate = 30;  // Match getDisplayMedia ideal (24 causes stuttering)
                 params.encodings[0].priority = 'high';
                 params.encodings[0].networkPriority = 'high';
                 // Disable scalability for lower latency
                 params.encodings[0].scalabilityMode = 'L1T1';
                 // Maintain frame rate even if quality has to drop (better for responsiveness)
-                params.encodings[0].degradationPreference = 'maintain-framerate';
+                params.encodings[0].degradationPreference = 'maintain-resolution';
                 sender.setParameters(params).catch(e => console.warn('Could not set encoding params:', e));
 
                 // Report actual capture dimensions to host C# (source of truth for coordinate mapping)
@@ -860,6 +1043,26 @@ window.SteamViewerWebRTC = {
                     } catch (e) {
                         console.warn('Could not report capture dims:', e);
                     }
+                }
+
+                // Add silent audio track with SEPARATE MediaStream (different MSID)
+                // This bypasses Chrome's RtpStreamsSynchronizer which adds A/V sync delay to video
+                try {
+                    const audioCtx = new AudioContext();
+                    const oscillator = audioCtx.createOscillator();
+                    const gain = audioCtx.createGain();
+                    gain.gain.value = 0; // silent
+                    oscillator.connect(gain);
+                    const dest = audioCtx.createMediaStreamDestination();
+                    gain.connect(dest);
+                    oscillator.start();
+                    const audioTrack = dest.stream.getAudioTracks()[0];
+                    // Key: new MediaStream([audioTrack]) = different MSID than video stream
+                    session.peerConnection.addTrack(audioTrack, new MediaStream([audioTrack]));
+                    session._silentAudioCtx = audioCtx;
+                    console.log('Silent audio track added (separate MSID for A/V sync bypass)');
+                } catch (e) {
+                    console.warn('Could not add silent audio track:', e);
                 }
 
                 // Handle track ending — retry with fullscreen constraints (keeps connection alive during lock screen)
@@ -972,6 +1175,195 @@ window.SteamViewerWebRTC = {
         }
     },
 
+    // --- Native DXGI Capture (canvas bridge) ---
+    // Replaces getDisplayMedia() — no screen picker, programmatic monitor selection.
+    // C# captures via DXGI Desktop Duplication → JPEG → pushNativeFrame() → hidden canvas
+    // → captureStream() → MediaStream → WebRTC (browser handles H264 encoding)
+
+    // Start native capture: use MediaStreamTrackGenerator (push-based, no canvas)
+    // Fallback to canvas + captureStream(0) if MediaStreamTrackGenerator unavailable
+    startNativeCapture(sessionId, fps) {
+        const session = this._getSession(sessionId);
+        if (!session.peerConnection) {
+            console.error(`[${sessionId}] Cannot start native capture - no peer connection`);
+            return false;
+        }
+
+        fps = fps || 30;
+        let track;
+        let stream;
+
+        // Prefer MediaStreamTrackGenerator (push-based, lower latency)
+        if (typeof MediaStreamTrackGenerator !== 'undefined') {
+            console.log(`[${sessionId}] Starting native DXGI capture (MediaStreamTrackGenerator, ${fps} FPS)`);
+            const generator = new MediaStreamTrackGenerator({ kind: 'video' });
+            session._trackGenerator = generator;
+            session._trackWriter = generator.writable.getWriter();
+            session._useTrackGenerator = true;
+            track = generator;
+            stream = new MediaStream([generator]);
+        } else {
+            // Fallback: canvas + captureStream(0) with manual requestFrame
+            console.log(`[${sessionId}] Starting native DXGI capture (canvas fallback, ${fps} FPS)`);
+            session._nativeCanvas = document.createElement('canvas');
+            session._nativeCtx = session._nativeCanvas.getContext('2d');
+            session._nativeStream = session._nativeCanvas.captureStream(0);
+            session._useTrackGenerator = false;
+            track = session._nativeStream.getVideoTracks()[0];
+            stream = session._nativeStream;
+
+            if (!track) {
+                console.error(`[${sessionId}] captureStream produced no video track`);
+                return false;
+            }
+        }
+
+        // Optimize for screen content (sharp text/UI)
+        track.contentHint = 'motion'; // Prioritize frame rate + low latency over text sharpness
+
+        // Add to peer connection
+        const sender = session.peerConnection.addTrack(track, stream);
+        console.log(`[${sessionId}] Native capture track added to peer connection`);
+
+        // Configure encoding parameters — high ceiling, let WebRTC self-regulate
+        const params = sender.getParameters();
+        if (!params.encodings) params.encodings = [{}];
+        params.encodings[0].maxBitrate = 50_000_000; // 50 Mbps ceiling — WebRTC BWE controls actual rate
+        params.encodings[0].maxFramerate = fps;
+        params.encodings[0].priority = 'high';
+        params.encodings[0].networkPriority = 'high';
+        params.encodings[0].scalabilityMode = 'L1T1';
+        params.encodings[0].degradationPreference = 'maintain-resolution';
+        sender.setParameters(params).catch(e => console.warn('Could not set native capture encoding params:', e));
+
+        // Add silent audio track with SEPARATE MediaStream (different MSID)
+        // This bypasses Chrome's RtpStreamsSynchronizer which adds A/V sync delay to video
+        try {
+            const audioCtx = new AudioContext();
+            const oscillator = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            gain.gain.value = 0; // silent
+            oscillator.connect(gain);
+            const dest = audioCtx.createMediaStreamDestination();
+            gain.connect(dest);
+            oscillator.start();
+            const audioTrack = dest.stream.getAudioTracks()[0];
+            session.peerConnection.addTrack(audioTrack, new MediaStream([audioTrack]));
+            session._silentAudioCtx = audioCtx;
+            console.log(`[${sessionId}] Silent audio track added (separate MSID for A/V sync bypass)`);
+        } catch (e) {
+            console.warn(`[${sessionId}] Could not add silent audio track:`, e);
+        }
+
+        session._nativeCaptureActive = true;
+        session._nativeFrameCount = 0;
+        session._nativeSender = sender;
+        session._nativeStreamRef = stream;
+        console.log(`[${sessionId}] Native DXGI capture ready (waiting for frames from C#)`);
+        return true;
+    },
+
+    // Receive a JPEG frame from C# DXGI capture.
+    // MediaStreamTrackGenerator path: JPEG → createImageBitmap → VideoFrame → writer (push-based)
+    // Canvas fallback path: JPEG → createImageBitmap → drawImage → requestFrame()
+    pushNativeFrame(sessionId, base64Jpeg, width, height) {
+        const session = this.sessions.get(sessionId);
+        if (!session || !session._nativeCaptureActive) return;
+
+        // Decode base64 to binary ArrayBuffer
+        const binary = atob(base64Jpeg);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        const blob = new Blob([bytes], { type: 'image/jpeg' });
+
+        // GPU-accelerated JPEG decode → ImageBitmap
+        createImageBitmap(blob).then(bitmap => {
+            if (!session._nativeCaptureActive) { bitmap.close(); return; }
+
+            if (session._useTrackGenerator && session._trackWriter) {
+                // Push-based: ImageBitmap → VideoFrame → MediaStreamTrackGenerator → WebRTC
+                const frame = new VideoFrame(bitmap, { timestamp: performance.now() * 1000 });
+                bitmap.close();
+                session._trackWriter.write(frame).catch(e => {
+                    // Writer may be closed during shutdown — not an error
+                    if (session._nativeCaptureActive) console.warn('TrackWriter error:', e);
+                });
+            } else if (session._nativeCanvas) {
+                // Canvas fallback: drawImage + manual requestFrame
+                const canvas = session._nativeCanvas;
+                if (canvas.width !== width || canvas.height !== height) {
+                    canvas.width = width;
+                    canvas.height = height;
+                }
+                session._nativeCtx.drawImage(bitmap, 0, 0);
+                bitmap.close();
+                const track = session._nativeStream?.getVideoTracks()[0];
+                if (track?.requestFrame) track.requestFrame();
+            }
+        }).catch(e => {
+            if (session._nativeCaptureActive) console.warn('createImageBitmap error:', e);
+        });
+
+        session._nativeFrameCount = (session._nativeFrameCount || 0) + 1;
+
+        // Report capture dimensions to C# on first frame (same as getDisplayMedia path)
+        if (session._nativeFrameCount === 1 && session.dotNetRef) {
+            try {
+                session.dotNetRef.invokeMethodAsync('OnCaptureStartedCallback', width, height);
+                console.log(`[${sessionId}] Native capture: reported dims ${width}x${height} to C#`);
+            } catch (e) {
+                console.warn('Could not report native capture dims:', e);
+            }
+        }
+    },
+
+    // Stop native DXGI capture and clean up
+    stopNativeCapture(sessionId) {
+        const session = this.sessions.get(sessionId);
+        if (!session) return;
+
+        const frameCount = session._nativeFrameCount || 0;
+        session._nativeCaptureActive = false;
+
+        // Close MediaStreamTrackGenerator resources
+        if (session._trackWriter) {
+            session._trackWriter.close().catch(() => {});
+            session._trackWriter = null;
+        }
+        if (session._trackGenerator) {
+            session._trackGenerator.stop();
+            session._trackGenerator = null;
+        }
+
+        // Stop stream tracks (canvas fallback or generator stream)
+        if (session._nativeStreamRef) {
+            session._nativeStreamRef.getTracks().forEach(t => t.stop());
+            session._nativeStreamRef = null;
+        }
+        if (session._nativeStream) {
+            session._nativeStream.getTracks().forEach(t => t.stop());
+            session._nativeStream = null;
+        }
+
+        // Remove sender from peer connection
+        if (session._nativeSender && session.peerConnection) {
+            try {
+                session.peerConnection.removeTrack(session._nativeSender);
+            } catch (e) {
+                console.warn(`[${sessionId}] Could not remove native capture sender:`, e);
+            }
+            session._nativeSender = null;
+        }
+
+        // Clean up canvas fallback resources
+        session._nativeCanvas = null;
+        session._nativeCtx = null;
+        session._useTrackGenerator = false;
+
+        console.log(`[${sessionId}] Native DXGI capture stopped (${frameCount} frames total)`);
+        session._nativeFrameCount = 0;
+    },
+
     // Pause video track sender (frees bandwidth for data channel during Secure Desktop)
     pauseVideoTrack(sessionId) {
         const session = this._getSession(sessionId);
@@ -979,7 +1371,7 @@ window.SteamViewerWebRTC = {
         session.peerConnection.getSenders().forEach(s => {
             if (s.track?.kind === 'video') {
                 s.track.enabled = false;
-                console.log(`[${sessionId}] Video track paused (Secure Desktop active)`);
+                console.log(`[${sessionId}] Video track paused`);
             }
         });
     },
@@ -991,7 +1383,7 @@ window.SteamViewerWebRTC = {
         session.peerConnection.getSenders().forEach(s => {
             if (s.track?.kind === 'video') {
                 s.track.enabled = true;
-                console.log(`[${sessionId}] Video track resumed (Secure Desktop inactive)`);
+                console.log(`[${sessionId}] Video track resumed`);
             }
         });
     },
@@ -1022,6 +1414,24 @@ window.SteamViewerWebRTC = {
             if ('jitterBufferTarget' in videoReceiver) {
                 videoReceiver.jitterBufferTarget = 0;
                 console.log('Manual setup: Set jitterBufferTarget to 0');
+            }
+
+            // Start 15ms JB pressure interval if not already running
+            if (!session._jbPressureInterval) {
+                session._jbPressureInterval = setInterval(() => {
+                    if (!session.peerConnection) {
+                        clearInterval(session._jbPressureInterval);
+                        session._jbPressureInterval = null;
+                        return;
+                    }
+                    const recvs = session.peerConnection.getReceivers();
+                    for (const r of recvs) {
+                        if (r.track?.kind === 'video') {
+                            if ('jitterBufferTarget' in r) r.jitterBufferTarget = 0;
+                            if ('playoutDelayHint' in r) r.playoutDelayHint = 0;
+                        }
+                    }
+                }, 15);
             }
 
             // Set up the video track (same logic as ontrack)
@@ -1272,6 +1682,7 @@ window.SteamViewerWebRTC = {
     clearDirectRenderTarget(sessionId) {
         const session = this.sessions.get(sessionId);
         if (!session) return;
+        session._firstDirectFrameNotified = false;
         if (session._resizeObserver) {
             session._resizeObserver.disconnect();
             session._resizeObserver = null;
@@ -1526,16 +1937,28 @@ window.SteamViewerWebRTC = {
             if (session._bitrateHistory.length > 5) session._bitrateHistory.shift();
             const avgBandwidth = session._bitrateHistory.reduce((a, b) => a + b, 0) / session._bitrateHistory.length;
 
-            // Target 80% of available bandwidth
-            let newTarget = Math.floor(avgBandwidth * 0.8);
+            // Target 90% of available bandwidth (ramp up aggressively)
+            let newTarget = Math.floor(avgBandwidth * 0.9);
 
-            // Reduce on packet loss
+            // Only reduce below initial bitrate on actual packet loss — never on BWE alone.
+            // BWE starts conservatively and needs high usage to ramp up. Reducing to match
+            // BWE's estimate creates a feedback loop where bitrate gets stuck at ~3Mbps.
             let lossPercent = 0;
             if (packetsReceived + packetsLost > 0) {
                 lossPercent = (packetsLost / (packetsReceived + packetsLost)) * 100;
             }
-            if (lossPercent > 2) newTarget = Math.floor(newTarget * 0.7);
-            else if (lossPercent > 0.5) newTarget = Math.floor(newTarget * 0.9);
+
+            const initialBitrate = 10_000_000; // Must match startNativeCapture / startScreenShare
+            if (lossPercent > 2) {
+                // Significant loss — reduce aggressively, allow going below initial
+                newTarget = Math.floor(newTarget * 0.7);
+            } else if (lossPercent > 0.5) {
+                // Mild loss — reduce gently, allow going below initial
+                newTarget = Math.floor(newTarget * 0.9);
+            } else {
+                // No loss — never reduce below initial, only ramp up
+                newTarget = Math.max(newTarget, initialBitrate);
+            }
 
             // Clamp
             newTarget = Math.max(session._minBitrate, Math.min(session._maxBitrate, newTarget));
@@ -1561,9 +1984,9 @@ window.SteamViewerWebRTC = {
 
             session._targetBitrate = newTarget;
 
-            if (newTarget >= 4_000_000) session._qualityMode = 'HQ';
-            else if (newTarget >= 2_000_000) session._qualityMode = 'MQ';
-            else if (newTarget >= 1_000_000) session._qualityMode = 'LQ';
+            if (newTarget >= 20_000_000) session._qualityMode = 'HQ';
+            else if (newTarget >= 8_000_000) session._qualityMode = 'MQ';
+            else if (newTarget >= 2_000_000) session._qualityMode = 'LQ';
             else session._qualityMode = 'MIN';
         } catch (e) {
             console.warn('[Bitrate] adaptation error:', e);
@@ -1611,6 +2034,11 @@ window.SteamViewerWebRTC = {
                 if (report.frameWidth && report.frameHeight) {
                     resolution = `${report.frameWidth}x${report.frameHeight}`;
                 }
+                // Jitter buffer metrics — track cumulative values for delta calculation
+                if (report.jitterBufferDelay !== undefined && report.jitterBufferEmittedCount) {
+                    session._jbDelay = report.jitterBufferDelay;
+                    session._jbCount = report.jitterBufferEmittedCount;
+                }
             }
             // RTT from candidate pair
             if (report.type === 'candidate-pair' && report.state === 'succeeded') {
@@ -1654,8 +2082,26 @@ window.SteamViewerWebRTC = {
         session._inputEventsCount = 0;
         session._inputThrottledCount = 0;
 
-        // Save for next delta
-        session._statsPrev = { time: now, bytes: currentBytes, frames: currentFrames };
+        // Jitter buffer delta — average JB delay since last poll
+        // Source: .claude/research/webrtc-latency/research.md (Selkies pattern)
+        let jbAvgMs = session._jbAvgMs || 0;
+        if (session._jbDelay !== undefined && session._statsPrev?.jbDelay !== undefined) {
+            const deltaDelay = session._jbDelay - session._statsPrev.jbDelay;
+            const deltaCount = session._jbCount - (session._statsPrev.jbCount || 0);
+            if (deltaCount > 0) {
+                jbAvgMs = (deltaDelay / deltaCount) * 1000; // seconds → ms
+                session._jbAvgMs = jbAvgMs;
+            }
+        }
+
+        // JB pressure moved to dedicated 15ms interval (_jbPressureInterval)
+        // — 1000ms was too slow, Chrome's adaptive algorithm regrows buffer between polls
+
+        // Save for next delta (include jitter buffer cumulative values)
+        session._statsPrev = {
+            time: now, bytes: currentBytes, frames: currentFrames,
+            jbDelay: session._jbDelay, jbCount: session._jbCount
+        };
 
         // If resolution still unknown, try from canvas/video
         if (resolution === '?') {
@@ -1669,7 +2115,7 @@ window.SteamViewerWebRTC = {
         // Format overlay text
         const lines = [
             `Video: ${videoFps.toFixed(0)} FPS | ${bitrateMbps.toFixed(1)} Mbps | ${resolution}`,
-            `Net:   RTT ${rttMs.toFixed(0)}ms | Loss ${lossPercent.toFixed(1)}%`,
+            `Lat:   JB ${jbAvgMs.toFixed(0)}ms | RTT ${rttMs.toFixed(0)}ms | Loss ${lossPercent.toFixed(1)}%`,
             `Input: ${inputPerSec} evt/s${throttledPerSec > 0 ? ` (${throttledPerSec} throttled)` : ''} | Buf: ${bufferKB.toFixed(0)} KB`,
             `Data:  ${fmtBytes(currentBytes)} video | ${fmtBytes(dataChannelBytes)} ctrl`,
             `Mode:  [${session._qualityMode}] Target: ${(session._targetBitrate / 1_000_000).toFixed(1)} Mbps`
@@ -1686,7 +2132,7 @@ window.SteamViewerWebRTC = {
             try {
                 session.dotNetRef.invokeMethodAsync('OnStatsUpdate', JSON.stringify({
                     videoFps, bitrateMbps, resolution,
-                    rttMs, lossPercent,
+                    rttMs, lossPercent, jbAvgMs,
                     inputPerSec, throttledPerSec, bufferKB,
                     currentBytes, dataChannelBytes,
                     qualityMode: session._qualityMode
@@ -1706,6 +2152,12 @@ window.SteamViewerWebRTC = {
         const session = this.sessions.get(sessionId);
         if (!session) return;
 
+        // Stop JB pressure interval
+        if (session._jbPressureInterval) {
+            clearInterval(session._jbPressureInterval);
+            session._jbPressureInterval = null;
+        }
+
         this._stopStatsPolling(sessionId);
         this._removeStatsOverlay(sessionId);
         this.stopFrameCapture(sessionId);
@@ -1723,6 +2175,11 @@ window.SteamViewerWebRTC = {
 
         session.remoteCanvas = null;
         session.remoteCtx = null;
+
+        if (session.mouseChannel) {
+            session.mouseChannel.close();
+            session.mouseChannel = null;
+        }
 
         if (session.dataChannel) {
             session.dataChannel.close();
@@ -1743,6 +2200,12 @@ window.SteamViewerWebRTC = {
         if (session._visibilityHandler) {
             document.removeEventListener('visibilitychange', session._visibilityHandler);
             session._visibilityHandler = null;
+        }
+
+        // Close silent audio context
+        if (session._silentAudioCtx) {
+            session._silentAudioCtx.close().catch(() => {});
+            session._silentAudioCtx = null;
         }
 
         session.dotNetRef = null;
@@ -1798,11 +2261,33 @@ window.SteamViewerInput = {
     _inputEventCount: 0,
     _lastMouseDownCoords: null,  // Cache coords from mouse_down for identical mouse_up (prevents micro-drag)
     _focusWatchdogId: null,
-    // Mouse throttle — send at 30 Hz max, draw local cursor on every move
-    _lastMouseSendTime: 0,
-    _mouseSendInterval: 33, // ms (~30 Hz)
-    _pendingMouseCoords: null, // Buffered coords for trailing send
-    _pendingMouseTimer: null,
+    // PID mouse regulation — sends every event at low velocity (precision/hover),
+    // suppresses during sweeps, sends immediately on deceleration (arrival detection)
+    _pidAlpha: 0.3,           // EMA smoothing factor for velocity (0-1, lower = smoother)
+    _pidKp: 1.0,              // Proportional gain (velocity weight)
+    _pidKi: 0.5,              // Integral gain (accumulated movement weight)
+    _pidKd: 2.0,              // Derivative gain (acceleration/deceleration weight)
+    _pidSendThreshold: 0.8,   // Score above this = suppress (buffer for interval)
+    _pidIDecay: 0.95,         // Integral decay per event (anti-windup via EMA)
+    _pidIMax: 5.0,            // Integral clamp (anti-windup hard limit)
+    _pidIdleThresholdMs: 100, // ms idle before triggering cold start burst
+    _pidColdStartBurst: 5,    // Number of events to force-send after idle
+    _pidColdStartRemaining: 0, // Counter for remaining burst events
+    // Dynamic cooldown — timer send rate scales with velocity
+    _pidMinCooldown: 16,      // ms — fastest timer rate during sweeps (~60 FPS)
+    _pidMaxCooldown: 100,     // ms — slowest timer rate for fast sweeps (~10 FPS)
+    _pidVelocityCap: 2.0,     // px/ms — velocity at which cooldown maxes out
+    // PID internal state
+    _pidVelocity: 0,          // EMA-smoothed velocity (px/ms)
+    _pidIntegral: 0,          // Accumulated velocity integral (with decay)
+    _pidLastVelocity: 0,      // Previous smoothed velocity (for D term)
+    _pidLastEventTime: 0,     // Timestamp of previous mousemove
+    // Regulation plumbing
+    _lastTimerSendTime: 0,    // Timestamp of last timer-initiated send
+    _lastSentX: 0,
+    _lastSentY: 0,
+    _bufferedMouseCoords: null,     // Latest coords waiting for interval send
+    _regulationTimer: null,         // setInterval for sweep mode sends
 
 
     initialize(canvasId, dotNetReference, options = {}) {
@@ -1963,14 +2448,21 @@ window.SteamViewerInput = {
         }
     },
 
+    // Remote cursor shape from host (set via cursorShape data channel message)
+    _remoteCursorShape: 'default',
+
     lock() {
         this.ensureCanvas();
         this.isLocked = true;
         this.updateLockIndicator();
         this.notifyLockChange();
         this.canvas.focus();
+        // Apply remote cursor shape — shows the host's current cursor type locally
+        this.canvas.style.cursor = this._remoteCursorShape || 'default';
         // Gesture-backed restart: user click to lock = user gesture for getDisplayMedia
         this._restartSharingIfLost();
+        // Start mouse regulation interval timer (sweep mode sends)
+        this._startRegulationTimer();
         console.log('Input LOCKED - sending inputs to host');
     },
 
@@ -1995,7 +2487,53 @@ window.SteamViewerInput = {
         this.isLocked = false;
         this.updateLockIndicator();
         this.notifyLockChange();
+        this._stopRegulationTimer();
+        // Restore default cursor (no longer mirroring host cursor shape)
+        if (this.canvas) this.canvas.style.cursor = '';
         console.log('Input UNLOCKED');
+    },
+
+    _startRegulationTimer() {
+        this._stopRegulationTimer();
+        this._pidVelocity = 0;
+        this._pidIntegral = 0;
+        this._pidLastVelocity = 0;
+        this._pidLastEventTime = 0;
+        this._lastTimerSendTime = 0;
+        this._pidColdStartRemaining = 0;
+        this._regulationTimer = setInterval(async () => {
+            const c = this._bufferedMouseCoords;
+            if (!c || !this.dotNetRef || !this.isLocked) return;
+
+            const now = performance.now();
+            const elapsed = now - this._lastTimerSendTime;
+            // Dynamic cooldown: scales linearly with velocity
+            const t = Math.min(this._pidVelocity / this._pidVelocityCap, 1);
+            const cooldown = this._pidMinCooldown + (this._pidMaxCooldown - this._pidMinCooldown) * t;
+
+            if (elapsed < cooldown) return; // not enough time since last send
+
+            this._lastSentX = c.x;
+            this._lastSentY = c.y;
+            this._bufferedMouseCoords = null;
+            this._lastTimerSendTime = now;
+            try {
+                await this.dotNetRef.invokeMethodAsync('OnMouseMove', c.x, c.y, c.captureW, c.captureH);
+            } catch (err) { /* ignore sweep send errors */ }
+        }, 16); // Poll at 60Hz, actual send rate governed by dynamic cooldown
+    },
+
+    _stopRegulationTimer() {
+        if (this._regulationTimer) {
+            clearInterval(this._regulationTimer);
+            this._regulationTimer = null;
+        }
+        this._bufferedMouseCoords = null;
+        this._pidVelocity = 0;
+        this._pidIntegral = 0;
+        this._pidLastVelocity = 0;
+        this._pidLastEventTime = 0;
+        this._lastTimerSendTime = 0;
     },
 
     notifyLockChange() {
@@ -2132,36 +2670,49 @@ window.SteamViewerInput = {
             captureH = lb ? lb.videoH : this.canvas.height;
         }
 
-        // Throttle data channel sends to ~30 Hz (local cursor is already updated above)
+        // PID mouse regulation:
+        // Low score (slow/decelerating/arriving) → send immediately
+        // High score (fast/sustained/accelerating) → buffer, interval timer flushes
         const now = performance.now();
-        const elapsed = now - this._lastMouseSendTime;
+        let dt = now - this._pidLastEventTime;
+        if (dt <= 0) dt = 1; // guard against same-timestamp events
 
-        if (elapsed >= this._mouseSendInterval) {
-            // Enough time passed — send immediately
-            this._lastMouseSendTime = now;
-            if (this._pendingMouseTimer) {
-                clearTimeout(this._pendingMouseTimer);
-                this._pendingMouseTimer = null;
-            }
+        // Cold start burst — detect idle→movement transition, force-send first N events
+        if (dt > this._pidIdleThresholdMs) {
+            this._pidColdStartRemaining = this._pidColdStartBurst;
+        }
+
+        const rawVelocity = Math.hypot(e.movementX, e.movementY) / dt; // px/ms
+        const velocity = this._pidAlpha * rawVelocity + (1 - this._pidAlpha) * this._pidVelocity;
+
+        // PID terms
+        const P = this._pidKp * velocity;
+        this._pidIntegral = Math.min(this._pidIntegral * this._pidIDecay + velocity * dt, this._pidIMax);
+        const I = this._pidKi * this._pidIntegral;
+        const D = this._pidKd * (velocity - this._pidLastVelocity) / dt;
+
+        const score = P + I + D;
+
+        // Update state before send (so first event after lock works)
+        this._pidLastVelocity = velocity;
+        this._pidVelocity = velocity;
+        this._pidLastEventTime = now;
+
+        // Cold start burst bypasses PID — always send immediately after idle
+        const coldStart = this._pidColdStartRemaining > 0;
+        if (coldStart) this._pidColdStartRemaining--;
+
+        if (coldStart || score < this._pidSendThreshold) {
+            // Precision / arrival — send immediately
+            this._lastSentX = x;
+            this._lastSentY = y;
+            this._bufferedMouseCoords = null;
             try {
                 await this.dotNetRef.invokeMethodAsync('OnMouseMove', x, y, captureW, captureH);
             } catch (err) { console.error('[Input] OnMouseMove failed:', err); }
         } else {
-            // Buffer coords for trailing send (ensures final position is always sent)
-            this._pendingMouseCoords = { x, y, captureW, captureH };
-            if (!this._pendingMouseTimer) {
-                this._pendingMouseTimer = setTimeout(async () => {
-                    this._pendingMouseTimer = null;
-                    const c = this._pendingMouseCoords;
-                    if (c && this.dotNetRef && this.isLocked) {
-                        this._lastMouseSendTime = performance.now();
-                        this._pendingMouseCoords = null;
-                        try {
-                            await this.dotNetRef.invokeMethodAsync('OnMouseMove', c.x, c.y, c.captureW, c.captureH);
-                        } catch (err) { /* ignore trailing send errors */ }
-                    }
-                }, this._mouseSendInterval - elapsed);
-            }
+            // Sweep or decelerating (not yet arrived) — buffer, interval timer will flush
+            this._bufferedMouseCoords = { x, y, captureW, captureH };
         }
     },
 
@@ -2264,11 +2815,8 @@ window.SteamViewerInput = {
             this.lockIndicator = null;
         }
 
-        // Clear throttle timers
-        if (this._pendingMouseTimer) {
-            clearTimeout(this._pendingMouseTimer);
-            this._pendingMouseTimer = null;
-        }
+        // Clear regulation timer
+        this._stopRegulationTimer();
 
         // Remove event listeners from canvas
         if (this.canvas) {
@@ -2532,3 +3080,86 @@ window.SteamViewerSecureDesktop = {
         ctx.fill();
     }
 };
+
+// --- WebView2 SharedBuffer receiver (zero-copy frame transfer from C# DXGI capture) ---
+// Supports two modes:
+//   raw BGRA: VideoFrame directly from pixel data (no JPEG encode/decode — fastest)
+//   JPEG fallback: createImageBitmap → VideoFrame (when raw not available)
+// Source: .claude/research/binary-frame-transfer/research.md
+if (window.chrome?.webview) {
+    window.chrome.webview.addEventListener('sharedbufferreceived', (e) => {
+        try {
+            const meta = e.additionalData; // Already parsed by WebView2 — NOT a string
+            const buf = e.getBuffer();
+
+            const session = window.SteamViewerWebRTC.sessions.get(meta.sid);
+            if (!session?._nativeCaptureActive) {
+                chrome.webview.releaseBuffer(buf);
+                return;
+            }
+
+            if (meta.raw) {
+                // Raw BGRA path — VideoFrame directly from pixel data
+                // No JPEG encode, no JPEG decode, no createImageBitmap. Synchronous.
+                // Must copy bytes out of SharedBuffer before releasing (SharedBuffer
+                // ArrayBuffer may not be accepted by VideoFrame constructor directly)
+                const bgraCopy = new Uint8Array(buf, 0, meta.len).slice();
+                chrome.webview.releaseBuffer(buf);
+                const frame = new VideoFrame(bgraCopy, {
+                    format: 'BGRA',
+                    codedWidth: meta.w,
+                    codedHeight: meta.h,
+                    timestamp: performance.now() * 1000,
+                });
+
+                if (session._useTrackGenerator && session._trackWriter) {
+                    session._trackWriter.write(frame).catch(() => {});
+                } else {
+                    frame.close();
+                }
+            } else {
+                // JPEG fallback path (async — needs createImageBitmap)
+                const jpegBytes = new Uint8Array(buf, 0, meta.len).slice();
+                chrome.webview.releaseBuffer(buf);
+
+                const blob = new Blob([jpegBytes], { type: 'image/jpeg' });
+                createImageBitmap(blob).then(bitmap => {
+                    if (!session._nativeCaptureActive) { bitmap.close(); return; }
+
+                    if (session._useTrackGenerator && session._trackWriter) {
+                        const frame = new VideoFrame(bitmap, { timestamp: performance.now() * 1000 });
+                        bitmap.close();
+                        session._trackWriter.write(frame).catch(() => {});
+                    } else if (session._nativeCanvas) {
+                        const canvas = session._nativeCanvas;
+                        if (canvas.width !== meta.w || canvas.height !== meta.h) {
+                            canvas.width = meta.w;
+                            canvas.height = meta.h;
+                        }
+                        session._nativeCtx.drawImage(bitmap, 0, 0);
+                        bitmap.close();
+                        const track = session._nativeStream?.getVideoTracks()[0];
+                        if (track?.requestFrame) track.requestFrame();
+                    }
+                }).catch(() => {});
+            }
+
+            session._nativeFrameCount = (session._nativeFrameCount || 0) + 1;
+
+            // Report dimensions on first frame
+            if (session._nativeFrameCount === 1 && session.dotNetRef) {
+                try {
+                    session.dotNetRef.invokeMethodAsync('OnCaptureStartedCallback', meta.w, meta.h);
+                    console.log(`[${meta.sid}] SharedBuffer: reported dims ${meta.w}x${meta.h} to C#`);
+                } catch (err) {
+                    console.warn('Could not report SharedBuffer dims:', err);
+                }
+            }
+        } catch (err) {
+            console.warn('SharedBuffer frame error:', err);
+        }
+    });
+    console.log('[SharedBuffer] WebView2 SharedBuffer receiver registered');
+} else {
+    console.log('[SharedBuffer] Not in WebView2 — using JSInterop fallback');
+}

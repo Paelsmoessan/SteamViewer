@@ -62,6 +62,12 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
     public event Action<string>? OnStatsUpdated;
 
     /// <summary>
+    /// Raised when the first video frame is rendered via direct rendering.
+    /// Used by RemoteViewer to dismiss the "Waiting for host screen" overlay.
+    /// </summary>
+    public event Action? OnVideoStarted;
+
+    /// <summary>
     /// Raised when screen sharing was lost and all JS auto-restart attempts failed.
     /// </summary>
     public event Action? OnScreenShareLost;
@@ -178,6 +184,16 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
     }
 
     /// <summary>
+    /// Create dual data channels: control (reliable) + mouse (unreliable).
+    /// </summary>
+    public async Task CreateDataChannelsAsync()
+    {
+        EnsureInitialized();
+        await _jsRuntime.InvokeVoidAsync("SteamViewerWebRTC.createDataChannels", _sessionId);
+        _logger.LogDebug("Dual data channels created (control + mouse)");
+    }
+
+    /// <summary>
     /// Create an SDP offer (for viewer initiating connection).
     /// </summary>
     public async Task<string> CreateOfferAsync()
@@ -242,6 +258,37 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
     }
 
     /// <summary>
+    /// Start native DXGI capture via canvas bridge (no screen picker).
+    /// Creates hidden canvas + captureStream → MediaStream → addTrack.
+    /// </summary>
+    public async Task<bool> StartNativeCaptureAsync(int fps = 30)
+    {
+        EnsureInitialized();
+        var success = await _jsRuntime.InvokeAsync<bool>("SteamViewerWebRTC.startNativeCapture", _sessionId, fps);
+        _logger.LogInformation("Native DXGI capture started: {Success}", success);
+        return success;
+    }
+
+    /// <summary>
+    /// Push a JPEG frame from DXGI capture to the JS canvas bridge.
+    /// Fire-and-forget from capture thread — do not await on hot path.
+    /// </summary>
+    public ValueTask PushNativeFrameAsync(string base64Jpeg, int width, int height)
+    {
+        return _jsRuntime.InvokeVoidAsync("SteamViewerWebRTC.pushNativeFrame", _sessionId, base64Jpeg, width, height);
+    }
+
+    /// <summary>
+    /// Stop native DXGI capture and clean up canvas bridge.
+    /// </summary>
+    public async Task StopNativeCaptureAsync()
+    {
+        EnsureInitialized();
+        await _jsRuntime.InvokeVoidAsync("SteamViewerWebRTC.stopNativeCapture", _sessionId);
+        _logger.LogInformation("Native DXGI capture stopped");
+    }
+
+    /// <summary>
     /// Pause video track sender (frees bandwidth for data channel during Secure Desktop).
     /// </summary>
     public async Task PauseVideoTrackAsync()
@@ -260,12 +307,21 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
     }
 
     /// <summary>
-    /// Send string data over the data channel.
+    /// Send string data over the control data channel.
     /// </summary>
     public async Task<bool> SendDataAsync(string data)
     {
         EnsureInitialized();
         return await _jsRuntime.InvokeAsync<bool>("SteamViewerWebRTC.sendData", _sessionId, data);
+    }
+
+    /// <summary>
+    /// Send mouse data over the unreliable mouse channel (falls back to control channel).
+    /// </summary>
+    public async Task<bool> SendMouseDataAsync(string data)
+    {
+        EnsureInitialized();
+        return await _jsRuntime.InvokeAsync<bool>("SteamViewerWebRTC.sendMouseData", _sessionId, data);
     }
 
     /// <summary>
@@ -291,9 +347,8 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
             await InitializeAsync();
         }
 
-        // Create data channels for video and input
-        await CreateDataChannelAsync("video");
-        await CreateDataChannelAsync("input");
+        // Create dual data channels: control (reliable) + mouse (unreliable)
+        await CreateDataChannelsAsync();
 
         // Create offer
         var offer = await CreateOfferAsync();
@@ -519,6 +574,13 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
     {
         _logger.LogInformation("Capture started: {Width}x{Height} (physical pixels)", width, height);
         OnCaptureStarted?.Invoke(width, height);
+    }
+
+    [JSInvokable]
+    public void OnVideoStartedCallback()
+    {
+        _logger.LogInformation("First video frame rendered via direct rendering");
+        OnVideoStarted?.Invoke();
     }
 
     #endregion
