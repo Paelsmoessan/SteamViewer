@@ -1,5 +1,6 @@
 using SteamViewer.App.Services;
 using System.Collections.Concurrent;
+using System.Text.Json;
 
 namespace SteamViewer.App;
 
@@ -8,8 +9,13 @@ public partial class App : Application
     private CollaborationViewerService? _collabViewerService;
     private ViewerTabManager? _tabManager;
     private Window? _collabViewerWindow;
+    private Window? _mainWindow;
     private readonly ConcurrentDictionary<string, Window> _viewerWindows = new();
     private bool _initialized;
+
+    private static readonly string WindowStateFile = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "SteamViewer", "window-state.json");
 
     public App()
     {
@@ -18,16 +24,39 @@ public partial class App : Application
 
     protected override Window CreateWindow(IActivationState? activationState)
     {
-        var mainWindow = new Window(new MainPage())
+        var state = LoadWindowState();
+
+        double width = state?.Width ?? 640;
+        double height = state?.Height ?? 720;
+        double x, y;
+
+        if (state != null)
+        {
+            x = state.X;
+            y = state.Y;
+        }
+        else
+        {
+            var display = DeviceDisplay.MainDisplayInfo;
+            var screenW = display.Width / display.Density;
+            var screenH = display.Height / display.Density;
+            x = (screenW - width) / 2;
+            y = (screenH - height) / 2;
+        }
+
+        _mainWindow = new Window(new MainPage())
         {
             Title = "SteamViewer",
-            Width = 640,
-            Height = 720
+            Width = width,
+            Height = height,
+            X = x,
+            Y = y
         };
 
-        // Kill entire process tree on main window close (prevents orphaned WebView2 processes)
-        mainWindow.Destroying += (s, e) =>
+        // Save window state and kill process on close
+        _mainWindow.Destroying += (s, e) =>
         {
+            SaveWindowState();
             Environment.Exit(0);
         };
 
@@ -38,7 +67,44 @@ public partial class App : Application
             MainThread.BeginInvokeOnMainThread(InitializeViewerServices);
         }
 
-        return mainWindow;
+        return _mainWindow;
+    }
+
+    private static WindowState? LoadWindowState()
+    {
+        try
+        {
+            if (!File.Exists(WindowStateFile)) return null;
+            var json = File.ReadAllText(WindowStateFile);
+            return JsonSerializer.Deserialize<WindowState>(json);
+        }
+        catch { return null; }
+    }
+
+    private void SaveWindowState()
+    {
+        try
+        {
+            if (_mainWindow == null) return;
+            var state = new WindowState
+            {
+                X = _mainWindow.X,
+                Y = _mainWindow.Y,
+                Width = _mainWindow.Width,
+                Height = _mainWindow.Height
+            };
+            Directory.CreateDirectory(Path.GetDirectoryName(WindowStateFile)!);
+            File.WriteAllText(WindowStateFile, JsonSerializer.Serialize(state));
+        }
+        catch { /* best effort */ }
+    }
+
+    private record WindowState
+    {
+        public double X { get; init; }
+        public double Y { get; init; }
+        public double Width { get; init; }
+        public double Height { get; init; }
     }
 
     private void InitializeViewerServices()

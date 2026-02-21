@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.IO.Compression;
 using System.Reflection;
+using System.Runtime.InteropServices;
 
 namespace SteamViewer.Launcher;
 
@@ -11,7 +12,6 @@ static class Program
     private static readonly string VersionFileName = "launcher-version.txt";
     private static readonly string PayloadResourceName = "SteamViewer.Launcher.payload.SteamViewer.zip";
 
-    [STAThread]
     static int Main(string[] args)
     {
         try
@@ -25,42 +25,41 @@ static class Program
 
             if (needsExtract)
             {
-                ShowConsole();
-                Console.WriteLine();
-                Console.WriteLine("  SteamViewer Launcher");
-                Console.WriteLine("  ====================");
-                Console.WriteLine();
+                using var splash = new SplashWindow();
+                splash.Show();
 
-                if (!File.Exists(appExePath))
-                    Console.WriteLine("  First run — installing SteamViewer...");
-                else
-                    Console.WriteLine("  Update detected — installing new version...");
+                var isFirstRun = !File.Exists(appExePath);
+                splash.SetStatus(isFirstRun ? "Installing SteamViewer..." : "Updating SteamViewer...");
 
-                Console.WriteLine();
-
-                if (!ExtractPayload(installDir))
+                var success = ExtractPayload(installDir, (extracted, total) =>
                 {
-                    Console.WriteLine("  [ERROR] Failed to extract application files.");
-                    Console.WriteLine("  Press any key to exit...");
-                    Console.ReadKey(true);
+                    var percent = (int)((double)extracted / total * 100);
+                    splash.SetProgress(percent, $"Extracting files... ({extracted}/{total})");
+                });
+
+                if (!success)
+                {
+                    splash.Close();
+                    MessageBoxW(IntPtr.Zero,
+                        "Failed to extract application files.\nPlease try downloading again.",
+                        "SteamViewer", 0x10); // MB_ICONERROR
                     return 1;
                 }
 
                 File.WriteAllText(versionFilePath, launcherVersion);
-                Console.WriteLine($"  Installed to: {installDir}");
-                Console.WriteLine();
+                splash.SetProgress(100, "Launching...");
+                Thread.Sleep(300);
+                splash.Close();
             }
 
             if (!File.Exists(appExePath))
             {
-                ShowConsole();
-                Console.WriteLine($"  [ERROR] {AppExeName} not found at: {appExePath}");
-                Console.WriteLine("  Press any key to exit...");
-                Console.ReadKey(true);
+                MessageBoxW(IntPtr.Zero,
+                    $"{AppExeName} not found.\nPlease try downloading again.",
+                    "SteamViewer", 0x10);
                 return 1;
             }
 
-            // Launch the app and exit
             var startInfo = new ProcessStartInfo
             {
                 FileName = appExePath,
@@ -68,7 +67,6 @@ static class Program
                 UseShellExecute = true
             };
 
-            // Forward any command-line arguments
             foreach (var arg in args)
                 startInfo.ArgumentList.Add(arg);
 
@@ -77,11 +75,9 @@ static class Program
         }
         catch (Exception ex)
         {
-            ShowConsole();
-            Console.WriteLine($"  [ERROR] {ex.Message}");
-            Console.WriteLine();
-            Console.WriteLine("  Press any key to exit...");
-            Console.ReadKey(true);
+            MessageBoxW(IntPtr.Zero,
+                $"Launch failed:\n{ex.Message}",
+                "SteamViewer", 0x10);
             return 1;
         }
     }
@@ -108,28 +104,16 @@ static class Program
         return installedVersion == launcherVersion;
     }
 
-    private static bool ExtractPayload(string installDir)
+    private static bool ExtractPayload(string installDir, Action<int, int> onProgress)
     {
         var assembly = Assembly.GetExecutingAssembly();
         using var stream = assembly.GetManifestResourceStream(PayloadResourceName);
 
         if (stream == null)
-        {
-            Console.WriteLine("  [ERROR] Embedded payload not found in launcher.");
-            Console.WriteLine($"  Expected resource: {PayloadResourceName}");
-            Console.WriteLine();
-            Console.WriteLine("  Available resources:");
-            foreach (var name in assembly.GetManifestResourceNames())
-                Console.WriteLine($"    - {name}");
             return false;
-        }
 
-        Console.Write("  Extracting...");
-
-        // Ensure install directory exists
         Directory.CreateDirectory(installDir);
 
-        // Extract to a temp directory first, then swap
         var tempDir = installDir + ".update";
         if (Directory.Exists(tempDir))
             Directory.Delete(tempDir, true);
@@ -139,39 +123,33 @@ static class Program
         try
         {
             using var archive = new ZipArchive(stream, ZipArchiveMode.Read);
-            var totalEntries = archive.Entries.Count;
+            var totalEntries = archive.Entries.Count(e => !string.IsNullOrEmpty(e.Name));
             var extracted = 0;
 
             foreach (var entry in archive.Entries)
             {
                 var destPath = Path.Combine(tempDir, entry.FullName);
 
-                // Create subdirectories
                 var destDir = Path.GetDirectoryName(destPath);
                 if (destDir != null)
                     Directory.CreateDirectory(destDir);
 
-                // Skip directory entries
                 if (string.IsNullOrEmpty(entry.Name))
                     continue;
 
                 entry.ExtractToFile(destPath, true);
                 extracted++;
 
-                // Progress indicator
-                if (extracted % 50 == 0 || extracted == totalEntries)
-                    Console.Write($"\r  Extracting... {extracted}/{totalEntries} files");
+                if (extracted % 20 == 0 || extracted == totalEntries)
+                    onProgress(extracted, totalEntries);
             }
 
-            Console.WriteLine($"\r  Extracting... {extracted}/{totalEntries} files — done!");
+            onProgress(totalEntries, totalEntries);
 
-            // Kill any running instance before swapping
             KillRunningInstances();
 
-            // Swap: delete old install, rename temp to install
             if (Directory.Exists(installDir))
             {
-                // Move old to .old, move new to install, delete .old
                 var oldDir = installDir + ".old";
                 if (Directory.Exists(oldDir))
                     Directory.Delete(oldDir, true);
@@ -189,7 +167,6 @@ static class Program
         }
         catch
         {
-            // Clean up temp dir on failure
             if (Directory.Exists(tempDir))
                 Directory.Delete(tempDir, true);
             throw;
@@ -203,23 +180,16 @@ static class Program
             var processes = Process.GetProcessesByName("SteamViewer.App");
             foreach (var proc in processes)
             {
-                Console.WriteLine($"  Stopping running instance (PID {proc.Id})...");
                 proc.Kill();
                 proc.WaitForExit(5000);
             }
         }
         catch
         {
-            // Best effort — if we can't kill it, the swap will fail and we'll error out
+            // Best effort
         }
     }
 
-    private static void ShowConsole()
-    {
-        // WinExe hides console by default — allocate one for output
-        AllocConsole();
-    }
-
-    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
-    private static extern bool AllocConsole();
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int MessageBoxW(IntPtr hWnd, string text, string caption, uint type);
 }
