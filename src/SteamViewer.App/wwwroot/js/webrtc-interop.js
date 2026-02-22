@@ -845,8 +845,14 @@ window.SteamViewerWebRTC = {
 
         channel.onmessage = async (event) => {
             if (event.data instanceof ArrayBuffer && session.dotNetRef) {
+                // Blazor JSInterop deserializes byte[] from base64 strings, not number arrays
                 const uint8Array = new Uint8Array(event.data);
-                await session.dotNetRef.invokeMethodAsync('OnFileDataBinaryCallback', Array.from(uint8Array));
+                let binary = '';
+                for (let i = 0; i < uint8Array.length; i++) {
+                    binary += String.fromCharCode(uint8Array[i]);
+                }
+                const base64 = btoa(binary);
+                await session.dotNetRef.invokeMethodAsync('OnFileDataBinaryCallback', base64);
             }
         };
 
@@ -868,10 +874,15 @@ window.SteamViewerWebRTC = {
     },
 
     // Send raw binary data over file-data channel (file content responses)
-    sendFileDataBinary(sessionId, data) {
+    // C# byte[] arrives as base64 string via JSInterop — decode to ArrayBuffer before sending
+    sendFileDataBinary(sessionId, base64Data) {
         const session = this._getSession(sessionId);
         if (session.fileDataChannel && session.fileDataChannel.readyState === 'open') {
-            const uint8Array = new Uint8Array(data);
+            const binary = atob(base64Data);
+            const uint8Array = new Uint8Array(binary.length);
+            for (let i = 0; i < binary.length; i++) {
+                uint8Array[i] = binary.charCodeAt(i);
+            }
             session.fileDataChannel.send(uint8Array.buffer);
             return true;
         }

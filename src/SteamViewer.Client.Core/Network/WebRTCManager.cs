@@ -590,10 +590,11 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
     }
 
     [JSInvokable]
-    public async Task OnFileDataBinaryCallback(byte[] data)
+    public async Task OnFileDataBinaryCallback(string base64Data)
     {
         if (OnFileDataBinaryMessage != null)
         {
+            var data = Convert.FromBase64String(base64Data);
             await OnFileDataBinaryMessage.Invoke(data);
         }
     }
