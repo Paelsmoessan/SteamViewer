@@ -404,6 +404,8 @@ window.SteamViewerWebRTC = {
             session.peerConnection.ondatachannel = (event) => {
                 if (event.channel.label === 'mouse') {
                     this._setupMouseChannel(sessionId, event.channel);
+                } else if (event.channel.label === 'file') {
+                    this._setupFileChannel(sessionId, event.channel);
                 } else {
                     this._setupDataChannel(sessionId, event.channel);
                 }
@@ -676,7 +678,7 @@ window.SteamViewerWebRTC = {
             return;
         }
 
-        // Control channel: ordered, reliable — keyboard, commands, clipboard, files, SD frames
+        // Control channel: ordered, reliable — keyboard, commands, clipboard text, SD frames
         session.dataChannel = session.peerConnection.createDataChannel('control', {
             ordered: true
         });
@@ -689,7 +691,13 @@ window.SteamViewerWebRTC = {
         });
         this._setupMouseChannel(sessionId, session.mouseChannel);
 
-        console.log(`[${sessionId}] Dual data channels created (control + mouse)`);
+        // File channel: ordered, reliable — clipboard file transfer (virtual file streaming)
+        session.fileChannel = session.peerConnection.createDataChannel('file', {
+            ordered: true
+        });
+        this._setupFileChannel(sessionId, session.fileChannel);
+
+        console.log(`[${sessionId}] Triple data channels created (control + mouse + file)`);
     },
 
     _setupDataChannel(sessionId, channel) {
@@ -781,6 +789,46 @@ window.SteamViewerWebRTC = {
             console.error(`[${sessionId}] Mouse channel error: ${detail}`, event);
             window.SteamViewerLogger?.log('error', `Mouse channel error: ${detail}`);
         };
+    },
+
+    // Set up reliable file channel (clipboard file transfer — virtual file streaming)
+    _setupFileChannel(sessionId, channel) {
+        const session = this._getSession(sessionId);
+        session.fileChannel = channel;
+        channel.binaryType = 'arraybuffer';
+
+        channel.onopen = () => {
+            console.log(`[${sessionId}] File channel opened`);
+        };
+
+        channel.onclose = () => {
+            console.log(`[${sessionId}] File channel closed`);
+        };
+
+        channel.onmessage = async (event) => {
+            if (typeof event.data === 'string' && session.dotNetRef) {
+                await session.dotNetRef.invokeMethodAsync('OnFileChannelMessageCallback', event.data);
+            } else if (event.data instanceof ArrayBuffer && session.dotNetRef) {
+                const uint8Array = new Uint8Array(event.data);
+                await session.dotNetRef.invokeMethodAsync('OnFileChannelBinaryCallback', Array.from(uint8Array));
+            }
+        };
+
+        channel.onerror = (event) => {
+            const err = event.error;
+            const detail = err ? `errorDetail=${err.errorDetail}, message=${err.message}` : 'no error object';
+            console.error(`[${sessionId}] File channel error: ${detail}`, event);
+        };
+    },
+
+    // Send string data over file channel (clipboard file transfer)
+    sendFileChannelData(sessionId, data) {
+        const session = this._getSession(sessionId);
+        if (session.fileChannel && session.fileChannel.readyState === 'open') {
+            session.fileChannel.send(data);
+            return true;
+        }
+        return false;
     },
 
     // Send string data over data channel (control channel)

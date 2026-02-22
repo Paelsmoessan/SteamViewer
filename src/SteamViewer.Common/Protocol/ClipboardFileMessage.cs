@@ -1,0 +1,53 @@
+using System.Text.Json.Serialization;
+
+namespace SteamViewer.Common.Protocol;
+
+/// <summary>
+/// Clipboard file transfer messages sent over the dedicated file WebRTC data channel.
+/// Follows the RDP CLIPRDR virtual channel pattern: metadata first, then on-demand streaming.
+/// </summary>
+[JsonPolymorphic(TypeDiscriminatorPropertyName = "type")]
+[JsonDerivedType(typeof(FormatList), "clipboard_file_format_list")]
+[JsonDerivedType(typeof(FileContentsRequest), "clipboard_file_contents_request")]
+[JsonDerivedType(typeof(FileContentsResponse), "clipboard_file_contents_response")]
+public abstract record ClipboardFileMessage
+{
+    /// <summary>
+    /// Sent when the source machine detects files on its clipboard (CF_HDROP).
+    /// Contains file metadata so the receiver can present them as pasteable immediately.
+    /// </summary>
+    public sealed record FormatList(
+        [property: JsonPropertyName("files")] ClipboardFileInfo[] Files
+    ) : ClipboardFileMessage;
+
+    /// <summary>
+    /// Sent by the receiver's IStream::Read when Explorer pastes — requests a chunk of a specific file.
+    /// The source reads from disk and responds with FileContentsResponse.
+    /// </summary>
+    public sealed record FileContentsRequest(
+        [property: JsonPropertyName("stream_id")] int StreamId,
+        [property: JsonPropertyName("file_index")] int FileIndex,
+        [property: JsonPropertyName("position")] long Position,
+        [property: JsonPropertyName("bytes_requested")] int BytesRequested
+    ) : ClipboardFileMessage;
+
+    /// <summary>
+    /// Response to FileContentsRequest — contains the requested file bytes.
+    /// </summary>
+    public sealed record FileContentsResponse(
+        [property: JsonPropertyName("stream_id")] int StreamId,
+        [property: JsonPropertyName("data")] byte[]? Data,
+        [property: JsonPropertyName("is_error")] bool IsError = false,
+        [property: JsonPropertyName("error_message")] string? ErrorMessage = null
+    ) : ClipboardFileMessage;
+}
+
+/// <summary>
+/// Metadata for a single file on the clipboard.
+/// </summary>
+public sealed record ClipboardFileInfo(
+    [property: JsonPropertyName("file_name")] string FileName,
+    [property: JsonPropertyName("file_size")] long FileSize,
+    [property: JsonPropertyName("file_attributes")] uint FileAttributes = 0,
+    [property: JsonPropertyName("last_write_time")] long LastWriteTime = 0
+);

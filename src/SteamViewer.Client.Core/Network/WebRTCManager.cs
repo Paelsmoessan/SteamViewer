@@ -73,6 +73,11 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
     public event Action? OnScreenShareLost;
 
     /// <summary>
+    /// Raised when a message is received on the file data channel (clipboard file transfer).
+    /// </summary>
+    public event Func<string, Task>? OnFileChannelMessage;
+
+    /// <summary>
     /// Raised when screen capture starts, reporting actual physical capture dimensions.
     /// </summary>
     public event Action<int, int>? OnCaptureStarted;
@@ -325,6 +330,15 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
     }
 
     /// <summary>
+    /// Send string data over the file data channel (clipboard file transfer).
+    /// </summary>
+    public async Task<bool> SendFileChannelDataAsync(string data)
+    {
+        EnsureInitialized();
+        return await _jsRuntime.InvokeAsync<bool>("SteamViewerWebRTC.sendFileChannelData", _sessionId, data);
+    }
+
+    /// <summary>
     /// Send binary data over the data channel.
     /// </summary>
     public async Task<bool> SendBinaryDataAsync(byte[] data)
@@ -544,6 +558,21 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
         {
             await OnDataChannelBinaryMessage.Invoke(data);
         }
+    }
+
+    [JSInvokable]
+    public async Task OnFileChannelMessageCallback(string data)
+    {
+        if (OnFileChannelMessage != null)
+        {
+            await OnFileChannelMessage.Invoke(data);
+        }
+    }
+
+    [JSInvokable]
+    public async Task OnFileChannelBinaryCallback(byte[] data)
+    {
+        // Binary file channel data — currently unused, file messages are JSON
     }
 
     [JSInvokable]
