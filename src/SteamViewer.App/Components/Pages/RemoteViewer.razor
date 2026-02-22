@@ -962,13 +962,19 @@
 
     private void HandleClipboardReceived(string format, string data)
     {
+        FileLogger.Log("INFO", "RemoteViewer", $"HandleClipboardReceived ENTERED: format={format}, len={data.Length}");
         InvokeAsync(() =>
         {
+            FileLogger.Log("INFO", "RemoteViewer", $"HandleClipboardReceived InvokeAsync: format={format}, len={data.Length}");
             if (format == "text")
             {
                 bool written = false;
                 if (OperatingSystem.IsWindows())
+                {
+                    FileLogger.Log("INFO", "RemoteViewer", "Calling TrySetClipboardNative...");
                     written = TrySetClipboardNative(data);
+                    FileLogger.Log("INFO", "RemoteViewer", $"TrySetClipboardNative returned: {written}");
+                }
 
                 if (written)
                     ShowToast($"Remote clipboard copied ({data.Length} chars)");

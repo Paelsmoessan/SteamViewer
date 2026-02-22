@@ -655,7 +655,10 @@ public sealed class ViewerSession : IAsyncDisposable
                         {
                             _logger.LogDebug("Session {SessionId}: Received clipboard ({Format}, {Length} chars)",
                                 SessionId, cbFormat, cbData.Length);
-                            OnClipboardReceived?.Invoke(cbFormat, cbData);
+                            var handler = OnClipboardReceived;
+                            _logger.LogInformation("Session {SessionId}: OnClipboardReceived handler is {Status}",
+                                SessionId, handler != null ? "subscribed" : "NULL");
+                            handler?.Invoke(cbFormat, cbData);
                         }
                         break;
 
