@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.ComTypes;
@@ -103,26 +104,47 @@ public sealed class ClipboardFileWriter : IDisposable
     }
 
     /// <summary>
-    /// Resolve a pending FileContentsResponse — unblocks the RemoteFileStream::Read.
+    /// Resolve a pending binary FileContentsResponse from the file-data channel.
+    /// Format: [4 bytes streamId BE] [4 bytes flags BE] [N bytes data]
     /// </summary>
-    public void HandleFileContentsResponse(ClipboardFileMessage.FileContentsResponse response)
+    public void HandleBinaryFileContentsResponse(byte[] raw)
     {
-        if (PendingRequests.TryGetValue(response.StreamId, out var tcs))
+        if (raw.Length < 8)
         {
-            if (response.IsError)
-            {
-                _logger.LogWarning("File contents error for stream {StreamId}: {Error}",
-                    response.StreamId, response.ErrorMessage);
-                tcs.TrySetResult(null);
-            }
-            else
-            {
-                tcs.TrySetResult(response.Data);
-            }
+            _logger.LogWarning("Binary file response too short: {Length} bytes", raw.Length);
+            return;
         }
-        else
+
+        int streamId = BinaryPrimitives.ReadInt32BigEndian(raw.AsSpan(0, 4));
+        int flags = BinaryPrimitives.ReadInt32BigEndian(raw.AsSpan(4, 4));
+
+        if (!PendingRequests.TryGetValue(streamId, out var tcs))
         {
-            _logger.LogWarning("No pending request for stream {StreamId}", response.StreamId);
+            _logger.LogWarning("No pending request for stream {StreamId}", streamId);
+            return;
+        }
+
+        switch (flags)
+        {
+            case ClipboardFileServer.FlagSuccess:
+                var data = raw.Length > 8 ? raw[8..] : Array.Empty<byte>();
+                tcs.TrySetResult(data);
+                break;
+
+            case ClipboardFileServer.FlagError:
+                var errorMsg = System.Text.Encoding.UTF8.GetString(raw.AsSpan(8));
+                _logger.LogWarning("File contents error for stream {StreamId}: {Error}", streamId, errorMsg);
+                tcs.TrySetResult(null);
+                break;
+
+            case ClipboardFileServer.FlagEof:
+                tcs.TrySetResult(Array.Empty<byte>());
+                break;
+
+            default:
+                _logger.LogWarning("Unknown binary response flag {Flags} for stream {StreamId}", flags, streamId);
+                tcs.TrySetResult(null);
+                break;
         }
     }
 

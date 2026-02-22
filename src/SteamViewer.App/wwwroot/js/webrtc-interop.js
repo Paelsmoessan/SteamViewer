@@ -406,6 +406,8 @@ window.SteamViewerWebRTC = {
                     this._setupMouseChannel(sessionId, event.channel);
                 } else if (event.channel.label === 'file') {
                     this._setupFileChannel(sessionId, event.channel);
+                } else if (event.channel.label === 'file-data') {
+                    this._setupFileDataChannel(sessionId, event.channel);
                 } else {
                     this._setupDataChannel(sessionId, event.channel);
                 }
@@ -691,13 +693,19 @@ window.SteamViewerWebRTC = {
         });
         this._setupMouseChannel(sessionId, session.mouseChannel);
 
-        // File channel: ordered, reliable — clipboard file transfer (virtual file streaming)
+        // File channel: ordered, reliable — clipboard file signaling (FormatList, FileContentsRequest)
         session.fileChannel = session.peerConnection.createDataChannel('file', {
             ordered: true
         });
         this._setupFileChannel(sessionId, session.fileChannel);
 
-        console.log(`[${sessionId}] Triple data channels created (control + mouse + file)`);
+        // File data channel: ordered, reliable — raw binary file content responses
+        session.fileDataChannel = session.peerConnection.createDataChannel('file-data', {
+            ordered: true
+        });
+        this._setupFileDataChannel(sessionId, session.fileDataChannel);
+
+        console.log(`[${sessionId}] Quad data channels created (control + mouse + file + file-data)`);
     },
 
     _setupDataChannel(sessionId, channel) {
@@ -821,11 +829,50 @@ window.SteamViewerWebRTC = {
         };
     },
 
-    // Send string data over file channel (clipboard file transfer)
+    // Set up reliable binary file-data channel (raw file content responses)
+    _setupFileDataChannel(sessionId, channel) {
+        const session = this._getSession(sessionId);
+        session.fileDataChannel = channel;
+        channel.binaryType = 'arraybuffer';
+
+        channel.onopen = () => {
+            console.log(`[${sessionId}] File-data channel opened`);
+        };
+
+        channel.onclose = () => {
+            console.log(`[${sessionId}] File-data channel closed`);
+        };
+
+        channel.onmessage = async (event) => {
+            if (event.data instanceof ArrayBuffer && session.dotNetRef) {
+                const uint8Array = new Uint8Array(event.data);
+                await session.dotNetRef.invokeMethodAsync('OnFileDataBinaryCallback', Array.from(uint8Array));
+            }
+        };
+
+        channel.onerror = (event) => {
+            const err = event.error;
+            const detail = err ? `errorDetail=${err.errorDetail}, message=${err.message}` : 'no error object';
+            console.error(`[${sessionId}] File-data channel error: ${detail}`, event);
+        };
+    },
+
+    // Send string data over file channel (clipboard file signaling)
     sendFileChannelData(sessionId, data) {
         const session = this._getSession(sessionId);
         if (session.fileChannel && session.fileChannel.readyState === 'open') {
             session.fileChannel.send(data);
+            return true;
+        }
+        return false;
+    },
+
+    // Send raw binary data over file-data channel (file content responses)
+    sendFileDataBinary(sessionId, data) {
+        const session = this._getSession(sessionId);
+        if (session.fileDataChannel && session.fileDataChannel.readyState === 'open') {
+            const uint8Array = new Uint8Array(data);
+            session.fileDataChannel.send(uint8Array.buffer);
             return true;
         }
         return false;

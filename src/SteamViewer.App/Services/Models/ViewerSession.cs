@@ -208,6 +208,7 @@ public sealed class ViewerSession : IAsyncDisposable
         _webrtc.OnDataChannelClose += HandleDataChannelClose;
         _webrtc.OnDataChannelMessage += HandleDataChannelMessage;
         _webrtc.OnFileChannelMessage += HandleFileChannelMessage;
+        _webrtc.OnFileDataBinaryMessage += HandleFileDataBinaryMessage;
         _webrtc.OnRenegotiationNeeded += HandleRenegotiationNeeded;
         _webrtc.OnConnectionStateChange += HandleConnectionStateChange;
         _webrtc.OnStatsUpdated += json => OnStatsUpdated?.Invoke(json);
@@ -818,11 +819,10 @@ public sealed class ViewerSession : IAsyncDisposable
 
         try
         {
-            // File server — serves file chunks to host when they paste our files
+            // File server — serves file chunks as raw binary on file-data channel
             _clipboardFileServer = new ClipboardFileServer(
                 _loggerFactory.CreateLogger<ClipboardFileServer>(),
-                async (data) => await _webrtc.SendFileChannelDataAsync(
-                    System.Text.Encoding.UTF8.GetString(data)));
+                async (data) => await _webrtc.SendFileDataBinaryAsync(data));
 
             // Clipboard monitor — detects when viewer user copies files (CF_HDROP)
             _clipboardMonitor = new ClipboardMonitor(_loggerFactory.CreateLogger<ClipboardMonitor>());
@@ -896,16 +896,18 @@ public sealed class ViewerSession : IAsyncDisposable
                     if (_clipboardFileServer != null)
                         await _clipboardFileServer.HandleRequestAsync(request);
                     break;
-
-                case ClipboardFileMessage.FileContentsResponse response:
-                    _clipboardFileWriter?.HandleFileContentsResponse(response);
-                    break;
             }
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Session {SessionId}: Failed to handle file channel message", SessionId);
         }
+    }
+
+    private Task HandleFileDataBinaryMessage(byte[] data)
+    {
+        _clipboardFileWriter?.HandleBinaryFileContentsResponse(data);
+        return Task.CompletedTask;
     }
 
     private void StopClipboardFileTransfer()
@@ -950,6 +952,7 @@ public sealed class ViewerSession : IAsyncDisposable
             _webrtc.OnDataChannelClose -= HandleDataChannelClose;
             _webrtc.OnDataChannelMessage -= HandleDataChannelMessage;
             _webrtc.OnFileChannelMessage -= HandleFileChannelMessage;
+            _webrtc.OnFileDataBinaryMessage -= HandleFileDataBinaryMessage;
             _webrtc.OnRenegotiationNeeded -= HandleRenegotiationNeeded;
             _webrtc.OnConnectionStateChange -= HandleConnectionStateChange;
 

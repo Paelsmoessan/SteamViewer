@@ -202,6 +202,7 @@ public sealed class HostSession : IAsyncDisposable
         _webrtc.OnIceCandidate += HandleIceCandidate;
         _webrtc.OnDataChannelMessage += HandleDataChannelMessage;
         _webrtc.OnFileChannelMessage += HandleFileChannelMessage;
+        _webrtc.OnFileDataBinaryMessage += HandleFileDataBinaryMessage;
         _webrtc.OnRenegotiationNeeded += HandleRenegotiationNeeded;
         _webrtc.OnDataChannelOpen += HandleDataChannelOpen;
         _webrtc.OnDataChannelClose += HandleDataChannelClose;
@@ -1177,11 +1178,10 @@ public sealed class HostSession : IAsyncDisposable
 
         try
         {
-            // File server — serves file chunks to remote when they paste
+            // File server — serves file chunks as raw binary on file-data channel
             _clipboardFileServer = new ClipboardFileServer(
                 _loggerFactory.CreateLogger<ClipboardFileServer>(),
-                async (data) => await _webrtc.SendFileChannelDataAsync(
-                    System.Text.Encoding.UTF8.GetString(data)));
+                async (data) => await _webrtc.SendFileDataBinaryAsync(data));
 
             // Clipboard monitor — detects when user copies files (CF_HDROP)
             _clipboardMonitor = new ClipboardMonitor(_loggerFactory.CreateLogger<ClipboardMonitor>());
@@ -1258,17 +1258,19 @@ public sealed class HostSession : IAsyncDisposable
                     if (_clipboardFileServer != null)
                         await _clipboardFileServer.HandleRequestAsync(request);
                     break;
-
-                case ClipboardFileMessage.FileContentsResponse response:
-                    // We requested file data (we're pasting remote files) — resolve pending stream
-                    _clipboardFileWriter?.HandleFileContentsResponse(response);
-                    break;
             }
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Failed to handle file channel message");
         }
+    }
+
+    private Task HandleFileDataBinaryMessage(byte[] data)
+    {
+        // Binary file content response — resolve pending RemoteFileStream
+        _clipboardFileWriter?.HandleBinaryFileContentsResponse(data);
+        return Task.CompletedTask;
     }
 
     private void StopClipboardFileTransfer()
@@ -1806,6 +1808,7 @@ public sealed class HostSession : IAsyncDisposable
             _webrtc.OnIceCandidate -= HandleIceCandidate;
             _webrtc.OnDataChannelMessage -= HandleDataChannelMessage;
             _webrtc.OnFileChannelMessage -= HandleFileChannelMessage;
+            _webrtc.OnFileDataBinaryMessage -= HandleFileDataBinaryMessage;
             _webrtc.OnRenegotiationNeeded -= HandleRenegotiationNeeded;
             _webrtc.OnDataChannelOpen -= HandleDataChannelOpen;
             _webrtc.OnDataChannelClose -= HandleDataChannelClose;

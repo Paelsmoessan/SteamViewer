@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using Microsoft.Extensions.Logging;
 using SteamViewer.Common.Protocol;
@@ -7,21 +8,28 @@ namespace SteamViewer.Platform.Windows.Clipboard;
 /// <summary>
 /// Serves file chunks on demand when the remote side's IStream requests data.
 /// Maintains open file handles for the current clipboard file set with idle timeout.
+/// Responses are sent as raw binary on a dedicated file-data channel (no JSON/base64).
 /// </summary>
 public sealed class ClipboardFileServer : IDisposable
 {
     private readonly ILogger _logger;
-    private readonly Func<byte[], Task> _sendAsync;
+    private readonly Func<byte[], Task> _sendBinaryAsync;
     private string[] _currentPaths = Array.Empty<string>();
     private readonly ConcurrentDictionary<int, CachedFileHandle> _fileHandles = new();
     private readonly Timer _idleTimer;
 
     private const int IdleTimeoutMs = 30_000; // Close idle file handles after 30s
+    private const int MaxChunkSize = 65_536;   // 64KB — well under SCTP 256KB limit
 
-    public ClipboardFileServer(ILogger logger, Func<byte[], Task> sendAsync)
+    // Binary response flags (in 4-byte flags field)
+    internal const int FlagSuccess = 0x00;
+    internal const int FlagError = 0x01;
+    internal const int FlagEof = 0x02;
+
+    public ClipboardFileServer(ILogger logger, Func<byte[], Task> sendBinaryAsync)
     {
         _logger = logger;
-        _sendAsync = sendAsync;
+        _sendBinaryAsync = sendBinaryAsync;
         _idleTimer = new Timer(CleanupIdleHandles, null, IdleTimeoutMs, IdleTimeoutMs);
     }
 
@@ -38,7 +46,7 @@ public sealed class ClipboardFileServer : IDisposable
     }
 
     /// <summary>
-    /// Handle an incoming FileContentsRequest — read the requested chunk and send response.
+    /// Handle an incoming FileContentsRequest — read the requested chunk and send binary response.
     /// </summary>
     public async Task HandleRequestAsync(ClipboardFileMessage.FileContentsRequest request)
     {
@@ -46,7 +54,7 @@ public sealed class ClipboardFileServer : IDisposable
         {
             if (request.FileIndex < 0 || request.FileIndex >= _currentPaths.Length)
             {
-                await SendErrorResponse(request.StreamId, $"Invalid file index: {request.FileIndex}");
+                await SendBinaryError(request.StreamId, $"Invalid file index: {request.FileIndex}");
                 return;
             }
 
@@ -63,16 +71,14 @@ public sealed class ClipboardFileServer : IDisposable
             handle.Touch(); // Reset idle timeout
 
             var stream = handle.Stream;
-            var bytesToRead = request.BytesRequested;
+            var bytesToRead = Math.Min(request.BytesRequested, MaxChunkSize);
 
             // Clamp to remaining bytes
             long remaining = stream.Length - request.Position;
             if (remaining <= 0)
             {
-                // EOF — send empty response
-                var eofResponse = new ClipboardFileMessage.FileContentsResponse(
-                    request.StreamId, Array.Empty<byte>());
-                await SendResponse(eofResponse);
+                // EOF
+                await SendBinaryResponse(request.StreamId, FlagEof, Array.Empty<byte>());
                 return;
             }
 
@@ -93,28 +99,31 @@ public sealed class ClipboardFileServer : IDisposable
             // Trim buffer if we read less than requested
             var data = totalRead == buffer.Length ? buffer : buffer[..totalRead];
 
-            var response = new ClipboardFileMessage.FileContentsResponse(request.StreamId, data);
-            await SendResponse(response);
+            await SendBinaryResponse(request.StreamId, FlagSuccess, data);
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error serving file contents for index {Index}", request.FileIndex);
-            await SendErrorResponse(request.StreamId, ex.Message);
+            await SendBinaryError(request.StreamId, ex.Message);
         }
     }
 
-    private async Task SendResponse(ClipboardFileMessage.FileContentsResponse response)
+    /// <summary>
+    /// Send binary response: [4 bytes streamId BE] [4 bytes flags BE] [N bytes data]
+    /// </summary>
+    private async Task SendBinaryResponse(int streamId, int flags, byte[] data)
     {
-        var json = System.Text.Json.JsonSerializer.SerializeToUtf8Bytes<ClipboardFileMessage>(response);
-        await _sendAsync(json);
+        var message = new byte[8 + data.Length];
+        BinaryPrimitives.WriteInt32BigEndian(message.AsSpan(0, 4), streamId);
+        BinaryPrimitives.WriteInt32BigEndian(message.AsSpan(4, 4), flags);
+        data.CopyTo(message.AsSpan(8));
+        await _sendBinaryAsync(message);
     }
 
-    private async Task SendErrorResponse(int streamId, string message)
+    private async Task SendBinaryError(int streamId, string errorMessage)
     {
-        var response = new ClipboardFileMessage.FileContentsResponse(
-            streamId, null, IsError: true, ErrorMessage: message);
-        var json = System.Text.Json.JsonSerializer.SerializeToUtf8Bytes<ClipboardFileMessage>(response);
-        await _sendAsync(json);
+        var errorBytes = System.Text.Encoding.UTF8.GetBytes(errorMessage);
+        await SendBinaryResponse(streamId, FlagError, errorBytes);
     }
 
     private void CleanupIdleHandles(object? state)

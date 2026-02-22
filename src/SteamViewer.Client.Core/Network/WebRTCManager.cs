@@ -73,9 +73,14 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
     public event Action? OnScreenShareLost;
 
     /// <summary>
-    /// Raised when a message is received on the file data channel (clipboard file transfer).
+    /// Raised when a JSON message is received on the file signaling channel (FormatList, FileContentsRequest).
     /// </summary>
     public event Func<string, Task>? OnFileChannelMessage;
+
+    /// <summary>
+    /// Raised when raw binary data is received on the file-data channel (FileContentsResponse bytes).
+    /// </summary>
+    public event Func<byte[], Task>? OnFileDataBinaryMessage;
 
     /// <summary>
     /// Raised when screen capture starts, reporting actual physical capture dimensions.
@@ -330,12 +335,21 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
     }
 
     /// <summary>
-    /// Send string data over the file data channel (clipboard file transfer).
+    /// Send string data over the file signaling channel (FormatList, FileContentsRequest).
     /// </summary>
     public async Task<bool> SendFileChannelDataAsync(string data)
     {
         EnsureInitialized();
         return await _jsRuntime.InvokeAsync<bool>("SteamViewerWebRTC.sendFileChannelData", _sessionId, data);
+    }
+
+    /// <summary>
+    /// Send raw binary data over the file-data channel (FileContentsResponse bytes).
+    /// </summary>
+    public async Task<bool> SendFileDataBinaryAsync(byte[] data)
+    {
+        EnsureInitialized();
+        return await _jsRuntime.InvokeAsync<bool>("SteamViewerWebRTC.sendFileDataBinary", _sessionId, data);
     }
 
     /// <summary>
@@ -572,7 +586,16 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
     [JSInvokable]
     public async Task OnFileChannelBinaryCallback(byte[] data)
     {
-        // Binary file channel data — currently unused, file messages are JSON
+        // Legacy binary on file channel — unused, kept for compat
+    }
+
+    [JSInvokable]
+    public async Task OnFileDataBinaryCallback(byte[] data)
+    {
+        if (OnFileDataBinaryMessage != null)
+        {
+            await OnFileDataBinaryMessage.Invoke(data);
+        }
     }
 
     [JSInvokable]
