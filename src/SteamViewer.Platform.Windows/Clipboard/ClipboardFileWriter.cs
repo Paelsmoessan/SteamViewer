@@ -29,11 +29,23 @@ public sealed class ClipboardFileWriter : IDisposable
     public ConcurrentDictionary<int, TaskCompletionSource<byte[]?>> PendingRequests { get; } = new();
 
     private VirtualFileDataObject? _currentDataObject;
+    private ClipboardFileInfo[]? _currentFiles;
     private Thread? _staThread;
     private IntPtr _hwnd;
     private volatile bool _stopping;
     private readonly ConcurrentQueue<ClipboardFileInfo[]> _pendingClipboardSets = new();
     private WndProcDelegate? _wndProc; // prevent GC of delegate
+
+    // Transfer tracking (receiver side)
+    private long _receiveStartTick;
+    private long _receiveBytesTotal;
+    private long _lastReceiveReportTick;
+    private const int ReceiveProgressIntervalMs = 500;
+
+    /// <summary>
+    /// Fired periodically during file receive with (fileIndex, bytesReceived, totalBytes, speedMBps).
+    /// </summary>
+    public event Action<int, long, long, double>? OnTransferProgress;
 
     private const uint WM_SET_CLIPBOARD = 0x0400 + 1; // WM_USER + 1
     private const uint WM_QUIT = 0x0012;
@@ -99,6 +111,11 @@ public sealed class ClipboardFileWriter : IDisposable
             return;
         }
 
+        _currentFiles = files;
+        // Reset receive tracking for new transfer
+        Interlocked.Exchange(ref _receiveBytesTotal, 0);
+        Interlocked.Exchange(ref _receiveStartTick, 0);
+
         _pendingClipboardSets.Enqueue(files);
         PostMessage(_hwnd, WM_SET_CLIPBOARD, IntPtr.Zero, IntPtr.Zero);
     }
@@ -129,6 +146,7 @@ public sealed class ClipboardFileWriter : IDisposable
             case ClipboardFileServer.FlagSuccess:
                 var data = raw.Length > 8 ? raw[8..] : Array.Empty<byte>();
                 tcs.TrySetResult(data);
+                TrackReceiveProgress(data.Length);
                 break;
 
             case ClipboardFileServer.FlagError:
@@ -146,6 +164,64 @@ public sealed class ClipboardFileWriter : IDisposable
                 tcs.TrySetResult(null);
                 break;
         }
+    }
+
+    private void TrackReceiveProgress(int bytesReceived)
+    {
+        if (bytesReceived <= 0) return;
+
+        // Initialize on first chunk
+        if (Interlocked.Read(ref _receiveBytesTotal) == 0)
+            Interlocked.Exchange(ref _receiveStartTick, Environment.TickCount64);
+
+        Interlocked.Add(ref _receiveBytesTotal, bytesReceived);
+
+        long totalReceived = Interlocked.Read(ref _receiveBytesTotal);
+        long elapsed = Environment.TickCount64 - Interlocked.Read(ref _receiveStartTick);
+        double elapsedSec = elapsed / 1000.0;
+        double speedMBps = elapsedSec > 0 ? (totalReceived / 1_048_576.0) / elapsedSec : 0;
+
+        // Determine total file size from current files
+        long totalSize = 0;
+        string fileName = "unknown";
+        if (_currentFiles is { Length: > 0 })
+        {
+            totalSize = _currentFiles.Sum(f => f.FileSize);
+            fileName = _currentFiles[0].FileName;
+            if (_currentFiles.Length > 1) fileName += $" (+{_currentFiles.Length - 1} more)";
+        }
+
+        // Report periodically
+        long now = Environment.TickCount64;
+        long lastReport = Interlocked.Read(ref _lastReceiveReportTick);
+        if (now - lastReport >= ReceiveProgressIntervalMs)
+        {
+            Interlocked.Exchange(ref _lastReceiveReportTick, now);
+
+            _logger.LogInformation("File transfer [receiving]: {FileName} — {Transferred}/{Total} ({Speed:F1} MB/s)",
+                fileName, FormatBytes(totalReceived), FormatBytes(totalSize), speedMBps);
+
+            OnTransferProgress?.Invoke(0, totalReceived, totalSize, Math.Round(speedMBps, 2));
+        }
+
+        // Log completion
+        if (totalSize > 0 && totalReceived >= totalSize)
+        {
+            _logger.LogInformation("File transfer [receiving]: {FileName} COMPLETE — {Total} in {Elapsed:F1}s ({Speed:F1} MB/s)",
+                fileName, FormatBytes(totalSize), elapsedSec, speedMBps);
+
+            // Reset for next transfer
+            Interlocked.Exchange(ref _receiveBytesTotal, 0);
+            Interlocked.Exchange(ref _receiveStartTick, 0);
+        }
+    }
+
+    private static string FormatBytes(long bytes)
+    {
+        if (bytes >= 1_073_741_824) return $"{bytes / 1_073_741_824.0:F1} GB";
+        if (bytes >= 1_048_576) return $"{bytes / 1_048_576.0:F1} MB";
+        if (bytes >= 1024) return $"{bytes / 1024.0:F1} KB";
+        return $"{bytes} B";
     }
 
     public void Dispose()

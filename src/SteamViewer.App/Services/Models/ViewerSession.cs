@@ -823,9 +823,11 @@ public sealed class ViewerSession : IAsyncDisposable
         try
         {
             // File server — serves file chunks as raw binary on file-data channel
+            // Progress updates sent as JSON on file channel
             _clipboardFileServer = new ClipboardFileServer(
                 _loggerFactory.CreateLogger<ClipboardFileServer>(),
-                async (data) => await _webrtc.SendFileDataBinaryAsync(data));
+                async (data) => await _webrtc.SendFileDataBinaryAsync(data),
+                async (json) => await _webrtc.SendFileChannelDataAsync(json));
 
             // Clipboard monitor — detects when viewer user copies files (CF_HDROP)
             _clipboardMonitor = new ClipboardMonitor(_loggerFactory.CreateLogger<ClipboardMonitor>());
@@ -899,12 +901,25 @@ public sealed class ViewerSession : IAsyncDisposable
                     if (_clipboardFileServer != null)
                         await _clipboardFileServer.HandleRequestAsync(request);
                     break;
+
+                case ClipboardFileMessage.TransferProgress progress:
+                    _logger.LogInformation("Session {SessionId}: Remote transfer progress: {FileName} — {Transferred}/{Total} ({Speed} MB/s)",
+                        SessionId, progress.FileName, FormatBytes(progress.BytesTransferred), FormatBytes(progress.TotalBytes), progress.SpeedMBps);
+                    break;
             }
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Session {SessionId}: Failed to handle file channel message", SessionId);
         }
+    }
+
+    private static string FormatBytes(long bytes)
+    {
+        if (bytes >= 1_073_741_824) return $"{bytes / 1_073_741_824.0:F1} GB";
+        if (bytes >= 1_048_576) return $"{bytes / 1_048_576.0:F1} MB";
+        if (bytes >= 1024) return $"{bytes / 1024.0:F1} KB";
+        return $"{bytes} B";
     }
 
     private Task HandleFileDataBinaryMessage(byte[] data)

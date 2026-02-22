@@ -840,12 +840,13 @@ window.SteamViewerWebRTC = {
         channel.onmessage = async (event) => {
             if (event.data instanceof ArrayBuffer && session.dotNetRef) {
                 // Blazor JSInterop deserializes byte[] from base64 strings, not number arrays
+                // Chunked conversion — avoids O(n) string concatenation per byte
                 const uint8Array = new Uint8Array(event.data);
-                let binary = '';
-                for (let i = 0; i < uint8Array.length; i++) {
-                    binary += String.fromCharCode(uint8Array[i]);
+                const chunks = [];
+                for (let i = 0; i < uint8Array.length; i += 8192) {
+                    chunks.push(String.fromCharCode.apply(null, uint8Array.subarray(i, i + 8192)));
                 }
-                const base64 = btoa(binary);
+                const base64 = btoa(chunks.join(''));
                 await session.dotNetRef.invokeMethodAsync('OnFileDataBinaryCallback', base64);
             }
         };
@@ -872,11 +873,9 @@ window.SteamViewerWebRTC = {
     sendFileDataBinary(sessionId, base64Data) {
         const session = this._getSession(sessionId);
         if (session.fileDataChannel && session.fileDataChannel.readyState === 'open') {
+            // Efficient base64 decode — single pass instead of byte-by-byte loop
             const binary = atob(base64Data);
-            const uint8Array = new Uint8Array(binary.length);
-            for (let i = 0; i < binary.length; i++) {
-                uint8Array[i] = binary.charCodeAt(i);
-            }
+            const uint8Array = Uint8Array.from(binary, c => c.charCodeAt(0));
             session.fileDataChannel.send(uint8Array.buffer);
             return true;
         }

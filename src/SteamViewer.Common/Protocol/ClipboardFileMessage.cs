@@ -10,6 +10,7 @@ namespace SteamViewer.Common.Protocol;
 [JsonDerivedType(typeof(FormatList), "clipboard_file_format_list")]
 [JsonDerivedType(typeof(FileContentsRequest), "clipboard_file_contents_request")]
 [JsonDerivedType(typeof(FileContentsResponse), "clipboard_file_contents_response")]
+[JsonDerivedType(typeof(TransferProgress), "clipboard_file_transfer_progress")]
 public abstract record ClipboardFileMessage
 {
     /// <summary>
@@ -39,6 +40,18 @@ public abstract record ClipboardFileMessage
         [property: JsonPropertyName("data")] byte[]? Data,
         [property: JsonPropertyName("is_error")] bool IsError = false,
         [property: JsonPropertyName("error_message")] string? ErrorMessage = null
+    ) : ClipboardFileMessage;
+
+    /// <summary>
+    /// Periodic progress update sent over the file channel during active transfers.
+    /// Sent by the serving side so the receiver can track speed.
+    /// </summary>
+    public sealed record TransferProgress(
+        [property: JsonPropertyName("file_index")] int FileIndex,
+        [property: JsonPropertyName("file_name")] string FileName,
+        [property: JsonPropertyName("bytes_transferred")] long BytesTransferred,
+        [property: JsonPropertyName("total_bytes")] long TotalBytes,
+        [property: JsonPropertyName("speed_mbps")] double SpeedMBps
     ) : ClipboardFileMessage;
 }
 
