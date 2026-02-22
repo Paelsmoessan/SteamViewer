@@ -15,11 +15,22 @@ namespace SteamViewer.Platform.Windows.Clipboard;
 /// Source attribution: Pattern derived from VirtualFileDataObject (MIT license)
 /// and RustDesk/FreeRDP clipboard redirection (Apache-2.0).
 /// </summary>
-public sealed class VirtualFileDataObject : IComDataObject
+public sealed class VirtualFileDataObject : IComDataObject, IDisposable
 {
     private readonly ClipboardFileInfo[] _files;
     private readonly Func<ClipboardFileMessage.FileContentsRequest, Task> _sendRequest;
+    private readonly Func<ClipboardFileMessage.StartStreaming, Task>? _sendStartStreaming;
+    private readonly Func<ClipboardFileMessage.StopStreaming, Task>? _sendStopStreaming;
     private readonly ConcurrentDictionary<int, TaskCompletionSource<byte[]?>> _pendingRequests;
+
+    // Eagerly-created streams for push-mode routing
+    private readonly RemoteFileStream[] _streams;
+
+    /// <summary>
+    /// Get a stream by file index for routing push chunks.
+    /// </summary>
+    public RemoteFileStream? GetStream(int fileIndex) =>
+        fileIndex >= 0 && fileIndex < _streams.Length ? _streams[fileIndex] : null;
 
     // Registered clipboard format IDs (registered once, cached)
     // MUST be short (not ushort) — FORMATETC.cfFormat is short, and registered formats
@@ -44,11 +55,25 @@ public sealed class VirtualFileDataObject : IComDataObject
     public VirtualFileDataObject(
         ClipboardFileInfo[] files,
         Func<ClipboardFileMessage.FileContentsRequest, Task> sendRequest,
-        ConcurrentDictionary<int, TaskCompletionSource<byte[]?>> pendingRequests)
+        ConcurrentDictionary<int, TaskCompletionSource<byte[]?>> pendingRequests,
+        Func<ClipboardFileMessage.StartStreaming, Task>? sendStartStreaming = null,
+        Func<ClipboardFileMessage.StopStreaming, Task>? sendStopStreaming = null)
     {
         _files = files;
         _sendRequest = sendRequest;
         _pendingRequests = pendingRequests;
+        _sendStartStreaming = sendStartStreaming;
+        _sendStopStreaming = sendStopStreaming;
+
+        // Eagerly create streams so push chunks can be routed to them
+        _streams = new RemoteFileStream[files.Length];
+        for (int i = 0; i < files.Length; i++)
+        {
+            _streams[i] = new RemoteFileStream(
+                i, files[i].FileName, files[i].FileSize,
+                sendRequest, pendingRequests,
+                sendStartStreaming, sendStopStreaming);
+        }
     }
 
     public void GetData(ref FORMATETC format, out STGMEDIUM medium)
@@ -67,12 +92,8 @@ public sealed class VirtualFileDataObject : IComDataObject
             (format.tymed & TYMED.TYMED_ISTREAM) != 0 &&
             format.lindex >= 0 && format.lindex < _files.Length)
         {
-            var stream = new RemoteFileStream(
-                format.lindex,
-                _files[format.lindex].FileName,
-                _files[format.lindex].FileSize,
-                _sendRequest,
-                _pendingRequests);
+            // Use eagerly-created stream (supports push-mode prefetch)
+            var stream = _streams[format.lindex];
 
             medium.tymed = TYMED.TYMED_ISTREAM;
             medium.unionmember = Marshal.GetComInterfaceForObject(stream, typeof(IStream));
@@ -299,6 +320,15 @@ public sealed class VirtualFileDataObject : IComDataObject
     }
 
     #endregion
+
+    public void Dispose()
+    {
+        foreach (var stream in _streams)
+        {
+            try { stream.Dispose(); }
+            catch { /* best effort */ }
+        }
+    }
 
     #region Constants
 

@@ -20,6 +20,8 @@ public sealed class ClipboardFileWriter : IDisposable
 {
     private readonly ILogger _logger;
     private readonly Func<ClipboardFileMessage.FileContentsRequest, Task> _sendRequest;
+    private readonly Func<ClipboardFileMessage.StartStreaming, Task>? _sendStartStreaming;
+    private readonly Func<ClipboardFileMessage.StopStreaming, Task>? _sendStopStreaming;
     private readonly ClipboardMonitor? _clipboardMonitor;
 
     /// <summary>
@@ -53,11 +55,15 @@ public sealed class ClipboardFileWriter : IDisposable
     public ClipboardFileWriter(
         ILogger logger,
         Func<ClipboardFileMessage.FileContentsRequest, Task> sendRequest,
-        ClipboardMonitor? clipboardMonitor = null)
+        ClipboardMonitor? clipboardMonitor = null,
+        Func<ClipboardFileMessage.StartStreaming, Task>? sendStartStreaming = null,
+        Func<ClipboardFileMessage.StopStreaming, Task>? sendStopStreaming = null)
     {
         _logger = logger;
         _sendRequest = sendRequest;
         _clipboardMonitor = clipboardMonitor;
+        _sendStartStreaming = sendStartStreaming;
+        _sendStopStreaming = sendStopStreaming;
     }
 
     /// <summary>
@@ -122,7 +128,10 @@ public sealed class ClipboardFileWriter : IDisposable
 
     /// <summary>
     /// Resolve a pending binary FileContentsResponse from the file-data channel.
-    /// Format: [4 bytes streamId BE] [4 bytes flags BE] [N bytes data]
+    /// Handles both pull-mode responses and push-mode streaming chunks.
+    /// Format: [4 bytes id BE] [4 bytes flags BE] [N bytes data]
+    ///   Pull: id=streamId, flags=0x00/0x01/0x02
+    ///   Push: id=fileIndex, flags=0x10/0x12
     /// </summary>
     public void HandleBinaryFileContentsResponse(byte[] raw)
     {
@@ -132,26 +141,47 @@ public sealed class ClipboardFileWriter : IDisposable
             return;
         }
 
-        int streamId = BinaryPrimitives.ReadInt32BigEndian(raw.AsSpan(0, 4));
+        int id = BinaryPrimitives.ReadInt32BigEndian(raw.AsSpan(0, 4));
         int flags = BinaryPrimitives.ReadInt32BigEndian(raw.AsSpan(4, 4));
 
-        if (!PendingRequests.TryGetValue(streamId, out var tcs))
+        // Push-mode: route to RemoteFileStream prefetch buffer
+        if (flags == ClipboardFileServer.FlagPushChunk)
         {
-            _logger.LogWarning("No pending request for stream {StreamId}", streamId);
+            var data = raw.Length > 8 ? raw[8..] : Array.Empty<byte>();
+            var stream = _currentDataObject?.GetStream(id);
+            if (stream != null)
+            {
+                stream.AcceptPushChunk(data);
+                TrackReceiveProgress(data.Length);
+            }
+            return;
+        }
+
+        if (flags == ClipboardFileServer.FlagPushEof)
+        {
+            var stream = _currentDataObject?.GetStream(id);
+            stream?.AcceptPushEof();
+            return;
+        }
+
+        // Pull-mode: resolve pending TCS
+        if (!PendingRequests.TryGetValue(id, out var tcs))
+        {
+            _logger.LogWarning("No pending request for stream {StreamId}", id);
             return;
         }
 
         switch (flags)
         {
             case ClipboardFileServer.FlagSuccess:
-                var data = raw.Length > 8 ? raw[8..] : Array.Empty<byte>();
-                tcs.TrySetResult(data);
-                TrackReceiveProgress(data.Length);
+                var successData = raw.Length > 8 ? raw[8..] : Array.Empty<byte>();
+                tcs.TrySetResult(successData);
+                TrackReceiveProgress(successData.Length);
                 break;
 
             case ClipboardFileServer.FlagError:
                 var errorMsg = System.Text.Encoding.UTF8.GetString(raw.AsSpan(8));
-                _logger.LogWarning("File contents error for stream {StreamId}: {Error}", streamId, errorMsg);
+                _logger.LogWarning("File contents error for stream {StreamId}: {Error}", id, errorMsg);
                 tcs.TrySetResult(null);
                 break;
 
@@ -160,7 +190,7 @@ public sealed class ClipboardFileWriter : IDisposable
                 break;
 
             default:
-                _logger.LogWarning("Unknown binary response flag {Flags} for stream {StreamId}", flags, streamId);
+                _logger.LogWarning("Unknown binary response flag {Flags} for stream {StreamId}", flags, id);
                 tcs.TrySetResult(null);
                 break;
         }
@@ -235,6 +265,7 @@ public sealed class ClipboardFileWriter : IDisposable
         }
         PendingRequests.Clear();
 
+        _currentDataObject?.Dispose();
         _currentDataObject = null;
     }
 
@@ -322,7 +353,12 @@ public sealed class ClipboardFileWriter : IDisposable
         {
             try
             {
-                _currentDataObject = new VirtualFileDataObject(files, _sendRequest, PendingRequests);
+                // Dispose old data object (cleans up RemoteFileStream temp files)
+                _currentDataObject?.Dispose();
+
+                _currentDataObject = new VirtualFileDataObject(
+                    files, _sendRequest, PendingRequests,
+                    _sendStartStreaming, _sendStopStreaming);
 
                 // Tell our own clipboard monitor to ignore this change
                 _clipboardMonitor?.SetEchoFlag();

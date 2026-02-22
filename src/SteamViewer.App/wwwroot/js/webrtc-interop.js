@@ -870,13 +870,29 @@ window.SteamViewerWebRTC = {
 
     // Send raw binary data over file-data channel (file content responses)
     // C# byte[] arrives as base64 string via JSInterop — decode to ArrayBuffer before sending
+    // Returns false if bufferedAmount exceeds high watermark (1MB) — caller should pause and retry
     sendFileDataBinary(sessionId, base64Data) {
         const session = this._getSession(sessionId);
         if (session.fileDataChannel && session.fileDataChannel.readyState === 'open') {
-            // Efficient base64 decode — single pass instead of byte-by-byte loop
+            // Watermark flow control — prevent Chrome silent channel death at 16MB bufferedAmount
+            const HIGH_WATERMARK = 1048576; // 1MB
+            if (session.fileDataChannel.bufferedAmount > HIGH_WATERMARK) {
+                return false; // Signal C# to pause and retry
+            }
+
+            // Set low watermark threshold for resume notification (if needed in future)
+            if (!session._fileDataLowWatermarkSet) {
+                session.fileDataChannel.bufferedAmountLowThreshold = 65536; // 64KB
+                session._fileDataLowWatermarkSet = true;
+            }
+
+            // Fast base64 decode — for-loop is ~5-10x faster than Uint8Array.from with callback
             const binary = atob(base64Data);
-            const uint8Array = Uint8Array.from(binary, c => c.charCodeAt(0));
-            session.fileDataChannel.send(uint8Array.buffer);
+            const bytes = new Uint8Array(binary.length);
+            for (let i = 0; i < binary.length; i++) {
+                bytes[i] = binary.charCodeAt(i);
+            }
+            session.fileDataChannel.send(bytes.buffer);
             return true;
         }
         return false;

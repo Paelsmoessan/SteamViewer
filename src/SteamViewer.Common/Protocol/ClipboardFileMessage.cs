@@ -11,6 +11,8 @@ namespace SteamViewer.Common.Protocol;
 [JsonDerivedType(typeof(FileContentsRequest), "clipboard_file_contents_request")]
 [JsonDerivedType(typeof(FileContentsResponse), "clipboard_file_contents_response")]
 [JsonDerivedType(typeof(TransferProgress), "clipboard_file_transfer_progress")]
+[JsonDerivedType(typeof(StartStreaming), "clipboard_file_start_streaming")]
+[JsonDerivedType(typeof(StopStreaming), "clipboard_file_stop_streaming")]
 public abstract record ClipboardFileMessage
 {
     /// <summary>
@@ -52,6 +54,21 @@ public abstract record ClipboardFileMessage
         [property: JsonPropertyName("bytes_transferred")] long BytesTransferred,
         [property: JsonPropertyName("total_bytes")] long TotalBytes,
         [property: JsonPropertyName("speed_mbps")] double SpeedMBps
+    ) : ClipboardFileMessage;
+
+    /// <summary>
+    /// Sent by the receiver to tell the sender to start push-streaming a file.
+    /// Triggers a background push loop that sends chunks without waiting for individual requests.
+    /// </summary>
+    public sealed record StartStreaming(
+        [property: JsonPropertyName("file_index")] int FileIndex
+    ) : ClipboardFileMessage;
+
+    /// <summary>
+    /// Sent by the receiver to tell the sender to stop push-streaming a file.
+    /// </summary>
+    public sealed record StopStreaming(
+        [property: JsonPropertyName("file_index")] int FileIndex
     ) : ClipboardFileMessage;
 }
 

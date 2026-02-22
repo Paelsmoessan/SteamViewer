@@ -1182,8 +1182,8 @@ public sealed class HostSession : IAsyncDisposable
             // Progress updates sent as JSON on file channel
             _clipboardFileServer = new ClipboardFileServer(
                 _loggerFactory.CreateLogger<ClipboardFileServer>(),
-                async (data) => await _webrtc.SendFileDataBinaryAsync(data),
-                async (json) => await _webrtc.SendFileChannelDataAsync(json));
+                async (data) => { return await _webrtc!.SendFileDataBinaryAsync(data); },
+                async (json) => await _webrtc!.SendFileChannelDataAsync(json));
 
             // Clipboard monitor — detects when user copies files (CF_HDROP)
             _clipboardMonitor = new ClipboardMonitor(_loggerFactory.CreateLogger<ClipboardMonitor>());
@@ -1198,7 +1198,17 @@ public sealed class HostSession : IAsyncDisposable
                     var json = System.Text.Json.JsonSerializer.Serialize<ClipboardFileMessage>(request);
                     await _webrtc.SendFileChannelDataAsync(json);
                 },
-                _clipboardMonitor);
+                _clipboardMonitor,
+                async (startMsg) =>
+                {
+                    var json = System.Text.Json.JsonSerializer.Serialize<ClipboardFileMessage>(startMsg);
+                    await _webrtc.SendFileChannelDataAsync(json);
+                },
+                async (stopMsg) =>
+                {
+                    var json = System.Text.Json.JsonSerializer.Serialize<ClipboardFileMessage>(stopMsg);
+                    await _webrtc.SendFileChannelDataAsync(json);
+                });
             _clipboardFileWriter.Start();
 
             _logger.LogInformation("Clipboard file transfer initialized");
@@ -1256,9 +1266,19 @@ public sealed class HostSession : IAsyncDisposable
                     break;
 
                 case ClipboardFileMessage.FileContentsRequest request:
-                    // Remote is pasting — they need file data from us
+                    // Remote is pasting — they need file data from us (pull mode)
                     if (_clipboardFileServer != null)
                         await _clipboardFileServer.HandleRequestAsync(request);
+                    break;
+
+                case ClipboardFileMessage.StartStreaming startStreaming:
+                    // Remote wants push-mode streaming for a file
+                    _clipboardFileServer?.HandleStartStreaming(startStreaming.FileIndex);
+                    break;
+
+                case ClipboardFileMessage.StopStreaming stopStreaming:
+                    // Remote wants to stop push-mode streaming
+                    _clipboardFileServer?.HandleStopStreaming(stopStreaming.FileIndex);
                     break;
 
                 case ClipboardFileMessage.TransferProgress progress:

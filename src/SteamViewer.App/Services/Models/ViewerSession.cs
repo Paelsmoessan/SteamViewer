@@ -826,8 +826,8 @@ public sealed class ViewerSession : IAsyncDisposable
             // Progress updates sent as JSON on file channel
             _clipboardFileServer = new ClipboardFileServer(
                 _loggerFactory.CreateLogger<ClipboardFileServer>(),
-                async (data) => await _webrtc.SendFileDataBinaryAsync(data),
-                async (json) => await _webrtc.SendFileChannelDataAsync(json));
+                async (data) => { return await _webrtc!.SendFileDataBinaryAsync(data); },
+                async (json) => await _webrtc!.SendFileChannelDataAsync(json));
 
             // Clipboard monitor — detects when viewer user copies files (CF_HDROP)
             _clipboardMonitor = new ClipboardMonitor(_loggerFactory.CreateLogger<ClipboardMonitor>());
@@ -842,7 +842,17 @@ public sealed class ViewerSession : IAsyncDisposable
                     var json = JsonSerializer.Serialize<ClipboardFileMessage>(request);
                     await _webrtc.SendFileChannelDataAsync(json);
                 },
-                _clipboardMonitor);
+                _clipboardMonitor,
+                async (startMsg) =>
+                {
+                    var json = JsonSerializer.Serialize<ClipboardFileMessage>(startMsg);
+                    await _webrtc.SendFileChannelDataAsync(json);
+                },
+                async (stopMsg) =>
+                {
+                    var json = JsonSerializer.Serialize<ClipboardFileMessage>(stopMsg);
+                    await _webrtc.SendFileChannelDataAsync(json);
+                });
             _clipboardFileWriter.Start();
 
             _logger.LogInformation("Session {SessionId}: Clipboard file transfer initialized", SessionId);
@@ -900,6 +910,14 @@ public sealed class ViewerSession : IAsyncDisposable
                 case ClipboardFileMessage.FileContentsRequest request:
                     if (_clipboardFileServer != null)
                         await _clipboardFileServer.HandleRequestAsync(request);
+                    break;
+
+                case ClipboardFileMessage.StartStreaming startStreaming:
+                    _clipboardFileServer?.HandleStartStreaming(startStreaming.FileIndex);
+                    break;
+
+                case ClipboardFileMessage.StopStreaming stopStreaming:
+                    _clipboardFileServer?.HandleStopStreaming(stopStreaming.FileIndex);
                     break;
 
                 case ClipboardFileMessage.TransferProgress progress:

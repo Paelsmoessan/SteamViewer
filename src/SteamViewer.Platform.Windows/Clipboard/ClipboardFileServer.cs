@@ -13,23 +13,28 @@ namespace SteamViewer.Platform.Windows.Clipboard;
 public sealed class ClipboardFileServer : IDisposable
 {
     private readonly ILogger _logger;
-    private readonly Func<byte[], Task> _sendBinaryAsync;
+    private readonly Func<byte[], Task<bool>> _sendBinaryAsync;
     private readonly Func<string, Task>? _sendProgressAsync;
     private string[] _currentPaths = Array.Empty<string>();
     private readonly ConcurrentDictionary<int, CachedFileHandle> _fileHandles = new();
     private readonly ConcurrentDictionary<int, TransferTracker> _transferTrackers = new();
+    private readonly ConcurrentDictionary<int, CancellationTokenSource> _streamingCts = new();
     private readonly Timer _idleTimer;
 
     private const int IdleTimeoutMs = 30_000; // Close idle file handles after 30s
-    private const int MaxChunkSize = 65_536;   // 64KB — well under SCTP 256KB limit
+    private const int MaxChunkSize = 196_608;  // 192KB — 3x fewer JSInterop calls, still under SCTP 256KB limit
     private const int ProgressIntervalMs = 500; // Send progress every 500ms
 
     // Binary response flags (in 4-byte flags field)
+    // Pull-mode (request-response): [4B streamId][4B flags][data]
     internal const int FlagSuccess = 0x00;
     internal const int FlagError = 0x01;
     internal const int FlagEof = 0x02;
+    // Push-mode (streaming): [4B fileIndex][4B flags][data]
+    internal const int FlagPushChunk = 0x10;
+    internal const int FlagPushEof = 0x12;
 
-    public ClipboardFileServer(ILogger logger, Func<byte[], Task> sendBinaryAsync, Func<string, Task>? sendProgressAsync = null)
+    public ClipboardFileServer(ILogger logger, Func<byte[], Task<bool>> sendBinaryAsync, Func<string, Task>? sendProgressAsync = null)
     {
         _logger = logger;
         _sendBinaryAsync = sendBinaryAsync;
@@ -43,6 +48,8 @@ public sealed class ClipboardFileServer : IDisposable
     /// </summary>
     public void SetFilePaths(string[] paths)
     {
+        // Cancel any active push streams
+        StopAllStreaming();
         // Close any existing handles — clipboard changed
         CloseAllHandles();
         _transferTrackers.Clear();
@@ -116,6 +123,117 @@ public sealed class ClipboardFileServer : IDisposable
         }
     }
 
+    /// <summary>
+    /// Start push-streaming a file — reads sequentially and pushes chunks without waiting for requests.
+    /// Binary format: [4B fileIndex BE][4B flags BE][data]
+    /// </summary>
+    public void HandleStartStreaming(int fileIndex)
+    {
+        if (fileIndex < 0 || fileIndex >= _currentPaths.Length)
+        {
+            _logger.LogWarning("StartStreaming: invalid file index {Index}", fileIndex);
+            return;
+        }
+
+        // Cancel any existing stream for this file
+        HandleStopStreaming(fileIndex);
+
+        var cts = new CancellationTokenSource();
+        _streamingCts[fileIndex] = cts;
+
+        _ = Task.Run(() => PushStreamLoopAsync(fileIndex, cts.Token));
+    }
+
+    /// <summary>
+    /// Stop push-streaming a file.
+    /// </summary>
+    public void HandleStopStreaming(int fileIndex)
+    {
+        if (_streamingCts.TryRemove(fileIndex, out var cts))
+        {
+            cts.Cancel();
+            cts.Dispose();
+        }
+    }
+
+    private async Task PushStreamLoopAsync(int fileIndex, CancellationToken ct)
+    {
+        var path = _currentPaths[fileIndex];
+        _logger.LogInformation("Push streaming started for file {Index}: {Path}", fileIndex, Path.GetFileName(path));
+
+        try
+        {
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: MaxChunkSize);
+            var buffer = new byte[MaxChunkSize];
+            long position = 0;
+
+            while (!ct.IsCancellationRequested)
+            {
+                int bytesRead = await fs.ReadAsync(buffer.AsMemory(0, MaxChunkSize), ct);
+                if (bytesRead == 0) break;
+
+                var data = bytesRead == buffer.Length ? buffer : buffer[..bytesRead];
+
+                // Send with backpressure retry — JS returns false when DC buffer > 1MB
+                while (!ct.IsCancellationRequested)
+                {
+                    if (await SendPushChunk(fileIndex, data))
+                        break;
+                    // Buffer full — wait briefly and retry
+                    await Task.Delay(10, ct);
+                }
+
+                position += bytesRead;
+
+                // Track progress (reuse existing tracker)
+                await TrackProgressAsync(fileIndex, bytesRead);
+            }
+
+            // Send EOF
+            if (!ct.IsCancellationRequested)
+            {
+                await SendPushEof(fileIndex);
+                _logger.LogInformation("Push streaming completed for file {Index}: {Path}", fileIndex, Path.GetFileName(path));
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogDebug("Push streaming cancelled for file {Index}", fileIndex);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Push streaming error for file {Index}", fileIndex);
+        }
+        finally
+        {
+            _streamingCts.TryRemove(fileIndex, out _);
+        }
+    }
+
+    /// <summary>
+    /// Send push chunk: [4B fileIndex BE][4B flags=0x10 BE][data]
+    /// Returns false if data channel buffer is full (backpressure).
+    /// </summary>
+    private async Task<bool> SendPushChunk(int fileIndex, byte[] data)
+    {
+        var message = new byte[8 + data.Length];
+        BinaryPrimitives.WriteInt32BigEndian(message.AsSpan(0, 4), fileIndex);
+        BinaryPrimitives.WriteInt32BigEndian(message.AsSpan(4, 4), FlagPushChunk);
+        data.CopyTo(message.AsSpan(8));
+        return await _sendBinaryAsync(message);
+    }
+
+    /// <summary>
+    /// Send push EOF: [4B fileIndex BE][4B flags=0x12 BE]
+    /// </summary>
+    private async Task SendPushEof(int fileIndex)
+    {
+        var message = new byte[8];
+        BinaryPrimitives.WriteInt32BigEndian(message.AsSpan(0, 4), fileIndex);
+        BinaryPrimitives.WriteInt32BigEndian(message.AsSpan(4, 4), FlagPushEof);
+        await _sendBinaryAsync(message); // Don't care about backpressure for EOF
+    }
+
     private async Task TrackProgressAsync(int fileIndex, int bytesServed)
     {
         if (fileIndex < 0 || fileIndex >= _currentPaths.Length) return;
@@ -168,13 +286,13 @@ public sealed class ClipboardFileServer : IDisposable
     /// <summary>
     /// Send binary response: [4 bytes streamId BE] [4 bytes flags BE] [N bytes data]
     /// </summary>
-    private async Task SendBinaryResponse(int streamId, int flags, byte[] data)
+    private async Task<bool> SendBinaryResponse(int streamId, int flags, byte[] data)
     {
         var message = new byte[8 + data.Length];
         BinaryPrimitives.WriteInt32BigEndian(message.AsSpan(0, 4), streamId);
         BinaryPrimitives.WriteInt32BigEndian(message.AsSpan(4, 4), flags);
         data.CopyTo(message.AsSpan(8));
-        await _sendBinaryAsync(message);
+        return await _sendBinaryAsync(message);
     }
 
     private async Task SendBinaryError(int streamId, string errorMessage)
@@ -210,8 +328,21 @@ public sealed class ClipboardFileServer : IDisposable
 
     public void Dispose()
     {
+        StopAllStreaming();
         _idleTimer.Dispose();
         CloseAllHandles();
+    }
+
+    private void StopAllStreaming()
+    {
+        foreach (var kvp in _streamingCts)
+        {
+            if (_streamingCts.TryRemove(kvp.Key, out var cts))
+            {
+                cts.Cancel();
+                cts.Dispose();
+            }
+        }
     }
 
     private sealed class CachedFileHandle : IDisposable
