@@ -349,7 +349,8 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
     public async Task<bool> SendFileDataBinaryAsync(byte[] data)
     {
         EnsureInitialized();
-        return await _jsRuntime.InvokeAsync<bool>("SteamViewerWebRTC.sendFileDataBinary", _sessionId, data);
+        var base64 = Convert.ToBase64String(data);
+        return await _jsRuntime.InvokeAsync<bool>("SteamViewerWebRTC.sendFileDataBinary", _sessionId, base64);
     }
 
     /// <summary>
