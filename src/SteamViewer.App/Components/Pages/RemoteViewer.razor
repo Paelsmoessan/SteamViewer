@@ -962,13 +962,20 @@
 
     private void HandleClipboardReceived(string format, string data)
     {
-        InvokeAsync(async () =>
+        InvokeAsync(() =>
         {
             if (format == "text")
             {
-                await JSRuntime.InvokeVoidAsync("navigator.clipboard.writeText", data);
-                ShowToast($"Remote clipboard copied ({data.Length} chars)");
+                bool written = false;
+                if (OperatingSystem.IsWindows())
+                    written = TrySetClipboardNative(data);
+
+                if (written)
+                    ShowToast($"Remote clipboard copied ({data.Length} chars)");
+                else
+                    FileLogger.Log("WARN", "RemoteViewer", $"Failed to write clipboard ({data.Length} chars)");
             }
+            return Task.CompletedTask;
         });
     }
 
@@ -1036,7 +1043,43 @@
         catch { return null; }
     }
 
+    private static bool TrySetClipboardNative(string text)
+    {
+        if (!OperatingSystem.IsWindows()) return false;
+        try
+        {
+            if (!OpenClipboard(IntPtr.Zero)) return false;
+            try
+            {
+                EmptyClipboard();
+                int byteCount = (text.Length + 1) * 2; // UTF-16 + null terminator
+                var hGlobal = GlobalAlloc(GMEM_MOVEABLE, (UIntPtr)byteCount);
+                if (hGlobal == IntPtr.Zero) return false;
+
+                var pGlobal = GlobalLock(hGlobal);
+                if (pGlobal == IntPtr.Zero) { GlobalFree(hGlobal); return false; }
+                try
+                {
+                    System.Runtime.InteropServices.Marshal.Copy(text.ToCharArray(), 0, pGlobal, text.Length);
+                    System.Runtime.InteropServices.Marshal.WriteInt16(pGlobal + text.Length * 2, 0);
+                }
+                finally { GlobalUnlock(hGlobal); }
+
+                if (SetClipboardData(CF_UNICODETEXT, hGlobal) == IntPtr.Zero)
+                {
+                    GlobalFree(hGlobal);
+                    return false;
+                }
+                // SetClipboardData takes ownership of hGlobal — do NOT free it
+                return true;
+            }
+            finally { CloseClipboard(); }
+        }
+        catch { return false; }
+    }
+
     private const uint CF_UNICODETEXT = 13;
+    private const uint GMEM_MOVEABLE = 0x0002;
 
     [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
     private static extern bool OpenClipboard(IntPtr hWndNewOwner);
@@ -1045,7 +1088,16 @@
     private static extern bool CloseClipboard();
 
     [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+    private static extern bool EmptyClipboard();
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr SetClipboardData(uint uFormat, IntPtr hMem);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
     private static extern IntPtr GetClipboardData(uint uFormat);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr GlobalAlloc(uint uFlags, UIntPtr dwBytes);
 
     [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
     private static extern IntPtr GlobalLock(IntPtr hMem);
@@ -1053,6 +1105,9 @@
     [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
     [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
     private static extern bool GlobalUnlock(IntPtr hMem);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr GlobalFree(IntPtr hMem);
 
     #endregion
 

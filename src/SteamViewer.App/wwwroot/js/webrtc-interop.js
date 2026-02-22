@@ -740,15 +740,9 @@ window.SteamViewerWebRTC = {
                         }
                         return;
                     }
-                    // Clipboard data from host — write directly to viewer clipboard (no C# round-trip)
+                    // Clipboard data from host — forwarded to C# for native Win32 clipboard write
                     if (parsed.type === 'clipboard_data' && parsed.data) {
-                        try {
-                            await navigator.clipboard.writeText(parsed.data);
-                            console.log(`[${sessionId}] Clipboard synced from host: ${parsed.data.length} chars`);
-                        } catch (clipErr) {
-                            console.warn(`[${sessionId}] Failed to write clipboard:`, clipErr);
-                        }
-                        // Still forward to C# for toast notification
+                        console.log(`[${sessionId}] Clipboard data from host: ${parsed.data.length} chars (routing to C#)`);
                     }
                 } catch (e) {
                     // Not JSON - continue normally
