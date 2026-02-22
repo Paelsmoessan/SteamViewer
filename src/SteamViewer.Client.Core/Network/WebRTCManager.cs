@@ -73,6 +73,16 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
     public event Action? OnScreenShareLost;
 
     /// <summary>
+    /// Raised when a JSON message is received on the file signaling channel (FormatList, FileContentsRequest).
+    /// </summary>
+    public event Func<string, Task>? OnFileChannelMessage;
+
+    /// <summary>
+    /// Raised when raw binary data is received on the file-data channel (FileContentsResponse bytes).
+    /// </summary>
+    public event Func<byte[], Task>? OnFileDataBinaryMessage;
+
+    /// <summary>
     /// Raised when screen capture starts, reporting actual physical capture dimensions.
     /// </summary>
     public event Action<int, int>? OnCaptureStarted;
@@ -325,6 +335,25 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
     }
 
     /// <summary>
+    /// Send string data over the file signaling channel (FormatList, FileContentsRequest).
+    /// </summary>
+    public async Task<bool> SendFileChannelDataAsync(string data)
+    {
+        EnsureInitialized();
+        return await _jsRuntime.InvokeAsync<bool>("SteamViewerWebRTC.sendFileChannelData", _sessionId, data);
+    }
+
+    /// <summary>
+    /// Send raw binary data over the file-data channel (FileContentsResponse bytes).
+    /// </summary>
+    public async Task<bool> SendFileDataBinaryAsync(byte[] data)
+    {
+        EnsureInitialized();
+        var base64 = Convert.ToBase64String(data);
+        return await _jsRuntime.InvokeAsync<bool>("SteamViewerWebRTC.sendFileDataBinary", _sessionId, base64);
+    }
+
+    /// <summary>
     /// Send binary data over the data channel.
     /// </summary>
     public async Task<bool> SendBinaryDataAsync(byte[] data)
@@ -543,6 +572,31 @@ public sealed class WebRTCManager : IWebRTCManager, IAsyncDisposable
         if (OnDataChannelBinaryMessage != null)
         {
             await OnDataChannelBinaryMessage.Invoke(data);
+        }
+    }
+
+    [JSInvokable]
+    public async Task OnFileChannelMessageCallback(string data)
+    {
+        if (OnFileChannelMessage != null)
+        {
+            await OnFileChannelMessage.Invoke(data);
+        }
+    }
+
+    [JSInvokable]
+    public async Task OnFileChannelBinaryCallback(byte[] data)
+    {
+        // Legacy binary on file channel — unused, kept for compat
+    }
+
+    [JSInvokable]
+    public async Task OnFileDataBinaryCallback(string base64Data)
+    {
+        if (OnFileDataBinaryMessage != null)
+        {
+            var data = Convert.FromBase64String(base64Data);
+            await OnFileDataBinaryMessage.Invoke(data);
         }
     }
 

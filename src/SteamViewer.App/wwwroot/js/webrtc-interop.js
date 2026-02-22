@@ -404,6 +404,10 @@ window.SteamViewerWebRTC = {
             session.peerConnection.ondatachannel = (event) => {
                 if (event.channel.label === 'mouse') {
                     this._setupMouseChannel(sessionId, event.channel);
+                } else if (event.channel.label === 'file') {
+                    this._setupFileChannel(sessionId, event.channel);
+                } else if (event.channel.label === 'file-data') {
+                    this._setupFileDataChannel(sessionId, event.channel);
                 } else {
                     this._setupDataChannel(sessionId, event.channel);
                 }
@@ -676,7 +680,7 @@ window.SteamViewerWebRTC = {
             return;
         }
 
-        // Control channel: ordered, reliable — keyboard, commands, clipboard, files, SD frames
+        // Control channel: ordered, reliable — keyboard, commands, clipboard text, SD frames
         session.dataChannel = session.peerConnection.createDataChannel('control', {
             ordered: true
         });
@@ -689,7 +693,19 @@ window.SteamViewerWebRTC = {
         });
         this._setupMouseChannel(sessionId, session.mouseChannel);
 
-        console.log(`[${sessionId}] Dual data channels created (control + mouse)`);
+        // File channel: ordered, reliable — clipboard file signaling (FormatList, FileContentsRequest)
+        session.fileChannel = session.peerConnection.createDataChannel('file', {
+            ordered: true
+        });
+        this._setupFileChannel(sessionId, session.fileChannel);
+
+        // File data channel: ordered, reliable — raw binary file content responses
+        session.fileDataChannel = session.peerConnection.createDataChannel('file-data', {
+            ordered: true
+        });
+        this._setupFileDataChannel(sessionId, session.fileDataChannel);
+
+        console.log(`[${sessionId}] Quad data channels created (control + mouse + file + file-data)`);
     },
 
     _setupDataChannel(sessionId, channel) {
@@ -723,6 +739,10 @@ window.SteamViewerWebRTC = {
                             window.SteamViewerInput.canvas.style.cursor = parsed.cursor;
                         }
                         return;
+                    }
+                    // Clipboard data from host — forwarded to C# for native Win32 clipboard write
+                    if (parsed.type === 'clipboard_data' && parsed.data) {
+                        console.log(`[${sessionId}] Clipboard data from host: ${parsed.data.length} chars (routing to C#)`);
                     }
                 } catch (e) {
                     // Not JSON - continue normally
@@ -771,6 +791,111 @@ window.SteamViewerWebRTC = {
             console.error(`[${sessionId}] Mouse channel error: ${detail}`, event);
             window.SteamViewerLogger?.log('error', `Mouse channel error: ${detail}`);
         };
+    },
+
+    // Set up reliable file channel (clipboard file transfer — virtual file streaming)
+    _setupFileChannel(sessionId, channel) {
+        const session = this._getSession(sessionId);
+        session.fileChannel = channel;
+        channel.binaryType = 'arraybuffer';
+
+        channel.onopen = () => {
+            console.log(`[${sessionId}] File channel opened`);
+        };
+
+        channel.onclose = () => {
+            console.log(`[${sessionId}] File channel closed`);
+        };
+
+        channel.onmessage = async (event) => {
+            if (typeof event.data === 'string' && session.dotNetRef) {
+                await session.dotNetRef.invokeMethodAsync('OnFileChannelMessageCallback', event.data);
+            } else if (event.data instanceof ArrayBuffer && session.dotNetRef) {
+                const uint8Array = new Uint8Array(event.data);
+                await session.dotNetRef.invokeMethodAsync('OnFileChannelBinaryCallback', Array.from(uint8Array));
+            }
+        };
+
+        channel.onerror = (event) => {
+            const err = event.error;
+            const detail = err ? `errorDetail=${err.errorDetail}, message=${err.message}` : 'no error object';
+            console.error(`[${sessionId}] File channel error: ${detail}`, event);
+        };
+    },
+
+    // Set up reliable binary file-data channel (raw file content responses)
+    _setupFileDataChannel(sessionId, channel) {
+        const session = this._getSession(sessionId);
+        session.fileDataChannel = channel;
+        channel.binaryType = 'arraybuffer';
+
+        channel.onopen = () => {
+            console.log(`[${sessionId}] File-data channel opened`);
+        };
+
+        channel.onclose = () => {
+            console.log(`[${sessionId}] File-data channel closed`);
+        };
+
+        channel.onmessage = async (event) => {
+            if (event.data instanceof ArrayBuffer && session.dotNetRef) {
+                // Blazor JSInterop deserializes byte[] from base64 strings, not number arrays
+                // Chunked conversion — avoids O(n) string concatenation per byte
+                const uint8Array = new Uint8Array(event.data);
+                const chunks = [];
+                for (let i = 0; i < uint8Array.length; i += 8192) {
+                    chunks.push(String.fromCharCode.apply(null, uint8Array.subarray(i, i + 8192)));
+                }
+                const base64 = btoa(chunks.join(''));
+                await session.dotNetRef.invokeMethodAsync('OnFileDataBinaryCallback', base64);
+            }
+        };
+
+        channel.onerror = (event) => {
+            const err = event.error;
+            const detail = err ? `errorDetail=${err.errorDetail}, message=${err.message}` : 'no error object';
+            console.error(`[${sessionId}] File-data channel error: ${detail}`, event);
+        };
+    },
+
+    // Send string data over file channel (clipboard file signaling)
+    sendFileChannelData(sessionId, data) {
+        const session = this._getSession(sessionId);
+        if (session.fileChannel && session.fileChannel.readyState === 'open') {
+            session.fileChannel.send(data);
+            return true;
+        }
+        return false;
+    },
+
+    // Send raw binary data over file-data channel (file content responses)
+    // C# byte[] arrives as base64 string via JSInterop — decode to ArrayBuffer before sending
+    // Returns false if bufferedAmount exceeds high watermark (1MB) — caller should pause and retry
+    sendFileDataBinary(sessionId, base64Data) {
+        const session = this._getSession(sessionId);
+        if (session.fileDataChannel && session.fileDataChannel.readyState === 'open') {
+            // Watermark flow control — prevent Chrome silent channel death at 16MB bufferedAmount
+            const HIGH_WATERMARK = 1048576; // 1MB
+            if (session.fileDataChannel.bufferedAmount > HIGH_WATERMARK) {
+                return false; // Signal C# to pause and retry
+            }
+
+            // Set low watermark threshold for resume notification (if needed in future)
+            if (!session._fileDataLowWatermarkSet) {
+                session.fileDataChannel.bufferedAmountLowThreshold = 65536; // 64KB
+                session._fileDataLowWatermarkSet = true;
+            }
+
+            // Fast base64 decode — for-loop is ~5-10x faster than Uint8Array.from with callback
+            const binary = atob(base64Data);
+            const bytes = new Uint8Array(binary.length);
+            for (let i = 0; i < binary.length; i++) {
+                bytes[i] = binary.charCodeAt(i);
+            }
+            session.fileDataChannel.send(bytes.buffer);
+            return true;
+        }
+        return false;
     },
 
     // Send string data over data channel (control channel)
@@ -2786,6 +2911,40 @@ window.SteamViewerInput = {
     async handleKeyDown(e) {
         if (!this.isCapturing || !this.isLocked || !this.dotNetRef) return;
         e.preventDefault();
+
+        // Clipboard interception — Ctrl+V: route through C# which has clipboard permission
+        // (WebView2 blocks navigator.clipboard.readText() in JS keydown context)
+        if (e.ctrlKey && !e.altKey && !e.metaKey && (e.key === 'v' || e.key === 'V')) {
+            try {
+                console.log('[Input] Ctrl+V detected — routing clipboard paste through C#');
+                await this.dotNetRef.invokeMethodAsync('OnClipboardPaste');
+            } catch (err) {
+                console.warn('[Input] OnClipboardPaste failed, forwarding Ctrl+V keystroke:', err);
+                try {
+                    await this.dotNetRef.invokeMethodAsync('OnKeyDown', e.key, this.getModifiers(e));
+                } catch (e2) { console.error('[Input] OnKeyDown failed:', e2); }
+            }
+            return;
+        }
+
+        // Clipboard interception — Ctrl+C/X: forward keystroke, then request host clipboard
+        if (e.ctrlKey && !e.altKey && !e.metaKey && (e.key === 'c' || e.key === 'x')) {
+            try {
+                // Send the keystroke to host first (host app copies/cuts)
+                await this.dotNetRef.invokeMethodAsync('OnKeyDown', e.key, this.getModifiers(e));
+                // After a delay, request the host's clipboard
+                if (this._activeSessionId) {
+                    const sid = this._activeSessionId;
+                    setTimeout(() => {
+                        const msg = JSON.stringify({ type: 'clipboard_request' });
+                        window.SteamViewerWebRTC.sendData(sid, msg);
+                        console.log(`[Input] Clipboard request sent after Ctrl+${e.key.toUpperCase()}`);
+                    }, 150);
+                }
+            } catch (err) { console.error('[Input] OnKeyDown failed:', err); }
+            return;
+        }
+
         try {
             await this.dotNetRef.invokeMethodAsync('OnKeyDown', e.key, this.getModifiers(e));
         } catch (err) { console.error('[Input] OnKeyDown failed:', err); }

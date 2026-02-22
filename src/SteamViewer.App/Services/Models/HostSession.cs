@@ -8,6 +8,7 @@ using SteamViewer.Client.Core.Elevation;
 using SteamViewer.Client.Core.Network;
 using SteamViewer.Common.Protocol;
 using System.Text.Json.Serialization;
+using SteamViewer.Platform.Windows.Clipboard;
 using SteamViewer.Platform.Windows.ScreenCapture;
 
 namespace SteamViewer.App.Services.Models;
@@ -65,6 +66,11 @@ public sealed class HostSession : IAsyncDisposable
     // Native DXGI capture state
     private bool _isNativeCapture;
     private DxgiScreenCapture? _activeDxgi;
+
+    // Clipboard file transfer — host is both sender (monitors clipboard) and receiver (serves file chunks)
+    private ClipboardMonitor? _clipboardMonitor;
+    private ClipboardFileServer? _clipboardFileServer;
+    private ClipboardFileWriter? _clipboardFileWriter;
 
     /// <summary>Session ID for JS interop — always "host".</summary>
     public string SessionId => "host";
@@ -195,6 +201,8 @@ public sealed class HostSession : IAsyncDisposable
         // Subscribe to WebRTC events
         _webrtc.OnIceCandidate += HandleIceCandidate;
         _webrtc.OnDataChannelMessage += HandleDataChannelMessage;
+        _webrtc.OnFileChannelMessage += HandleFileChannelMessage;
+        _webrtc.OnFileDataBinaryMessage += HandleFileDataBinaryMessage;
         _webrtc.OnRenegotiationNeeded += HandleRenegotiationNeeded;
         _webrtc.OnDataChannelOpen += HandleDataChannelOpen;
         _webrtc.OnDataChannelClose += HandleDataChannelClose;
@@ -517,6 +525,9 @@ public sealed class HostSession : IAsyncDisposable
         SetState(HostSessionState.Connected);
         OnReady?.Invoke();
 
+        // Start clipboard file monitoring (detect CF_HDROP on host clipboard)
+        StartClipboardFileTransfer();
+
         // Send elevation status to viewer (elevated = admin helper, systemLevel = SYSTEM helper)
         try
         {
@@ -614,6 +625,10 @@ public sealed class HostSession : IAsyncDisposable
 
                     case "clipboard_set":
                         await HandleClipboardSetAsync(root);
+                        return;
+
+                    case "clipboard_paste":
+                        await HandleClipboardPasteAsync(root);
                         return;
 
                     case "switchDisplay":
@@ -945,20 +960,28 @@ public sealed class HostSession : IAsyncDisposable
     private async Task HandleClipboardRequestAsync()
     {
         if (_webrtc == null) return;
+
+        string? text = null;
+        // Try browser API first
         try
         {
-            var text = await _jsRuntime.InvokeAsync<string>("navigator.clipboard.readText");
-            if (!string.IsNullOrEmpty(text))
-            {
-                var response = JsonSerializer.Serialize<ClipboardMessage>(
-                    new ClipboardMessage.Response("text", text));
-                await _webrtc.SendDataAsync(response);
-                _logger.LogDebug("Sent clipboard to viewer: {Length} chars", text.Length);
-            }
+            text = await _jsRuntime.InvokeAsync<string>("navigator.clipboard.readText");
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Failed to read clipboard for viewer request");
+            _logger.LogWarning(ex, "Browser clipboard.readText failed — trying native Win32");
+        }
+
+        // Fall back to native Win32
+        if (string.IsNullOrEmpty(text))
+            text = TryGetClipboardNative();
+
+        if (!string.IsNullOrEmpty(text))
+        {
+            var response = JsonSerializer.Serialize<ClipboardMessage>(
+                new ClipboardMessage.Response("text", text));
+            await _webrtc.SendDataAsync(response);
+            _logger.LogDebug("Sent clipboard to viewer: {Length} chars", text.Length);
         }
     }
 
@@ -975,6 +998,326 @@ public sealed class HostSession : IAsyncDisposable
         {
             _logger.LogWarning(ex, "Failed to set clipboard from viewer");
         }
+    }
+
+    private async Task HandleClipboardPasteAsync(JsonElement root)
+    {
+        var data = root.TryGetProperty("data", out var d) ? d.GetString() : null;
+        if (data == null) return;
+
+        // Step 1: Set host clipboard — try browser API first, fall back to native Win32
+        bool clipboardSet = false;
+        try
+        {
+            await _jsRuntime.InvokeVoidAsync("navigator.clipboard.writeText", data);
+            clipboardSet = true;
+            _logger.LogDebug("Clipboard paste: set via browser API ({Length} chars)", data.Length);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Browser clipboard.writeText failed — trying native Win32");
+        }
+
+        if (!clipboardSet)
+        {
+            clipboardSet = TrySetClipboardNative(data);
+            if (clipboardSet)
+                _logger.LogDebug("Clipboard paste: set via Win32 ({Length} chars)", data.Length);
+            else
+                _logger.LogWarning("Failed to set clipboard via both browser API and Win32");
+        }
+
+        if (!clipboardSet) return; // Don't inject Ctrl+V if clipboard wasn't set
+
+        // Step 2: Inject Ctrl+V to paste from the clipboard we just set
+        try
+        {
+            var ctrlMod = new KeyModifiers(Ctrl: true);
+            var noMod = KeyModifiers.None;
+            InputEvent[] keystrokes =
+            [
+                new InputEvent.KeyDown("Control", ctrlMod),
+                new InputEvent.KeyDown("v", ctrlMod),
+                new InputEvent.KeyUp("v", ctrlMod),
+                new InputEvent.KeyUp("Control", noMod),
+            ];
+
+            foreach (var keystroke in keystrokes)
+            {
+                var json = JsonSerializer.Serialize(keystroke);
+                if (_elevationService != null && (_elevationService.IsAdminConnected || _elevationService.IsSystemConnected))
+                {
+                    await _elevationService.InjectInputAsync(json, _lastCaptureWidth, _lastCaptureHeight);
+                }
+                else
+                {
+                    _inputInjector.InjectInput(keystroke, _lastCaptureWidth, _lastCaptureHeight);
+                }
+            }
+            _logger.LogDebug("Clipboard paste: Ctrl+V injected");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to inject Ctrl+V for clipboard paste");
+        }
+    }
+
+    /// <summary>
+    /// Native Win32 clipboard read — works without WebView focus.
+    /// </summary>
+    private static string? TryGetClipboardNative()
+    {
+        if (!OperatingSystem.IsWindows()) return null;
+        try
+        {
+            if (!OpenClipboard(IntPtr.Zero)) return null;
+            try
+            {
+                var hData = GetClipboardData(CF_UNICODETEXT);
+                if (hData == IntPtr.Zero) return null;
+
+                var pData = GlobalLock(hData);
+                if (pData == IntPtr.Zero) return null;
+                try
+                {
+                    return System.Runtime.InteropServices.Marshal.PtrToStringUni(pData);
+                }
+                finally { GlobalUnlock(hData); }
+            }
+            finally { CloseClipboard(); }
+        }
+        catch { return null; }
+    }
+
+    /// <summary>
+    /// Native Win32 clipboard write — works without WebView focus.
+    /// </summary>
+    private static bool TrySetClipboardNative(string text)
+    {
+        if (!OperatingSystem.IsWindows()) return false;
+        try
+        {
+            if (!OpenClipboard(IntPtr.Zero)) return false;
+            try
+            {
+                EmptyClipboard();
+                // Clipboard requires GlobalAlloc(GMEM_MOVEABLE) — NOT Marshal.StringToHGlobal
+                int byteCount = (text.Length + 1) * 2; // UTF-16 + null terminator
+                var hGlobal = GlobalAlloc(GMEM_MOVEABLE, (UIntPtr)byteCount);
+                if (hGlobal == IntPtr.Zero) return false;
+
+                var pGlobal = GlobalLock(hGlobal);
+                if (pGlobal == IntPtr.Zero) { GlobalFree(hGlobal); return false; }
+                try
+                {
+                    System.Runtime.InteropServices.Marshal.Copy(text.ToCharArray(), 0, pGlobal, text.Length);
+                    // Write null terminator
+                    System.Runtime.InteropServices.Marshal.WriteInt16(pGlobal + text.Length * 2, 0);
+                }
+                finally { GlobalUnlock(hGlobal); }
+
+                if (SetClipboardData(CF_UNICODETEXT, hGlobal) == IntPtr.Zero)
+                {
+                    GlobalFree(hGlobal);
+                    return false;
+                }
+                // SetClipboardData takes ownership of hGlobal — do NOT free it
+                return true;
+            }
+            finally
+            {
+                CloseClipboard();
+            }
+        }
+        catch { return false; }
+    }
+
+    private const uint CF_UNICODETEXT = 13;
+    private const uint GMEM_MOVEABLE = 0x0002;
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+    private static extern bool OpenClipboard(IntPtr hWndNewOwner);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+    private static extern bool CloseClipboard();
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+    private static extern bool EmptyClipboard();
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr SetClipboardData(uint uFormat, IntPtr hMem);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr GetClipboardData(uint uFormat);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr GlobalAlloc(uint uFlags, UIntPtr dwBytes);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr GlobalLock(IntPtr hMem);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+    private static extern bool GlobalUnlock(IntPtr hMem);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr GlobalFree(IntPtr hMem);
+
+
+    #endregion
+
+    #region Clipboard File Transfer
+
+    /// <summary>
+    /// Initialize clipboard file transfer infrastructure.
+    /// Host monitors clipboard for CF_HDROP, serves file chunks, and receives remote files.
+    /// </summary>
+    private void StartClipboardFileTransfer()
+    {
+        if (!OperatingSystem.IsWindows() || _webrtc == null) return;
+
+        try
+        {
+            // File server — serves file chunks as raw binary on file-data channel
+            // Progress updates sent as JSON on file channel
+            _clipboardFileServer = new ClipboardFileServer(
+                _loggerFactory.CreateLogger<ClipboardFileServer>(),
+                async (data) => { return await _webrtc!.SendFileDataBinaryAsync(data); },
+                async (json) => await _webrtc!.SendFileChannelDataAsync(json));
+
+            // Clipboard monitor — detects when user copies files (CF_HDROP)
+            _clipboardMonitor = new ClipboardMonitor(_loggerFactory.CreateLogger<ClipboardMonitor>());
+            _clipboardMonitor.ClipboardFilesDetected += OnClipboardFilesDetected;
+            _clipboardMonitor.Start();
+
+            // Clipboard file writer — receives FormatList from viewer and presents virtual files
+            _clipboardFileWriter = new ClipboardFileWriter(
+                _loggerFactory.CreateLogger<ClipboardFileWriter>(),
+                async (request) =>
+                {
+                    var json = System.Text.Json.JsonSerializer.Serialize<ClipboardFileMessage>(request);
+                    await _webrtc.SendFileChannelDataAsync(json);
+                },
+                _clipboardMonitor,
+                async (startMsg) =>
+                {
+                    var json = System.Text.Json.JsonSerializer.Serialize<ClipboardFileMessage>(startMsg);
+                    await _webrtc.SendFileChannelDataAsync(json);
+                },
+                async (stopMsg) =>
+                {
+                    var json = System.Text.Json.JsonSerializer.Serialize<ClipboardFileMessage>(stopMsg);
+                    await _webrtc.SendFileChannelDataAsync(json);
+                });
+            _clipboardFileWriter.Start();
+
+            _logger.LogInformation("Clipboard file transfer initialized");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to initialize clipboard file transfer");
+        }
+    }
+
+    private void OnClipboardFilesDetected(ClipboardFileInfo[] files, string[] localPaths)
+    {
+        if (_webrtc == null || !_webrtc.IsDataChannelOpen) return;
+
+        try
+        {
+            // Update file server with new paths
+            _clipboardFileServer?.SetFilePaths(localPaths);
+
+            // Send format list to remote so they can present virtual files
+            var formatList = new ClipboardFileMessage.FormatList(files);
+            var json = System.Text.Json.JsonSerializer.Serialize<ClipboardFileMessage>(formatList);
+
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await _webrtc.SendFileChannelDataAsync(json);
+                    _logger.LogInformation("Sent clipboard file format list: {Count} files", files.Length);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Failed to send clipboard file format list");
+                }
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error handling clipboard files detected");
+        }
+    }
+
+    private async Task HandleFileChannelMessage(string json)
+    {
+        try
+        {
+            var message = System.Text.Json.JsonSerializer.Deserialize<ClipboardFileMessage>(json);
+            if (message == null) return;
+
+            switch (message)
+            {
+                case ClipboardFileMessage.FormatList formatList:
+                    // Remote has files on clipboard — present them as virtual files on our clipboard
+                    _clipboardFileWriter?.SetClipboard(formatList.Files);
+                    break;
+
+                case ClipboardFileMessage.FileContentsRequest request:
+                    // Remote is pasting — they need file data from us (pull mode)
+                    if (_clipboardFileServer != null)
+                        await _clipboardFileServer.HandleRequestAsync(request);
+                    break;
+
+                case ClipboardFileMessage.StartStreaming startStreaming:
+                    // Remote wants push-mode streaming for a file
+                    _clipboardFileServer?.HandleStartStreaming(startStreaming.FileIndex);
+                    break;
+
+                case ClipboardFileMessage.StopStreaming stopStreaming:
+                    // Remote wants to stop push-mode streaming
+                    _clipboardFileServer?.HandleStopStreaming(stopStreaming.FileIndex);
+                    break;
+
+                case ClipboardFileMessage.TransferProgress progress:
+                    _logger.LogInformation("Remote transfer progress: {FileName} — {Transferred}/{Total} ({Speed} MB/s)",
+                        progress.FileName, FormatBytes(progress.BytesTransferred), FormatBytes(progress.TotalBytes), progress.SpeedMBps);
+                    break;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to handle file channel message");
+        }
+    }
+
+    private static string FormatBytes(long bytes)
+    {
+        if (bytes >= 1_073_741_824) return $"{bytes / 1_073_741_824.0:F1} GB";
+        if (bytes >= 1_048_576) return $"{bytes / 1_048_576.0:F1} MB";
+        if (bytes >= 1024) return $"{bytes / 1024.0:F1} KB";
+        return $"{bytes} B";
+    }
+
+    private Task HandleFileDataBinaryMessage(byte[] data)
+    {
+        // Binary file content response — resolve pending RemoteFileStream
+        _clipboardFileWriter?.HandleBinaryFileContentsResponse(data);
+        return Task.CompletedTask;
+    }
+
+    private void StopClipboardFileTransfer()
+    {
+        _clipboardMonitor?.Dispose();
+        _clipboardMonitor = null;
+
+        _clipboardFileServer?.Dispose();
+        _clipboardFileServer = null;
+
+        _clipboardFileWriter?.Dispose();
+        _clipboardFileWriter = null;
     }
 
     #endregion
@@ -1483,6 +1826,9 @@ public sealed class HostSession : IAsyncDisposable
             await _elevationService.DisposeAsync();
         }
 
+        // Stop clipboard file transfer
+        StopClipboardFileTransfer();
+
         // Stop DXGI capture if active
         if (_isNativeCapture && _screenCapture is DxgiScreenCapture dxgi)
         {
@@ -1496,6 +1842,8 @@ public sealed class HostSession : IAsyncDisposable
         {
             _webrtc.OnIceCandidate -= HandleIceCandidate;
             _webrtc.OnDataChannelMessage -= HandleDataChannelMessage;
+            _webrtc.OnFileChannelMessage -= HandleFileChannelMessage;
+            _webrtc.OnFileDataBinaryMessage -= HandleFileDataBinaryMessage;
             _webrtc.OnRenegotiationNeeded -= HandleRenegotiationNeeded;
             _webrtc.OnDataChannelOpen -= HandleDataChannelOpen;
             _webrtc.OnDataChannelClose -= HandleDataChannelClose;

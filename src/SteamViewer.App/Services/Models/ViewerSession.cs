@@ -3,6 +3,7 @@ using Microsoft.JSInterop;
 using SteamViewer.App.Services;
 using SteamViewer.Client.Core.Network;
 using SteamViewer.Common.Protocol;
+using SteamViewer.Platform.Windows.Clipboard;
 using System.Collections.Concurrent;
 using System.Text.Json;
 
@@ -25,6 +26,11 @@ public sealed class ViewerSession : IAsyncDisposable
     private bool _disposed;
     private bool _directRenderBound;
     private readonly ConcurrentQueue<Func<Task>> _pendingSignaling = new();
+
+    // Clipboard file transfer — viewer monitors clipboard and receives remote files
+    private ClipboardMonitor? _clipboardMonitor;
+    private ClipboardFileServer? _clipboardFileServer;
+    private ClipboardFileWriter? _clipboardFileWriter;
 
     /// <summary>
     /// Unique identifier for this session.
@@ -201,6 +207,8 @@ public sealed class ViewerSession : IAsyncDisposable
         _webrtc.OnDataChannelOpen += HandleDataChannelOpen;
         _webrtc.OnDataChannelClose += HandleDataChannelClose;
         _webrtc.OnDataChannelMessage += HandleDataChannelMessage;
+        _webrtc.OnFileChannelMessage += HandleFileChannelMessage;
+        _webrtc.OnFileDataBinaryMessage += HandleFileDataBinaryMessage;
         _webrtc.OnRenegotiationNeeded += HandleRenegotiationNeeded;
         _webrtc.OnConnectionStateChange += HandleConnectionStateChange;
         _webrtc.OnStatsUpdated += json => OnStatsUpdated?.Invoke(json);
@@ -385,6 +393,26 @@ public sealed class ViewerSession : IAsyncDisposable
     }
 
     /// <summary>
+    /// Send clipboard data to the host and trigger a paste (Ctrl+V) on the host side.
+    /// </summary>
+    public async Task SendClipboardPasteAsync(string format, string data)
+    {
+        if (_webrtc == null || !_webrtc.IsDataChannelOpen) return;
+
+        try
+        {
+            var json = JsonSerializer.Serialize<ClipboardMessage>(new ClipboardMessage.Paste(format, data));
+            await _webrtc.SendDataAsync(json);
+            _logger.LogDebug("Session {SessionId}: Sent clipboard paste ({Format}, {Length} chars)",
+                SessionId, format, data.Length);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to send clipboard paste for session {SessionId}", SessionId);
+        }
+    }
+
+    /// <summary>
     /// Enable stats relay polling in JS for this session.
     /// </summary>
     public async Task EnableStatsRelayAsync()
@@ -531,6 +559,9 @@ public sealed class ViewerSession : IAsyncDisposable
         SetState(ViewerSessionState.Connected);
         OnReady?.Invoke();
 
+        // Start clipboard file monitoring (detect CF_HDROP on viewer clipboard for viewer→host transfer)
+        StartClipboardFileTransfer();
+
         // Skip JPEG relay frame capture when direct rendering is active
         // (PeerConnection is in the viewer's JS context — renders directly to canvas)
         if (!_directRenderBound)
@@ -624,7 +655,10 @@ public sealed class ViewerSession : IAsyncDisposable
                         {
                             _logger.LogDebug("Session {SessionId}: Received clipboard ({Format}, {Length} chars)",
                                 SessionId, cbFormat, cbData.Length);
-                            OnClipboardReceived?.Invoke(cbFormat, cbData);
+                            var handler = OnClipboardReceived;
+                            _logger.LogInformation("Session {SessionId}: OnClipboardReceived handler is {Status}",
+                                SessionId, handler != null ? "subscribed" : "NULL");
+                            handler?.Invoke(cbFormat, cbData);
                         }
                         break;
 
@@ -780,10 +814,159 @@ public sealed class ViewerSession : IAsyncDisposable
         }
     }
 
+    #region Clipboard File Transfer
+
+    private void StartClipboardFileTransfer()
+    {
+        if (!OperatingSystem.IsWindows() || _webrtc == null) return;
+
+        try
+        {
+            // File server — serves file chunks as raw binary on file-data channel
+            // Progress updates sent as JSON on file channel
+            _clipboardFileServer = new ClipboardFileServer(
+                _loggerFactory.CreateLogger<ClipboardFileServer>(),
+                async (data) => { return await _webrtc!.SendFileDataBinaryAsync(data); },
+                async (json) => await _webrtc!.SendFileChannelDataAsync(json));
+
+            // Clipboard monitor — detects when viewer user copies files (CF_HDROP)
+            _clipboardMonitor = new ClipboardMonitor(_loggerFactory.CreateLogger<ClipboardMonitor>());
+            _clipboardMonitor.ClipboardFilesDetected += OnClipboardFilesDetected;
+            _clipboardMonitor.Start();
+
+            // Clipboard file writer — receives FormatList from host and presents virtual files
+            _clipboardFileWriter = new ClipboardFileWriter(
+                _loggerFactory.CreateLogger<ClipboardFileWriter>(),
+                async (request) =>
+                {
+                    var json = JsonSerializer.Serialize<ClipboardFileMessage>(request);
+                    await _webrtc.SendFileChannelDataAsync(json);
+                },
+                _clipboardMonitor,
+                async (startMsg) =>
+                {
+                    var json = JsonSerializer.Serialize<ClipboardFileMessage>(startMsg);
+                    await _webrtc.SendFileChannelDataAsync(json);
+                },
+                async (stopMsg) =>
+                {
+                    var json = JsonSerializer.Serialize<ClipboardFileMessage>(stopMsg);
+                    await _webrtc.SendFileChannelDataAsync(json);
+                });
+            _clipboardFileWriter.Start();
+
+            _logger.LogInformation("Session {SessionId}: Clipboard file transfer initialized", SessionId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Session {SessionId}: Failed to initialize clipboard file transfer", SessionId);
+        }
+    }
+
+    private void OnClipboardFilesDetected(ClipboardFileInfo[] files, string[] localPaths)
+    {
+        if (_webrtc == null || !_webrtc.IsDataChannelOpen) return;
+
+        try
+        {
+            _clipboardFileServer?.SetFilePaths(localPaths);
+
+            var formatList = new ClipboardFileMessage.FormatList(files);
+            var json = JsonSerializer.Serialize<ClipboardFileMessage>(formatList);
+
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await _webrtc.SendFileChannelDataAsync(json);
+                    _logger.LogInformation("Session {SessionId}: Sent clipboard file format list: {Count} files",
+                        SessionId, files.Length);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Session {SessionId}: Failed to send clipboard file format list", SessionId);
+                }
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Session {SessionId}: Error handling clipboard files detected", SessionId);
+        }
+    }
+
+    private async Task HandleFileChannelMessage(string json)
+    {
+        try
+        {
+            var message = JsonSerializer.Deserialize<ClipboardFileMessage>(json);
+            if (message == null) return;
+
+            switch (message)
+            {
+                case ClipboardFileMessage.FormatList formatList:
+                    _clipboardFileWriter?.SetClipboard(formatList.Files);
+                    break;
+
+                case ClipboardFileMessage.FileContentsRequest request:
+                    if (_clipboardFileServer != null)
+                        await _clipboardFileServer.HandleRequestAsync(request);
+                    break;
+
+                case ClipboardFileMessage.StartStreaming startStreaming:
+                    _clipboardFileServer?.HandleStartStreaming(startStreaming.FileIndex);
+                    break;
+
+                case ClipboardFileMessage.StopStreaming stopStreaming:
+                    _clipboardFileServer?.HandleStopStreaming(stopStreaming.FileIndex);
+                    break;
+
+                case ClipboardFileMessage.TransferProgress progress:
+                    _logger.LogInformation("Session {SessionId}: Remote transfer progress: {FileName} — {Transferred}/{Total} ({Speed} MB/s)",
+                        SessionId, progress.FileName, FormatBytes(progress.BytesTransferred), FormatBytes(progress.TotalBytes), progress.SpeedMBps);
+                    break;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Session {SessionId}: Failed to handle file channel message", SessionId);
+        }
+    }
+
+    private static string FormatBytes(long bytes)
+    {
+        if (bytes >= 1_073_741_824) return $"{bytes / 1_073_741_824.0:F1} GB";
+        if (bytes >= 1_048_576) return $"{bytes / 1_048_576.0:F1} MB";
+        if (bytes >= 1024) return $"{bytes / 1024.0:F1} KB";
+        return $"{bytes} B";
+    }
+
+    private Task HandleFileDataBinaryMessage(byte[] data)
+    {
+        _clipboardFileWriter?.HandleBinaryFileContentsResponse(data);
+        return Task.CompletedTask;
+    }
+
+    private void StopClipboardFileTransfer()
+    {
+        _clipboardMonitor?.Dispose();
+        _clipboardMonitor = null;
+
+        _clipboardFileServer?.Dispose();
+        _clipboardFileServer = null;
+
+        _clipboardFileWriter?.Dispose();
+        _clipboardFileWriter = null;
+    }
+
+    #endregion
+
     public async ValueTask DisposeAsync()
     {
         if (_disposed) return;
         _disposed = true;
+
+        // Stop clipboard file transfer
+        StopClipboardFileTransfer();
 
         // Stop frame capture
         try
@@ -804,6 +987,8 @@ public sealed class ViewerSession : IAsyncDisposable
             _webrtc.OnDataChannelOpen -= HandleDataChannelOpen;
             _webrtc.OnDataChannelClose -= HandleDataChannelClose;
             _webrtc.OnDataChannelMessage -= HandleDataChannelMessage;
+            _webrtc.OnFileChannelMessage -= HandleFileChannelMessage;
+            _webrtc.OnFileDataBinaryMessage -= HandleFileDataBinaryMessage;
             _webrtc.OnRenegotiationNeeded -= HandleRenegotiationNeeded;
             _webrtc.OnConnectionStateChange -= HandleConnectionStateChange;
 
