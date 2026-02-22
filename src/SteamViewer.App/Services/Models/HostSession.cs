@@ -1197,6 +1197,7 @@ public sealed class HostSession : IAsyncDisposable
                     await _webrtc.SendFileChannelDataAsync(json);
                 },
                 _clipboardMonitor);
+            _clipboardFileWriter.Start();
 
             _logger.LogInformation("Clipboard file transfer initialized");
         }

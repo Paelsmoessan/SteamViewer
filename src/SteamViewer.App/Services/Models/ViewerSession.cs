@@ -838,6 +838,7 @@ public sealed class ViewerSession : IAsyncDisposable
                     await _webrtc.SendFileChannelDataAsync(json);
                 },
                 _clipboardMonitor);
+            _clipboardFileWriter.Start();
 
             _logger.LogInformation("Session {SessionId}: Clipboard file transfer initialized", SessionId);
         }

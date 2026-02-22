@@ -9,8 +9,11 @@ namespace SteamViewer.Platform.Windows.Clipboard;
 
 /// <summary>
 /// Places a VirtualFileDataObject on the clipboard via OleSetClipboard.
-/// Runs clipboard operations on a dedicated STA thread (required by OLE).
-/// Handles echo prevention via ClipboardMonitor coordination.
+/// Runs on a persistent STA thread with a message pump so the COM apartment
+/// stays alive — Explorer needs it to call IDataObject.GetData / IStream.Read
+/// when the user pastes.
+///
+/// Source attribution: STA + message pump pattern from RustDesk/FreeRDP (Apache-2.0).
 /// </summary>
 public sealed class ClipboardFileWriter : IDisposable
 {
@@ -25,6 +28,14 @@ public sealed class ClipboardFileWriter : IDisposable
     public ConcurrentDictionary<int, TaskCompletionSource<byte[]?>> PendingRequests { get; } = new();
 
     private VirtualFileDataObject? _currentDataObject;
+    private Thread? _staThread;
+    private IntPtr _hwnd;
+    private volatile bool _stopping;
+    private readonly ConcurrentQueue<ClipboardFileInfo[]> _pendingClipboardSets = new();
+    private WndProcDelegate? _wndProc; // prevent GC of delegate
+
+    private const uint WM_SET_CLIPBOARD = 0x0400 + 1; // WM_USER + 1
+    private const uint WM_QUIT = 0x0012;
 
     public ClipboardFileWriter(
         ILogger logger,
@@ -37,64 +48,58 @@ public sealed class ClipboardFileWriter : IDisposable
     }
 
     /// <summary>
+    /// Start the persistent STA thread with message pump.
+    /// Must be called before SetClipboard.
+    /// </summary>
+    public void Start()
+    {
+        if (_staThread != null) return;
+
+        _stopping = false;
+        _staThread = new Thread(StaThreadProc)
+        {
+            Name = "ClipboardFileWriter-STA",
+            IsBackground = true
+        };
+        _staThread.SetApartmentState(ApartmentState.STA);
+        _staThread.Start();
+
+        _logger.LogInformation("ClipboardFileWriter STA thread started");
+    }
+
+    /// <summary>
+    /// Stop the STA thread and clean up.
+    /// </summary>
+    public void Stop()
+    {
+        _stopping = true;
+        if (_hwnd != IntPtr.Zero)
+        {
+            PostMessage(_hwnd, WM_QUIT, IntPtr.Zero, IntPtr.Zero);
+        }
+        _staThread?.Join(3000);
+        _staThread = null;
+        _hwnd = IntPtr.Zero;
+        _logger.LogInformation("ClipboardFileWriter STA thread stopped");
+    }
+
+    /// <summary>
     /// Present remote files as pasteable clipboard items.
     /// Called when we receive a FormatList from the remote machine.
+    /// Posts to the STA thread — OleSetClipboard runs there.
     /// </summary>
     public void SetClipboard(ClipboardFileInfo[] files)
     {
         _logger.LogInformation("Setting clipboard with {Count} virtual file(s)", files.Length);
 
-        // Run on STA thread — OleSetClipboard requires it
-        var thread = new Thread(() =>
+        if (_hwnd == IntPtr.Zero)
         {
-            try
-            {
-                int hr = OleInitialize(IntPtr.Zero);
-                if (hr < 0)
-                {
-                    _logger.LogError("OleInitialize failed: 0x{HR:X8}", hr);
-                    return;
-                }
+            _logger.LogWarning("ClipboardFileWriter not started — cannot set clipboard");
+            return;
+        }
 
-                try
-                {
-                    _currentDataObject = new VirtualFileDataObject(files, _sendRequest, PendingRequests);
-
-                    // Tell our own clipboard monitor to ignore this change
-                    _clipboardMonitor?.SetEchoFlag();
-
-                    hr = OleSetClipboard(_currentDataObject);
-                    if (hr < 0)
-                    {
-                        _logger.LogError("OleSetClipboard failed: 0x{HR:X8}", hr);
-                        _clipboardMonitor?.ClearEchoFlag();
-                        return;
-                    }
-
-                    _logger.LogDebug("OleSetClipboard succeeded — {Count} virtual files available", files.Length);
-
-                    // Clear echo flag after a brief delay to let clipboard notification propagate
-                    Thread.Sleep(100);
-                    _clipboardMonitor?.ClearEchoFlag();
-                }
-                finally
-                {
-                    OleUninitialize();
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Failed to set virtual file clipboard");
-                _clipboardMonitor?.ClearEchoFlag();
-            }
-        })
-        {
-            Name = "ClipboardFileWriter-STA",
-            IsBackground = true
-        };
-        thread.SetApartmentState(ApartmentState.STA);
-        thread.Start();
-        thread.Join(5000); // Wait for clipboard to be set
+        _pendingClipboardSets.Enqueue(files);
+        PostMessage(_hwnd, WM_SET_CLIPBOARD, IntPtr.Zero, IntPtr.Zero);
     }
 
     /// <summary>
@@ -121,11 +126,10 @@ public sealed class ClipboardFileWriter : IDisposable
         }
     }
 
-    /// <summary>
-    /// Clean up — flush clipboard so data persists if our process exits.
-    /// </summary>
     public void Dispose()
     {
+        Stop();
+
         // Cancel all pending requests
         foreach (var kvp in PendingRequests)
         {
@@ -136,7 +140,153 @@ public sealed class ClipboardFileWriter : IDisposable
         _currentDataObject = null;
     }
 
-    #region P/Invoke
+    #region STA Thread
+
+    private void StaThreadProc()
+    {
+        try
+        {
+            int hr = OleInitialize(IntPtr.Zero);
+            if (hr < 0)
+            {
+                _logger.LogError("OleInitialize failed: 0x{HR:X8}", hr);
+                return;
+            }
+
+            try
+            {
+                _hwnd = CreateWriterWindow();
+                if (_hwnd == IntPtr.Zero)
+                {
+                    _logger.LogError("Failed to create ClipboardFileWriter window");
+                    return;
+                }
+
+                _logger.LogDebug("ClipboardFileWriter STA thread running with message pump");
+
+                // Message pump — keeps COM apartment alive for Explorer's IDataObject/IStream calls
+                while (!_stopping && GetMessage(out var msg, IntPtr.Zero, 0, 0) > 0)
+                {
+                    TranslateMessage(ref msg);
+                    DispatchMessage(ref msg);
+                }
+
+                DestroyWindow(_hwnd);
+            }
+            finally
+            {
+                OleUninitialize();
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "ClipboardFileWriter STA thread crashed");
+        }
+    }
+
+    private IntPtr CreateWriterWindow()
+    {
+        const string className = "SteamViewer_ClipboardFileWriter";
+
+        _wndProc = WndProc; // prevent GC of delegate
+
+        var wc = new WNDCLASSEX
+        {
+            cbSize = (uint)Marshal.SizeOf<WNDCLASSEX>(),
+            lpfnWndProc = Marshal.GetFunctionPointerForDelegate(_wndProc),
+            hInstance = GetModuleHandle(null),
+            lpszClassName = className
+        };
+
+        RegisterClassEx(ref wc);
+
+        return CreateWindowEx(
+            0, className, "SteamViewer Clipboard Writer",
+            0, 0, 0, 0, 0,
+            HWND_MESSAGE, // message-only window
+            IntPtr.Zero, wc.hInstance, IntPtr.Zero);
+    }
+
+    private IntPtr WndProc(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam)
+    {
+        if (msg == WM_SET_CLIPBOARD)
+        {
+            ProcessPendingClipboardSets();
+            return IntPtr.Zero;
+        }
+
+        return DefWindowProc(hwnd, msg, wParam, lParam);
+    }
+
+    private void ProcessPendingClipboardSets()
+    {
+        while (_pendingClipboardSets.TryDequeue(out var files))
+        {
+            try
+            {
+                _currentDataObject = new VirtualFileDataObject(files, _sendRequest, PendingRequests);
+
+                // Tell our own clipboard monitor to ignore this change
+                _clipboardMonitor?.SetEchoFlag();
+
+                int hr = OleSetClipboard(_currentDataObject);
+                if (hr < 0)
+                {
+                    _logger.LogError("OleSetClipboard failed: 0x{HR:X8}", hr);
+                    _clipboardMonitor?.ClearEchoFlag();
+                    continue;
+                }
+
+                _logger.LogDebug("OleSetClipboard succeeded — {Count} virtual files available", files.Length);
+
+                // Clear echo flag after a brief delay to let clipboard notification propagate
+                Thread.Sleep(100);
+                _clipboardMonitor?.ClearEchoFlag();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to set virtual file clipboard");
+                _clipboardMonitor?.ClearEchoFlag();
+            }
+        }
+    }
+
+    #endregion
+
+    #region Win32
+
+    private static readonly IntPtr HWND_MESSAGE = new(-3);
+
+    private delegate IntPtr WndProcDelegate(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam);
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct WNDCLASSEX
+    {
+        public uint cbSize;
+        public uint style;
+        public IntPtr lpfnWndProc;
+        public int cbClsExtra;
+        public int cbWndExtra;
+        public IntPtr hInstance;
+        public IntPtr hIcon;
+        public IntPtr hCursor;
+        public IntPtr hbrBackground;
+        public string? lpszMenuName;
+        public string lpszClassName;
+        public IntPtr hIconSm;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MSG
+    {
+        public IntPtr hwnd;
+        public uint message;
+        public IntPtr wParam;
+        public IntPtr lParam;
+        public uint time;
+        public int pt_x;
+        public int pt_y;
+    }
 
     [DllImport("ole32.dll")]
     private static extern int OleInitialize(IntPtr pvReserved);
@@ -148,8 +298,38 @@ public sealed class ClipboardFileWriter : IDisposable
     private static extern int OleSetClipboard(
         [MarshalAs(UnmanagedType.Interface)] IComDataObject? pDataObj);
 
-    [DllImport("ole32.dll")]
-    private static extern int OleFlushClipboard();
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern ushort RegisterClassEx(ref WNDCLASSEX lpWndClass);
+
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern IntPtr CreateWindowEx(
+        uint dwExStyle, string lpClassName, string lpWindowName,
+        uint dwStyle, int x, int y, int nWidth, int nHeight,
+        IntPtr hWndParent, IntPtr hMenu, IntPtr hInstance, IntPtr lpParam);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool DestroyWindow(IntPtr hwnd);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr DefWindowProc(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    private static extern int GetMessage(out MSG lpMsg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool TranslateMessage(ref MSG lpMsg);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr DispatchMessage(ref MSG lpMsg);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr GetModuleHandle(string? lpModuleName);
 
     #endregion
 }

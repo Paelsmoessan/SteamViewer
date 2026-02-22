@@ -22,12 +22,15 @@ public sealed class VirtualFileDataObject : IComDataObject
     private readonly ConcurrentDictionary<int, TaskCompletionSource<byte[]?>> _pendingRequests;
 
     // Registered clipboard format IDs (registered once, cached)
-    private static readonly ushort CF_FILEDESCRIPTORW =
-        RegisterClipboardFormat("FileGroupDescriptorW");
-    private static readonly ushort CF_FILECONTENTS =
-        RegisterClipboardFormat("FileContents");
-    private static readonly ushort CF_PREFERREDDROPEFFECT =
-        RegisterClipboardFormat("Preferred DropEffect");
+    // MUST be short (not ushort) — FORMATETC.cfFormat is short, and registered formats
+    // are >= 0xC000 which overflows to negative. Comparison short==ushort promotes to int
+    // with different sign extension, causing format matching to always fail.
+    private static readonly short CF_FILEDESCRIPTORW =
+        (short)RegisterClipboardFormat("FileGroupDescriptorW");
+    private static readonly short CF_FILECONTENTS =
+        (short)RegisterClipboardFormat("FileContents");
+    private static readonly short CF_PREFERREDDROPEFFECT =
+        (short)RegisterClipboardFormat("Preferred DropEffect");
 
     private const int DROPEFFECT_COPY = 1;
 
@@ -124,7 +127,7 @@ public sealed class VirtualFileDataObject : IComDataObject
         {
             new()
             {
-                cfFormat = (short)CF_FILEDESCRIPTORW,
+                cfFormat = CF_FILEDESCRIPTORW,
                 dwAspect = DVASPECT.DVASPECT_CONTENT,
                 lindex = -1,
                 ptd = IntPtr.Zero,
@@ -132,7 +135,7 @@ public sealed class VirtualFileDataObject : IComDataObject
             },
             new()
             {
-                cfFormat = (short)CF_FILECONTENTS,
+                cfFormat = CF_FILECONTENTS,
                 dwAspect = DVASPECT.DVASPECT_CONTENT,
                 lindex = -1,
                 ptd = IntPtr.Zero,
@@ -140,7 +143,7 @@ public sealed class VirtualFileDataObject : IComDataObject
             },
             new()
             {
-                cfFormat = (short)CF_PREFERREDDROPEFFECT,
+                cfFormat = CF_PREFERREDDROPEFFECT,
                 dwAspect = DVASPECT.DVASPECT_CONTENT,
                 lindex = -1,
                 ptd = IntPtr.Zero,
