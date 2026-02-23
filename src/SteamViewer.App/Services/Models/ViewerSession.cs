@@ -22,7 +22,6 @@ public sealed class ViewerSession : IAsyncDisposable
     private int _sdViewerFrameCount;
     private WebRTCManager? _webrtc;
     private DotNetObjectReference<ViewerSession>? _dotNetRef;
-    private bool _frameCaptureStarted;
     private bool _disposed;
     private bool _directRenderBound;
     private readonly ConcurrentQueue<Func<Task>> _pendingSignaling = new();
@@ -61,11 +60,6 @@ public sealed class ViewerSession : IAsyncDisposable
     /// Whether the remote peer is sharing their screen.
     /// </summary>
     public bool IsPeerSharing { get; private set; }
-
-    /// <summary>
-    /// Raised when a JPEG video frame is received (JPEG relay path).
-    /// </summary>
-    public event Action<JpegFrame>? OnFrame;
 
     /// <summary>
     /// Raised when the first video frame is rendered via direct rendering.
@@ -561,13 +555,6 @@ public sealed class ViewerSession : IAsyncDisposable
 
         // Start clipboard file monitoring (detect CF_HDROP on viewer clipboard for viewer→host transfer)
         StartClipboardFileTransfer();
-
-        // Skip JPEG relay frame capture when direct rendering is active
-        // (PeerConnection is in the viewer's JS context — renders directly to canvas)
-        if (!_directRenderBound)
-        {
-            await StartFrameCaptureAsync();
-        }
     }
 
     private async Task HandleDataChannelClose()
@@ -718,14 +705,6 @@ public sealed class ViewerSession : IAsyncDisposable
         {
             case "connected":
                 SetState(ViewerSessionState.Connected);
-                // Restart frame capture if it was stopped by a previous disconnect
-                // (only needed for JPEG relay path — skip when direct rendering is active)
-                if (_frameCaptureStarted && !_directRenderBound)
-                {
-                    _logger.LogInformation("Session {SessionId}: Connection recovered, restarting frame capture", SessionId);
-                    _frameCaptureStarted = false;
-                    await StartFrameCaptureAsync();
-                }
                 break;
             case "disconnected":
             case "failed":
@@ -746,25 +725,7 @@ public sealed class ViewerSession : IAsyncDisposable
     }
 
     /// <summary>
-    /// Relay a JPEG frame to this session's listeners.
-    /// Called by frame capture mechanism.
-    /// </summary>
-    public void RelayFrame(JpegFrame frame)
-    {
-        OnFrame?.Invoke(frame);
-    }
-
-    /// <summary>
-    /// Called from JS when a video frame is captured.
-    /// </summary>
-    [JSInvokable]
-    public void OnFrameCaptured(string base64Data, int width, int height)
-    {
-        OnFrame?.Invoke(new JpegFrame(base64Data, width, height));
-    }
-
-    /// <summary>
-    /// Enable direct rendering to a visible canvas (bypasses JPEG relay).
+    /// Enable direct rendering to a visible DOM video element.
     /// Only works when PeerConnection's JSRuntime matches the viewer's window.
     /// </summary>
     public async Task<bool> TryEnableDirectRenderingAsync(string canvasId, IJSRuntime viewerJsRuntime)
@@ -772,7 +733,7 @@ public sealed class ViewerSession : IAsyncDisposable
         // Direct rendering only works if the PeerConnection is in the same JS context
         if (!ReferenceEquals(_jsRuntime, viewerJsRuntime))
         {
-            _logger.LogInformation("Session {SessionId}: JSRuntime mismatch — using JPEG relay", SessionId);
+            _logger.LogWarning("Session {SessionId}: JSRuntime mismatch — no video rendering available (JPEG relay removed)", SessionId);
             return false;
         }
 
@@ -790,27 +751,6 @@ public sealed class ViewerSession : IAsyncDisposable
         {
             _logger.LogWarning(ex, "Session {SessionId}: Failed to enable direct rendering", SessionId);
             return false;
-        }
-    }
-
-    /// <summary>
-    /// Start capturing frames from the JS WebRTC video track.
-    /// </summary>
-    private async Task StartFrameCaptureAsync()
-    {
-        if (_frameCaptureStarted || _disposed) return;
-        _frameCaptureStarted = true;
-
-        try
-        {
-            _dotNetRef = DotNetObjectReference.Create(this);
-            await _jsRuntime.InvokeVoidAsync("SteamViewerWebRTC.startFrameCapture", SessionId, _dotNetRef);
-            _logger.LogInformation("Session {SessionId}: Frame capture started", SessionId);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Session {SessionId}: Failed to start frame capture", SessionId);
-            _frameCaptureStarted = false;
         }
     }
 
@@ -968,15 +908,6 @@ public sealed class ViewerSession : IAsyncDisposable
         // Stop clipboard file transfer
         StopClipboardFileTransfer();
 
-        // Stop frame capture
-        try
-        {
-            await _jsRuntime.InvokeVoidAsync("SteamViewerWebRTC.stopFrameCapture", SessionId);
-        }
-        catch
-        {
-            // Ignore if JS not available during shutdown
-        }
 
         _dotNetRef?.Dispose();
         _dotNetRef = null;

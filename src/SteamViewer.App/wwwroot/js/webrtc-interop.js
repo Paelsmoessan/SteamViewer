@@ -152,17 +152,12 @@ window.SteamViewerWebRTC = {
             remoteCanvas: null,
             remoteCtx: null,
             // Frame capture
-            frameCaptureDotNetRef: null,
-            frameCaptureEnabled: false,
-            frameCaptureAnimationId: null,
             lastFrameTime: 0,
             frameInterval: 33, // ~30fps (match WebRTC source)
-            captureCanvas: null,
-            captureCtx: null,
-            // Direct rendering (bypasses JPEG relay when canvas is in same JS context)
+            // Direct rendering (video element in DOM, canvas overlay for mouse events)
             _directRenderCanvas: null,
-            _directRenderCtx: null,
-            _letterbox: { dx: 0, dy: 0, dw: 0, dh: 0, videoW: 0, videoH: 0 },
+            _directRenderVideo: null,
+            _videoLetterbox: { dx: 0, dy: 0, dw: 0, dh: 0, videoW: 0, videoH: 0 },
             _resizeObserver: null,
             // Stats overlay
             _statsInterval: null,
@@ -289,8 +284,6 @@ window.SteamViewerWebRTC = {
                 console.log(`=== CONNECTION STATE [${sessionId}]:`, state, '===');
 
                 if (state === 'connected') {
-                    // Recovery from temporary disconnect — resume capture if it was paused
-                    this.resumeFrameCapture(sessionId);
                     // Re-focus canvas on reconnect to ensure keyboard events work
                     if (window.SteamViewerInput && window.SteamViewerInput.canvas) {
                         window.SteamViewerInput.canvas.focus();
@@ -304,13 +297,9 @@ window.SteamViewerWebRTC = {
 
                 // Handle disconnect/failure
                 if (state === 'disconnected') {
-                    // Temporary disconnect — pause capture but KEEP input locked
-                    // ICE will usually reconnect within seconds
-                    this.pauseFrameCapture(sessionId);
                     console.log('Temporary disconnect — input lock preserved');
                 } else if (state === 'failed' || state === 'closed') {
                     // Permanent failure — full cleanup
-                    this.stopFrameCapture(sessionId);
                     if (window.SteamViewerInput && window.SteamViewerInput.isLocked
                         && window.SteamViewerInput._activeSessionId === sessionId) {
                         window.SteamViewerInput.unlock();
@@ -527,20 +516,39 @@ window.SteamViewerWebRTC = {
                                 }
 
                                 try {
-                                    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                                    // Self-healing: if DOM video element exists but has no stream, set it up
+                                    // (handles JSRuntime mismatch where setDirectRenderTarget never ran)
+                                    if (!session._directRenderVideo && video.srcObject) {
+                                        const domVideo = document.getElementById('viewerVideo');
+                                        if (domVideo) {
+                                            domVideo.muted = true;
+                                            domVideo.srcObject = video.srcObject;
+                                            domVideo.play().catch(e => console.warn('[DirectRender] DOM video play failed:', e));
+                                            session._directRenderVideo = domVideo;
+                                            // Set up CSS-space letterbox + resize observer
+                                            const updateVideoLetterbox = () => {
+                                                const r = domVideo.getBoundingClientRect();
+                                                const vW = video.videoWidth || 0;
+                                                const vH = video.videoHeight || 0;
+                                                session._videoLetterbox = computeLetterbox(r.width, r.height, vW, vH);
+                                            };
+                                            updateVideoLetterbox();
+                                            if (!session._resizeObserver) {
+                                                session._resizeObserver = new ResizeObserver(updateVideoLetterbox);
+                                                session._resizeObserver.observe(domVideo.parentElement || domVideo);
+                                            }
+                                            session._updateCanvasSize = updateVideoLetterbox;
+                                            console.log('[DirectRender] Self-healed: attached stream to DOM video element');
+                                        }
+                                    }
 
-                                    // Direct render: draw to visible canvas with letterbox (bypasses JPEG relay)
-                                    if (session._directRenderCtx) {
-                                        const dc = session._directRenderCanvas;
-                                        const lb = session._letterbox;
-                                        // Recompute letterbox if video resolution changed
-                                        if (lb.videoW !== video.videoWidth || lb.videoH !== video.videoHeight) {
+                                    // Recompute CSS-space letterbox if video resolution changed (for coordinate mapping)
+                                    if (session._directRenderVideo) {
+                                        const lb = session._videoLetterbox;
+                                        if (lb && (lb.videoW !== video.videoWidth || lb.videoH !== video.videoHeight)) {
                                             if (session._updateCanvasSize) session._updateCanvasSize();
                                         }
-                                        session._directRenderCtx.clearRect(0, 0, dc.width, dc.height);
-                                        session._directRenderCtx.drawImage(video, lb.dx, lb.dy, lb.dw, lb.dh);
-
-                                        // Notify C# about first direct-render frame (dismisses "Waiting for host screen" overlay)
+                                        // Notify C# about first frame (dismisses "Waiting for host screen" overlay)
                                         if (!session._firstDirectFrameNotified && session.dotNetRef) {
                                             session._firstDirectFrameNotified = true;
                                             session.dotNetRef.invokeMethodAsync('OnVideoStartedCallback');
@@ -552,7 +560,7 @@ window.SteamViewerWebRTC = {
                                     // Log frame rate every 2 seconds
                                     if (now - lastFrameTime > 2000) {
                                         const fps = frameCount / ((now - lastFrameTime) / 1000);
-                                        const mode = session._directRenderCtx ? 'DIRECT' : 'RVFC';
+                                        const mode = session._directRenderVideo ? 'DIRECT' : 'RVFC';
                                         console.log(`Video rendering (${mode}): ${fps.toFixed(1)} FPS, ${frameCount} frames`);
                                         frameCount = 0;
                                         lastFrameTime = now;
@@ -573,19 +581,36 @@ window.SteamViewerWebRTC = {
 
                                 if (video.readyState >= 2) {
                                     try {
-                                        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                                        // Self-healing: same as RVFC path above
+                                        if (!session._directRenderVideo && video.srcObject) {
+                                            const domVideo = document.getElementById('viewerVideo');
+                                            if (domVideo) {
+                                                domVideo.muted = true;
+                                                domVideo.srcObject = video.srcObject;
+                                                domVideo.play().catch(e => console.warn('[DirectRender] DOM video play failed (RAF):', e));
+                                                session._directRenderVideo = domVideo;
+                                                const updateVideoLetterbox = () => {
+                                                    const r = domVideo.getBoundingClientRect();
+                                                    const vW = video.videoWidth || 0;
+                                                    const vH = video.videoHeight || 0;
+                                                    session._videoLetterbox = computeLetterbox(r.width, r.height, vW, vH);
+                                                };
+                                                updateVideoLetterbox();
+                                                if (!session._resizeObserver) {
+                                                    session._resizeObserver = new ResizeObserver(updateVideoLetterbox);
+                                                    session._resizeObserver.observe(domVideo.parentElement || domVideo);
+                                                }
+                                                session._updateCanvasSize = updateVideoLetterbox;
+                                                console.log('[DirectRender] Self-healed (RAF): attached stream to DOM video element');
+                                            }
+                                        }
 
-                                        // Direct render: draw to visible canvas with letterbox
-                                        if (session._directRenderCtx) {
-                                            const dc = session._directRenderCanvas;
-                                            const lb = session._letterbox;
-                                            if (lb.videoW !== video.videoWidth || lb.videoH !== video.videoHeight) {
+                                        // Recompute CSS-space letterbox if video resolution changed
+                                        if (session._directRenderVideo) {
+                                            const lb = session._videoLetterbox;
+                                            if (lb && (lb.videoW !== video.videoWidth || lb.videoH !== video.videoHeight)) {
                                                 if (session._updateCanvasSize) session._updateCanvasSize();
                                             }
-                                            session._directRenderCtx.clearRect(0, 0, dc.width, dc.height);
-                                            session._directRenderCtx.drawImage(video, lb.dx, lb.dy, lb.dw, lb.dh);
-
-                                            // Notify C# about first direct-render frame
                                             if (!session._firstDirectFrameNotified && session.dotNetRef) {
                                                 session._firstDirectFrameNotified = true;
                                                 session.dotNetRef.invokeMethodAsync('OnVideoStartedCallback');
@@ -949,10 +974,10 @@ window.SteamViewerWebRTC = {
         modified = modified.replace(/(m=video[^\r\n]*\r\n)/g, '$1b=AS:50000\r\n');
 
         // Add x-google bitrate params to H264 fmtp lines — fast ramp-up, no slow BWE climb
-        // start=10Mbps (instant quality), min=5Mbps (floor), max=50Mbps (ceiling)
+        // start=30Mbps (instant quality on LAN), min=10Mbps (floor), max=50Mbps (ceiling)
         modified = modified.replace(
             /(a=fmtp:\d+ .*profile-level-id=[0-9a-fA-F]+)(?!.*x-google)/g,
-            '$1;x-google-start-bitrate=10000;x-google-min-bitrate=5000;x-google-max-bitrate=50000'
+            '$1;x-google-start-bitrate=30000;x-google-min-bitrate=10000;x-google-max-bitrate=50000'
         );
 
         // Add playout-delay RTP header extension — tells Chrome "render ASAP, don't buffer"
@@ -1140,7 +1165,7 @@ window.SteamViewerWebRTC = {
 
                 // Set content hint for screen sharing (improves encoding for text/UI)
                 if (track.contentHint !== undefined) {
-                    track.contentHint = 'motion'; // Prioritize frame rate + low latency over text sharpness // Optimizes for sharp text/UI
+                    track.contentHint = 'detail'; // Optimizes for sharp text/UI (screen sharing)
                 }
 
                 const sender = session.peerConnection.addTrack(track, session.localStream);
@@ -1344,7 +1369,7 @@ window.SteamViewerWebRTC = {
         }
 
         // Optimize for screen content (sharp text/UI)
-        track.contentHint = 'motion'; // Prioritize frame rate + low latency over text sharpness
+        track.contentHint = 'detail'; // Optimizes for sharp text/UI (screen sharing)
 
         // Add to peer connection
         const sender = session.peerConnection.addTrack(track, stream);
@@ -1741,18 +1766,7 @@ window.SteamViewerWebRTC = {
         });
     },
 
-    // Check if video is ready for capture
-    _isVideoReady(sessionId) {
-        const session = this.sessions.get(sessionId);
-        if (!session) return false;
-        return session.remoteCanvas &&
-               session.remoteCanvas.width > 0 &&
-               session.remoteCanvas.height > 0 &&
-               session.remoteVideo &&
-               session.remoteVideo.readyState >= 2;
-    },
-
-    // Enable direct rendering to a visible canvas (bypasses JPEG relay)
+    // Enable direct rendering to a visible DOM video element
     // Only works when PeerConnection is in the same JS context as the canvas
     setDirectRenderTarget(sessionId, canvasId) {
         const session = this.sessions.get(sessionId);
@@ -1767,39 +1781,43 @@ window.SteamViewerWebRTC = {
             return false;
         }
 
+        // Attach video stream to DOM video element for GPU-accelerated scaling
+        const domVideo = document.getElementById('viewerVideo');
+        if (!domVideo) {
+            console.warn(`[DirectRender] Video element 'viewerVideo' not found`);
+            return false;
+        }
+        domVideo.muted = true;
+        domVideo.srcObject = session.remoteVideo?.srcObject || null;
+        domVideo.play().catch(e => console.warn('[DirectRender] Video play failed:', e));
+        session._directRenderVideo = domVideo;
         session._directRenderCanvas = canvas;
-        session._directRenderCtx = canvas.getContext('2d');
 
-        // Size canvas bitmap to CSS display size × devicePixelRatio
-        // We handle letterboxing ourselves in drawImage — no object-fit:contain
-        const updateCanvasSize = () => {
-            const rect = canvas.getBoundingClientRect();
-            const dpr = window.devicePixelRatio || 1;
-            const newW = Math.round(rect.width * dpr);
-            const newH = Math.round(rect.height * dpr);
-            if (canvas.width !== newW || canvas.height !== newH) {
-                canvas.width = newW;
-                canvas.height = newH;
-            }
-            // Recompute letterbox with current video dimensions
+        // Clear canvas to ensure transparency (remove any stale content that could hide the video)
+        const ctx = canvas.getContext('2d');
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        // Compute letterbox in CSS space (no DPR — video element handles scaling)
+        const updateVideoLetterbox = () => {
+            const rect = domVideo.getBoundingClientRect();
             const videoW = session.remoteVideo?.videoWidth || 0;
             const videoH = session.remoteVideo?.videoHeight || 0;
-            session._letterbox = computeLetterbox(newW, newH, videoW, videoH);
+            session._videoLetterbox = computeLetterbox(rect.width, rect.height, videoW, videoH);
         };
 
-        updateCanvasSize();
+        updateVideoLetterbox();
 
         // Watch for container resizes (window resize, tab switch, etc.)
         if (session._resizeObserver) {
             session._resizeObserver.disconnect();
         }
-        session._resizeObserver = new ResizeObserver(updateCanvasSize);
+        session._resizeObserver = new ResizeObserver(updateVideoLetterbox);
         session._resizeObserver.observe(canvas.parentElement || canvas);
 
-        // Store updater so render loop can call it when video resolution changes
-        session._updateCanvasSize = updateCanvasSize;
+        // Store updater so render loop can recompute on video resolution change
+        session._updateCanvasSize = updateVideoLetterbox;
 
-        console.log(`[DirectRender] Enabled for session ${sessionId} → canvas '${canvasId}' (${canvas.width}x${canvas.height} bitmap)`);
+        console.log(`[DirectRender] Enabled for session ${sessionId} → video element + canvas overlay`);
         return true;
     },
 
@@ -1814,135 +1832,13 @@ window.SteamViewerWebRTC = {
         }
         session._updateCanvasSize = null;
         session._directRenderCanvas = null;
-        session._directRenderCtx = null;
+        // Stop DOM video element
+        if (session._directRenderVideo) {
+            session._directRenderVideo.srcObject = null;
+            session._directRenderVideo = null;
+        }
+        session._videoLetterbox = null;
         console.log(`[DirectRender] Disabled for session ${sessionId}`);
-    },
-
-    // Enable frame capture to relay to viewer window
-    async startFrameCapture(sessionId, dotNetRef) {
-        const session = this._getSession(sessionId);
-        console.log(`[${sessionId}] Starting frame capture for viewer window`);
-        session.frameCaptureDotNetRef = dotNetRef;
-        session.frameCaptureEnabled = true;
-        session.lastFrameTime = 0;
-
-        // Wait for video to be ready (up to 5 seconds)
-        let attempts = 0;
-        while (!this._isVideoReady(sessionId) && attempts < 50) {
-            await new Promise(r => setTimeout(r, 100));
-            attempts++;
-        }
-
-        if (!this._isVideoReady(sessionId)) {
-            console.warn('Video not ready after 5s, starting capture anyway');
-        } else {
-            console.log('Video ready, starting frame capture');
-        }
-
-        // Use requestAnimationFrame for better performance
-        const captureLoop = (timestamp) => {
-            if (!session.frameCaptureEnabled) return;
-
-            // Throttle to target frame rate
-            if (timestamp - session.lastFrameTime >= session.frameInterval) {
-                this._captureAndSendFrame(sessionId);
-                session.lastFrameTime = timestamp;
-            }
-
-            session.frameCaptureAnimationId = requestAnimationFrame(captureLoop);
-        };
-
-        session.frameCaptureAnimationId = requestAnimationFrame(captureLoop);
-        return true;
-    },
-
-    stopFrameCapture(sessionId) {
-        const session = this.sessions.get(sessionId);
-        if (!session) return;
-        console.log(`[${sessionId}] Stopping frame capture`);
-        session.frameCaptureEnabled = false;
-        if (session.frameCaptureAnimationId) {
-            cancelAnimationFrame(session.frameCaptureAnimationId);
-            session.frameCaptureAnimationId = null;
-        }
-        session.frameCaptureDotNetRef = null;
-        session.captureCanvas = null;
-        session.captureCtx = null;
-    },
-
-    // Pause frame capture (keeps dotNetRef for resume)
-    pauseFrameCapture(sessionId) {
-        const session = this.sessions.get(sessionId);
-        if (!session || !session.frameCaptureEnabled) return;
-        console.log(`[${sessionId}] Pausing frame capture`);
-        session.frameCaptureEnabled = false;
-        if (session.frameCaptureAnimationId) {
-            cancelAnimationFrame(session.frameCaptureAnimationId);
-            session.frameCaptureAnimationId = null;
-        }
-    },
-
-    // Resume frame capture (restarts rAF loop if dotNetRef is still set)
-    resumeFrameCapture(sessionId) {
-        const session = this.sessions.get(sessionId);
-        if (!session || !session.frameCaptureDotNetRef || session.frameCaptureEnabled) return;
-        console.log(`[${sessionId}] Resuming frame capture`);
-        session.frameCaptureEnabled = true;
-        session.lastFrameTime = 0;
-
-        const captureLoop = (timestamp) => {
-            if (!session.frameCaptureEnabled) return;
-            if (timestamp - session.lastFrameTime >= session.frameInterval) {
-                this._captureAndSendFrame(sessionId);
-                session.lastFrameTime = timestamp;
-            }
-            session.frameCaptureAnimationId = requestAnimationFrame(captureLoop);
-        };
-        session.frameCaptureAnimationId = requestAnimationFrame(captureLoop);
-    },
-
-    _captureAndSendFrame(sessionId) {
-        const session = this.sessions.get(sessionId);
-        if (!session || !session.frameCaptureEnabled || !session.remoteCanvas || !session.frameCaptureDotNetRef) return;
-
-        try {
-            const srcWidth = session.remoteCanvas.width;
-            const srcHeight = session.remoteCanvas.height;
-
-            if (srcWidth === 0 || srcHeight === 0) return;
-
-            // Downscale very large resolutions for encoding (max 4K)
-            const maxWidth = 3840;
-            const maxHeight = 2160;
-            let destWidth = srcWidth;
-            let destHeight = srcHeight;
-
-            if (srcWidth > maxWidth || srcHeight > maxHeight) {
-                const scale = Math.min(maxWidth / srcWidth, maxHeight / srcHeight);
-                destWidth = Math.round(srcWidth * scale);
-                destHeight = Math.round(srcHeight * scale);
-            }
-
-            // Create/reuse downscale canvas
-            if (!session.captureCanvas || session.captureCanvas.width !== destWidth || session.captureCanvas.height !== destHeight) {
-                session.captureCanvas = document.createElement('canvas');
-                session.captureCanvas.width = destWidth;
-                session.captureCanvas.height = destHeight;
-                session.captureCtx = session.captureCanvas.getContext('2d');
-            }
-
-            // Draw downscaled frame
-            session.captureCtx.drawImage(session.remoteCanvas, 0, 0, destWidth, destHeight);
-
-            // Convert to JPEG (0.65 quality — faster encode/decode, smaller payload for relay path)
-            const dataUrl = session.captureCanvas.toDataURL('image/jpeg', 0.65);
-
-            // Send to C# - use original dimensions for coordinate scaling
-            const base64Data = dataUrl.replace(/^data:image\/jpeg;base64,/, '');
-            if (session.frameCaptureDotNetRef) session.frameCaptureDotNetRef.invokeMethodAsync('OnFrameCaptured', base64Data, srcWidth, srcHeight);
-        } catch (e) {
-            // Ignore capture errors
-        }
     },
 
     // === Stats Overlay ===
@@ -2285,7 +2181,6 @@ window.SteamViewerWebRTC = {
 
         this._stopStatsPolling(sessionId);
         this._removeStatsOverlay(sessionId);
-        this.stopFrameCapture(sessionId);
 
         if (session.localStream) {
             session.localStream.getTracks().forEach(track => track.stop());
@@ -2342,8 +2237,6 @@ window.SteamViewerWebRTC = {
     resetForReconnect(sessionId) {
         const session = this.sessions.get(sessionId);
         if (!session) return;
-
-        this.stopFrameCapture(sessionId);
 
         if (session.localStream) {
             session.localStream.getTracks().forEach(track => track.stop());
@@ -2673,41 +2566,52 @@ window.SteamViewerInput = {
     },
 
     _coordLogCount: 0,
-    _frameLetterbox: null, // Set by SteamViewerViewer.renderJpegFrame (JPEG relay path)
+    _frameLetterbox: null,
     getScaledCoords(e) {
         // Map CSS mouse position → video pixel coordinates.
-        // Source 1: session._letterbox (direct rendering — same JS context)
-        // Source 2: _frameLetterbox (JPEG relay — cross-window, set by SteamViewerViewer)
         const session = window.SteamViewerWebRTC.sessions.get(this._activeSessionId);
-        const lb = (session?._letterbox?.videoW > 0 ? session._letterbox : null)
-                || (this._frameLetterbox?.videoW > 0 ? this._frameLetterbox : null);
 
-        if (!lb) {
+        // Direct render: CSS-space letterbox from video element (no DPR needed)
+        if (session?._videoLetterbox?.videoW > 0) {
+            const lb = session._videoLetterbox;
+            const rect = (session._directRenderVideo || this.canvas).getBoundingClientRect();
+            const relX = (e.clientX - rect.left) - lb.dx;
+            const relY = (e.clientY - rect.top) - lb.dy;
             if (this._coordLogCount < 5) {
                 this._coordLogCount++;
-                console.warn(`[Input] getScaledCoords: no letterbox source, using canvas fallback`);
+                console.log(`[Input] getScaledCoords(video): lb=${JSON.stringify(lb)}, rel=(${relX.toFixed(0)},${relY.toFixed(0)})`);
             }
-            return this.getScaledCoordsForCanvas(e, this.canvas);
+            return {
+                x: Math.max(0, Math.min(lb.videoW, relX * lb.videoW / lb.dw)),
+                y: Math.max(0, Math.min(lb.videoH, relY * lb.videoH / lb.dh))
+            };
         }
 
-        const rect = this.canvas.getBoundingClientRect();
-        const dpr = window.devicePixelRatio || 1;
-        // Convert CSS mouse position to canvas bitmap coords (matching _letterbox space)
-        const bitmapX = (e.clientX - rect.left) * dpr;
-        const bitmapY = (e.clientY - rect.top) * dpr;
-        // Subtract letterbox offset, scale to video pixel coords
-        const relX = bitmapX - lb.dx;
-        const relY = bitmapY - lb.dy;
+        // JPEG relay: bitmap-space letterbox (needs DPR)
+        if (this._frameLetterbox?.videoW > 0) {
+            const lb = this._frameLetterbox;
+            const rect = this.canvas.getBoundingClientRect();
+            const dpr = window.devicePixelRatio || 1;
+            const bitmapX = (e.clientX - rect.left) * dpr;
+            const bitmapY = (e.clientY - rect.top) * dpr;
+            const relX = bitmapX - lb.dx;
+            const relY = bitmapY - lb.dy;
+            if (this._coordLogCount < 5) {
+                this._coordLogCount++;
+                console.log(`[Input] getScaledCoords(jpeg): lb=${JSON.stringify(lb)}, dpr=${dpr}, bitmap=(${bitmapX.toFixed(0)},${bitmapY.toFixed(0)})`);
+            }
+            return {
+                x: Math.max(0, Math.min(lb.videoW, relX * lb.videoW / lb.dw)),
+                y: Math.max(0, Math.min(lb.videoH, relY * lb.videoH / lb.dh))
+            };
+        }
 
+        // Fallback: no letterbox data yet
         if (this._coordLogCount < 5) {
             this._coordLogCount++;
-            console.log(`[Input] getScaledCoords: lb=${JSON.stringify(lb)}, dpr=${dpr}, bitmap=(${bitmapX.toFixed(0)},${bitmapY.toFixed(0)}), rel=(${relX.toFixed(0)},${relY.toFixed(0)})`);
+            console.warn(`[Input] getScaledCoords: no letterbox source, using canvas fallback`);
         }
-
-        return {
-            x: Math.max(0, Math.min(lb.videoW, relX * lb.videoW / lb.dw)),
-            y: Math.max(0, Math.min(lb.videoH, relY * lb.videoH / lb.dh))
-        };
+        return this.getScaledCoordsForCanvas(e, this.canvas);
     },
 
     // Like getScaledCoords but for any canvas element (used for SD overlay)
@@ -2789,7 +2693,7 @@ window.SteamViewerInput = {
             y = coords.y;
             // Use letterbox video dims for captureW/captureH (matches getScaledCoords space)
             const session = window.SteamViewerWebRTC.sessions.get(this._activeSessionId);
-            const lb = (session?._letterbox?.videoW > 0 ? session._letterbox : null)
+            const lb = (session?._videoLetterbox?.videoW > 0 ? session._videoLetterbox : null)
                     || (this._frameLetterbox?.videoW > 0 ? this._frameLetterbox : null);
             captureW = lb ? lb.videoW : this.canvas.width;
             captureH = lb ? lb.videoH : this.canvas.height;
@@ -2850,7 +2754,7 @@ window.SteamViewerInput = {
         }
         const coords = this.getScaledCoords(e);
         const session = window.SteamViewerWebRTC.sessions.get(this._activeSessionId);
-        const lb = (session?._letterbox?.videoW > 0 ? session._letterbox : null)
+        const lb = (session?._videoLetterbox?.videoW > 0 ? session._videoLetterbox : null)
                 || (this._frameLetterbox?.videoW > 0 ? this._frameLetterbox : null);
         const captureW = lb ? lb.videoW : this.canvas.width;
         const captureH = lb ? lb.videoH : this.canvas.height;
@@ -2991,69 +2895,6 @@ window.SteamViewerInput = {
         this.dotNetRef = null;
         this._activeSessionId = null;
         console.log('Input capture stopped');
-    }
-};
-
-// JPEG frame rendering for remote viewer window
-window.SteamViewerViewer = {
-    canvas: null,
-    ctx: null,
-    img: null,
-    _lastFrameW: 0,
-    _lastFrameH: 0,
-
-    // Render a JPEG frame to the viewer canvas with proper letterboxing
-    renderJpegFrame(canvasId, base64Data, width, height) {
-        // Get or create canvas context
-        if (!this.canvas || this.canvas.id !== canvasId) {
-            this.canvas = document.getElementById(canvasId);
-            if (!this.canvas) {
-                console.error(`Canvas '${canvasId}' not found`);
-                return;
-            }
-            this.ctx = this.canvas.getContext('2d');
-        }
-
-        // Size canvas bitmap to CSS display size × DPR (not video resolution)
-        const rect = this.canvas.getBoundingClientRect();
-        const dpr = window.devicePixelRatio || 1;
-        const canvasW = Math.round(rect.width * dpr);
-        const canvasH = Math.round(rect.height * dpr);
-        if (this.canvas.width !== canvasW || this.canvas.height !== canvasH) {
-            this.canvas.width = canvasW;
-            this.canvas.height = canvasH;
-        }
-
-        // Compute letterbox and publish to SteamViewerInput for coordinate mapping
-        const lb = computeLetterbox(canvasW, canvasH, width, height);
-        this._lastFrameW = width;
-        this._lastFrameH = height;
-
-        // Publish letterbox to input system (cross-namespace, same JS context)
-        if (window.SteamViewerInput) {
-            window.SteamViewerInput._frameLetterbox = lb;
-        }
-
-        // Create image and draw to canvas with letterboxing
-        if (!this.img) {
-            this.img = new Image();
-            this.img.onload = () => {
-                if (this.ctx && this.canvas) {
-                    // Clear black bars
-                    this.ctx.fillStyle = '#000';
-                    this.ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
-                    // Draw frame in letterbox area
-                    const lb = window.SteamViewerInput?._frameLetterbox;
-                    if (lb) {
-                        this.ctx.drawImage(this.img, lb.dx, lb.dy, lb.dw, lb.dh);
-                    } else {
-                        this.ctx.drawImage(this.img, 0, 0, this.canvas.width, this.canvas.height);
-                    }
-                }
-            };
-        }
-
-        this.img.src = 'data:image/jpeg;base64,' + base64Data;
     }
 };
 
