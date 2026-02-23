@@ -185,6 +185,7 @@
             <button class="tab-add" title="New connection" @onclick="OpenConnectionDialog">+</button>
         </div>
         <div class="canvas-container" id="canvasContainer">
+            <video id="viewerVideo" class="viewer-video" autoplay muted playsinline></video>
             <canvas id="viewerCanvas" class="@(_secureDesktopActive ? "canvas-dimmed" : "")"></canvas>
             <canvas id="secureDesktopOverlay" class="secure-desktop-overlay" style="display: @(_secureDesktopActive ? "block" : "none")"></canvas>
             @if (_secureDesktopActive)
@@ -273,7 +274,6 @@
     private bool? _hostElevated;
     private bool? _hostSystemLevel;
     private bool _hasReceivedFrame;
-    private bool _directRenderingActive;
     private bool _secureDesktopActive;
     private bool _secureDesktopFrameReceived;
     private List<MonitorInfo>? _hostMonitors;
@@ -421,7 +421,6 @@
         if (_activeSession != null)
         {
             var oldSessionId = _activeSession.SessionId;
-            _activeSession.OnFrame -= HandleSessionFrame;
             _activeSession.OnVideoStarted -= HandleVideoStarted;
             _activeSession.OnDisconnected -= HandleSessionDisconnected;
             _activeSession.OnStatsUpdated -= HandleStatsUpdate;
@@ -431,11 +430,7 @@
             _activeSession.OnSecureDesktopFrame -= HandleSecureDesktopFrame;
             _activeSession.OnMonitorLayoutReceived -= HandleMonitorLayoutReceived;
             if (_statsVisible) _ = _activeSession.DisableStatsRelayAsync();
-            if (_directRenderingActive)
-                _ = JSRuntime.InvokeVoidAsync("SteamViewerWebRTC.clearDirectRenderTarget", oldSessionId);
-            else
-                _ = JSRuntime.InvokeVoidAsync("SteamViewerWebRTC.pauseFrameCapture", oldSessionId);
-            _directRenderingActive = false;
+            _ = JSRuntime.InvokeVoidAsync("SteamViewerWebRTC.clearDirectRenderTarget", oldSessionId);
         }
 
         _activeSessionId = sessionId;
@@ -458,7 +453,6 @@
             _activeSession = SessionManager.GetSession(sessionId);
             if (_activeSession != null)
             {
-                _activeSession.OnFrame += HandleSessionFrame;
                 _activeSession.OnVideoStarted += HandleVideoStarted;
                 _activeSession.OnDisconnected += HandleSessionDisconnected;
                 _activeSession.OnStatsUpdated += HandleStatsUpdate;
@@ -581,36 +575,6 @@
         }
     }
 
-    private void HandleSessionFrame(JpegFrame frame)
-    {
-        if (!_hasReceivedFrame)
-        {
-            _hasReceivedFrame = true;
-            _ = InvokeAsync(StateHasChanged);
-        }
-
-        // Skip JPEG relay rendering when direct rendering is active
-        // (video renders directly to canvas via requestVideoFrameCallback in JS)
-        if (_directRenderingActive) return;
-
-        // JPEG relay fallback — frames from multi-session manager
-        if (_canvasInitialized)
-        {
-            _ = InvokeAsync(async () =>
-            {
-                try
-                {
-                    await JSRuntime.InvokeVoidAsync("SteamViewerViewer.renderJpegFrame",
-                        "viewerCanvas", frame.Base64Data, frame.Width, frame.Height);
-                }
-                catch
-                {
-                    // Ignore rendering errors during shutdown
-                }
-            });
-        }
-    }
-
     private void ShowToast(string message)
     {
         _toastMessage = message;
@@ -643,18 +607,11 @@
 
             // Enable direct rendering — PeerConnection is now in our window
             var enabled = await session.TryEnableDirectRenderingAsync("viewerCanvas", JSRuntime);
-            _directRenderingActive = enabled;
 
             if (enabled)
-            {
-                Console.WriteLine($"[DirectRender] Session {sessionId}: direct rendering active (JPEG relay bypassed)");
-            }
+                Console.WriteLine($"[DirectRender] Session {sessionId}: active");
             else
-            {
-                // Fallback: direct rendering failed, use JPEG relay
-                Console.WriteLine($"[DirectRender] Session {sessionId}: direct rendering failed, falling back to JPEG relay");
-                _ = JSRuntime.InvokeVoidAsync("SteamViewerWebRTC.resumeFrameCapture", sessionId);
-            }
+                Console.WriteLine($"[DirectRender] Session {sessionId}: FAILED — no video rendering available");
         }
         catch (Exception ex)
         {
@@ -1420,7 +1377,6 @@
             if (newSession != null)
             {
                 // Unsubscribe from old session events
-                _activeSession.OnFrame -= HandleSessionFrame;
                 _activeSession.OnVideoStarted -= HandleVideoStarted;
                 _activeSession.OnDisconnected -= HandleSessionDisconnected;
                 _activeSession.OnStatsUpdated -= HandleStatsUpdate;
@@ -1435,7 +1391,6 @@
                 _activeSession = newSession;
 
                 // Subscribe to new session events
-                _activeSession.OnFrame += HandleSessionFrame;
                 _activeSession.OnVideoStarted += HandleVideoStarted;
                 _activeSession.OnDisconnected += HandleSessionDisconnected;
                 _activeSession.OnStatsUpdated += HandleStatsUpdate;
@@ -1518,7 +1473,6 @@
         // Unsubscribe from active session
         if (_activeSession != null)
         {
-            _activeSession.OnFrame -= HandleSessionFrame;
             _activeSession.OnVideoStarted -= HandleVideoStarted;
             _activeSession.OnDisconnected -= HandleSessionDisconnected;
             _activeSession.OnStatsUpdated -= HandleStatsUpdate;
@@ -1908,10 +1862,19 @@
         background: #000;
     }
 
+    .viewer-video {
+        position: absolute;
+        top: 0; left: 0;
+        width: 100%; height: 100%;
+        object-fit: contain;
+        background: #000;
+    }
+
     .canvas-container canvas {
+        position: absolute;
+        top: 0; left: 0;
         width: 100%;
         height: 100%;
-        /* No object-fit — we draw letterbox ourselves in JS for pixel-perfect coord mapping */
     }
 
     /* Secure Desktop - dimmed canvas when UAC active */

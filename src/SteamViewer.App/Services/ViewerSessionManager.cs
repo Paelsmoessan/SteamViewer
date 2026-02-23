@@ -278,17 +278,6 @@ public sealed class ViewerSessionManager : IAsyncDisposable
         return session;
     }
 
-    /// <summary>
-    /// Relay a JPEG frame to the specified session.
-    /// </summary>
-    public void RelayFrame(string sessionId, JpegFrame frame)
-    {
-        if (_sessions.TryGetValue(sessionId, out var session))
-        {
-            session.RelayFrame(frame);
-        }
-    }
-
     private void EnsureSignalingSubscribed()
     {
         if (_signalingSubscribed) return;
