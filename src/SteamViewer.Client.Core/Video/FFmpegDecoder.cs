@@ -97,7 +97,7 @@ public sealed unsafe class FFmpegDecoder : IDisposable
             _swsCtx = ffmpeg.sws_getContext(
                 frameWidth, frameHeight, pixFmt,
                 frameWidth, frameHeight, AVPixelFormat.AV_PIX_FMT_BGRA,
-                ffmpeg.SWS_FAST_BILINEAR, null, null, null);
+                (int)SwsFlags.SWS_FAST_BILINEAR, null, null, null);
 
             if (_swsCtx == null)
             {

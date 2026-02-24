@@ -126,7 +126,7 @@ public sealed unsafe class VideoEncoder : IDisposable
         _swsContext = ffmpeg.sws_getContext(
             width, height, AVPixelFormat.AV_PIX_FMT_BGRA,
             width, height, AVPixelFormat.AV_PIX_FMT_YUV420P,
-            ffmpeg.SWS_FAST_BILINEAR, null, null, null);
+            (int)SwsFlags.SWS_FAST_BILINEAR, null, null, null);
 
         if (_swsContext == null)
         {

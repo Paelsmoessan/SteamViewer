@@ -271,7 +271,7 @@ public sealed unsafe class VideoDecoder : IDisposable
             _swsContext = ffmpeg.sws_getContext(
                 width, height, (AVPixelFormat)yuvFrame->format,
                 width, height, AVPixelFormat.AV_PIX_FMT_RGBA,
-                ffmpeg.SWS_FAST_BILINEAR, null, null, null);
+                (int)SwsFlags.SWS_FAST_BILINEAR, null, null, null);
 
             if (_swsContext == null)
             {

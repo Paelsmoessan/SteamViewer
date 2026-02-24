@@ -90,7 +90,7 @@ public sealed unsafe class FFmpegEncoder : IDisposable
         _swsCtx = ffmpeg.sws_getContext(
             width, height, AVPixelFormat.AV_PIX_FMT_BGRA,
             width, height, AVPixelFormat.AV_PIX_FMT_YUV444P,
-            ffmpeg.SWS_FAST_BILINEAR, null, null, null);
+            (int)SwsFlags.SWS_FAST_BILINEAR, null, null, null);
         if (_swsCtx == null)
             throw new InvalidOperationException("Failed to create sws context (BGRA→YUV444P)");
 
@@ -143,13 +143,13 @@ public sealed unsafe class FFmpegEncoder : IDisposable
         if (_forceKeyframe)
         {
             _frame->pict_type = AVPictureType.AV_PICTURE_TYPE_I;
-            _frame->key_frame = 1;
+            _frame->flags |= ffmpeg.AV_FRAME_FLAG_KEY;
             _forceKeyframe = false;
         }
         else
         {
             _frame->pict_type = AVPictureType.AV_PICTURE_TYPE_NONE;
-            _frame->key_frame = 0;
+            _frame->flags &= ~ffmpeg.AV_FRAME_FLAG_KEY;
         }
 
         var ret = ffmpeg.avcodec_send_frame(_codecCtx, _frame);
