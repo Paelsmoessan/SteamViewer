@@ -155,6 +155,7 @@ public sealed class SignalingHandler
             SignalingMessage.SdpAnswer answer => HandleSdpAnswer(answer, currentClientId),
             SignalingMessage.IceCandidate candidate => HandleIceCandidate(candidate, currentClientId),
             SignalingMessage.Disconnect disconnect => HandleDisconnect(disconnect, currentClientId),
+            SignalingMessage.TransportEndpoint endpoint => HandleTransportEndpoint(endpoint, currentClientId),
             SignalingMessage.Ping => new SignalingMessage.Pong(),
             // Collaboration session messages
             SignalingMessage.CreateSession createSession => HandleCreateSession(createSession, currentClientId),
@@ -307,6 +308,18 @@ public sealed class SignalingHandler
         // Notify peer
         _registry.TrySendToClient(disconnect.PeerId, new SignalingMessage.Disconnected(fromId, "Peer disconnected"));
         _logger.LogInformation("Disconnect between {FromId} and {PeerId}", fromId, disconnect.PeerId);
+        return null;
+    }
+
+    private SignalingMessage? HandleTransportEndpoint(SignalingMessage.TransportEndpoint endpoint, string? fromId)
+    {
+        if (fromId == null)
+        {
+            return new SignalingMessage.Error("Not registered");
+        }
+
+        _registry.TrySendToClient(endpoint.TargetId, new SignalingMessage.TransportEndpoint(fromId, endpoint.IPs, endpoint.Port));
+        _logger.LogDebug("Transport endpoint forwarded from {FromId} to {TargetId}", fromId, endpoint.TargetId);
         return null;
     }
 

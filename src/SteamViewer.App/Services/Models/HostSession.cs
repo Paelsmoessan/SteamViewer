@@ -6,6 +6,7 @@ using Microsoft.JSInterop;
 using SteamViewer.Client.Core.Capture;
 using SteamViewer.Client.Core.Elevation;
 using SteamViewer.Client.Core.Network;
+using SteamViewer.Client.Core.Video;
 using SteamViewer.Common.Protocol;
 using System.Text.Json.Serialization;
 using SteamViewer.Platform.Windows.Clipboard;
@@ -18,11 +19,11 @@ namespace SteamViewer.App.Services.Models;
 /// </summary>
 public enum HostSessionState
 {
-    /// <summary>Session is being initialized (WebRTC setup).</summary>
+    /// <summary>Session is being initialized (transport setup).</summary>
     Initializing,
-    /// <summary>WebRTC initialized, waiting for data channel to open.</summary>
-    WaitingForDataChannel,
-    /// <summary>Data channel is open; ready for screen sharing and input.</summary>
+    /// <summary>Transport listening, waiting for viewer to connect.</summary>
+    WaitingForViewer,
+    /// <summary>Viewer connected; ready for screen sharing and input.</summary>
     Connected,
     /// <summary>Session has been disconnected.</summary>
     Disconnected,
@@ -32,7 +33,7 @@ public enum HostSessionState
 
 /// <summary>
 /// Represents a single host session with a connected viewer peer.
-/// Encapsulates WebRTC connection, screen sharing, input injection, and file transfer.
+/// Encapsulates TCP transport, FFmpeg encoding, screen sharing, input injection, and file transfer.
 /// </summary>
 public sealed class HostSession : IAsyncDisposable
 {
@@ -43,21 +44,14 @@ public sealed class HostSession : IAsyncDisposable
     private readonly IMonitorEnumerator? _monitorEnumerator;
     private readonly IElevationService? _elevationService;
     private readonly IScreenCapture? _screenCapture;
-#if WINDOWS
-    private readonly Services.NativeFrameBridge? _frameBridge;
-#endif
     private readonly IConfiguration _configuration;
     private readonly Func<SignalingMessage, Task> _sendSignaling;
     private readonly string _hostClientId;
     private readonly string _hostPasswordHash;
-    private WebRTCManager? _webrtc;
-    private bool _webrtcInitialized;
+    private HostStreamTransport? _transport;
+    private FFmpegEncoder? _encoder;
     private bool _disposed;
     private bool _elevationDetached;
-
-    // Pending SDP/ICE (buffered if received before WebRTC init)
-    private string? _pendingSdpOffer;
-    private readonly List<(string candidate, string? sdpMid, int? sdpMLineIndex)> _pendingIceCandidates = new();
 
     // Track capture dimensions from viewer's mouse events (0 = not yet received)
     private int _lastCaptureWidth;
@@ -81,8 +75,8 @@ public sealed class HostSession : IAsyncDisposable
     /// <summary>Current session state.</summary>
     public HostSessionState State { get; private set; } = HostSessionState.Initializing;
 
-    /// <summary>Whether the data channel is open and ready.</summary>
-    public bool IsDataChannelReady => _webrtc?.IsDataChannelOpen ?? false;
+    /// <summary>Whether the transport is connected and ready.</summary>
+    public bool IsDataChannelReady => _transport?.IsConnected ?? false;
 
     /// <summary>Whether this host is sharing its screen to the viewer.</summary>
     public bool IsSharingScreen { get; private set; }
@@ -90,7 +84,7 @@ public sealed class HostSession : IAsyncDisposable
     /// <summary>Whether the connected viewer is sharing their screen.</summary>
     public bool IsPeerSharingScreen { get; private set; }
 
-    /// <summary>When true, auto-start full screen sharing when the data channel opens (used for post-reboot reconnect).</summary>
+    /// <summary>When true, auto-start full screen sharing when transport connects (used for post-reboot reconnect).</summary>
     public bool AutoShareOnReady { get; set; }
 
     #region Events
@@ -98,7 +92,7 @@ public sealed class HostSession : IAsyncDisposable
     /// <summary>Raised when session state changes.</summary>
     public event Action<HostSessionState>? OnStateChanged;
 
-    /// <summary>Raised when the data channel opens (ready for screen share/input).</summary>
+    /// <summary>Raised when the transport connects (ready for screen share/input).</summary>
     public event Action? OnReady;
 
     /// <summary>Raised when the session disconnects.</summary>
@@ -109,12 +103,6 @@ public sealed class HostSession : IAsyncDisposable
 
     /// <summary>Raised when the peer starts/stops sharing their screen.</summary>
     public event Action<bool>? OnPeerSharingChanged;
-
-    /// <summary>Raised when an ICE candidate needs to be sent via signaling.</summary>
-    public event Func<string, string?, ushort?, Task>? OnIceCandidate;
-
-    /// <summary>Raised when an SDP offer/answer needs to be sent via signaling.</summary>
-    public event Func<string, string, Task>? OnSdpMessage;
 
     #endregion
 
@@ -142,9 +130,6 @@ public sealed class HostSession : IAsyncDisposable
         _monitorEnumerator = monitorEnumerator;
         _elevationService = elevationService;
         _screenCapture = screenCapture;
-#if WINDOWS
-        _frameBridge = frameBridge;
-#endif
         _configuration = configuration;
         _sendSignaling = sendSignaling;
         _hostClientId = hostClientId;
@@ -178,362 +163,68 @@ public sealed class HostSession : IAsyncDisposable
     }
 
     /// <summary>
-    /// Initialize WebRTC as host: configure TURN, create peer connection,
-    /// create data channel, create and send SDP offer.
+    /// Initialize transport: start TCP listener, send endpoint to viewer via signaling,
+    /// wait for viewer to connect.
     /// </summary>
     public async Task InitializeAsync()
     {
         _logger.LogInformation("Initializing host session for peer {PeerId}", PeerId);
 
-        // Configure TURN server before WebRTC init
-        await SetTurnConfigFromSettings();
-
         // Set logger to host mode
         await _jsRuntime.InvokeVoidAsync("SteamViewerLogger.setMode", true);
 
-        _webrtc = new WebRTCManager(
-            _jsRuntime,
-            _loggerFactory.CreateLogger<WebRTCManager>(),
-            SessionId,
-            PeerId,
-            _sendSignaling);
+        // Create TCP transport and start listening
+        _transport = new HostStreamTransport(_loggerFactory.CreateLogger<HostStreamTransport>());
+        var port = await _transport.StartListeningAsync();
 
-        // Subscribe to WebRTC events
-        _webrtc.OnIceCandidate += HandleIceCandidate;
-        _webrtc.OnDataChannelMessage += HandleDataChannelMessage;
-        _webrtc.OnFileChannelMessage += HandleFileChannelMessage;
-        _webrtc.OnFileDataBinaryMessage += HandleFileDataBinaryMessage;
-        _webrtc.OnRenegotiationNeeded += HandleRenegotiationNeeded;
-        _webrtc.OnDataChannelOpen += HandleDataChannelOpen;
-        _webrtc.OnDataChannelClose += HandleDataChannelClose;
-        _webrtc.OnConnectionStateChange += HandleConnectionStateChange;
-        _webrtc.OnScreenShareLost += HandleScreenShareLost;
-        _webrtc.OnCaptureStarted += HandleCaptureStarted;
+        // Subscribe to transport events
+        _transport.OnControlMessage += HandleControlMessage;
+        _transport.OnFileData += HandleFileDataBinary;
+        _transport.OnFileSignalingMessage += HandleFileChannelMessage;
+        _transport.OnConnectionStateChanged += HandleTransportStateChanged;
 
-        await _webrtc.InitializeAsync();
-        _webrtcInitialized = true;
-        await _webrtc.CreateDataChannelsAsync();
+        _logger.LogInformation("Transport listening on port {Port}", port);
 
-        // Create and send initial SDP offer
-        var offer = await _webrtc.CreateOfferAsync();
-        if (OnSdpMessage != null)
-            await OnSdpMessage.Invoke(PeerId, offer);
+        // Send transport endpoint to viewer via signaling (replaces SDP offer)
+        var ips = HostStreamTransport.GetLocalIPs().ToArray();
+        await _sendSignaling(new SignalingMessage.TransportEndpoint(PeerId, ips, port));
 
-        SetState(HostSessionState.WaitingForDataChannel);
-        _logger.LogInformation("SDP offer sent to {PeerId}", PeerId);
+        SetState(HostSessionState.WaitingForViewer);
 
-        // Flush any buffered signaling messages
-        await FlushPendingSignalingAsync();
-    }
-
-    #region SDP/ICE Handling
-
-    /// <summary>Handle incoming SDP offer (renegotiation from viewer).</summary>
-    public async Task HandleSdpOfferAsync(string sdp)
-    {
-        if (_webrtc != null && _webrtcInitialized)
-        {
-            _logger.LogInformation("Received SDP offer from {PeerId}", PeerId);
-            await _webrtc.SetRemoteDescriptionAsync(sdp);
-            var answer = await _webrtc.CreateAnswerAsync();
-            if (OnSdpMessage != null)
-                await OnSdpMessage.Invoke(PeerId, answer);
-            _logger.LogInformation("SDP answer sent");
-        }
-        else
-        {
-            _logger.LogWarning("WebRTC not ready, buffering SDP offer");
-            _pendingSdpOffer = sdp;
-        }
-    }
-
-    /// <summary>Handle incoming SDP answer from viewer.</summary>
-    public async Task HandleSdpAnswerAsync(string sdp)
-    {
-        if (_webrtc == null) return;
-        _logger.LogInformation("Received SDP answer from {PeerId}", PeerId);
-        await _webrtc.SetRemoteDescriptionAsync(sdp);
-    }
-
-    /// <summary>Handle incoming ICE candidate from viewer.</summary>
-    public async Task HandleIceCandidateAsync(string candidate, string? sdpMid, int? sdpMLineIndex)
-    {
-        if (_webrtc != null && _webrtcInitialized)
-        {
-            var candidateJson = JsonSerializer.Serialize(new { candidate, sdpMid, sdpMLineIndex });
-            await _webrtc.AddIceCandidateAsync(candidateJson);
-        }
-        else
-        {
-            _logger.LogDebug("WebRTC not ready, buffering ICE candidate");
-            _pendingIceCandidates.Add((candidate, sdpMid, sdpMLineIndex));
-        }
-    }
-
-    private async Task FlushPendingSignalingAsync()
-    {
-        if (_webrtc == null || !_webrtcInitialized) return;
-
-        if (_pendingSdpOffer != null)
-        {
-            _logger.LogInformation("Flushing buffered SDP offer");
-            var sdp = _pendingSdpOffer;
-            _pendingSdpOffer = null;
-            await HandleSdpOfferAsync(sdp);
-        }
-
-        if (_pendingIceCandidates.Count > 0)
-        {
-            _logger.LogInformation("Flushing {Count} buffered ICE candidates", _pendingIceCandidates.Count);
-            var candidates = _pendingIceCandidates.ToList();
-            _pendingIceCandidates.Clear();
-            foreach (var (candidate, sdpMid, sdpMLineIndex) in candidates)
-            {
-                await HandleIceCandidateAsync(candidate, sdpMid, sdpMLineIndex);
-            }
-        }
-    }
-
-    #endregion
-
-    #region Screen Sharing
-
-    /// <summary>
-    /// Start sharing screen to the connected viewer.
-    /// Tries DXGI native capture first (no picker!), falls back to getDisplayMedia.
-    /// </summary>
-    /// <param name="outputIndex">DXGI output index to capture (null = auto-select primary)</param>
-    public async Task<bool> StartScreenShareAsync(uint? outputIndex = null)
-    {
-        if (_webrtc == null) return false;
-
-        // Try DXGI native capture first (Windows only, no screen picker)
-        if (_screenCapture is DxgiScreenCapture dxgi)
+        // Accept viewer connection in background (don't block)
+        _ = Task.Run(async () =>
         {
             try
             {
-                var targetOutput = outputIndex ?? 0; // Default to primary monitor
-                _logger.LogInformation("Trying DXGI native capture on output {Output} (no picker)...", targetOutput);
+                await _transport.AcceptViewerAsync(TimeSpan.FromSeconds(30));
+                _logger.LogInformation("Viewer connected via transport");
 
-                // Set up JS canvas bridge first
-                var bridgeOk = await _webrtc.StartNativeCaptureAsync(30);
-                if (!bridgeOk)
-                {
-                    _logger.LogWarning("JS canvas bridge setup failed, falling back to getDisplayMedia");
-                    goto fallback;
-                }
-
-                // Subscribe to DXGI frame events — raw BGRA when SharedBuffer available, JPEG fallback
-#if WINDOWS
-                if (_frameBridge?.IsInitialized == true)
-                {
-                    dxgi.OnRawFrameCaptured += OnDxgiRawFrameCaptured;
-                    _logger.LogInformation("Using raw BGRA pipeline (no JPEG encode)");
-                }
-                else
-#endif
-                {
-                    dxgi.OnFrameCaptured += OnDxgiFrameCaptured;
-                }
-
-                // Subscribe to cursor shape changes for local overlay on viewer
-                dxgi.OnCursorShapeChanged += OnCursorShapeChanged;
-
-                // Start DXGI capture loop (fires OnFrameCaptured at ~30 FPS)
-                dxgi.StartCaptureLoop(targetOutput);
-
-                _isNativeCapture = true;
-                _activeDxgi = dxgi;
-                IsSharingScreen = true;
-                _logger.LogInformation("DXGI native capture started on output {Output} — no picker!", targetOutput);
-
-                // Notify peer
-                await NotifyScreenShareStarted();
-                return true;
+                // Transport connected — trigger ready state
+                await HandleTransportConnected();
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "DXGI native capture failed, falling back to getDisplayMedia");
-                // Clean up partial DXGI state
-                try { dxgi.OnRawFrameCaptured -= OnDxgiRawFrameCaptured; } catch { }
-                try { dxgi.OnFrameCaptured -= OnDxgiFrameCaptured; } catch { }
-                try { dxgi.OnCursorShapeChanged -= OnCursorShapeChanged; } catch { }
-                try { dxgi.StopCaptureLoop(); } catch { }
-                try { await _webrtc.StopNativeCaptureAsync(); } catch { }
-                _isNativeCapture = false;
+                _logger.LogError(ex, "Failed to accept viewer connection");
+                SetState(HostSessionState.Error);
             }
-        }
-
-        fallback:
-        // Fallback: browser getDisplayMedia (shows picker)
-        try
-        {
-            _logger.LogInformation("Starting screen share via getDisplayMedia (browser picker)...");
-            var success = await _webrtc.StartScreenCaptureAsync();
-            if (success)
-            {
-                _isNativeCapture = false;
-                IsSharingScreen = true;
-                _logger.LogInformation("Screen sharing started via getDisplayMedia");
-                await NotifyScreenShareStarted();
-                return true;
-            }
-            return false;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed to start screen sharing");
-            return false;
-        }
+        });
     }
 
-    /// <summary>Stop sharing screen (handles both DXGI native and getDisplayMedia paths).</summary>
-    public async Task StopScreenShareAsync()
+    private async Task HandleTransportConnected()
     {
-        if (_webrtc == null) return;
-
-        try
-        {
-            _logger.LogInformation("Stopping screen share (native={IsNative})...", _isNativeCapture);
-
-            if (_isNativeCapture && _screenCapture is DxgiScreenCapture dxgi)
-            {
-                // Stop DXGI capture loop and unsubscribe from both event paths
-                dxgi.OnRawFrameCaptured -= OnDxgiRawFrameCaptured;
-                dxgi.OnFrameCaptured -= OnDxgiFrameCaptured;
-                dxgi.StopCaptureLoop();
-                await _webrtc.StopNativeCaptureAsync();
-                _isNativeCapture = false;
-            }
-            else
-            {
-                // Stop browser getDisplayMedia capture
-                await _webrtc.StopScreenCaptureAsync();
-            }
-
-            IsSharingScreen = false;
-            _inputInjector.ClearCapturedMonitor();
-            await _webrtc.SendDataAsync(
-                JsonSerializer.Serialize(new { type = "screenShareStopped" }));
-            _logger.LogInformation("Screen sharing stopped");
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed to stop screen sharing");
-        }
-    }
-
-    /// <summary>
-    /// Relay DXGI captured JPEG frames to JS WebRTC pipeline.
-    /// SharedBuffer path: zero-copy via WebView2 shared memory (preferred).
-    /// Fallback path: base64 + JSInterop (slower, higher latency).
-    /// Called from DXGI capture thread — fire-and-forget (don't block capture).
-    /// </summary>
-    /// <summary>
-    /// Raw BGRA path — skip JPEG encode entirely. SharedBuffer sends raw pixels to JS,
-    /// which creates VideoFrame directly. Saves 20-40ms per frame.
-    /// </summary>
-    private void OnDxgiRawFrameCaptured(byte[] bgraData, int width, int height, int stride)
-    {
-        if (_webrtc == null || !_isNativeCapture) return;
-#if WINDOWS
-        _frameBridge!.PushRawFrame(bgraData, width, height, stride, SessionId);
-#endif
-    }
-
-    /// <summary>
-    /// JPEG fallback path — used when SharedBuffer not available.
-    /// </summary>
-    private void OnDxgiFrameCaptured(byte[] jpegData, int width, int height)
-    {
-        if (_webrtc == null || !_isNativeCapture) return;
-
-#if WINDOWS
-        if (_frameBridge?.IsInitialized == true)
-        {
-            _frameBridge.PushFrame(jpegData, width, height, SessionId);
-            return;
-        }
-#endif
-
-        var base64Normal = Convert.ToBase64String(jpegData);
-        _ = _webrtc.PushNativeFrameAsync(base64Normal, width, height);
-    }
-
-    private string? _lastSentCursorShape;
-
-    private void OnCursorShapeChanged(string cssValue)
-    {
-        // Deduplicate (already checked by HCURSOR handle, but guard against rapid re-fires)
-        if (cssValue == _lastSentCursorShape) return;
-        _lastSentCursorShape = cssValue;
-
-        // Fire-and-forget over data channel — cursor shape is transient, loss is OK
-        if (_webrtc?.IsDataChannelOpen == true)
-        {
-            _ = _webrtc.SendDataAsync(JsonSerializer.Serialize(new
-            {
-                type = "cursorShape",
-                cursor = cssValue
-            }));
-        }
-    }
-
-    private async Task HandleToggleCursorAsync()
-    {
-        if (_activeDxgi != null)
-        {
-            _activeDxgi.ShowCursor = !_activeDxgi.ShowCursor;
-            _logger.LogInformation("Host cursor visibility: {Visible}", _activeDxgi.ShowCursor);
-
-            await _webrtc!.SendDataAsync(JsonSerializer.Serialize(new
-            {
-                type = "cursorVisibilityChanged",
-                visible = _activeDxgi.ShowCursor
-            }));
-        }
-    }
-
-    private async Task NotifyScreenShareStarted()
-    {
-        // Wait for track to propagate, then notify peer
-        await Task.Delay(500);
-        for (int i = 0; i < 3; i++)
-        {
-            var sent = await _webrtc!.SendDataAsync(
-                JsonSerializer.Serialize(new { type = "screenShareStarted" }));
-            _logger.LogInformation("screenShareStarted message sent: {Sent}", sent);
-            if (sent) break;
-            await Task.Delay(200);
-        }
-    }
-
-    #endregion
-
-    #region Data Channel
-
-    /// <summary>Send string data to the peer via data channel.</summary>
-    public async Task<bool> SendDataAsync(string data)
-    {
-        if (_webrtc == null || !_webrtc.IsDataChannelOpen) return false;
-        return await _webrtc.SendDataAsync(data);
-    }
-
-    private async Task HandleDataChannelOpen()
-    {
-        _logger.LogInformation("Host: Data channel opened - ready for communication");
+        _logger.LogInformation("Host: Transport connected - ready for communication");
         SetState(HostSessionState.Connected);
         OnReady?.Invoke();
 
         // Start clipboard file monitoring (detect CF_HDROP on host clipboard)
         StartClipboardFileTransfer();
 
-        // Send elevation status to viewer (elevated = admin helper, systemLevel = SYSTEM helper)
+        // Send elevation status to viewer
         try
         {
             var elevated = _elevationService?.IsAdminConnected ?? false;
             var systemLevel = _elevationService?.IsSystemConnected ?? false;
-            await _webrtc!.SendDataAsync(JsonSerializer.Serialize(new
+            await _transport!.SendControlAsync(JsonSerializer.Serialize(new
             {
                 type = "hostStatus",
                 elevated,
@@ -546,7 +237,7 @@ public sealed class HostSession : IAsyncDisposable
             _logger.LogWarning(ex, "Failed to send elevation status");
         }
 
-        // Send monitor layout to viewer (so they see the monitor picker)
+        // Send monitor layout to viewer
         await SendMonitorLayoutAsync();
 
         // Auto-start full screen sharing on reconnect after reboot
@@ -565,18 +256,183 @@ public sealed class HostSession : IAsyncDisposable
         }
     }
 
-    private async Task HandleDataChannelClose()
+    #region Screen Sharing
+
+    /// <summary>
+    /// Start sharing screen to the connected viewer via DXGI capture + FFmpeg encoding.
+    /// </summary>
+    /// <param name="outputIndex">DXGI output index to capture (null = auto-select primary)</param>
+    public async Task<bool> StartScreenShareAsync(uint? outputIndex = null)
     {
-        _logger.LogWarning("Host: Data channel closed");
-        if (State == HostSessionState.Connected)
+        if (_transport == null || !_transport.IsConnected) return false;
+
+        if (_screenCapture is DxgiScreenCapture dxgi)
         {
-            SetState(HostSessionState.Disconnected);
-            OnDisconnected?.Invoke("Data channel closed");
+            try
+            {
+                var targetOutput = outputIndex ?? 0;
+                _logger.LogInformation("Starting DXGI capture on output {Output} → FFmpeg encode → transport...", targetOutput);
+
+                // Subscribe to DXGI frame events — raw BGRA → FFmpeg encode → transport
+                dxgi.OnRawFrameCaptured += OnDxgiRawFrameCaptured;
+                dxgi.OnCursorShapeChanged += OnCursorShapeChanged;
+
+                // Start DXGI capture loop (~30 FPS)
+                dxgi.StartCaptureLoop(targetOutput);
+
+                _isNativeCapture = true;
+                _activeDxgi = dxgi;
+                IsSharingScreen = true;
+                _logger.LogInformation("DXGI capture started on output {Output} → FFmpeg encoder", targetOutput);
+
+                // Notify peer
+                await NotifyScreenShareStarted();
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "DXGI capture + FFmpeg encoding failed");
+                try { dxgi.OnRawFrameCaptured -= OnDxgiRawFrameCaptured; } catch { }
+                try { dxgi.OnCursorShapeChanged -= OnCursorShapeChanged; } catch { }
+                try { dxgi.StopCaptureLoop(); } catch { }
+                _isNativeCapture = false;
+                _encoder?.Dispose();
+                _encoder = null;
+                return false;
+            }
         }
-        await Task.CompletedTask;
+
+        _logger.LogWarning("No DXGI screen capture available");
+        return false;
     }
 
-    private async Task HandleDataChannelMessage(string json)
+    /// <summary>Stop sharing screen.</summary>
+    public async Task StopScreenShareAsync()
+    {
+        if (_transport == null) return;
+
+        try
+        {
+            _logger.LogInformation("Stopping screen share...");
+
+            if (_isNativeCapture && _screenCapture is DxgiScreenCapture dxgi)
+            {
+                dxgi.OnRawFrameCaptured -= OnDxgiRawFrameCaptured;
+                dxgi.OnCursorShapeChanged -= OnCursorShapeChanged;
+                dxgi.StopCaptureLoop();
+                _isNativeCapture = false;
+            }
+
+            _encoder?.Dispose();
+            _encoder = null;
+
+            IsSharingScreen = false;
+            _inputInjector.ClearCapturedMonitor();
+            await _transport.SendControlAsync(
+                JsonSerializer.Serialize(new { type = "screenShareStopped" }));
+            _logger.LogInformation("Screen sharing stopped");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to stop screen sharing");
+        }
+    }
+
+    /// <summary>
+    /// DXGI raw BGRA frame → FFmpeg encode → transport.
+    /// Called from DXGI capture thread — must not block.
+    /// </summary>
+    private void OnDxgiRawFrameCaptured(byte[] bgraData, int width, int height, int stride)
+    {
+        if (_transport == null || !_transport.IsConnected || !_isNativeCapture) return;
+
+        try
+        {
+            // Lazy-init encoder on first frame (need real dimensions)
+            if (_encoder == null)
+            {
+                FFmpegInit.EnsureInitialized();
+                _encoder = new FFmpegEncoder(_loggerFactory.CreateLogger<FFmpegEncoder>());
+                _encoder.Initialize(width, height, 30, 20_000_000); // 30fps, 20Mbps
+                _logger.LogInformation("FFmpeg encoder initialized: {W}x{H}", width, height);
+            }
+            else
+            {
+                _encoder.ReinitializeIfNeeded(width, height);
+            }
+
+            var result = _encoder.EncodeFrame(bgraData, stride);
+            if (result is var (naluData, naluLength))
+            {
+                _transport.EnqueueVideoFrame(naluData, naluLength);
+            }
+        }
+        catch (Exception ex)
+        {
+            if (_encoderErrorCount++ % 300 == 0)
+                _logger.LogWarning(ex, "FFmpeg encode error (sample)");
+        }
+    }
+
+    private int _encoderErrorCount;
+
+    private string? _lastSentCursorShape;
+
+    private void OnCursorShapeChanged(string cssValue)
+    {
+        if (cssValue == _lastSentCursorShape) return;
+        _lastSentCursorShape = cssValue;
+
+        if (_transport?.IsConnected == true)
+        {
+            _ = _transport.SendControlAsync(JsonSerializer.Serialize(new
+            {
+                type = "cursorShape",
+                cursor = cssValue
+            }));
+        }
+    }
+
+    private async Task HandleToggleCursorAsync()
+    {
+        if (_activeDxgi != null)
+        {
+            _activeDxgi.ShowCursor = !_activeDxgi.ShowCursor;
+            _logger.LogInformation("Host cursor visibility: {Visible}", _activeDxgi.ShowCursor);
+
+            await _transport!.SendControlAsync(JsonSerializer.Serialize(new
+            {
+                type = "cursorVisibilityChanged",
+                visible = _activeDxgi.ShowCursor
+            }));
+        }
+    }
+
+    private async Task NotifyScreenShareStarted()
+    {
+        await Task.Delay(500);
+        for (int i = 0; i < 3; i++)
+        {
+            var sent = await _transport!.SendControlAsync(
+                JsonSerializer.Serialize(new { type = "screenShareStarted" }));
+            _logger.LogInformation("screenShareStarted message sent: {Sent}", sent);
+            if (sent) break;
+            await Task.Delay(200);
+        }
+    }
+
+    #endregion
+
+    #region Control Messages
+
+    /// <summary>Send string data to the peer via control channel.</summary>
+    public async Task<bool> SendDataAsync(string data)
+    {
+        if (_transport == null || !_transport.IsConnected) return false;
+        return await _transport.SendControlAsync(data);
+    }
+
+    private async Task HandleControlMessage(string json)
     {
         try
         {
@@ -645,7 +501,6 @@ public sealed class HostSession : IAsyncDisposable
                         var locked = root.TryGetProperty("locked", out var lockedProp) && lockedProp.GetBoolean();
                         if (_activeDxgi != null)
                         {
-                            // Hide host cursor in video when viewer is controlling (local overlay replaces it)
                             _activeDxgi.ShowCursor = !locked;
                             _logger.LogInformation("Viewer input lock: {Locked} → host cursor in video: {Visible}", locked, !locked);
                         }
@@ -670,12 +525,24 @@ public sealed class HostSession : IAsyncDisposable
         }
         catch (JsonException)
         {
-            // Not JSON, try as input
             HandleInputMessage(json);
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Failed to handle data channel message");
+            _logger.LogWarning(ex, "Failed to handle control message");
+        }
+    }
+
+    private void HandleTransportStateChanged(string state)
+    {
+        _logger.LogInformation("Transport state changed: {State}", state);
+        if (state == "disconnected")
+        {
+            if (State == HostSessionState.Connected)
+            {
+                SetState(HostSessionState.Disconnected);
+                OnDisconnected?.Invoke("Transport disconnected");
+            }
         }
     }
 
@@ -683,13 +550,9 @@ public sealed class HostSession : IAsyncDisposable
 
     #region Monitor Layout
 
-    /// <summary>
-    /// Send the host's monitor layout to the viewer via data channel.
-    /// Includes monitor positions, sizes, names, and which one is actively captured.
-    /// </summary>
     private async Task SendMonitorLayoutAsync(int? activeMonitorId = null)
     {
-        if (_webrtc == null || !IsDataChannelReady || _monitorEnumerator == null) return;
+        if (_transport == null || !IsDataChannelReady || _monitorEnumerator == null) return;
 
         try
         {
@@ -714,7 +577,7 @@ public sealed class HostSession : IAsyncDisposable
             };
 
             var json = JsonSerializer.Serialize(layout);
-            await _webrtc.SendDataAsync(json);
+            await _transport.SendControlAsync(json);
             _logger.LogInformation("Sent monitor layout to viewer: {Count} monitors, active={Active}",
                 monitors.Count, layout.activeMonitorId);
         }
@@ -724,17 +587,11 @@ public sealed class HostSession : IAsyncDisposable
         }
     }
 
-    /// <summary>
-    /// Match capture dimensions to a monitor in the enumerated list.
-    /// Returns the monitor ID, or null if no match.
-    /// </summary>
     private int? MatchCaptureToMonitor(int captureWidth, int captureHeight)
     {
         if (_monitorEnumerator == null) return null;
 
         var monitors = _monitorEnumerator.GetMonitors();
-
-        // Exact match — unique resolution
         MonitorInfo? firstMatch = null;
         var matchCount = 0;
         foreach (var m in monitors)
@@ -747,22 +604,15 @@ public sealed class HostSession : IAsyncDisposable
         }
 
         if (matchCount == 1) return (int)firstMatch!.Id;
-
-        // Multiple matches — prefer primary
         if (matchCount > 1)
         {
             var primary = monitors.FirstOrDefault(m => m.Width == captureWidth && m.Height == captureHeight && m.IsPrimary);
             return (int)(primary?.Id ?? firstMatch!.Id);
         }
 
-        return null; // No match (downscaled capture or full desktop)
+        return null;
     }
 
-    /// <summary>
-    /// Handle viewer's request to switch which monitor is being captured.
-    /// With DXGI native capture: programmatic switch, no picker.
-    /// With getDisplayMedia: stops and restarts (browser picker appears).
-    /// </summary>
     private async Task HandleSwitchDisplayAsync(int monitorId)
     {
         _requestedMonitorId = monitorId;
@@ -770,7 +620,6 @@ public sealed class HostSession : IAsyncDisposable
         var name = monitor?.Name ?? $"Display {monitorId}";
         _logger.LogInformation("Viewer requested switch to {Monitor} (id={Id})", name, monitorId);
 
-        // Stop current capture, restart on requested monitor
         await StopScreenShareAsync();
         await StartScreenShareAsync(outputIndex: (uint)monitorId);
     }
@@ -785,7 +634,6 @@ public sealed class HostSession : IAsyncDisposable
 
     private void HandleInputMessage(string json)
     {
-        // Only process input if we're sharing our screen
         if (!IsSharingScreen) return;
 
         _inputCount++;
@@ -794,10 +642,8 @@ public sealed class HostSession : IAsyncDisposable
         {
             TrackCaptureDimensions(json);
 
-            // Don't inject until we know real capture dimensions (avoids wrong coordinate mapping)
             if (_lastCaptureWidth <= 0 || _lastCaptureHeight <= 0) return;
 
-            // If an elevated helper is connected, route through the elevation service (async, fire-and-forget)
             if (_elevationService != null && (_elevationService.IsAdminConnected || _elevationService.IsSystemConnected))
             {
                 if (_inputCount <= 3 || _inputCount % 500 == 0)
@@ -810,7 +656,6 @@ public sealed class HostSession : IAsyncDisposable
             if (_inputCount <= 3 || _inputCount % 500 == 0)
                 _logger.LogInformation("Input #{Count}: local injection", _inputCount);
 
-            // No elevation active — local injection (synchronous, no async overhead)
             var inputEvent = JsonSerializer.Deserialize<InputEvent>(json);
             if (inputEvent != null)
             {
@@ -882,15 +727,15 @@ public sealed class HostSession : IAsyncDisposable
     {
         _sdHostFrameCount++;
         if (_sdHostFrameCount <= 3 || _sdHostFrameCount % 100 == 0)
-            _logger.LogInformation("SD frame #{Count}: {Bytes}b {W}x{H}, webrtc={Webrtc}, dcReady={DcReady}",
-                _sdHostFrameCount, jpegData.Length, width, height, _webrtc != null, IsDataChannelReady);
+            _logger.LogInformation("SD frame #{Count}: {Bytes}b {W}x{H}, transport={Transport}, ready={Ready}",
+                _sdHostFrameCount, jpegData.Length, width, height, _transport != null, IsDataChannelReady);
 
-        if (_webrtc == null || !IsDataChannelReady) return;
+        if (_transport == null || !IsDataChannelReady) return;
 
         try
         {
             var base64 = Convert.ToBase64String(jpegData);
-            _ = _webrtc.SendDataAsync(JsonSerializer.Serialize(new
+            _ = _transport.SendControlAsync(JsonSerializer.Serialize(new
             {
                 type = "secureDesktopFrame",
                 data = base64,
@@ -906,10 +751,10 @@ public sealed class HostSession : IAsyncDisposable
 
     private void HandleSecureDesktopStateChanged(bool active)
     {
-        _logger.LogInformation("SD state handler: active={Active}, webrtc={Webrtc}, dcReady={DcReady}",
-            active, _webrtc != null, IsDataChannelReady);
+        _logger.LogInformation("SD state handler: active={Active}, transport={Transport}, ready={Ready}",
+            active, _transport != null, IsDataChannelReady);
 
-        if (_webrtc == null || !IsDataChannelReady) return;
+        if (_transport == null || !IsDataChannelReady) return;
 
         try
         {
@@ -917,14 +762,10 @@ public sealed class HostSession : IAsyncDisposable
                 ? JsonSerializer.Serialize(new { type = "secureDesktopActive" })
                 : JsonSerializer.Serialize(new { type = "secureDesktopInactive" });
 
-            _ = _webrtc.SendDataAsync(message);
+            _ = _transport.SendControlAsync(message);
 
-            // Pause/resume video track to free bandwidth for Secure Desktop JPEG frames
-            _ = active ? _webrtc.PauseVideoTrackAsync() : _webrtc.ResumeVideoTrackAsync();
-
-            _logger.LogInformation("Sent {Type} to viewer, video track {Action}",
-                active ? "secureDesktopActive" : "secureDesktopInactive",
-                active ? "paused" : "resumed");
+            _logger.LogInformation("Sent {Type} to viewer",
+                active ? "secureDesktopActive" : "secureDesktopInactive");
         }
         catch (Exception ex)
         {
@@ -934,12 +775,11 @@ public sealed class HostSession : IAsyncDisposable
 
     private void HandleSystemStateChanged(bool connected)
     {
-        if (_webrtc == null || !IsDataChannelReady) return;
+        if (_transport == null || !IsDataChannelReady) return;
 
         try
         {
-            // Notify viewer that SYSTEM helper connected (auto-launched with admin)
-            _ = _webrtc.SendDataAsync(JsonSerializer.Serialize(new
+            _ = _transport.SendControlAsync(JsonSerializer.Serialize(new
             {
                 type = "hostStatus",
                 elevated = _elevationService?.IsAdminConnected ?? false,
@@ -959,10 +799,9 @@ public sealed class HostSession : IAsyncDisposable
 
     private async Task HandleClipboardRequestAsync()
     {
-        if (_webrtc == null) return;
+        if (_transport == null) return;
 
         string? text = null;
-        // Try browser API first
         try
         {
             text = await _jsRuntime.InvokeAsync<string>("navigator.clipboard.readText");
@@ -972,7 +811,6 @@ public sealed class HostSession : IAsyncDisposable
             _logger.LogWarning(ex, "Browser clipboard.readText failed — trying native Win32");
         }
 
-        // Fall back to native Win32
         if (string.IsNullOrEmpty(text))
             text = TryGetClipboardNative();
 
@@ -980,7 +818,7 @@ public sealed class HostSession : IAsyncDisposable
         {
             var response = JsonSerializer.Serialize<ClipboardMessage>(
                 new ClipboardMessage.Response("text", text));
-            await _webrtc.SendDataAsync(response);
+            await _transport.SendControlAsync(response);
             _logger.LogDebug("Sent clipboard to viewer: {Length} chars", text.Length);
         }
     }
@@ -1005,7 +843,6 @@ public sealed class HostSession : IAsyncDisposable
         var data = root.TryGetProperty("data", out var d) ? d.GetString() : null;
         if (data == null) return;
 
-        // Step 1: Set host clipboard — try browser API first, fall back to native Win32
         bool clipboardSet = false;
         try
         {
@@ -1027,9 +864,8 @@ public sealed class HostSession : IAsyncDisposable
                 _logger.LogWarning("Failed to set clipboard via both browser API and Win32");
         }
 
-        if (!clipboardSet) return; // Don't inject Ctrl+V if clipboard wasn't set
+        if (!clipboardSet) return;
 
-        // Step 2: Inject Ctrl+V to paste from the clipboard we just set
         try
         {
             var ctrlMod = new KeyModifiers(Ctrl: true);
@@ -1062,9 +898,6 @@ public sealed class HostSession : IAsyncDisposable
         }
     }
 
-    /// <summary>
-    /// Native Win32 clipboard read — works without WebView focus.
-    /// </summary>
     private static string? TryGetClipboardNative()
     {
         if (!OperatingSystem.IsWindows()) return null;
@@ -1075,7 +908,6 @@ public sealed class HostSession : IAsyncDisposable
             {
                 var hData = GetClipboardData(CF_UNICODETEXT);
                 if (hData == IntPtr.Zero) return null;
-
                 var pData = GlobalLock(hData);
                 if (pData == IntPtr.Zero) return null;
                 try
@@ -1089,9 +921,6 @@ public sealed class HostSession : IAsyncDisposable
         catch { return null; }
     }
 
-    /// <summary>
-    /// Native Win32 clipboard write — works without WebView focus.
-    /// </summary>
     private static bool TrySetClipboardNative(string text)
     {
         if (!OperatingSystem.IsWindows()) return false;
@@ -1101,33 +930,25 @@ public sealed class HostSession : IAsyncDisposable
             try
             {
                 EmptyClipboard();
-                // Clipboard requires GlobalAlloc(GMEM_MOVEABLE) — NOT Marshal.StringToHGlobal
-                int byteCount = (text.Length + 1) * 2; // UTF-16 + null terminator
+                int byteCount = (text.Length + 1) * 2;
                 var hGlobal = GlobalAlloc(GMEM_MOVEABLE, (UIntPtr)byteCount);
                 if (hGlobal == IntPtr.Zero) return false;
-
                 var pGlobal = GlobalLock(hGlobal);
                 if (pGlobal == IntPtr.Zero) { GlobalFree(hGlobal); return false; }
                 try
                 {
                     System.Runtime.InteropServices.Marshal.Copy(text.ToCharArray(), 0, pGlobal, text.Length);
-                    // Write null terminator
                     System.Runtime.InteropServices.Marshal.WriteInt16(pGlobal + text.Length * 2, 0);
                 }
                 finally { GlobalUnlock(hGlobal); }
-
                 if (SetClipboardData(CF_UNICODETEXT, hGlobal) == IntPtr.Zero)
                 {
                     GlobalFree(hGlobal);
                     return false;
                 }
-                // SetClipboardData takes ownership of hGlobal — do NOT free it
                 return true;
             }
-            finally
-            {
-                CloseClipboard();
-            }
+            finally { CloseClipboard(); }
         }
         catch { return false; }
     }
@@ -1137,77 +958,60 @@ public sealed class HostSession : IAsyncDisposable
 
     [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
     private static extern bool OpenClipboard(IntPtr hWndNewOwner);
-
     [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
     private static extern bool CloseClipboard();
-
     [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
     private static extern bool EmptyClipboard();
-
     [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
     private static extern IntPtr SetClipboardData(uint uFormat, IntPtr hMem);
-
     [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
     private static extern IntPtr GetClipboardData(uint uFormat);
-
     [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
     private static extern IntPtr GlobalAlloc(uint uFlags, UIntPtr dwBytes);
-
     [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
     private static extern IntPtr GlobalLock(IntPtr hMem);
-
     [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
     [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
     private static extern bool GlobalUnlock(IntPtr hMem);
-
     [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
     private static extern IntPtr GlobalFree(IntPtr hMem);
-
 
     #endregion
 
     #region Clipboard File Transfer
 
-    /// <summary>
-    /// Initialize clipboard file transfer infrastructure.
-    /// Host monitors clipboard for CF_HDROP, serves file chunks, and receives remote files.
-    /// </summary>
     private void StartClipboardFileTransfer()
     {
-        if (!OperatingSystem.IsWindows() || _webrtc == null) return;
+        if (!OperatingSystem.IsWindows() || _transport == null) return;
 
         try
         {
-            // File server — serves file chunks as raw binary on file-data channel
-            // Progress updates sent as JSON on file channel
             _clipboardFileServer = new ClipboardFileServer(
                 _loggerFactory.CreateLogger<ClipboardFileServer>(),
-                async (data) => { return await _webrtc!.SendFileDataBinaryAsync(data); },
-                async (json) => await _webrtc!.SendFileChannelDataAsync(json));
+                async (data) => { return await _transport!.SendFileDataAsync(data); },
+                async (json) => await _transport!.SendFileSignalingAsync(json));
 
-            // Clipboard monitor — detects when user copies files (CF_HDROP)
             _clipboardMonitor = new ClipboardMonitor(_loggerFactory.CreateLogger<ClipboardMonitor>());
             _clipboardMonitor.ClipboardFilesDetected += OnClipboardFilesDetected;
             _clipboardMonitor.Start();
 
-            // Clipboard file writer — receives FormatList from viewer and presents virtual files
             _clipboardFileWriter = new ClipboardFileWriter(
                 _loggerFactory.CreateLogger<ClipboardFileWriter>(),
                 async (request) =>
                 {
-                    var json = System.Text.Json.JsonSerializer.Serialize<ClipboardFileMessage>(request);
-                    await _webrtc.SendFileChannelDataAsync(json);
+                    var json = JsonSerializer.Serialize<ClipboardFileMessage>(request);
+                    await _transport.SendFileSignalingAsync(json);
                 },
                 _clipboardMonitor,
                 async (startMsg) =>
                 {
-                    var json = System.Text.Json.JsonSerializer.Serialize<ClipboardFileMessage>(startMsg);
-                    await _webrtc.SendFileChannelDataAsync(json);
+                    var json = JsonSerializer.Serialize<ClipboardFileMessage>(startMsg);
+                    await _transport.SendFileSignalingAsync(json);
                 },
                 async (stopMsg) =>
                 {
-                    var json = System.Text.Json.JsonSerializer.Serialize<ClipboardFileMessage>(stopMsg);
-                    await _webrtc.SendFileChannelDataAsync(json);
+                    var json = JsonSerializer.Serialize<ClipboardFileMessage>(stopMsg);
+                    await _transport.SendFileSignalingAsync(json);
                 });
             _clipboardFileWriter.Start();
 
@@ -1221,22 +1025,20 @@ public sealed class HostSession : IAsyncDisposable
 
     private void OnClipboardFilesDetected(ClipboardFileInfo[] files, string[] localPaths)
     {
-        if (_webrtc == null || !_webrtc.IsDataChannelOpen) return;
+        if (_transport == null || !_transport.IsConnected) return;
 
         try
         {
-            // Update file server with new paths
             _clipboardFileServer?.SetFilePaths(localPaths);
 
-            // Send format list to remote so they can present virtual files
             var formatList = new ClipboardFileMessage.FormatList(files);
-            var json = System.Text.Json.JsonSerializer.Serialize<ClipboardFileMessage>(formatList);
+            var json = JsonSerializer.Serialize<ClipboardFileMessage>(formatList);
 
             _ = Task.Run(async () =>
             {
                 try
                 {
-                    await _webrtc.SendFileChannelDataAsync(json);
+                    await _transport.SendFileSignalingAsync(json);
                     _logger.LogInformation("Sent clipboard file format list: {Count} files", files.Length);
                 }
                 catch (Exception ex)
@@ -1255,32 +1057,24 @@ public sealed class HostSession : IAsyncDisposable
     {
         try
         {
-            var message = System.Text.Json.JsonSerializer.Deserialize<ClipboardFileMessage>(json);
+            var message = JsonSerializer.Deserialize<ClipboardFileMessage>(json);
             if (message == null) return;
 
             switch (message)
             {
                 case ClipboardFileMessage.FormatList formatList:
-                    // Remote has files on clipboard — present them as virtual files on our clipboard
                     _clipboardFileWriter?.SetClipboard(formatList.Files);
                     break;
-
                 case ClipboardFileMessage.FileContentsRequest request:
-                    // Remote is pasting — they need file data from us (pull mode)
                     if (_clipboardFileServer != null)
                         await _clipboardFileServer.HandleRequestAsync(request);
                     break;
-
                 case ClipboardFileMessage.StartStreaming startStreaming:
-                    // Remote wants push-mode streaming for a file
                     _clipboardFileServer?.HandleStartStreaming(startStreaming.FileIndex);
                     break;
-
                 case ClipboardFileMessage.StopStreaming stopStreaming:
-                    // Remote wants to stop push-mode streaming
                     _clipboardFileServer?.HandleStopStreaming(stopStreaming.FileIndex);
                     break;
-
                 case ClipboardFileMessage.TransferProgress progress:
                     _logger.LogInformation("Remote transfer progress: {FileName} — {Transferred}/{Total} ({Speed} MB/s)",
                         progress.FileName, FormatBytes(progress.BytesTransferred), FormatBytes(progress.TotalBytes), progress.SpeedMBps);
@@ -1301,9 +1095,8 @@ public sealed class HostSession : IAsyncDisposable
         return $"{bytes} B";
     }
 
-    private Task HandleFileDataBinaryMessage(byte[] data)
+    private Task HandleFileDataBinary(byte[] data)
     {
-        // Binary file content response — resolve pending RemoteFileStream
         _clipboardFileWriter?.HandleBinaryFileContentsResponse(data);
         return Task.CompletedTask;
     }
@@ -1312,10 +1105,8 @@ public sealed class HostSession : IAsyncDisposable
     {
         _clipboardMonitor?.Dispose();
         _clipboardMonitor = null;
-
         _clipboardFileServer?.Dispose();
         _clipboardFileServer = null;
-
         _clipboardFileWriter?.Dispose();
         _clipboardFileWriter = null;
     }
@@ -1324,25 +1115,19 @@ public sealed class HostSession : IAsyncDisposable
 
     #region Elevation & System Controls
 
-    /// <summary>
-    /// Launch the elevated helper process (triggers UAC on host).
-    /// No app restart — main app stays running, WebRTC stays connected.
-    /// </summary>
     private Task HandleRequestElevationAsync()
     {
-        if (_webrtc == null || _elevationService == null) return Task.CompletedTask;
+        if (_transport == null || _elevationService == null) return Task.CompletedTask;
 
         if (_elevationService.IsAdminConnected)
         {
             _logger.LogInformation("Elevated helper already connected");
-            return _webrtc.SendDataAsync(JsonSerializer.Serialize(new
+            return _transport.SendControlAsync(JsonSerializer.Serialize(new
             {
                 type = "elevationAlready"
-            }));
+            })).AsTask();
         }
 
-        // Run on background thread so we don't block data channel message processing
-        // (which handles input events). The pipe connect can take up to 10 seconds.
         _ = Task.Run(async () =>
         {
             _logger.LogInformation("Requesting admin elevation...");
@@ -1353,7 +1138,7 @@ public sealed class HostSession : IAsyncDisposable
                 if (success)
                 {
                     _logger.LogInformation("Admin elevation succeeded — admin features enabled");
-                    await _webrtc!.SendDataAsync(JsonSerializer.Serialize(new
+                    await _transport!.SendControlAsync(JsonSerializer.Serialize(new
                     {
                         type = "hostStatus",
                         elevated = true
@@ -1362,7 +1147,7 @@ public sealed class HostSession : IAsyncDisposable
                 else
                 {
                     _logger.LogWarning("Admin elevation failed (UAC denied or error)");
-                    await _webrtc!.SendDataAsync(JsonSerializer.Serialize(new
+                    await _transport!.SendControlAsync(JsonSerializer.Serialize(new
                     {
                         type = "elevationDenied",
                         message = "UAC prompt was denied or helper failed to start"
@@ -1374,25 +1159,22 @@ public sealed class HostSession : IAsyncDisposable
                 _logger.LogError(ex, "Failed to request admin elevation");
                 try
                 {
-                    await _webrtc!.SendDataAsync(JsonSerializer.Serialize(new
+                    await _transport!.SendControlAsync(JsonSerializer.Serialize(new
                     {
                         type = "elevationDenied",
                         message = ex.Message
                     }));
                 }
-                catch { /* webrtc may be gone */ }
+                catch { }
             }
         });
 
         return Task.CompletedTask;
     }
 
-    /// <summary>
-    /// Send Ctrl+Alt+Del (SAS) via elevation service if available.
-    /// </summary>
     private async Task HandleCtrlAltDelAsync()
     {
-        if (_webrtc == null) return;
+        if (_transport == null) return;
 
         if (_elevationService != null && (_elevationService.IsAdminConnected || _elevationService.IsSystemConnected))
         {
@@ -1404,7 +1186,7 @@ public sealed class HostSession : IAsyncDisposable
             else
             {
                 _logger.LogWarning("Ctrl+Alt+Del failed via elevation service");
-                await _webrtc.SendDataAsync(JsonSerializer.Serialize(new
+                await _transport.SendControlAsync(JsonSerializer.Serialize(new
                 {
                     type = "ctrlAltDelFailed",
                     message = "SendSAS failed via elevated helper"
@@ -1414,7 +1196,7 @@ public sealed class HostSession : IAsyncDisposable
         else
         {
             _logger.LogWarning("Ctrl+Alt+Del requested but no elevated helper connected");
-            await _webrtc.SendDataAsync(JsonSerializer.Serialize(new
+            await _transport.SendControlAsync(JsonSerializer.Serialize(new
             {
                 type = "ctrlAltDelFailed",
                 message = "Admin features not enabled — request elevation first"
@@ -1434,7 +1216,6 @@ public sealed class HostSession : IAsyncDisposable
             }
         }
 
-        // Fallback: rundll32 (works without elevation service being wired up)
         try
         {
             Process.Start(new ProcessStartInfo
@@ -1452,15 +1233,10 @@ public sealed class HostSession : IAsyncDisposable
         }
     }
 
-    /// <summary>
-    /// Reboot the host machine with auto-restart. Routes through elevation service
-    /// for RunOnceEx registry write, falls back to direct reboot if not elevated.
-    /// </summary>
     private async Task HandleRebootAsync()
     {
         if (_elevationService?.IsAdminConnected == true)
         {
-            // Pass server URL + STUN/TURN config for boot relay WebRTC reconnection
             var serverUrl = _configuration["SignalingServer"];
             var stunUrls = new[] { "stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302" };
             var turnUrls = _configuration.GetSection("TurnServer:Urls").Get<string[]>();
@@ -1475,8 +1251,8 @@ public sealed class HostSession : IAsyncDisposable
             else
             {
                 _logger.LogWarning("Reboot failed via elevation service");
-                if (_webrtc != null)
-                    await _webrtc.SendDataAsync(JsonSerializer.Serialize(new
+                if (_transport != null)
+                    await _transport.SendControlAsync(JsonSerializer.Serialize(new
                     {
                         type = "rebootFailed",
                         message = "Reboot command failed"
@@ -1485,7 +1261,6 @@ public sealed class HostSession : IAsyncDisposable
         }
         else
         {
-            // No elevated helper — reboot without RunOnceEx (no auto-restart)
             _logger.LogWarning("Reboot requested without elevated helper — rebooting without auto-restart");
             try
             {
@@ -1500,8 +1275,8 @@ public sealed class HostSession : IAsyncDisposable
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Failed to initiate reboot");
-                if (_webrtc != null)
-                    await _webrtc.SendDataAsync(JsonSerializer.Serialize(new
+                if (_transport != null)
+                    await _transport.SendControlAsync(JsonSerializer.Serialize(new
                     {
                         type = "rebootFailed",
                         message = ex.Message
@@ -1510,110 +1285,63 @@ public sealed class HostSession : IAsyncDisposable
         }
     }
 
-    /// <summary>
-    /// Run a process elevated via the helper pipe (no additional UAC prompt).
-    /// </summary>
     private async Task HandleRunElevatedAsync(JsonElement root)
     {
-        if (_webrtc == null) return;
-
+        if (_transport == null) return;
         var path = root.TryGetProperty("path", out var p) ? p.GetString() : null;
         var args = root.TryGetProperty("args", out var a) ? a.GetString() : null;
 
         if (string.IsNullOrEmpty(path))
         {
-            await _webrtc.SendDataAsync(JsonSerializer.Serialize(new
-            {
-                type = "runElevatedFailed",
-                message = "No path specified"
-            }));
+            await _transport.SendControlAsync(JsonSerializer.Serialize(new
+            { type = "runElevatedFailed", message = "No path specified" }));
             return;
         }
 
         if (_elevationService?.IsAdminConnected == true)
         {
             var success = await _elevationService.RunElevatedAsync(path, args);
-            if (success)
-            {
-                _logger.LogInformation("RunElevated succeeded: {Path}", path);
-                await _webrtc.SendDataAsync(JsonSerializer.Serialize(new
-                {
-                    type = "runElevatedSuccess",
-                    path
-                }));
-            }
-            else
-            {
-                await _webrtc.SendDataAsync(JsonSerializer.Serialize(new
-                {
-                    type = "runElevatedFailed",
-                    message = $"Failed to launch: {path}"
-                }));
-            }
+            var responseType = success ? "runElevatedSuccess" : "runElevatedFailed";
+            await _transport.SendControlAsync(JsonSerializer.Serialize(new
+            { type = responseType, path, message = success ? (string?)null : $"Failed to launch: {path}" }));
         }
         else
         {
-            await _webrtc.SendDataAsync(JsonSerializer.Serialize(new
-            {
-                type = "runElevatedFailed",
-                message = "Admin features not enabled — request elevation first"
-            }));
+            await _transport.SendControlAsync(JsonSerializer.Serialize(new
+            { type = "runElevatedFailed", message = "Admin features not enabled — request elevation first" }));
         }
     }
 
-    /// <summary>
-    /// Launch the SYSTEM-level helper via the admin helper (schtask as SYSTEM).
-    /// Requires admin helper to be connected first.
-    /// </summary>
     private Task HandleRequestSystemElevationAsync()
     {
-        if (_webrtc == null || _elevationService == null) return Task.CompletedTask;
+        if (_transport == null || _elevationService == null) return Task.CompletedTask;
 
         if (_elevationService.IsSystemConnected)
         {
-            _logger.LogInformation("SYSTEM helper already connected");
-            return _webrtc.SendDataAsync(JsonSerializer.Serialize(new
-            {
-                type = "systemElevationAlready"
-            }));
+            return _transport.SendControlAsync(JsonSerializer.Serialize(new { type = "systemElevationAlready" })).AsTask();
         }
 
         if (!_elevationService.IsAdminConnected)
         {
-            _logger.LogWarning("Cannot launch SYSTEM helper: admin helper not connected");
-            return _webrtc.SendDataAsync(JsonSerializer.Serialize(new
-            {
-                type = "systemElevationDenied",
-                message = "Admin features must be enabled first"
-            }));
+            return _transport.SendControlAsync(JsonSerializer.Serialize(new
+            { type = "systemElevationDenied", message = "Admin features must be enabled first" })).AsTask();
         }
 
-        // Run on background thread (schtask creation + pipe connect can take 15+ seconds)
         _ = Task.Run(async () =>
         {
             _logger.LogInformation("Requesting SYSTEM elevation...");
             try
             {
                 var success = await _elevationService.RequestSystemElevationAsync();
-
                 if (success)
                 {
-                    _logger.LogInformation("SYSTEM elevation succeeded — SYSTEM features enabled");
-                    await _webrtc!.SendDataAsync(JsonSerializer.Serialize(new
-                    {
-                        type = "hostStatus",
-                        elevated = true,
-                        systemLevel = true
-                    }));
+                    await _transport!.SendControlAsync(JsonSerializer.Serialize(new
+                    { type = "hostStatus", elevated = true, systemLevel = true }));
                 }
                 else
                 {
-                    _logger.LogWarning("SYSTEM elevation failed");
-                    await _webrtc!.SendDataAsync(JsonSerializer.Serialize(new
-                    {
-                        type = "systemElevationFailed",
-                        message = "Failed to create SYSTEM helper (scheduled task or pipe error)"
-                    }));
+                    await _transport!.SendControlAsync(JsonSerializer.Serialize(new
+                    { type = "systemElevationFailed", message = "Failed to create SYSTEM helper" }));
                 }
             }
             catch (Exception ex)
@@ -1621,173 +1349,41 @@ public sealed class HostSession : IAsyncDisposable
                 _logger.LogError(ex, "Failed to request SYSTEM elevation");
                 try
                 {
-                    await _webrtc!.SendDataAsync(JsonSerializer.Serialize(new
-                    {
-                        type = "systemElevationFailed",
-                        message = ex.Message
-                    }));
+                    await _transport!.SendControlAsync(JsonSerializer.Serialize(new
+                    { type = "systemElevationFailed", message = ex.Message }));
                 }
-                catch { /* webrtc may be gone */ }
+                catch { }
             }
         });
 
         return Task.CompletedTask;
     }
 
-    /// <summary>
-    /// Run a process as SYSTEM in the user's desktop session via the SYSTEM helper.
-    /// </summary>
     private async Task HandleRunAsSystemAsync(JsonElement root)
     {
-        if (_webrtc == null) return;
-
+        if (_transport == null) return;
         var path = root.TryGetProperty("path", out var p) ? p.GetString() : null;
         var args = root.TryGetProperty("args", out var a) ? a.GetString() : null;
 
         if (string.IsNullOrEmpty(path))
         {
-            await _webrtc.SendDataAsync(JsonSerializer.Serialize(new
-            {
-                type = "runAsSystemFailed",
-                message = "No path specified"
-            }));
+            await _transport.SendControlAsync(JsonSerializer.Serialize(new
+            { type = "runAsSystemFailed", message = "No path specified" }));
             return;
         }
 
         if (_elevationService?.IsSystemConnected == true)
         {
             var success = await _elevationService.RunAsSystemAsync(path, args);
-            if (success)
-            {
-                _logger.LogInformation("RunAsSystem succeeded: {Path}", path);
-                await _webrtc.SendDataAsync(JsonSerializer.Serialize(new
-                {
-                    type = "runAsSystemSuccess",
-                    path
-                }));
-            }
-            else
-            {
-                await _webrtc.SendDataAsync(JsonSerializer.Serialize(new
-                {
-                    type = "runAsSystemFailed",
-                    message = $"Failed to launch: {path}"
-                }));
-            }
+            var responseType = success ? "runAsSystemSuccess" : "runAsSystemFailed";
+            await _transport.SendControlAsync(JsonSerializer.Serialize(new
+            { type = responseType, path, message = success ? (string?)null : $"Failed to launch: {path}" }));
         }
         else
         {
-            await _webrtc.SendDataAsync(JsonSerializer.Serialize(new
-            {
-                type = "runAsSystemFailed",
-                message = "SYSTEM features not enabled — request system elevation first"
-            }));
+            await _transport.SendControlAsync(JsonSerializer.Serialize(new
+            { type = "runAsSystemFailed", message = "SYSTEM features not enabled — request system elevation first" }));
         }
-    }
-
-    #endregion
-
-    #region WebRTC Event Handlers
-
-    private async Task HandleIceCandidate(string candidateJson)
-    {
-        try
-        {
-            var candidate = JsonSerializer.Deserialize<IceCandidateData>(candidateJson);
-            if (candidate != null && OnIceCandidate != null)
-            {
-                await OnIceCandidate.Invoke(candidate.candidate, candidate.sdpMid, (ushort?)candidate.sdpMLineIndex);
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Failed to handle ICE candidate");
-        }
-    }
-
-    private async Task HandleRenegotiationNeeded(string offerJson)
-    {
-        _logger.LogInformation("Renegotiation: sending new offer to {PeerId}", PeerId);
-        if (OnSdpMessage != null)
-            await OnSdpMessage.Invoke(PeerId, offerJson);
-    }
-
-    private async Task HandleConnectionStateChange(string state)
-    {
-        _logger.LogInformation("Connection state changed to {State}", state);
-        switch (state)
-        {
-            case "connected":
-                SetState(HostSessionState.Connected);
-                break;
-            case "disconnected":
-                // Temporary ICE state — don't tear down. ICE will usually recover within seconds.
-                // JS side already handles this (pauses capture, keeps input lock).
-                _logger.LogWarning("WebRTC temporarily disconnected (ICE recovering)");
-                break;
-            case "failed":
-            case "closed":
-                SetState(HostSessionState.Disconnected);
-                OnDisconnected?.Invoke(state);
-                break;
-        }
-        await Task.CompletedTask;
-    }
-
-    private void HandleScreenShareLost()
-    {
-        _logger.LogWarning("Screen sharing lost — all auto-restart attempts failed");
-        IsSharingScreen = false;
-        OnScreenShareLost?.Invoke();
-    }
-
-    private void HandleCaptureStarted(int width, int height)
-    {
-        if (width > 0 && height > 0)
-        {
-            _lastCaptureWidth = width;
-            _lastCaptureHeight = height;
-            _inputInjector.SetCapturedMonitor(width, height);
-            var source = _isNativeCapture ? "DXGI native" : "getDisplayMedia";
-            _logger.LogInformation("Host capture dimensions set: {W}x{H} (from {Source}), monitor cached", width, height, source);
-
-            // Send updated monitor layout with the matched active monitor
-            var matchedId = MatchCaptureToMonitor(width, height);
-            _ = SendMonitorLayoutAsync(matchedId);
-        }
-    }
-
-    #endregion
-
-    #region TURN Configuration
-
-    private async Task SetTurnConfigFromSettings()
-    {
-        var turnEnabled = _configuration.GetValue<bool>("TurnServer:Enabled");
-        if (!turnEnabled)
-        {
-            _logger.LogInformation("TURN server disabled in config");
-            return;
-        }
-
-        var urls = _configuration.GetSection("TurnServer:Urls").Get<string[]>();
-        var username = _configuration["TurnServer:Username"];
-        var credential = _configuration["TurnServer:Credential"];
-
-        if (urls == null || urls.Length == 0 || string.IsNullOrEmpty(username))
-        {
-            _logger.LogWarning("TURN server enabled but not configured");
-            return;
-        }
-
-        if (urls[0].Contains("YOUR_TURN_SERVER"))
-        {
-            _logger.LogWarning("TURN server URL is placeholder");
-            return;
-        }
-
-        _logger.LogInformation("Configuring TURN server: {Urls}", string.Join(", ", urls));
-        await _jsRuntime.InvokeVoidAsync("SteamViewerWebRTC.setTurnConfig", urls, username, credential);
     }
 
     #endregion
@@ -1804,9 +1400,9 @@ public sealed class HostSession : IAsyncDisposable
     /// <summary>Disconnect and clean up the session.</summary>
     public async Task DisconnectAsync()
     {
-        if (_webrtc != null)
+        if (_transport != null)
         {
-            await _webrtc.CloseAsync();
+            await _transport.DisposeAsync();
         }
         IsSharingScreen = false;
         IsPeerSharingScreen = false;
@@ -1826,38 +1422,27 @@ public sealed class HostSession : IAsyncDisposable
             await _elevationService.DisposeAsync();
         }
 
-        // Stop clipboard file transfer
         StopClipboardFileTransfer();
 
-        // Stop DXGI capture if active
         if (_isNativeCapture && _screenCapture is DxgiScreenCapture dxgi)
         {
             dxgi.OnRawFrameCaptured -= OnDxgiRawFrameCaptured;
-            dxgi.OnFrameCaptured -= OnDxgiFrameCaptured;
+            dxgi.OnCursorShapeChanged -= OnCursorShapeChanged;
             dxgi.StopCaptureLoop();
             _isNativeCapture = false;
         }
 
-        if (_webrtc != null)
+        _encoder?.Dispose();
+        _encoder = null;
+
+        if (_transport != null)
         {
-            _webrtc.OnIceCandidate -= HandleIceCandidate;
-            _webrtc.OnDataChannelMessage -= HandleDataChannelMessage;
-            _webrtc.OnFileChannelMessage -= HandleFileChannelMessage;
-            _webrtc.OnFileDataBinaryMessage -= HandleFileDataBinaryMessage;
-            _webrtc.OnRenegotiationNeeded -= HandleRenegotiationNeeded;
-            _webrtc.OnDataChannelOpen -= HandleDataChannelOpen;
-            _webrtc.OnDataChannelClose -= HandleDataChannelClose;
-            _webrtc.OnConnectionStateChange -= HandleConnectionStateChange;
-            _webrtc.OnScreenShareLost -= HandleScreenShareLost;
-            _webrtc.OnCaptureStarted -= HandleCaptureStarted;
-
-            await _webrtc.DisposeAsync();
-            _webrtc = null;
+            _transport.OnControlMessage -= HandleControlMessage;
+            _transport.OnFileData -= HandleFileDataBinary;
+            _transport.OnFileSignalingMessage -= HandleFileChannelMessage;
+            _transport.OnConnectionStateChanged -= HandleTransportStateChanged;
+            await _transport.DisposeAsync();
+            _transport = null;
         }
-
-        _pendingSdpOffer = null;
-        _pendingIceCandidates.Clear();
     }
-
-    private record IceCandidateData(string candidate, string? sdpMid, int? sdpMLineIndex);
 }

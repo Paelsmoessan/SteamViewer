@@ -430,7 +430,7 @@
             _activeSession.OnSecureDesktopFrame -= HandleSecureDesktopFrame;
             _activeSession.OnMonitorLayoutReceived -= HandleMonitorLayoutReceived;
             if (_statsVisible) _ = _activeSession.DisableStatsRelayAsync();
-            _ = JSRuntime.InvokeVoidAsync("SteamViewerWebRTC.clearDirectRenderTarget", oldSessionId);
+            _ = JSRuntime.InvokeVoidAsync("SteamViewerVideo.dispose", oldSessionId);
         }
 
         _activeSessionId = sessionId;

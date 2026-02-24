@@ -33,6 +33,8 @@ namespace SteamViewer.Common.Protocol;
 [JsonDerivedType(typeof(ParticipantLeft), "participant_left")]
 [JsonDerivedType(typeof(LeaveSession), "leave_session")]
 [JsonDerivedType(typeof(ScreenShareStateChanged), "screen_share_state_changed")]
+// Direct transport endpoint exchange (FFmpeg transport, replaces SDP/ICE)
+[JsonDerivedType(typeof(TransportEndpoint), "transport_endpoint")]
 // Mesh WebRTC signaling (within session)
 [JsonDerivedType(typeof(MeshSdpOffer), "mesh_sdp_offer")]
 [JsonDerivedType(typeof(MeshSdpAnswer), "mesh_sdp_answer")]
@@ -167,6 +169,19 @@ public abstract record SignalingMessage
     public sealed record ScreenShareStateChanged(
         [property: JsonPropertyName("participant_id")] string ParticipantId,
         [property: JsonPropertyName("is_sharing")] bool IsSharing
+    ) : SignalingMessage;
+
+    // ==================== Direct Transport Endpoint Exchange ====================
+
+    /// <summary>
+    /// Host sends transport endpoint to viewer after approving connection.
+    /// Viewer connects directly via TCP to the host's IP:port.
+    /// Replaces SDP/ICE for the FFmpeg transport.
+    /// </summary>
+    public sealed record TransportEndpoint(
+        [property: JsonPropertyName("target_id")] string TargetId,
+        [property: JsonPropertyName("ips")] string[] IPs,
+        [property: JsonPropertyName("port")] int Port
     ) : SignalingMessage;
 
     // ==================== Mesh WebRTC Signaling ====================

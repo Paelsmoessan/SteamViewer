@@ -1,4 +1,3 @@
-using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.JSInterop;
 using SteamViewer.App.Services.Models;
@@ -12,13 +11,12 @@ namespace SteamViewer.App.Services;
 
 /// <summary>
 /// Manages multiple viewer sessions for the multi-tab viewer feature.
-/// Holds WebRTC connections and routes signaling messages to the correct session.
+/// Routes signaling messages (including TransportEndpoint) to the correct session.
 /// </summary>
 public sealed class ViewerSessionManager : IAsyncDisposable
 {
     private readonly ILogger<ViewerSessionManager> _logger;
     private readonly ILoggerFactory _loggerFactory;
-    private readonly IConfiguration _configuration;
     private readonly SignalingClient _signalingClient;
 
     private readonly ConcurrentDictionary<string, ViewerSession> _sessions = new();
@@ -64,12 +62,10 @@ public sealed class ViewerSessionManager : IAsyncDisposable
     public ViewerSessionManager(
         ILogger<ViewerSessionManager> logger,
         ILoggerFactory loggerFactory,
-        IConfiguration configuration,
         SignalingClient signalingClient)
     {
         _logger = logger;
         _loggerFactory = loggerFactory;
-        _configuration = configuration;
         _signalingClient = signalingClient;
     }
 
@@ -131,25 +127,15 @@ public sealed class ViewerSessionManager : IAsyncDisposable
         // Subscribe to session events
         session.OnStateChanged += state => HandleSessionStateChanged(sessionId, state);
         session.OnDisconnected += reason => HandleSessionDisconnected(sessionId, reason);
-        session.OnIceCandidate += (candidate, sdpMid, sdpMLineIndex) =>
-            _signalingClient.SendIceCandidateAsync(peerId, candidate, sdpMid, sdpMLineIndex);
-        session.OnSdpMessage += (targetPeerId, sdpJson) =>
-            sdpJson.Contains("\"type\":\"offer\"")
-                ? _signalingClient.SendSdpOfferAsync(targetPeerId, sdpJson)
-                : _signalingClient.SendSdpAnswerAsync(targetPeerId, sdpJson);
 
         _sessions[sessionId] = session;
         _peerToSession[peerId] = sessionId;
 
         _logger.LogInformation("Created session {SessionId} for peer {PeerId}", sessionId, peerId);
 
-        // WebRTC initialization is DEFERRED — RemoteViewer calls session.BindToViewerAsync()
-        // when the tab activates, creating the PeerConnection in the viewer window's JS context.
-        // This enables direct rendering (zero-copy video → canvas) instead of JPEG relay.
-        // Incoming SDP/ICE messages are queued in ViewerSession until binding completes.
-
-        // Store TURN config for the session to apply when binding to viewer JS context
-        StoreTurnConfig(session);
+        // Transport initialization is DEFERRED — host sends TransportEndpoint via signaling,
+        // which triggers HandleTransportEndpointAsync to connect TCP.
+        // RemoteViewer calls session.BindToViewerAsync() for rendering setup.
 
         // Request connection via signaling
         await _signalingClient.RequestConnectionAsync(peerId, password);
@@ -255,20 +241,11 @@ public sealed class ViewerSessionManager : IAsyncDisposable
         // Subscribe to session events
         session.OnStateChanged += state => HandleSessionStateChanged(sessionId, state);
         session.OnDisconnected += reason => HandleSessionDisconnected(sessionId, reason);
-        session.OnIceCandidate += (candidate, sdpMid, sdpMLineIndex) =>
-            _signalingClient.SendIceCandidateAsync(peerId, candidate, sdpMid, sdpMLineIndex);
-        session.OnSdpMessage += (targetPeerId, sdpJson) =>
-            sdpJson.Contains("\"type\":\"offer\"")
-                ? _signalingClient.SendSdpOfferAsync(targetPeerId, sdpJson)
-                : _signalingClient.SendSdpAnswerAsync(targetPeerId, sdpJson);
 
         _sessions[sessionId] = session;
         _peerToSession[peerId] = sessionId;
 
-        // WebRTC initialization is DEFERRED — RemoteViewer binds after reconnect
-
-        // Store TURN config for the session to apply when binding
-        StoreTurnConfig(session);
+        // Transport initialization is DEFERRED — host sends TransportEndpoint via signaling
 
         // Request connection via signaling
         await _signalingClient.RequestConnectionAsync(peerId, password);
@@ -306,6 +283,10 @@ public sealed class ViewerSessionManager : IAsyncDisposable
 
             case SignalingMessage.IceCandidate ice:
                 HandleIceCandidate(ice);
+                break;
+
+            case SignalingMessage.TransportEndpoint endpoint:
+                HandleTransportEndpoint(endpoint);
                 break;
 
             case SignalingMessage.Disconnected disconnected:
@@ -397,54 +378,30 @@ public sealed class ViewerSessionManager : IAsyncDisposable
         OnSessionStateChanged?.Invoke(sessionId, state);
     }
 
+    private void HandleTransportEndpoint(SignalingMessage.TransportEndpoint endpoint)
+    {
+        var session = GetSessionByPeerId(endpoint.TargetId);
+        if (session == null)
+        {
+            _logger.LogWarning("Received TransportEndpoint for unknown peer {PeerId}", endpoint.TargetId);
+            return;
+        }
+
+        _logger.LogInformation("Session {SessionId}: Received transport endpoint from {PeerId} ({IpCount} IPs, port {Port})",
+            session.SessionId, endpoint.TargetId, endpoint.IPs.Length, endpoint.Port);
+        _ = session.HandleTransportEndpointAsync(endpoint.IPs, endpoint.Port);
+    }
+
     private void HandleSessionDisconnected(string sessionId, string? reason)
     {
-        _logger.LogInformation("Session {SessionId} WebRTC disconnected: {Reason}", sessionId, reason ?? "unknown");
-        // Don't remove - WebRTC disconnects can be temporary.
+        _logger.LogInformation("Session {SessionId} transport disconnected: {Reason}", sessionId, reason ?? "unknown");
+        // Don't remove - transport disconnects can be temporary.
         // Removal via: HandlePeerDisconnected (signaling) or user closing the tab.
     }
 
     private async Task SendSignalingMessage(SignalingMessage message)
     {
         await _signalingClient.SendAsync(message);
-    }
-
-    private void StoreTurnConfig(ViewerSession session)
-    {
-        var turnEnabled = _configuration.GetValue<bool>("TurnServer:Enabled");
-        if (!turnEnabled) return;
-
-        var urls = _configuration.GetSection("TurnServer:Urls").Get<string[]>();
-        var username = _configuration["TurnServer:Username"];
-        var credential = _configuration["TurnServer:Credential"];
-
-        if (urls == null || urls.Length == 0 || string.IsNullOrEmpty(username)) return;
-        if (urls[0].Contains("YOUR_TURN_SERVER")) return;
-
-        session.TurnConfig = (urls, username, credential!);
-    }
-
-    private async Task ConfigureTurnServerAsync(IJSRuntime jsRuntime)
-    {
-        var turnEnabled = _configuration.GetValue<bool>("TurnServer:Enabled");
-        if (!turnEnabled) return;
-
-        var urls = _configuration.GetSection("TurnServer:Urls").Get<string[]>();
-        var username = _configuration["TurnServer:Username"];
-        var credential = _configuration["TurnServer:Credential"];
-
-        if (urls == null || urls.Length == 0 || string.IsNullOrEmpty(username))
-        {
-            return;
-        }
-
-        if (urls[0].Contains("YOUR_TURN_SERVER"))
-        {
-            return;
-        }
-
-        _logger.LogInformation("Configuring TURN server for session manager");
-        await jsRuntime.InvokeVoidAsync("SteamViewerWebRTC.setTurnConfig", urls, username, credential);
     }
 
     public async ValueTask DisposeAsync()

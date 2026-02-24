@@ -793,10 +793,6 @@
                 _canvasInitialized = false; // Reset canvas when peer sharing changes
                 StateHasChanged();
             });
-            _hostSession.OnIceCandidate += (candidate, sdpMid, sdpMLineIndex) =>
-                SignalingClient.SendIceCandidateAsync(connectedPeerId, candidate, sdpMid, sdpMLineIndex);
-            _hostSession.OnSdpMessage += (peerId, sdp) =>
-                SignalingClient.SendSdpOfferAsync(peerId, sdp);
 
             await _hostSession.InitializeAsync();
         }
@@ -971,24 +967,6 @@
                         errorMessage = "Connection rejected";
                         connectionState = ConnectionState.Registered;
                     }
-                    break;
-
-                case SignalingMessage.SdpOffer offer:
-                    if (offer.TargetId != connectedPeerId) break;
-                    if (_hostSession != null)
-                        await _hostSession.HandleSdpOfferAsync(offer.Sdp);
-                    break;
-
-                case SignalingMessage.SdpAnswer answer:
-                    if (answer.TargetId != connectedPeerId) break;
-                    if (_hostSession != null)
-                        await _hostSession.HandleSdpAnswerAsync(answer.Sdp);
-                    break;
-
-                case SignalingMessage.IceCandidate ice:
-                    if (ice.TargetId != connectedPeerId) break;
-                    if (_hostSession != null)
-                        await _hostSession.HandleIceCandidateAsync(ice.Candidate, ice.SdpMid, (int?)ice.SdpMLineIndex);
                     break;
 
                 case SignalingMessage.Disconnected disconnected:
