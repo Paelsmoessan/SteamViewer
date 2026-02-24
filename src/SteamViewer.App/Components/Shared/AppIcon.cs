@@ -1,0 +1,38 @@
+namespace SteamViewer.App.Components.Shared;
+
+public enum AppIcon
+{
+    Lock,
+    Unlock,
+    Mouse,
+    BarChart2,
+    Maximize,
+    X,
+    Monitor,
+    Keyboard,
+    Power,
+    Shield,
+    RotateCw,
+    Clipboard,
+    ClipboardPaste,
+    Upload,
+    Download,
+    Eye,
+    EyeOff,
+    ArrowUp,
+    AlertTriangle,
+    Link,
+    Plus,
+    MonitorPlay,
+    ArrowRight,
+    Users,
+    Copy,
+    Check,
+    Square,
+    Loader,
+    ChevronDown,
+    Fullscreen,
+    Star,
+    FolderOpen,
+    LogOut
+}

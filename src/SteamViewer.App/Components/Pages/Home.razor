@@ -38,20 +38,20 @@
 
             <div class="mode-buttons">
                 <button class="mode-btn host-btn" @onclick="SelectStartMode">
-                    <span class="icon">1:1</span>
+                    <span class="icon"><Icon Name="AppIcon.MonitorPlay" Size="36" /></span>
                     <span class="label">Start Session</span>
                     <span class="desc">Share your screen with others</span>
                 </button>
 
                 <button class="mode-btn viewer-btn" @onclick="SelectJoinMode">
-                    <span class="icon">-></span>
+                    <span class="icon"><Icon Name="AppIcon.ArrowRight" Size="36" /></span>
                     <span class="label">Join Session</span>
                     <span class="desc">Connect to an existing session</span>
                 </button>
             </div>
 
             <a href="/collaboration" class="collaboration-link">
-                <span class="collab-icon">N:N</span>
+                <span class="collab-icon"><Icon Name="AppIcon.Users" Size="18" /></span>
                 <span>Collaboration Mode</span>
                 <span class="collab-desc">Multi-user screen sharing</span>
             </a>
@@ -76,7 +76,7 @@
                         <div class="value-row">
                             <div class="value">@clientId</div>
                             <button class="copy-btn" @onclick="CopySessionId" title="@(_copiedId ? "Copied!" : "Copy to clipboard")">
-                                @(_copiedId ? "✓" : "📋")
+                                <Icon Name="@(_copiedId ? AppIcon.Check : AppIcon.Copy)" Size="14" />
                             </button>
                         </div>
                     </div>
@@ -85,7 +85,7 @@
                         <div class="value-row">
                             <div class="value">@password</div>
                             <button class="copy-btn" @onclick="CopyPassword" title="@(_copiedPassword ? "Copied!" : "Copy to clipboard")">
-                                @(_copiedPassword ? "✓" : "📋")
+                                <Icon Name="@(_copiedPassword ? AppIcon.Check : AppIcon.Copy)" Size="14" />
                             </button>
                         </div>
                     </div>
@@ -241,7 +241,7 @@
                 @if (_isSharingScreen)
                 {
                     <button class="share-btn sharing" @onclick="StopSharingScreen">
-                        <span class="icon">🛑</span>
+                        <span class="icon"><Icon Name="AppIcon.Square" Size="20" /></span>
                         <span>Stop Sharing</span>
                     </button>
                     <p class="share-status">You are sharing your screen</p>
@@ -270,7 +270,7 @@
                 else
                 {
                     <button class="share-btn" @onclick="StartSharingScreen" disabled="@(!_dataChannelReady)">
-                        <span class="icon">🖥️</span>
+                        <span class="icon"><Icon Name="AppIcon.Monitor" Size="20" /></span>
                         <span>Share My Screen</span>
                     </button>
                     @if (!_dataChannelReady)
@@ -285,7 +285,7 @@
             {
                 <div class="remote-screen-container">
                     <div class="remote-screen-header">
-                        <span class="remote-label">📺 Remote Screen</span>
+                        <span class="remote-label"><Icon Name="AppIcon.Monitor" Size="16" /> Remote Screen</span>
                     </div>
                     <div class="remote-screen">
                         <canvas id="remoteCanvas" width="1" height="1"></canvas>
@@ -299,8 +299,8 @@
 
             @* Toolbar *@
             <div class="session-toolbar">
-                <button class="toolbar-btn" @onclick="ShowTransfersDialog">📁 Transfers</button>
-                <button class="toolbar-btn disconnect" @onclick="Disconnect">⏏ Disconnect</button>
+                <button class="toolbar-btn" @onclick="ShowTransfersDialog"><Icon Name="AppIcon.FolderOpen" Size="14" /> Transfers</button>
+                <button class="toolbar-btn disconnect" @onclick="Disconnect"><Icon Name="AppIcon.LogOut" Size="14" /> Disconnect</button>
             </div>
         </div>
     };

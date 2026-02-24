@@ -26,27 +26,27 @@
                         <div class="menu-section">
                             <span class="menu-section-title">Special Keys</span>
                             <button class="menu-item" @onclick="SendCtrlShiftEsc" title="Open Task Manager">
-                                <span class="menu-icon">📋</span>
+                                <span class="menu-icon"><Icon Name="AppIcon.Keyboard" Size="16" /></span>
                                 <span>Task Manager</span>
                                 <span class="menu-shortcut">Ctrl+Shift+Esc</span>
                             </button>
                             <button class="menu-item" @onclick="SendWinD" title="Show Desktop">
-                                <span class="menu-icon">🖥️</span>
+                                <span class="menu-icon"><Icon Name="AppIcon.Monitor" Size="16" /></span>
                                 <span>Show Desktop</span>
                                 <span class="menu-shortcut">Win+D</span>
                             </button>
                             <button class="menu-item" @onclick="SendWinL" title="Lock Screen">
-                                <span class="menu-icon">🔒</span>
+                                <span class="menu-icon"><Icon Name="AppIcon.Lock" Size="16" /></span>
                                 <span>Lock Screen</span>
                                 <span class="menu-shortcut">Win+L</span>
                             </button>
                             <button class="menu-item" @onclick="SendAltTab" title="Switch Windows">
-                                <span class="menu-icon">🔄</span>
+                                <span class="menu-icon"><Icon Name="AppIcon.RotateCw" Size="16" /></span>
                                 <span>Switch Windows</span>
                                 <span class="menu-shortcut">Alt+Tab</span>
                             </button>
                             <button class="menu-item" @onclick="SendAltF4" title="Close Active Window">
-                                <span class="menu-icon">❌</span>
+                                <span class="menu-icon"><Icon Name="AppIcon.X" Size="16" /></span>
                                 <span>Close Window</span>
                                 <span class="menu-shortcut">Alt+F4</span>
                             </button>
@@ -57,7 +57,7 @@
                             <button class="menu-item @(_hostElevated != true ? "disabled" : "")"
                                     @onclick="SendCtrlAltDel"
                                     title="@(_hostElevated != true ? "Host needs admin privileges" : "Send Ctrl+Alt+Del to host")">
-                                <span class="menu-icon">🛡️</span>
+                                <span class="menu-icon"><Icon Name="AppIcon.Shield" Size="16" /></span>
                                 <span>Ctrl+Alt+Del</span>
                                 @if (_hostElevated == true)
                                 {
@@ -69,13 +69,13 @@
                                 }
                             </button>
                             <button class="menu-item" @onclick="SendRebootHost" title="Reboot the remote host">
-                                <span class="menu-icon">🔄</span>
+                                <span class="menu-icon"><Icon Name="AppIcon.Power" Size="16" /></span>
                                 <span>Reboot Host</span>
                             </button>
                             @if (_hostElevated == false)
                             {
                                 <button class="menu-item" @onclick="RequestElevation" title="Enable admin features on host (UAC prompt will appear on host)">
-                                    <span class="menu-icon">⬆️</span>
+                                    <span class="menu-icon"><Icon Name="AppIcon.ArrowUp" Size="16" /></span>
                                     <span>Enable Admin</span>
                                 </button>
                             }
@@ -85,11 +85,11 @@
                         <div class="menu-section">
                             <span class="menu-section-title">Clipboard</span>
                             <button class="menu-item" @onclick="SendClipboardToHost" title="Send your clipboard text to the remote machine">
-                                <span class="menu-icon">📋</span>
+                                <span class="menu-icon"><Icon Name="AppIcon.ClipboardPaste" Size="16" /></span>
                                 <span>Paste to Remote</span>
                             </button>
                             <button class="menu-item" @onclick="GetClipboardFromHost" title="Copy the remote machine's clipboard text">
-                                <span class="menu-icon">📥</span>
+                                <span class="menu-icon"><Icon Name="AppIcon.Clipboard" Size="16" /></span>
                                 <span>Copy from Remote</span>
                             </button>
                         </div>
@@ -105,7 +105,7 @@
                 {
                     <div class="menu-dropdown" @onclick:stopPropagation="true">
                         <button class="menu-item" @onclick="ToggleFullscreen">
-                            <span class="menu-icon">⛶</span>
+                            <span class="menu-icon"><Icon Name="AppIcon.Fullscreen" Size="16" /></span>
                             <span>Fullscreen</span>
                             <span class="menu-shortcut">F11</span>
                         </button>
@@ -120,7 +120,7 @@
                                     <button class="menu-item @(isActive ? "monitor-active" : "")"
                                             @onclick="() => SwitchMonitor((int)mon.Id)"
                                             title="@(mon.Name) (@(mon.Width)x@(mon.Height))">
-                                        <span class="menu-icon">@(mon.IsPrimary ? "★" : "🖥️")</span>
+                                        <span class="menu-icon">@if (mon.IsPrimary) { <Icon Name="AppIcon.Star" Size="16" /> } else { <Icon Name="AppIcon.Monitor" Size="16" /> }</span>
                                         <span>@(mon.Name) (@(mon.Width)x@(mon.Height))</span>
                                         @if (isActive)
                                         {
@@ -142,11 +142,11 @@
                 {
                     <div class="menu-dropdown" @onclick:stopPropagation="true">
                         <button class="menu-item disabled">
-                            <span class="menu-icon">📤</span>
+                            <span class="menu-icon"><Icon Name="AppIcon.Upload" Size="16" /></span>
                             <span>Send File...</span>
                         </button>
                         <button class="menu-item disabled">
-                            <span class="menu-icon">📥</span>
+                            <span class="menu-icon"><Icon Name="AppIcon.Download" Size="16" /></span>
                             <span>Receive File...</span>
                         </button>
                     </div>
@@ -155,12 +155,12 @@
         </div>
         <div class="toolbar-icons">
             <button class="icon-btn @(_inputLocked ? "locked" : "")" @onclick="ToggleInputLock" title="@(_inputLocked ? "Unlock input" : "Lock input")">
-                @(_inputLocked ? "🔒" : "🔓")
+                <Icon Name="@(_inputLocked ? AppIcon.Lock : AppIcon.Unlock)" Size="14" />
             </button>
-            <button class="icon-btn @(_hostCursorVisible ? "active-toggle" : "")" @onclick="ToggleHostCursor" title="Toggle host cursor">🖱️</button>
-            <button class="icon-btn @(_statsVisible ? "active-toggle" : "")" @onclick="ToggleStatsOverlay" title="Toggle stats overlay">📊</button>
-            <button class="icon-btn" @onclick="ToggleFullscreen" title="Fullscreen (F11)">⛶</button>
-            <button class="icon-btn close-btn" @onclick="CloseWindow" title="Close window">×</button>
+            <button class="icon-btn @(_hostCursorVisible ? "active-toggle" : "")" @onclick="ToggleHostCursor" title="Toggle host cursor"><Icon Name="AppIcon.Mouse" Size="14" /></button>
+            <button class="icon-btn @(_statsVisible ? "active-toggle" : "")" @onclick="ToggleStatsOverlay" title="Toggle stats overlay"><Icon Name="AppIcon.BarChart2" Size="14" /></button>
+            <button class="icon-btn" @onclick="ToggleFullscreen" title="Fullscreen (F11)"><Icon Name="AppIcon.Fullscreen" Size="14" /></button>
+            <button class="icon-btn close-btn" @onclick="CloseWindow" title="Close window"><Icon Name="AppIcon.X" Size="14" /></button>
         </div>
     </div>
     <div class="canvas-wrapper">
@@ -173,16 +173,16 @@
                          @onclick="() => SwitchTab(tab.SessionId)"
                          @onclick:stopPropagation="true"
                          data-session-id="@tab.SessionId">
-                        <span class="tab-icon">@GetTabIcon(tab)</span>
+                        <span class="tab-icon"><Icon Name="@GetTabIcon(tab)" Size="12" /></span>
                         <span class="tab-title">@tab.Title</span>
                         <button class="tab-close"
                                 title="Close tab"
                                 @onclick="() => CloseTab(tab.SessionId)"
-                                @onclick:stopPropagation="true">×</button>
+                                @onclick:stopPropagation="true"><Icon Name="AppIcon.X" Size="10" /></button>
                     </div>
                 }
             </div>
-            <button class="tab-add" title="New connection" @onclick="OpenConnectionDialog">+</button>
+            <button class="tab-add" title="New connection" @onclick="OpenConnectionDialog"><Icon Name="AppIcon.Plus" Size="14" /></button>
         </div>
         <div class="canvas-container" id="canvasContainer">
             <video id="viewerVideo" class="viewer-video" autoplay muted playsinline></video>
@@ -268,7 +268,7 @@
     private System.Threading.Timer? _reconnectTimer;
     private int _reconnectAttempts;
     private bool _statsVisible;
-    private bool _hostCursorVisible = true;
+    private bool _hostCursorVisible = false;
     private string? _statsText;
     private string? _toastMessage;
     private bool? _hostElevated;
@@ -653,11 +653,11 @@
         }
     }
 
-    private string GetTabIcon(TabState tab)
+    private AppIcon GetTabIcon(TabState tab)
     {
-        if (!tab.IsConnected) return "⚠️";
-        if (tab.IsPeerSharing) return "🖥️";
-        return "🔗";
+        if (!tab.IsConnected) return AppIcon.AlertTriangle;
+        if (tab.IsPeerSharing) return AppIcon.Monitor;
+        return AppIcon.Link;
     }
 
     private void OpenConnectionDialog()

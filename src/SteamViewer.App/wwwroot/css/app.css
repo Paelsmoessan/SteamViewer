@@ -1,3 +1,23 @@
+:root {
+    --ctp-base: #1e1e2e;
+    --ctp-mantle: #181825;
+    --ctp-crust: #11111b;
+    --ctp-surface0: #313244;
+    --ctp-surface1: #45475a;
+    --ctp-surface2: #585b70;
+    --ctp-overlay0: #6c7086;
+    --ctp-text: #cdd6f4;
+    --ctp-subtext0: #a6adc8;
+    --ctp-subtext1: #bac2de;
+    --ctp-blue: #89b4fa;
+    --ctp-green: #a6e3a1;
+    --ctp-red: #f38ba8;
+    --ctp-yellow: #f9e2af;
+    --ctp-teal: #94e2d5;
+    --ctp-lavender: #b4befe;
+    --ctp-peach: #fab387;
+}
+
 html, body {
     margin: 0;
     padding: 0;
