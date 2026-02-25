@@ -209,6 +209,9 @@ public sealed class ViewerSession : IAsyncDisposable
             // Connect relay (derives encryption key, subscribes to binary messages)
             _transport.ConnectRelay(encryptionNonce, passwordHash);
 
+            // Tell host we're ready — host waits for this before sending initial state
+            await _transport.SendControlAsync(JsonSerializer.Serialize(new { type = "viewerReady" }));
+
             _logger.LogInformation("Session {SessionId}: Relay transport connected", SessionId);
 
             // Initialize FFmpeg decoder

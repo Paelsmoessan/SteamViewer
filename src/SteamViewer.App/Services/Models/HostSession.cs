@@ -190,8 +190,9 @@ public sealed class HostSession : IAsyncDisposable
 
         _logger.LogInformation("Host transport relay started for peer {PeerId}", PeerId);
 
-        // Relay is immediately ready (binary frames flow through signaling WS)
-        await HandleTransportConnected();
+        // Don't send initial state yet — wait for viewer's "viewerReady" ack
+        // (viewer sends it after receiving RelayReady and connecting their relay)
+        SetState(HostSessionState.WaitingForViewer);
     }
 
     private async Task HandleTransportConnected()
@@ -428,6 +429,11 @@ public sealed class HostSession : IAsyncDisposable
                 var type = typeElement.GetString();
                 switch (type)
                 {
+                    case "viewerReady":
+                        _logger.LogInformation("Viewer relay connected — sending initial state");
+                        await HandleTransportConnected();
+                        return;
+
                     case "rebootHost":
                         _logger.LogInformation("Received reboot request from viewer");
                         await HandleRebootAsync();
