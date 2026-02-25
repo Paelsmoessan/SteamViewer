@@ -1,110 +1,139 @@
 using System.Net;
-using System.Net.Quic;
-using System.Net.Security;
+using System.Net.Sockets;
 using Microsoft.Extensions.Logging;
+using SteamViewer.Common.Protocol;
 
 namespace SteamViewer.Client.Core.Network;
 
 /// <summary>
-/// Viewer-side QUIC transport. Connects to the host at the endpoint received via signaling.
-/// Accepts two QUIC streams from host: bidirectional for control, unidirectional for video.
+/// Viewer-side transport. Starts with WebSocket relay (Phase 1), optionally upgrades to direct UDP (Phase 2).
 ///
 /// Connection flow:
-/// 1. Viewer receives TransportEndpoint from signaling (host IPs + port)
-/// 2. Viewer calls ConnectAsync(ips, port) — tries each IP until one connects
-/// 3. QUIC connection established (TLS 1.3 with self-signed cert acceptance)
-/// 4. Viewer accepts control stream (bidirectional) + video stream (unidirectional)
-/// 5. Read loops start
+/// 1. Viewer receives RelayReady(nonce) from host via signaling
+/// 2. ConnectRelay(): WebSocket relay via signaling server (immediate)
+/// 3. In background: AttemptUdpUpgradeAsync() tries STUN/TURN for direct P2P
+/// 4. If UDP works → switch backend (transparent to upper layers)
 /// </summary>
 public sealed class ViewerStreamTransport : StreamTransport
 {
-    public ViewerStreamTransport(ILogger logger) : base(logger) { }
+    private readonly SignalingClient _signalingClient;
+    private UdpTransportBackend? _udpBackend;
 
-    /// <summary>
-    /// Connect to the host at the given endpoint.
-    /// Establishes QUIC connection and accepts streams.
-    /// </summary>
-    public async Task ConnectAsync(string host, int port, TimeSpan timeout)
+    public ViewerStreamTransport(SignalingClient signalingClient, ILogger logger) : base(logger)
     {
-        if (!QuicConnection.IsSupported)
-            throw new PlatformNotSupportedException(
-                "QUIC is not supported on this platform. Ensure .NET 8+ and msquic are available.");
-
-        using var timeoutCts = new CancellationTokenSource(timeout);
-
-        _logger.LogInformation("Connecting to host {Host}:{Port} (QUIC/UDP)...", host, port);
-
-        _connection = await QuicConnection.ConnectAsync(new QuicClientConnectionOptions
-        {
-            RemoteEndPoint = new IPEndPoint(IPAddress.Parse(host), port),
-            DefaultStreamErrorCode = 0,
-            DefaultCloseErrorCode = 0,
-            ClientAuthenticationOptions = new SslClientAuthenticationOptions
-            {
-                ApplicationProtocols = new List<SslApplicationProtocol>
-                {
-                    new("steamviewer")
-                },
-                // Accept self-signed cert from host
-                RemoteCertificateValidationCallback = (_, _, _, _) => true
-            }
-        }, timeoutCts.Token);
-
-        _logger.LogInformation("QUIC connected to {Remote}", _connection.RemoteEndPoint);
-
-        // Accept streams opened by host (order-independent — identify by stream type)
-        for (int i = 0; i < 2; i++)
-        {
-            var stream = await _connection.AcceptInboundStreamAsync(timeoutCts.Token);
-            if (stream.Type == QuicStreamType.Bidirectional)
-            {
-                _controlStream = stream;
-                _logger.LogInformation("Control stream accepted (bidirectional)");
-            }
-            else
-            {
-                _videoStream = stream;
-                _logger.LogInformation("Video stream accepted (unidirectional)");
-            }
-        }
-
-        if (_controlStream == null || _videoStream == null)
-            throw new InvalidOperationException("Failed to accept required QUIC streams from host");
-
-        // Start read loops (video send skipped — viewer doesn't send video)
-        StartReadLoops();
+        _signalingClient = signalingClient;
     }
 
     /// <summary>
-    /// Connect to host, trying multiple IP addresses (for multi-homed hosts).
-    /// Tries each address in order until one succeeds.
+    /// Connect to the relay transport using the encryption nonce received from the host.
     /// </summary>
-    public async Task ConnectAsync(string[] hostIPs, int port, TimeSpan timeout)
+    public void ConnectRelay(string encryptionNonceHex, string passwordHashHex)
     {
-        Exception? lastEx = null;
+        var nonce = Convert.FromHexString(encryptionNonceHex);
+
+        _logger.LogInformation("Viewer transport: connecting relay with encryption nonce");
+
+        // Setup AES-256-GCM encryption (viewer direction)
+        _encryption = new TransportEncryption(passwordHashHex, nonce, isHost: false);
+
+        // Start with WebSocket relay backend
+        var relayBackend = new WebSocketRelayBackend(_signalingClient);
+        relayBackend.Start();
+        StartTransport(relayBackend, enableVideoSend: false);
+
+        _logger.LogInformation("Viewer transport: relay connected and encrypted");
+    }
+
+    /// <summary>
+    /// Attempt to upgrade from WebSocket relay to direct UDP.
+    /// Call after relay is established. If UDP fails, WebSocket relay continues.
+    /// </summary>
+    public async Task AttemptUdpUpgradeAsync(
+        Func<SignalingMessage, Task> sendSignaling,
+        string peerId,
+        string? turnServerUri = null,
+        string? turnUsername = null,
+        string? turnCredential = null)
+    {
+        try
+        {
+            _udpBackend = new UdpTransportBackend(_logger);
+            await _udpBackend.InitializeAsync(turnServerUri, turnUsername, turnCredential);
+
+            // Gather endpoints
+            var endpoints = new List<string>();
+            try
+            {
+                var host = Dns.GetHostEntry(Dns.GetHostName());
+                foreach (var ip in host.AddressList)
+                {
+                    if (ip.AddressFamily == AddressFamily.InterNetwork)
+                        endpoints.Add(ip.ToString());
+                }
+            }
+            catch { }
+
+            if (_udpBackend.ReflexiveEndPoint != null)
+                endpoints.Add(_udpBackend.ReflexiveEndPoint.Address.ToString());
+
+            var port = _udpBackend.LocalEndPoint?.Port ?? 0;
+
+            // Send our endpoints to host
+            if (endpoints.Count > 0 && port > 0)
+            {
+                await sendSignaling(new SignalingMessage.TransportEndpoint(peerId, endpoints.ToArray(), port));
+                _logger.LogInformation("Viewer UDP endpoints sent: {Endpoints}:{Port}", string.Join(",", endpoints), port);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Viewer UDP upgrade attempt failed — staying on WebSocket relay");
+            if (_udpBackend != null)
+            {
+                await _udpBackend.DisposeAsync();
+                _udpBackend = null;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Handle TransportEndpoint from the host (their UDP candidate).
+    /// Probes the endpoint and switches to UDP if successful.
+    /// </summary>
+    public async Task HandleHostEndpointAsync(string[] hostIPs, int hostPort)
+    {
+        if (_udpBackend == null) return;
+
         foreach (var ip in hostIPs)
         {
             try
             {
-                await ConnectAsync(ip, port, timeout);
-                return; // Success
+                var endpoint = new IPEndPoint(IPAddress.Parse(ip), hostPort);
+                var probeOk = await _udpBackend.ProbeAsync(endpoint, TimeSpan.FromSeconds(2));
+                if (probeOk)
+                {
+                    _udpBackend.ConnectToPeer(endpoint, useTurnRelay: false);
+                    await SwitchBackendAsync(_udpBackend);
+                    _logger.LogInformation("Viewer: switched to direct UDP via {Endpoint}", endpoint);
+                    return;
+                }
             }
             catch (Exception ex)
             {
-                lastEx = ex;
-                _logger.LogWarning("Failed to connect to {IP}:{Port}: {Error}", ip, port, ex.Message);
-                // Clean up failed attempt
-                if (_connection != null)
-                {
-                    try { await _connection.CloseAsync(0); } catch { }
-                    try { await _connection.DisposeAsync(); } catch { }
-                    _connection = null;
-                }
-                _controlStream = null;
-                _videoStream = null;
+                _logger.LogDebug(ex, "Viewer: UDP probe to {IP}:{Port} failed", ip, hostPort);
             }
         }
 
-        throw new InvalidOperationException("Failed to connect to any host address", lastEx);
+        _logger.LogInformation("Viewer: no UDP path available — staying on WebSocket relay");
+    }
+
+    public override async ValueTask DisposeAsync()
+    {
+        if (_udpBackend != null)
+        {
+            await _udpBackend.DisposeAsync();
+            _udpBackend = null;
+        }
+        await base.DisposeAsync();
     }
 }

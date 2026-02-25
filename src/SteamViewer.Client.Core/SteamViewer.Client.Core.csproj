@@ -6,11 +6,12 @@
     <Nullable>enable</Nullable>
     <RootNamespace>SteamViewer.Client.Core</RootNamespace>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <NoWarn>CA2252</NoWarn>
+    <!-- CA2252 removed: QUIC preview APIs no longer used -->
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="Blake3" Version="1.1.0" />
+    <PackageReference Include="SIPSorcery" Version="10.0.3" />
     <PackageReference Include="FFmpeg.AutoGen" Version="8.0.0" />
     <PackageReference Include="Microsoft.AspNetCore.Components.Web" Version="8.0.11" />
     <PackageReference Include="Microsoft.Extensions.Logging" Version="8.0.1" />

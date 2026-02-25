@@ -35,6 +35,7 @@ namespace SteamViewer.Common.Protocol;
 [JsonDerivedType(typeof(ScreenShareStateChanged), "screen_share_state_changed")]
 // Direct transport endpoint exchange (FFmpeg transport, replaces SDP/ICE)
 [JsonDerivedType(typeof(TransportEndpoint), "transport_endpoint")]
+[JsonDerivedType(typeof(RelayReady), "relay_ready")]
 // Mesh WebRTC signaling (within session)
 [JsonDerivedType(typeof(MeshSdpOffer), "mesh_sdp_offer")]
 [JsonDerivedType(typeof(MeshSdpAnswer), "mesh_sdp_answer")]
@@ -175,13 +176,23 @@ public abstract record SignalingMessage
 
     /// <summary>
     /// Host sends transport endpoint to viewer after approving connection.
-    /// Viewer connects directly via TCP to the host's IP:port.
-    /// Replaces SDP/ICE for the FFmpeg transport.
+    /// Used for Phase 2 direct UDP connection (IPs + port).
+    /// Phase 1 WebSocket relay doesn't need IPs/port but uses the encryption nonce.
     /// </summary>
     public sealed record TransportEndpoint(
         [property: JsonPropertyName("target_id")] string TargetId,
         [property: JsonPropertyName("ips")] string[] IPs,
         [property: JsonPropertyName("port")] int Port
+    ) : SignalingMessage;
+
+    /// <summary>
+    /// Signals readiness for binary WebSocket relay transport.
+    /// Host sends after approving connection, includes encryption nonce.
+    /// Server forwards to peer. Both sides derive AES-GCM key from password + nonce.
+    /// </summary>
+    public sealed record RelayReady(
+        [property: JsonPropertyName("target_id")] string TargetId,
+        [property: JsonPropertyName("encryption_nonce")] string EncryptionNonce
     ) : SignalingMessage;
 
     // ==================== Mesh WebRTC Signaling ====================

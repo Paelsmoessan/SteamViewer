@@ -1,5 +1,3 @@
-using System.Buffers.Binary;
-using System.Net.Quic;
 using System.Text;
 using System.Threading.Channels;
 using Microsoft.Extensions.Logging;
@@ -7,36 +5,38 @@ using Microsoft.Extensions.Logging;
 namespace SteamViewer.Client.Core.Network;
 
 /// <summary>
-/// QUIC-based transport replacing WebRTC PeerConnection + data channels.
-/// Uses QUIC streams over UDP: one bidirectional for control, one unidirectional for video.
+/// Transport layer replacing WebRTC PeerConnection + data channels.
+/// Sends encrypted, multiplexed frames through an ITransportBackend.
+/// Phase 1: WebSocketRelayBackend (via signaling server)
+/// Phase 2: UdpTransportBackend (direct P2P or TURN relay)
 ///
-/// Control protocol: [4 bytes big-endian: payload length][1 byte: channel][payload]
-///   Channel 0 = JSON control (commands, keyboard, clipboard, cursor, mouse)
-///   Channel 1 = Binary file data
-///   Channel 2 = JSON file signaling
+/// Wire format per frame (before encryption):
+///   [1 byte channel][payload]
 ///
-/// Video protocol: [4 bytes big-endian: payload length][payload = H.264 NALUs]
+/// Channel 0 = JSON control (commands, keyboard, clipboard, cursor, mouse)
+/// Channel 1 = H.264 video NALUs (host → viewer only)
+/// Channel 2 = Binary file data
+/// Channel 3 = JSON file signaling
+///
+/// Each frame is AES-256-GCM encrypted before sending through the backend.
 /// </summary>
 public abstract class StreamTransport : IAsyncDisposable
 {
     protected readonly ILogger _logger;
-    protected QuicConnection? _connection;
-    protected QuicStream? _controlStream;  // bidirectional
-    protected QuicStream? _videoStream;    // unidirectional host→viewer
+    protected ITransportBackend? _backend;
+    protected TransportEncryption? _encryption;
     protected CancellationTokenSource? _cts;
-    private readonly SemaphoreSlim _controlWriteLock = new(1, 1);
-    private readonly SemaphoreSlim _videoWriteLock = new(1, 1);
+    private readonly SemaphoreSlim _sendLock = new(1, 1);
     private readonly Channel<(byte[] data, int length)> _videoSendQueue;
-    private Task? _controlReadTask;
-    private Task? _videoReadTask;
     private Task? _videoSendTask;
     private bool _disposed;
     protected bool _connected;
 
-    // Channel IDs for control connection multiplexing
+    // Channel IDs for multiplexing over a single transport
     protected const byte ChannelControl = 0;
-    protected const byte ChannelFileData = 1;
-    protected const byte ChannelFileSignaling = 2;
+    protected const byte ChannelVideo = 1;
+    protected const byte ChannelFileData = 2;
+    protected const byte ChannelFileSignaling = 3;
 
     /// <summary>Raised when a JSON control message is received.</summary>
     public event Func<string, Task>? OnControlMessage;
@@ -73,24 +73,21 @@ public abstract class StreamTransport : IAsyncDisposable
     /// <summary>Send a JSON control message (commands, keyboard, clipboard, cursor, mouse).</summary>
     public async ValueTask<bool> SendControlAsync(string json)
     {
-        if (_controlStream == null) return false;
         var payload = Encoding.UTF8.GetBytes(json);
-        return await WriteControlFrameAsync(ChannelControl, payload);
+        return await SendFrameAsync(ChannelControl, payload, 0, payload.Length);
     }
 
     /// <summary>Send binary file data.</summary>
     public async ValueTask<bool> SendFileDataAsync(byte[] data)
     {
-        if (_controlStream == null) return false;
-        return await WriteControlFrameAsync(ChannelFileData, data);
+        return await SendFrameAsync(ChannelFileData, data, 0, data.Length);
     }
 
     /// <summary>Send JSON file signaling message (FormatList, FileContentsRequest, etc.).</summary>
     public async ValueTask<bool> SendFileSignalingAsync(string json)
     {
-        if (_controlStream == null) return false;
         var payload = Encoding.UTF8.GetBytes(json);
-        return await WriteControlFrameAsync(ChannelFileSignaling, payload);
+        return await SendFrameAsync(ChannelFileSignaling, payload, 0, payload.Length);
     }
 
     /// <summary>
@@ -105,149 +102,169 @@ public abstract class StreamTransport : IAsyncDisposable
         _videoSendQueue.Writer.TryWrite((copy, length));
     }
 
-    private async ValueTask<bool> WriteControlFrameAsync(byte channel, byte[] payload)
+    private async ValueTask<bool> SendFrameAsync(byte channel, byte[] payload, int offset, int length)
     {
-        if (_controlStream == null) return false;
+        if (!_connected || _disposed || _backend == null) return false;
 
-        await _controlWriteLock.WaitAsync();
         try
         {
-            // [4 bytes: length (includes channel byte)][1 byte: channel][payload]
-            var header = new byte[5];
-            BinaryPrimitives.WriteInt32BigEndian(header, payload.Length + 1);
-            header[4] = channel;
+            // Build frame: [1 byte channel][payload]
+            var frame = new byte[1 + length];
+            frame[0] = channel;
+            Buffer.BlockCopy(payload, offset, frame, 1, length);
 
-            await _controlStream.WriteAsync(header);
-            await _controlStream.WriteAsync(payload);
-            await _controlStream.FlushAsync();
-            return true;
+            // Encrypt
+            byte[] encrypted;
+            if (_encryption != null)
+                encrypted = _encryption.Encrypt(frame, 0, frame.Length);
+            else
+                encrypted = frame;
+
+            await _sendLock.WaitAsync();
+            try
+            {
+                await _backend.SendAsync(encrypted, 0, encrypted.Length);
+                return true;
+            }
+            finally { _sendLock.Release(); }
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Control write failed");
+            _logger.LogWarning(ex, "Frame send failed (channel {Channel})", channel);
             return false;
-        }
-        finally
-        {
-            _controlWriteLock.Release();
         }
     }
 
     #endregion
 
-    #region Read Loops
+    #region Receive
 
-    protected void StartReadLoops()
+    private void HandleDataReceived(byte[] data, int length)
     {
+        if (_disposed || !_connected) return;
+
+        try
+        {
+            // Decrypt
+            byte[] plaintext;
+            if (_encryption != null)
+                plaintext = _encryption.Decrypt(data, 0, length);
+            else
+            {
+                plaintext = new byte[length];
+                Buffer.BlockCopy(data, 0, plaintext, 0, length);
+            }
+
+            if (plaintext.Length < 1) return;
+
+            var channel = plaintext[0];
+
+            switch (channel)
+            {
+                case ChannelControl:
+                {
+                    var json = Encoding.UTF8.GetString(plaintext, 1, plaintext.Length - 1);
+                    if (OnControlMessage != null)
+                        _ = Task.Run(async () =>
+                        {
+                            try { await OnControlMessage.Invoke(json); }
+                            catch (Exception ex) { _logger.LogWarning(ex, "Control handler error"); }
+                        });
+                    break;
+                }
+                case ChannelVideo:
+                {
+                    var videoLen = plaintext.Length - 1;
+                    var videoData = new byte[videoLen];
+                    Buffer.BlockCopy(plaintext, 1, videoData, 0, videoLen);
+                    OnVideoData?.Invoke(videoData, videoLen);
+                    break;
+                }
+                case ChannelFileData:
+                {
+                    var fileData = new byte[plaintext.Length - 1];
+                    Buffer.BlockCopy(plaintext, 1, fileData, 0, fileData.Length);
+                    if (OnFileData != null)
+                        _ = Task.Run(async () =>
+                        {
+                            try { await OnFileData.Invoke(fileData); }
+                            catch (Exception ex) { _logger.LogWarning(ex, "File data handler error"); }
+                        });
+                    break;
+                }
+                case ChannelFileSignaling:
+                {
+                    var json = Encoding.UTF8.GetString(plaintext, 1, plaintext.Length - 1);
+                    if (OnFileSignalingMessage != null)
+                        _ = Task.Run(async () =>
+                        {
+                            try { await OnFileSignalingMessage.Invoke(json); }
+                            catch (Exception ex) { _logger.LogWarning(ex, "File signaling handler error"); }
+                        });
+                    break;
+                }
+                default:
+                    _logger.LogWarning("Unknown channel byte: {Channel}", channel);
+                    break;
+            }
+        }
+        catch (System.Security.Cryptography.CryptographicException ex)
+        {
+            _logger.LogWarning("Decryption failed (bad key or corrupted data): {Error}", ex.Message);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Data receive handler error");
+        }
+    }
+
+    #endregion
+
+    #region Transport Lifecycle
+
+    /// <summary>
+    /// Start the transport with the given backend.
+    /// Called by subclasses after encryption is configured.
+    /// </summary>
+    protected void StartTransport(ITransportBackend backend, bool enableVideoSend)
+    {
+        _backend = backend;
         _cts = new CancellationTokenSource();
-        _controlReadTask = Task.Run(() => ControlReadLoopAsync(_cts.Token));
 
-        // Only start video read loop if the stream is readable (viewer side — inbound unidirectional)
-        if (_videoStream?.CanRead == true)
-            _videoReadTask = Task.Run(() => VideoReadLoopAsync(_cts.Token));
+        // Subscribe to data from backend
+        _backend.OnDataReceived += HandleDataReceived;
 
-        // Only start video send loop if the stream is writable (host side — outbound unidirectional)
-        if (_videoStream?.CanWrite == true)
+        // Start video send loop (host only)
+        if (enableVideoSend)
             _videoSendTask = Task.Run(() => VideoSendLoopAsync(_cts.Token));
 
         _connected = true;
         OnConnectionStateChanged?.Invoke("connected");
+        _logger.LogInformation("Transport started (backend={Backend}, videoSend={VideoSend})",
+            backend.GetType().Name, enableVideoSend);
     }
 
-    private async Task ControlReadLoopAsync(CancellationToken ct)
+    /// <summary>
+    /// Switch to a different transport backend (e.g., upgrade from WebSocket relay to direct UDP).
+    /// The old backend is disposed after switching.
+    /// </summary>
+    protected async Task SwitchBackendAsync(ITransportBackend newBackend)
     {
-        var headerBuf = new byte[5]; // 4 bytes length + 1 byte channel
-        try
+        var oldBackend = _backend;
+        if (oldBackend != null)
         {
-            while (!ct.IsCancellationRequested && _controlStream != null)
-            {
-                // Read header
-                await ReadExactAsync(_controlStream, headerBuf, 0, 5, ct);
-                var totalLength = BinaryPrimitives.ReadInt32BigEndian(headerBuf);
-                var channel = headerBuf[4];
-                var payloadLength = totalLength - 1;
-
-                if (payloadLength <= 0 || payloadLength > 16 * 1024 * 1024) // 16MB max
-                {
-                    _logger.LogWarning("Invalid control frame length: {Length}", payloadLength);
-                    break;
-                }
-
-                var payload = new byte[payloadLength];
-                await ReadExactAsync(_controlStream, payload, 0, payloadLength, ct);
-
-                switch (channel)
-                {
-                    case ChannelControl:
-                        var json = Encoding.UTF8.GetString(payload);
-                        if (OnControlMessage != null)
-                            await OnControlMessage.Invoke(json);
-                        break;
-
-                    case ChannelFileData:
-                        if (OnFileData != null)
-                            await OnFileData.Invoke(payload);
-                        break;
-
-                    case ChannelFileSignaling:
-                        var fileJson = Encoding.UTF8.GetString(payload);
-                        if (OnFileSignalingMessage != null)
-                            await OnFileSignalingMessage.Invoke(fileJson);
-                        break;
-                }
-            }
-        }
-        catch (OperationCanceledException) { }
-        catch (QuicException qex)
-        {
-            _logger.LogWarning("QUIC control stream error: {Error}", qex.QuicError);
-        }
-        catch (IOException) { }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Control read loop error");
+            oldBackend.OnDataReceived -= HandleDataReceived;
         }
 
-        _logger.LogInformation("Control read loop ended");
-        _connected = false;
-        OnConnectionStateChanged?.Invoke("disconnected");
-    }
+        _backend = newBackend;
+        newBackend.OnDataReceived += HandleDataReceived;
 
-    private async Task VideoReadLoopAsync(CancellationToken ct)
-    {
-        var headerBuf = new byte[4];
-        try
+        if (oldBackend != null)
         {
-            while (!ct.IsCancellationRequested && _videoStream != null)
-            {
-                // Read 4-byte length prefix
-                await ReadExactAsync(_videoStream, headerBuf, 0, 4, ct);
-                var length = BinaryPrimitives.ReadInt32BigEndian(headerBuf);
-
-                if (length <= 0 || length > 4 * 1024 * 1024) // 4MB max per frame
-                {
-                    _logger.LogWarning("Invalid video frame length: {Length}", length);
-                    break;
-                }
-
-                var frameData = new byte[length];
-                await ReadExactAsync(_videoStream, frameData, 0, length, ct);
-
-                OnVideoData?.Invoke(frameData, length);
-            }
-        }
-        catch (OperationCanceledException) { }
-        catch (QuicException qex)
-        {
-            _logger.LogWarning("QUIC video stream error: {Error}", qex.QuicError);
-        }
-        catch (IOException) { }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Video read loop error");
+            await oldBackend.DisposeAsync();
         }
 
-        _logger.LogInformation("Video read loop ended");
+        _logger.LogInformation("Transport backend switched to {Backend}", newBackend.GetType().Name);
     }
 
     private async Task VideoSendLoopAsync(CancellationToken ct)
@@ -256,20 +273,33 @@ public abstract class StreamTransport : IAsyncDisposable
         {
             await foreach (var (data, length) in _videoSendQueue.Reader.ReadAllAsync(ct))
             {
-                if (_videoStream == null) break;
+                if (!_connected || _disposed || _backend == null) break;
 
-                await _videoWriteLock.WaitAsync(ct);
                 try
                 {
-                    var header = new byte[4];
-                    BinaryPrimitives.WriteInt32BigEndian(header, length);
-                    await _videoStream.WriteAsync(header, ct);
-                    await _videoStream.WriteAsync(data.AsMemory(0, length), ct);
-                    await _videoStream.FlushAsync(ct);
+                    // Build frame: [1 byte channel=video][video data]
+                    var frame = new byte[1 + length];
+                    frame[0] = ChannelVideo;
+                    Buffer.BlockCopy(data, 0, frame, 1, length);
+
+                    // Encrypt
+                    byte[] encrypted;
+                    if (_encryption != null)
+                        encrypted = _encryption.Encrypt(frame, 0, frame.Length);
+                    else
+                        encrypted = frame;
+
+                    await _sendLock.WaitAsync(ct);
+                    try
+                    {
+                        await _backend.SendAsync(encrypted, 0, encrypted.Length, ct);
+                    }
+                    finally { _sendLock.Release(); }
                 }
-                finally
+                catch (OperationCanceledException) { break; }
+                catch (Exception ex)
                 {
-                    _videoWriteLock.Release();
+                    _logger.LogWarning(ex, "Video send error");
                 }
             }
         }
@@ -277,18 +307,6 @@ public abstract class StreamTransport : IAsyncDisposable
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Video send loop error");
-        }
-    }
-
-    protected static async Task ReadExactAsync(Stream stream, byte[] buffer, int offset, int count, CancellationToken ct)
-    {
-        var totalRead = 0;
-        while (totalRead < count)
-        {
-            var read = await stream.ReadAsync(buffer.AsMemory(offset + totalRead, count - totalRead), ct);
-            if (read == 0)
-                throw new IOException("Stream ended");
-            totalRead += read;
         }
     }
 
@@ -300,28 +318,24 @@ public abstract class StreamTransport : IAsyncDisposable
         _disposed = true;
         _connected = false;
 
+        // Unsubscribe from backend
+        if (_backend != null)
+        {
+            _backend.OnDataReceived -= HandleDataReceived;
+            await _backend.DisposeAsync();
+        }
+
         _cts?.Cancel();
         _videoSendQueue.Writer.TryComplete();
 
-        // Wait for loops to finish
-        if (_controlReadTask != null) try { await _controlReadTask; } catch { }
-        if (_videoReadTask != null) try { await _videoReadTask; } catch { }
+        // Wait for video send loop to finish
         if (_videoSendTask != null) try { await _videoSendTask; } catch { }
 
-        // Dispose QUIC streams
-        if (_controlStream != null) try { await _controlStream.DisposeAsync(); } catch { }
-        if (_videoStream != null) try { await _videoStream.DisposeAsync(); } catch { }
-
-        // Close and dispose QUIC connection
-        if (_connection != null)
-        {
-            try { await _connection.CloseAsync(0); } catch { }
-            try { await _connection.DisposeAsync(); } catch { }
-        }
+        // Dispose encryption
+        _encryption?.Dispose();
 
         _cts?.Dispose();
-        _controlWriteLock.Dispose();
-        _videoWriteLock.Dispose();
+        _sendLock.Dispose();
 
         _logger.LogInformation("StreamTransport disposed");
     }

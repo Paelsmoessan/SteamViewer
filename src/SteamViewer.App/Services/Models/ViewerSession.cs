@@ -20,6 +20,7 @@ public sealed class ViewerSession : IAsyncDisposable
     private readonly ILogger _logger;
     private readonly ILoggerFactory _loggerFactory;
     private readonly Func<SignalingMessage, Task> _sendSignaling;
+    private readonly SignalingClient _signalingClient;
     private int _sdViewerFrameCount;
     private ViewerStreamTransport? _transport;
     private FFmpegDecoder? _decoder;
@@ -160,7 +161,8 @@ public sealed class ViewerSession : IAsyncDisposable
         string peerId,
         IJSRuntime jsRuntime,
         ILoggerFactory loggerFactory,
-        Func<SignalingMessage, Task> sendSignaling)
+        Func<SignalingMessage, Task> sendSignaling,
+        SignalingClient signalingClient)
     {
         SessionId = sessionId;
         PeerId = peerId;
@@ -169,6 +171,7 @@ public sealed class ViewerSession : IAsyncDisposable
         _logger = loggerFactory.CreateLogger<ViewerSession>();
         _loggerFactory = loggerFactory;
         _sendSignaling = sendSignaling;
+        _signalingClient = signalingClient;
     }
 
     /// <summary>
@@ -182,25 +185,31 @@ public sealed class ViewerSession : IAsyncDisposable
     }
 
     /// <summary>
-    /// Handle TransportEndpoint from host — connect TCP transport.
-    /// Replaces SDP/ICE negotiation.
+    /// Handle RelayReady from host — setup encrypted WebSocket relay transport.
+    /// Replaces the old TransportEndpoint/QUIC connection.
     /// </summary>
-    public async Task HandleTransportEndpointAsync(string[] ips, int port)
+    public async Task HandleRelayReadyAsync(string encryptionNonce)
     {
-        _logger.LogInformation("Session {SessionId}: Received transport endpoint: {IPs}:{Port}", SessionId, string.Join(",", ips), port);
+        _logger.LogInformation("Session {SessionId}: Received RelayReady with encryption nonce", SessionId);
 
         try
         {
-            _transport = new ViewerStreamTransport(_loggerFactory.CreateLogger<ViewerStreamTransport>());
+            // Compute password hash from stored password
+            var passwordHash = Convert.ToHexString(
+                Blake3.Hasher.Hash(System.Text.Encoding.UTF8.GetBytes(StoredPassword ?? "")).AsSpan()
+            ).ToLowerInvariant();
+
+            _transport = new ViewerStreamTransport(_signalingClient, _loggerFactory.CreateLogger<ViewerStreamTransport>());
             _transport.OnControlMessage += HandleControlMessage;
             _transport.OnVideoData += HandleVideoData;
             _transport.OnFileData += HandleFileDataBinary;
             _transport.OnFileSignalingMessage += HandleFileChannelMessage;
             _transport.OnConnectionStateChanged += HandleTransportStateChanged;
 
-            await _transport.ConnectAsync(ips, port, TimeSpan.FromSeconds(15));
+            // Connect relay (derives encryption key, subscribes to binary messages)
+            _transport.ConnectRelay(encryptionNonce, passwordHash);
 
-            _logger.LogInformation("Session {SessionId}: Transport connected", SessionId);
+            _logger.LogInformation("Session {SessionId}: Relay transport connected", SessionId);
 
             // Initialize FFmpeg decoder
             FFmpegInit.EnsureInitialized();
@@ -215,10 +224,22 @@ public sealed class ViewerSession : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Session {SessionId}: Failed to connect transport", SessionId);
+            _logger.LogError(ex, "Session {SessionId}: Failed to setup relay transport", SessionId);
             SetState(ViewerSessionState.Error);
-            OnDisconnected?.Invoke($"Transport connection failed: {ex.Message}");
+            OnDisconnected?.Invoke($"Relay transport setup failed: {ex.Message}");
         }
+
+        await Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Handle TransportEndpoint from host — legacy, kept for backward compatibility.
+    /// Phase 2 direct UDP will reuse this.
+    /// </summary>
+    public Task HandleTransportEndpointAsync(string[] ips, int port)
+    {
+        _logger.LogDebug("Session {SessionId}: Received TransportEndpoint (not used in relay mode)", SessionId);
+        return Task.CompletedTask;
     }
 
     /// <summary>

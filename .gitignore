@@ -42,6 +42,9 @@ logs/
 *.tmp
 nul
 
+# FFmpeg native DLLs (BtbN GPL-shared, ~98MB total — not tracked in git)
+src/SteamViewer.App/ffmpeg/*.dll
+
 # Local development helpers
 misc/SteamViewerMainSession.cmd
 misc/*.lnk

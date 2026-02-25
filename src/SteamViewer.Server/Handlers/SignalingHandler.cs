@@ -43,8 +43,14 @@ public sealed class SignalingHandler
         try
         {
             // Run send and receive concurrently
-            var sendTask = SendLoopAsync(webSocket, channel.Reader, cancellationToken);
-            var receiveTask = ReceiveLoopAsync(webSocket, channel.Writer, connectionId, id => clientId = id, cancellationToken);
+            var sendTask = SendLoopAsync(webSocket, channel.Reader, connectionId, cancellationToken);
+            var receiveTask = ReceiveLoopAsync(webSocket, channel.Writer, connectionId, id =>
+            {
+                clientId = id;
+                // Store WebSocket reference for binary relay
+                var client = _registry.GetClient(id);
+                if (client != null) client.WebSocket = webSocket;
+            }, cancellationToken);
 
             // Wait for either to complete
             await Task.WhenAny(sendTask, receiveTask);
@@ -62,19 +68,49 @@ public sealed class SignalingHandler
     private async Task SendLoopAsync(
         WebSocket webSocket,
         ChannelReader<SignalingMessage> reader,
+        Guid connectionId,
         CancellationToken cancellationToken)
     {
+        // Get write lock for this client (needed to coordinate with binary relay)
+        SemaphoreSlim? writeLock = null;
+
         await foreach (var message in reader.ReadAllAsync(cancellationToken))
         {
             var json = SignalingSerializer.Serialize(message);
             var bytes = Encoding.UTF8.GetBytes(json);
 
-            await webSocket.SendAsync(
-                new ArraySegment<byte>(bytes),
-                WebSocketMessageType.Text,
-                endOfMessage: true,
-                cancellationToken);
+            // Lazily get the write lock (client may not be registered yet for first messages)
+            writeLock ??= GetWriteLock(connectionId);
+
+            if (writeLock != null)
+            {
+                await writeLock.WaitAsync(cancellationToken);
+                try
+                {
+                    await webSocket.SendAsync(
+                        new ArraySegment<byte>(bytes),
+                        WebSocketMessageType.Text,
+                        endOfMessage: true,
+                        cancellationToken);
+                }
+                finally { writeLock.Release(); }
+            }
+            else
+            {
+                await webSocket.SendAsync(
+                    new ArraySegment<byte>(bytes),
+                    WebSocketMessageType.Text,
+                    endOfMessage: true,
+                    cancellationToken);
+            }
         }
+    }
+
+    private SemaphoreSlim? GetWriteLock(Guid connectionId)
+    {
+        var clientId = _registry.GetClientIdByConnection(connectionId);
+        if (clientId == null) return null;
+        return _registry.GetClient(clientId)?.WriteLock;
     }
 
     private async Task ReceiveLoopAsync(
@@ -84,7 +120,7 @@ public sealed class SignalingHandler
         Action<string> setClientId,
         CancellationToken cancellationToken)
     {
-        var buffer = new byte[8192];
+        var buffer = new byte[65536]; // 64KB for video frame relay
         var messageBuilder = new StringBuilder();
 
         while (webSocket.State == WebSocketState.Open && !cancellationToken.IsCancellationRequested)
@@ -98,7 +134,29 @@ public sealed class SignalingHandler
                     break;
                 }
 
-                if (result.MessageType == WebSocketMessageType.Text)
+                if (result.MessageType == WebSocketMessageType.Binary)
+                {
+                    // Binary relay: forward to peer's WebSocket (streaming, chunk by chunk)
+                    var clientId = _registry.GetClientIdByConnection(connectionId);
+                    if (clientId != null)
+                    {
+                        var peer = _registry.GetPeerWebSocket(clientId);
+                        if (peer.HasValue)
+                        {
+                            await peer.Value.writeLock.WaitAsync(cancellationToken);
+                            try
+                            {
+                                await peer.Value.ws.SendAsync(
+                                    new ArraySegment<byte>(buffer, 0, result.Count),
+                                    WebSocketMessageType.Binary,
+                                    result.EndOfMessage,
+                                    cancellationToken);
+                            }
+                            finally { peer.Value.writeLock.Release(); }
+                        }
+                    }
+                }
+                else if (result.MessageType == WebSocketMessageType.Text)
                 {
                     messageBuilder.Append(Encoding.UTF8.GetString(buffer, 0, result.Count));
 
@@ -156,6 +214,7 @@ public sealed class SignalingHandler
             SignalingMessage.IceCandidate candidate => HandleIceCandidate(candidate, currentClientId),
             SignalingMessage.Disconnect disconnect => HandleDisconnect(disconnect, currentClientId),
             SignalingMessage.TransportEndpoint endpoint => HandleTransportEndpoint(endpoint, currentClientId),
+            SignalingMessage.RelayReady relayReady => HandleRelayReady(relayReady, currentClientId),
             SignalingMessage.Ping => new SignalingMessage.Pong(),
             // Collaboration session messages
             SignalingMessage.CreateSession createSession => HandleCreateSession(createSession, currentClientId),
@@ -320,6 +379,19 @@ public sealed class SignalingHandler
 
         _registry.TrySendToClient(endpoint.TargetId, new SignalingMessage.TransportEndpoint(fromId, endpoint.IPs, endpoint.Port));
         _logger.LogDebug("Transport endpoint forwarded from {FromId} to {TargetId}", fromId, endpoint.TargetId);
+        return null;
+    }
+
+    private SignalingMessage? HandleRelayReady(SignalingMessage.RelayReady relayReady, string? fromId)
+    {
+        if (fromId == null)
+        {
+            return new SignalingMessage.Error("Not registered");
+        }
+
+        // Forward relay-ready to peer (swap target_id → fromId so peer knows who it's from)
+        _registry.TrySendToClient(relayReady.TargetId, new SignalingMessage.RelayReady(fromId, relayReady.EncryptionNonce));
+        _logger.LogInformation("Relay ready from {FromId} to {TargetId}", fromId, relayReady.TargetId);
         return null;
     }
 

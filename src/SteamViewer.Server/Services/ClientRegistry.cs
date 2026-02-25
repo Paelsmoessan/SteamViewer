@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Net.WebSockets;
 using System.Threading.Channels;
 using SteamViewer.Common.Protocol;
 
@@ -26,6 +27,12 @@ public sealed class ClientInfo
 
     /// <summary>Timestamp when client registered</summary>
     public required DateTimeOffset RegisteredAt { get; init; }
+
+    /// <summary>Raw WebSocket reference for binary relay.</summary>
+    public WebSocket? WebSocket { get; set; }
+
+    /// <summary>Write lock for thread-safe WebSocket sends (text + binary).</summary>
+    public SemaphoreSlim WriteLock { get; } = new(1, 1);
 }
 
 /// <summary>
@@ -148,5 +155,19 @@ public sealed class ClientRegistry
     public bool IsOnline(string clientId)
     {
         return _clients.ContainsKey(clientId);
+    }
+
+    /// <summary>
+    /// Get the peer's WebSocket and WriteLock for binary relay.
+    /// Returns null if peer not found or no WebSocket set.
+    /// </summary>
+    public (WebSocket ws, SemaphoreSlim writeLock)? GetPeerWebSocket(string clientId)
+    {
+        if (!_clients.TryGetValue(clientId, out var client)) return null;
+        var peerId = client.PeerId;
+        if (peerId == null) return null;
+        if (!_clients.TryGetValue(peerId, out var peer)) return null;
+        if (peer.WebSocket == null || peer.WebSocket.State != WebSocketState.Open) return null;
+        return (peer.WebSocket, peer.WriteLock);
     }
 }

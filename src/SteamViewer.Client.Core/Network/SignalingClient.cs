@@ -8,6 +8,7 @@ namespace SteamViewer.Client.Core.Network;
 
 /// <summary>
 /// Client-side WebSocket client for signaling server communication.
+/// Supports both text (JSON signaling) and binary (transport relay) messages.
 /// </summary>
 public sealed class SignalingClient : IAsyncDisposable
 {
@@ -17,11 +18,18 @@ public sealed class SignalingClient : IAsyncDisposable
     private CancellationTokenSource? _cts;
     private Task? _receiveTask;
     private Channel<SignalingMessage> _incomingMessages;
+    private readonly SemaphoreSlim _writeLock = new(1, 1);
 
     /// <summary>
-    /// Event raised when a message is received from the server.
+    /// Event raised when a text (JSON signaling) message is received from the server.
     /// </summary>
     public event Action<SignalingMessage>? OnMessageReceived;
+
+    /// <summary>
+    /// Event raised when a binary message is received (transport relay data).
+    /// Parameters: (byte[] data, int length)
+    /// </summary>
+    public event Action<byte[], int>? OnBinaryReceived;
 
     /// <summary>
     /// Event raised when the connection is closed.
@@ -89,7 +97,8 @@ public sealed class SignalingClient : IAsyncDisposable
     }
 
     /// <summary>
-    /// Send a message to the signaling server.
+    /// Send a text (JSON signaling) message to the server.
+    /// Thread-safe — uses write lock shared with binary sends.
     /// </summary>
     public async Task SendAsync(SignalingMessage message, CancellationToken cancellationToken = default)
     {
@@ -101,13 +110,41 @@ public sealed class SignalingClient : IAsyncDisposable
         var json = SignalingSerializer.Serialize(message);
         var bytes = Encoding.UTF8.GetBytes(json);
 
-        await _webSocket.SendAsync(
-            new ArraySegment<byte>(bytes),
-            WebSocketMessageType.Text,
-            endOfMessage: true,
-            cancellationToken);
+        await _writeLock.WaitAsync(cancellationToken);
+        try
+        {
+            await _webSocket.SendAsync(
+                new ArraySegment<byte>(bytes),
+                WebSocketMessageType.Text,
+                endOfMessage: true,
+                cancellationToken);
+        }
+        finally { _writeLock.Release(); }
 
         _logger.LogDebug("Sent message: {MessageType}", message.GetType().Name);
+    }
+
+    /// <summary>
+    /// Send binary data through the WebSocket (for transport relay).
+    /// Thread-safe — uses write lock shared with text sends.
+    /// </summary>
+    public async Task SendBinaryAsync(byte[] data, int offset, int length, CancellationToken cancellationToken = default)
+    {
+        if (_webSocket == null || _webSocket.State != WebSocketState.Open)
+        {
+            throw new InvalidOperationException("Not connected");
+        }
+
+        await _writeLock.WaitAsync(cancellationToken);
+        try
+        {
+            await _webSocket.SendAsync(
+                new ArraySegment<byte>(data, offset, length),
+                WebSocketMessageType.Binary,
+                endOfMessage: true,
+                cancellationToken);
+        }
+        finally { _writeLock.Release(); }
     }
 
     /// <summary>
@@ -206,8 +243,9 @@ public sealed class SignalingClient : IAsyncDisposable
 
     private async Task ReceiveLoopAsync(CancellationToken cancellationToken)
     {
-        var buffer = new byte[8192];
+        var buffer = new byte[65536]; // 64KB for binary relay frames
         var messageBuilder = new StringBuilder();
+        var binaryBuffer = new MemoryStream();
 
         try
         {
@@ -221,7 +259,20 @@ public sealed class SignalingClient : IAsyncDisposable
                     break;
                 }
 
-                if (result.MessageType == WebSocketMessageType.Text)
+                if (result.MessageType == WebSocketMessageType.Binary)
+                {
+                    // Accumulate binary chunks
+                    binaryBuffer.Write(buffer, 0, result.Count);
+
+                    if (result.EndOfMessage)
+                    {
+                        var data = binaryBuffer.GetBuffer();
+                        var length = (int)binaryBuffer.Length;
+                        OnBinaryReceived?.Invoke(data, length);
+                        binaryBuffer.SetLength(0); // Reset for next message
+                    }
+                }
+                else if (result.MessageType == WebSocketMessageType.Text)
                 {
                     messageBuilder.Append(Encoding.UTF8.GetString(buffer, 0, result.Count));
 
@@ -262,6 +313,7 @@ public sealed class SignalingClient : IAsyncDisposable
         finally
         {
             _incomingMessages.Writer.Complete();
+            binaryBuffer.Dispose();
         }
     }
 
@@ -338,5 +390,6 @@ public sealed class SignalingClient : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         await DisconnectAsync();
+        _writeLock.Dispose();
     }
 }

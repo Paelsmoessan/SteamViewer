@@ -46,6 +46,7 @@ public sealed class HostSession : IAsyncDisposable
     private readonly IScreenCapture? _screenCapture;
     private readonly IConfiguration _configuration;
     private readonly Func<SignalingMessage, Task> _sendSignaling;
+    private readonly SignalingClient _signalingClient;
     private readonly string _hostClientId;
     private readonly string _hostPasswordHash;
     private HostStreamTransport? _transport;
@@ -113,6 +114,7 @@ public sealed class HostSession : IAsyncDisposable
         IInputInjector inputInjector,
         IConfiguration configuration,
         Func<SignalingMessage, Task> sendSignaling,
+        SignalingClient signalingClient,
         IElevationService? elevationService = null,
         IMonitorEnumerator? monitorEnumerator = null,
         IScreenCapture? screenCapture = null,
@@ -132,6 +134,7 @@ public sealed class HostSession : IAsyncDisposable
         _screenCapture = screenCapture;
         _configuration = configuration;
         _sendSignaling = sendSignaling;
+        _signalingClient = signalingClient;
         _hostClientId = hostClientId;
         _hostPasswordHash = hostPasswordHash;
 
@@ -163,8 +166,8 @@ public sealed class HostSession : IAsyncDisposable
     }
 
     /// <summary>
-    /// Initialize transport: start TCP listener, send endpoint to viewer via signaling,
-    /// wait for viewer to connect.
+    /// Initialize transport: setup WebSocket relay with AES-GCM encryption,
+    /// send RelayReady to viewer via signaling.
     /// </summary>
     public async Task InitializeAsync()
     {
@@ -173,9 +176,8 @@ public sealed class HostSession : IAsyncDisposable
         // Set logger to host mode
         await _jsRuntime.InvokeVoidAsync("SteamViewerLogger.setMode", true);
 
-        // Create TCP transport and start listening
-        _transport = new HostStreamTransport(_loggerFactory.CreateLogger<HostStreamTransport>());
-        var port = await _transport.StartListeningAsync();
+        // Create relay transport (binary frames through signaling WebSocket)
+        _transport = new HostStreamTransport(_signalingClient, _loggerFactory.CreateLogger<HostStreamTransport>());
 
         // Subscribe to transport events
         _transport.OnControlMessage += HandleControlMessage;
@@ -183,31 +185,13 @@ public sealed class HostSession : IAsyncDisposable
         _transport.OnFileSignalingMessage += HandleFileChannelMessage;
         _transport.OnConnectionStateChanged += HandleTransportStateChanged;
 
-        _logger.LogInformation("Transport listening on port {Port}", port);
+        // Start relay: generate nonce, setup encryption, send RelayReady to viewer
+        await _transport.StartRelayAsync(PeerId, _hostPasswordHash, _sendSignaling);
 
-        // Send transport endpoint to viewer via signaling (replaces SDP offer)
-        var ips = HostStreamTransport.GetLocalIPs().ToArray();
-        await _sendSignaling(new SignalingMessage.TransportEndpoint(PeerId, ips, port));
+        _logger.LogInformation("Host transport relay started for peer {PeerId}", PeerId);
 
-        SetState(HostSessionState.WaitingForViewer);
-
-        // Accept viewer connection in background (don't block)
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                await _transport.AcceptViewerAsync(TimeSpan.FromSeconds(30));
-                _logger.LogInformation("Viewer connected via transport");
-
-                // Transport connected — trigger ready state
-                await HandleTransportConnected();
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Failed to accept viewer connection");
-                SetState(HostSessionState.Error);
-            }
-        });
+        // Relay is immediately ready (binary frames flow through signaling WS)
+        await HandleTransportConnected();
     }
 
     private async Task HandleTransportConnected()

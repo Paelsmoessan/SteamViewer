@@ -70,5 +70,20 @@
     <ProjectReference Include="..\SteamViewer.Platform.macOS\SteamViewer.Platform.macOS.csproj" />
   </ItemGroup>
 
+  <!-- FFmpeg native DLLs (BtbN GPL-shared, FFmpeg 8.x / avcodec-62) -->
+  <ItemGroup Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows'">
+    <Content Include="ffmpeg\avcodec-62.dll">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>ffmpeg\avcodec-62.dll</Link>
+    </Content>
+    <Content Include="ffmpeg\avutil-60.dll">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>ffmpeg\avutil-60.dll</Link>
+    </Content>
+    <Content Include="ffmpeg\swscale-9.dll">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>ffmpeg\swscale-9.dll</Link>
+    </Content>
+  </ItemGroup>
 
 </Project>

@@ -1,136 +1,172 @@
 using System.Net;
-using System.Net.Quic;
-using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Cryptography;
-using System.Security.Cryptography.X509Certificates;
 using Microsoft.Extensions.Logging;
+using SteamViewer.Common.Protocol;
 
 namespace SteamViewer.Client.Core.Network;
 
 /// <summary>
-/// Host-side QUIC transport. Listens for a viewer connection on an ephemeral UDP port.
-/// Opens two QUIC streams: bidirectional for control, unidirectional for video (host→viewer).
+/// Host-side transport. Starts with WebSocket relay (Phase 1), optionally upgrades to direct UDP (Phase 2).
 ///
 /// Connection flow:
-/// 1. Host calls StartListeningAsync() → gets ephemeral port
-/// 2. Host sends port to viewer via signaling server (TransportEndpoint message)
-/// 3. Viewer connects via QUIC (single UDP connection, TLS 1.3 handshake)
-/// 4. Host opens control stream (bidirectional) + video stream (unidirectional)
-/// 5. Read loops start
+/// 1. Host approves incoming connection
+/// 2. StartRelayAsync(): WebSocket relay via signaling server (immediate)
+/// 3. In background: AttemptUdpUpgradeAsync() tries STUN/TURN for direct P2P
+/// 4. If UDP works → switch backend (transparent to upper layers)
 /// </summary>
 public sealed class HostStreamTransport : StreamTransport
 {
-    private QuicListener? _listener;
-    private X509Certificate2? _cert;
-    private int _port;
+    private readonly SignalingClient _signalingClient;
+    private UdpTransportBackend? _udpBackend;
 
-    public int Port => _port;
-
-    public HostStreamTransport(ILogger logger) : base(logger) { }
-
-    /// <summary>
-    /// Start listening on an ephemeral UDP port. Returns the port number.
-    /// The viewer will connect to this port after receiving it via signaling.
-    /// </summary>
-    public async Task<int> StartListeningAsync()
+    public HostStreamTransport(SignalingClient signalingClient, ILogger logger) : base(logger)
     {
-        if (!QuicListener.IsSupported)
-            throw new PlatformNotSupportedException(
-                "QUIC is not supported on this platform. Ensure .NET 8+ and msquic are available.");
-
-        // Generate ephemeral self-signed cert for QUIC TLS 1.3
-        using var rsa = RSA.Create(2048);
-        var req = new CertificateRequest("CN=SteamViewer", rsa,
-            HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
-        var tempCert = req.CreateSelfSigned(DateTimeOffset.Now, DateTimeOffset.Now.AddDays(1));
-        // Re-import for Windows Schannel compatibility (ephemeral keys need export/import)
-        _cert = new X509Certificate2(tempCert.Export(X509ContentType.Pfx));
-
-        _listener = await QuicListener.ListenAsync(new QuicListenerOptions
-        {
-            ListenEndPoint = new IPEndPoint(IPAddress.Any, 0),
-            ApplicationProtocols = new List<SslApplicationProtocol>
-            {
-                new("steamviewer")
-            },
-            ConnectionOptionsCallback = (_, _, _) => ValueTask.FromResult(new QuicServerConnectionOptions
-            {
-                DefaultStreamErrorCode = 0,
-                DefaultCloseErrorCode = 0,
-                ServerAuthenticationOptions = new SslServerAuthenticationOptions
-                {
-                    ApplicationProtocols = new List<SslApplicationProtocol>
-                    {
-                        new("steamviewer")
-                    },
-                    ServerCertificate = _cert
-                }
-            })
-        });
-
-        _port = _listener.LocalEndPoint.Port;
-        _logger.LogInformation("Host transport listening on port {Port} (QUIC/UDP)", _port);
-        return _port;
+        _signalingClient = signalingClient;
     }
 
     /// <summary>
-    /// Accept a QUIC connection from the viewer and open streams.
-    /// Blocks until connection is established or timeout.
+    /// Start the relay transport. Generates encryption nonce, sets up encryption,
+    /// sends RelayReady to the viewer, and starts the transport.
     /// </summary>
-    public async Task AcceptViewerAsync(TimeSpan timeout)
+    public async Task StartRelayAsync(string peerId, string passwordHashHex, Func<SignalingMessage, Task> sendSignaling)
     {
-        if (_listener == null)
-            throw new InvalidOperationException("Call StartListeningAsync first");
+        // Generate random 32-byte encryption nonce for this session
+        var nonce = new byte[32];
+        RandomNumberGenerator.Fill(nonce);
+        var nonceHex = Convert.ToHexString(nonce).ToLowerInvariant();
 
-        using var timeoutCts = new CancellationTokenSource(timeout);
+        _logger.LogInformation("Host transport: starting relay for peer {PeerId}", peerId);
 
-        _logger.LogInformation("Waiting for viewer QUIC connection...");
-        _connection = await _listener.AcceptConnectionAsync(timeoutCts.Token);
-        _logger.LogInformation("Viewer QUIC connected from {Remote}", _connection.RemoteEndPoint);
+        // Setup AES-256-GCM encryption (host direction)
+        _encryption = new TransportEncryption(passwordHashHex, nonce, isHost: true);
 
-        // Host opens both streams — viewer accepts them by type
-        _controlStream = await _connection.OpenOutboundStreamAsync(
-            QuicStreamType.Bidirectional, timeoutCts.Token);
-        _logger.LogInformation("Control stream opened (bidirectional)");
+        // Start with WebSocket relay backend
+        var relayBackend = new WebSocketRelayBackend(_signalingClient);
+        relayBackend.Start();
+        StartTransport(relayBackend, enableVideoSend: true);
 
-        _videoStream = await _connection.OpenOutboundStreamAsync(
-            QuicStreamType.Unidirectional, timeoutCts.Token);
-        _logger.LogInformation("Video stream opened (unidirectional host→viewer)");
-
-        // Stop accepting — single viewer only
-        await _listener.DisposeAsync();
-        _listener = null;
-
-        // Start read loops (video read skipped — outbound unidirectional can't read)
-        StartReadLoops();
+        // Send RelayReady to viewer (includes nonce for key derivation)
+        await sendSignaling(new SignalingMessage.RelayReady(peerId, nonceHex));
+        _logger.LogInformation("Host transport: RelayReady sent to {PeerId}", peerId);
     }
 
-    /// <summary>Get the host's local IP addresses for signaling.</summary>
-    public static List<string> GetLocalIPs()
+    /// <summary>
+    /// Attempt to upgrade from WebSocket relay to direct UDP (or TURN relay).
+    /// Call after relay is established. Runs in background — does not block.
+    /// If UDP upgrade fails, the WebSocket relay continues working.
+    /// </summary>
+    /// <param name="peerId">Viewer's client ID.</param>
+    /// <param name="sendSignaling">Signaling callback.</param>
+    /// <param name="turnServerUri">TURN server URI (e.g., "turn:host:port").</param>
+    /// <param name="turnUsername">TURN username.</param>
+    /// <param name="turnCredential">TURN password.</param>
+    /// <param name="onEndpointReady">Called with local/reflexive/turn endpoints for signaling exchange.</param>
+    public async Task AttemptUdpUpgradeAsync(
+        string peerId,
+        Func<SignalingMessage, Task> sendSignaling,
+        string? turnServerUri = null,
+        string? turnUsername = null,
+        string? turnCredential = null,
+        Func<string[], int, Task>? onEndpointReady = null)
     {
-        var ips = new List<string>();
         try
         {
-            var host = Dns.GetHostEntry(Dns.GetHostName());
-            foreach (var ip in host.AddressList)
+            _udpBackend = new UdpTransportBackend(_logger);
+            await _udpBackend.InitializeAsync(turnServerUri, turnUsername, turnCredential);
+
+            // Gather endpoints: local IPs + reflexive + TURN relay
+            var endpoints = new List<string>();
+            // Local IPs
+            try
             {
-                if (ip.AddressFamily == AddressFamily.InterNetwork) // IPv4 only for now
-                    ips.Add(ip.ToString());
+                var host = Dns.GetHostEntry(Dns.GetHostName());
+                foreach (var ip in host.AddressList)
+                {
+                    if (ip.AddressFamily == AddressFamily.InterNetwork)
+                        endpoints.Add(ip.ToString());
+                }
+            }
+            catch { }
+
+            // Reflexive endpoint from STUN
+            if (_udpBackend.ReflexiveEndPoint != null)
+                endpoints.Add(_udpBackend.ReflexiveEndPoint.Address.ToString());
+
+            var port = _udpBackend.LocalEndPoint?.Port ?? 0;
+
+            // Send TransportEndpoint to viewer with all candidate IPs and the local port
+            if (endpoints.Count > 0 && port > 0)
+            {
+                await sendSignaling(new SignalingMessage.TransportEndpoint(peerId, endpoints.ToArray(), port));
+                onEndpointReady?.Invoke(endpoints.ToArray(), port);
+                _logger.LogInformation("Host UDP endpoints sent: {Endpoints}:{Port}", string.Join(",", endpoints), port);
+            }
+
+            // The viewer will try to probe us. We wait for incoming data on UDP.
+            // For now, the upgrade is triggered when viewer sends TransportEndpoint back.
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "UDP upgrade attempt failed — staying on WebSocket relay");
+            if (_udpBackend != null)
+            {
+                await _udpBackend.DisposeAsync();
+                _udpBackend = null;
             }
         }
-        catch { }
-        return ips;
+    }
+
+    /// <summary>
+    /// Handle a TransportEndpoint from the viewer (their UDP candidate).
+    /// Probes the endpoint and switches to UDP if successful.
+    /// </summary>
+    public async Task HandleViewerEndpointAsync(string[] viewerIPs, int viewerPort)
+    {
+        if (_udpBackend == null) return;
+
+        foreach (var ip in viewerIPs)
+        {
+            try
+            {
+                var endpoint = new IPEndPoint(IPAddress.Parse(ip), viewerPort);
+                var probeOk = await _udpBackend.ProbeAsync(endpoint, TimeSpan.FromSeconds(2));
+                if (probeOk)
+                {
+                    _udpBackend.ConnectToPeer(endpoint, useTurnRelay: false);
+                    await SwitchBackendAsync(_udpBackend);
+                    _logger.LogInformation("Host: switched to direct UDP via {Endpoint}", endpoint);
+                    return;
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Host: UDP probe to {IP}:{Port} failed", ip, viewerPort);
+            }
+        }
+
+        // Direct failed — try TURN relay
+        if (_udpBackend.TurnRelayEndPoint != null)
+        {
+            _logger.LogInformation("Host: direct UDP failed, trying TURN relay");
+            // For TURN, we'd send to the TURN server with SendIndication targeting the viewer's relay address
+            // This requires both sides to have allocated TURN and exchanged relay endpoints
+            // For now, log and stay on WebSocket relay
+            _logger.LogInformation("Host: TURN relay upgrade not yet implemented — staying on WebSocket relay");
+        }
+        else
+        {
+            _logger.LogInformation("Host: no UDP path available — staying on WebSocket relay");
+        }
     }
 
     public override async ValueTask DisposeAsync()
     {
-        if (_listener != null)
+        if (_udpBackend != null)
         {
-            try { await _listener.DisposeAsync(); } catch { }
-            _listener = null;
+            await _udpBackend.DisposeAsync();
+            _udpBackend = null;
         }
-        _cert?.Dispose();
         await base.DisposeAsync();
     }
 }

@@ -121,7 +121,8 @@ public sealed class ViewerSessionManager : IAsyncDisposable
             peerId,
             jsRuntime,
             _loggerFactory,
-            SendSignalingMessage);
+            SendSignalingMessage,
+            _signalingClient);
         session.StoredPassword = password;
 
         // Subscribe to session events
@@ -133,8 +134,8 @@ public sealed class ViewerSessionManager : IAsyncDisposable
 
         _logger.LogInformation("Created session {SessionId} for peer {PeerId}", sessionId, peerId);
 
-        // Transport initialization is DEFERRED — host sends TransportEndpoint via signaling,
-        // which triggers HandleTransportEndpointAsync to connect TCP.
+        // Transport initialization is DEFERRED — host sends RelayReady via signaling,
+        // which triggers HandleRelayReadyAsync to setup encrypted relay.
         // RemoteViewer calls session.BindToViewerAsync() for rendering setup.
 
         // Request connection via signaling
@@ -235,7 +236,8 @@ public sealed class ViewerSessionManager : IAsyncDisposable
             peerId,
             jsRuntime,
             _loggerFactory,
-            SendSignalingMessage);
+            SendSignalingMessage,
+            _signalingClient);
         session.StoredPassword = password;
 
         // Subscribe to session events
@@ -283,6 +285,10 @@ public sealed class ViewerSessionManager : IAsyncDisposable
 
             case SignalingMessage.IceCandidate ice:
                 HandleIceCandidate(ice);
+                break;
+
+            case SignalingMessage.RelayReady relayReady:
+                HandleRelayReady(relayReady);
                 break;
 
             case SignalingMessage.TransportEndpoint endpoint:
@@ -376,6 +382,20 @@ public sealed class ViewerSessionManager : IAsyncDisposable
     {
         _logger.LogDebug("Session {SessionId} state changed to {State}", sessionId, state);
         OnSessionStateChanged?.Invoke(sessionId, state);
+    }
+
+    private void HandleRelayReady(SignalingMessage.RelayReady relayReady)
+    {
+        var session = GetSessionByPeerId(relayReady.TargetId);
+        if (session == null)
+        {
+            _logger.LogWarning("Received RelayReady for unknown peer {PeerId}", relayReady.TargetId);
+            return;
+        }
+
+        _logger.LogInformation("Session {SessionId}: Received RelayReady from {PeerId}",
+            session.SessionId, relayReady.TargetId);
+        _ = session.HandleRelayReadyAsync(relayReady.EncryptionNonce);
     }
 
     private void HandleTransportEndpoint(SignalingMessage.TransportEndpoint endpoint)
