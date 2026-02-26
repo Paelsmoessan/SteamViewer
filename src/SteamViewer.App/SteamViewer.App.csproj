@@ -84,6 +84,10 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <Link>ffmpeg\swscale-9.dll</Link>
     </Content>
+    <Content Include="ffmpeg\swresample-6.dll">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>ffmpeg\swresample-6.dll</Link>
+    </Content>
   </ItemGroup>
 
 </Project>

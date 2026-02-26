@@ -1,3 +1,4 @@
+// Signaling + binary WebSocket relay handler
 using System.Net.WebSockets;
 using System.Text;
 using System.Threading.Channels;
