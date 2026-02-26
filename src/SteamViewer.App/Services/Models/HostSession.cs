@@ -337,8 +337,9 @@ public sealed class HostSession : IAsyncDisposable
             if (_encoder == null)
             {
                 FFmpegInit.EnsureInitialized();
-                _encoder = new FFmpegEncoder(_loggerFactory.CreateLogger<FFmpegEncoder>());
-                _encoder.Initialize(width, height, 30, 20_000_000); // 30fps, 20Mbps
+                var encoder = new FFmpegEncoder(_loggerFactory.CreateLogger<FFmpegEncoder>());
+                encoder.Initialize(width, height, 30, 20_000_000); // 30fps, 20Mbps
+                _encoder = encoder; // Assign only after successful init
                 _logger.LogInformation("FFmpeg encoder initialized: {W}x{H}", width, height);
             }
             else

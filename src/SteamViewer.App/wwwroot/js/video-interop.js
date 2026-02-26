@@ -286,88 +286,330 @@ if (window.chrome?.webview) {
 }
 
 // === Input Capture (mouse/keyboard) ===
+// Ported from webrtc-interop.js SteamViewerInput — adapted for FFmpeg transport
+// (no SteamViewerWebRTC references, uses SteamViewerVideo for letterbox/session data)
 window.SteamViewerInput = {
     canvas: null,
     dotNetRef: null,
     isCapturing: false,
     isLocked: false,
+    showLockIndicator: false,
+    lockIndicator: null,
     _activeSessionId: null,
     _inputEventCount: 0,
     _rawEventCount: 0,
     _lastMouseDownCoords: null,
     _coordLogCount: 0,
+    _focusWatchdogId: null,
 
-    // PID mouse regulation state
+    // Bound handler references (for proper removal)
+    _boundMouseMove: null,
+    _boundMouseDown: null,
+    _boundMouseUp: null,
+    _boundWheel: null,
+    _boundKeyDown: null,
+    _boundKeyUp: null,
+
+    // PID mouse regulation tuning
+    _pidAlpha: 0.35,
+    _pidKp: 0.6,
+    _pidKi: 0.15,
+    _pidKd: 0.3,
+    _pidSendThreshold: 2.5,
+    _pidIDecay: 0.85,
+    _pidIMax: 50,
+    _pidIdleThresholdMs: 100,
+    _pidColdStartBurst: 3,
+    // Dynamic cooldown — timer send rate scales with velocity
+    _pidMinCooldown: 16,
+    _pidMaxCooldown: 100,
+    _pidVelocityCap: 2.0,
+    // PID internal state
     _pidVelocity: 0,
     _pidLastVelocity: 0,
     _pidLastEventTime: 0,
     _pidIntegral: 0,
     _pidColdStartRemaining: 0,
-    _bufferedMouseCoords: null,
+    _lastTimerSendTime: 0,
     _lastSentX: 0,
     _lastSentY: 0,
-    // PID tuning parameters
-    _pidKp: 0.6,
-    _pidKi: 0.15,
-    _pidKd: 0.3,
-    _pidAlpha: 0.35,
-    _pidIDecay: 0.85,
-    _pidIMax: 50,
-    _pidSendThreshold: 2.5,
-    _pidIdleThresholdMs: 100,
-    _pidColdStartBurst: 3,
-    _pidFlushIntervalMs: 8,
-    _pidFlushTimer: null,
+    _bufferedMouseCoords: null,
+    _regulationTimer: null,
+    // Remote cursor shape from host
+    _remoteCursorShape: 'default',
 
-    setCapturing(canvasId, dotNetRef, sessionId) {
+    // === Lifecycle ===
+
+    initialize(canvasId, dotNetReference, options = {}) {
+        const { showLockIndicator = true } = options;
+
+        // Clean up any previous instance
+        if (this.canvas) {
+            this.stop();
+        }
+
         this.canvas = document.getElementById(canvasId);
-        this.dotNetRef = dotNetRef;
-        this._activeSessionId = sessionId;
+        this.dotNetRef = dotNetReference;
+        this.showLockIndicator = showLockIndicator;
+
+        if (!this.canvas) {
+            console.error(`Canvas '${canvasId}' not found`);
+            return false;
+        }
+
+        // Create lock indicator overlay (optional)
+        if (showLockIndicator) {
+            this.createLockIndicator();
+        }
+
+        // Bind event handlers (store references for removal)
+        this._boundMouseMove = (e) => this.handleMouseMove(e);
+        this._boundMouseDown = (e) => this.handleMouseDown(e);
+        this._boundMouseUp = (e) => this.handleMouseUp(e);
+        this._boundWheel = (e) => this.handleWheel(e);
+        this._boundKeyDown = (e) => this.handleKeyDown(e);
+        this._boundKeyUp = (e) => this.handleKeyUp(e);
+
+        // Mouse events on canvas
+        this.canvas.addEventListener('mousemove', this._boundMouseMove);
+        this.canvas.addEventListener('mousedown', this._boundMouseDown);
+        this.canvas.addEventListener('mouseup', this._boundMouseUp);
+        this.canvas.addEventListener('wheel', this._boundWheel, { passive: false });
+        this.canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+
+        // Make canvas focusable for keyboard events
+        this.canvas.tabIndex = 0;
+        this.canvas.style.outline = 'none';
+        this.canvas.addEventListener('keydown', this._boundKeyDown);
+        this.canvas.addEventListener('keyup', this._boundKeyUp);
+
         this.isCapturing = true;
+        this.isLocked = false;
         this._inputEventCount = 0;
         this._rawEventCount = 0;
         this._coordLogCount = 0;
 
-        if (this.canvas) {
-            this.canvas.addEventListener('mousedown', (e) => this.handleMouseDown(e));
-            this.canvas.addEventListener('mouseup', (e) => this.handleMouseUp(e));
-            this.canvas.addEventListener('mousemove', (e) => this.handleMouseMove(e));
-            this.canvas.addEventListener('wheel', (e) => this.handleWheel(e), { passive: false });
-            this.canvas.addEventListener('contextmenu', (e) => e.preventDefault());
-            document.addEventListener('keydown', (e) => this.handleKeyDown(e));
-            document.addEventListener('keyup', (e) => this.handleKeyUp(e));
-        }
+        // Focus canvas immediately so keyboard events are captured from the start
+        this.canvas.focus();
+        setTimeout(() => { this.canvas?.focus(); }, 200);
+        setTimeout(() => { this.canvas?.focus(); }, 500);
 
-        // PID flush timer — sends buffered mouse coords at regular intervals
-        this._pidFlushTimer = setInterval(() => {
-            if (this._bufferedMouseCoords && this.dotNetRef) {
-                const c = this._bufferedMouseCoords;
-                this._bufferedMouseCoords = null;
-                this._lastSentX = c.x;
-                this._lastSentY = c.y;
-                this.dotNetRef.invokeMethodAsync('OnMouseMove', c.x, c.y, c.captureW, c.captureH).catch(() => {});
-            }
-        }, this._pidFlushIntervalMs);
+        // Start periodic focus watchdog (restores focus if lost while locked)
+        this._startFocusWatchdog();
 
-        console.log(`[Input] Capture started on ${canvasId} for session ${sessionId}`);
+        console.log(`[Input] Initialized on ${canvasId} (lockIndicator=${showLockIndicator})`);
+        return true;
     },
 
-    stopCapturing() {
+    stop() {
         this.isCapturing = false;
         this.isLocked = false;
-        if (this._pidFlushTimer) { clearInterval(this._pidFlushTimer); this._pidFlushTimer = null; }
-        console.log('[Input] Capture stopped');
+
+        // Stop focus watchdog
+        if (this._focusWatchdogId) {
+            clearInterval(this._focusWatchdogId);
+            this._focusWatchdogId = null;
+        }
+
+        // Remove lock indicator
+        if (this.lockIndicator) {
+            this.lockIndicator.remove();
+            this.lockIndicator = null;
+        }
+
+        // Clear regulation timer
+        this._stopRegulationTimer();
+
+        // Remove event listeners from canvas
+        if (this.canvas) {
+            this.canvas.removeEventListener('mousemove', this._boundMouseMove);
+            this.canvas.removeEventListener('mousedown', this._boundMouseDown);
+            this.canvas.removeEventListener('mouseup', this._boundMouseUp);
+            this.canvas.removeEventListener('wheel', this._boundWheel);
+            this.canvas.removeEventListener('keydown', this._boundKeyDown);
+            this.canvas.removeEventListener('keyup', this._boundKeyUp);
+        }
+
+        this.canvas = null;
+        this.dotNetRef = null;
+        this._activeSessionId = null;
+        console.log('[Input] Stopped');
     },
 
-    setLocked(locked) {
-        this.isLocked = locked;
+    setActiveSession(sessionId) {
+        this._activeSessionId = sessionId;
+    },
+
+    // === Lock / Unlock ===
+
+    lock() {
+        this.ensureCanvas();
+        this.isLocked = true;
+        this.updateLockIndicator();
+        this.notifyLockChange();
+        this.canvas.focus();
+        // Apply remote cursor shape — shows the host's current cursor type locally
+        this.canvas.style.cursor = this._remoteCursorShape || 'default';
+        // Start mouse regulation interval timer (sweep mode sends)
+        this._startRegulationTimer();
+        console.log('[Input] LOCKED');
+    },
+
+    unlock() {
+        this.isLocked = false;
+        this.updateLockIndicator();
+        this.notifyLockChange();
+        this._stopRegulationTimer();
+        // Restore default cursor
+        if (this.canvas) this.canvas.style.cursor = '';
+        console.log('[Input] UNLOCKED');
+    },
+
+    notifyLockChange() {
+        if (this.dotNetRef) {
+            try {
+                this.dotNetRef.invokeMethodAsync('OnInputLockChanged', this.isLocked);
+            } catch (e) { /* disposed */ }
+        }
+    },
+
+    // === Lock Indicator ===
+
+    createLockIndicator() {
+        this.lockIndicator = document.createElement('div');
+        this.lockIndicator.id = 'inputLockIndicator';
+        this.lockIndicator.style.cssText = `
+            position: fixed; top: 10px; right: 10px; padding: 8px 16px;
+            border-radius: 4px; font-size: 12px; font-family: sans-serif;
+            z-index: 9999; pointer-events: none; transition: all 0.2s;
+        `;
+        this.updateLockIndicator();
+        document.body.appendChild(this.lockIndicator);
+    },
+
+    updateLockIndicator() {
+        if (!this.lockIndicator || !this.showLockIndicator) return;
+        if (this.isLocked) {
+            this.lockIndicator.textContent = 'Input Locked';
+            this.lockIndicator.style.background = '#a6e3a1';
+            this.lockIndicator.style.color = '#1e1e2e';
+        } else {
+            this.lockIndicator.textContent = 'Input Unlocked';
+            this.lockIndicator.style.background = '#45475a';
+            this.lockIndicator.style.color = '#cdd6f4';
+        }
+    },
+
+    // === Focus Watchdog ===
+
+    _startFocusWatchdog() {
+        if (this._focusWatchdogId) clearInterval(this._focusWatchdogId);
+        this._focusWatchdogId = setInterval(() => {
+            if (this.isLocked && this.canvas && document.activeElement !== this.canvas) {
+                const active = document.activeElement;
+                if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA'
+                    || active.tagName === 'SELECT' || active.closest('.menu-dropdown')
+                    || active.closest('.connection-dialog'))) {
+                    return;
+                }
+                this.canvas.focus();
+            }
+        }, 500);
+    },
+
+    // === Canvas DOM Recovery ===
+
+    _reattachCount: 0,
+    reattachIfNeeded() {
+        this._reattachCount++;
+        const current = document.getElementById('viewerCanvas');
+        const same = current === this.canvas;
+        if (this._reattachCount <= 5 || !same) {
+            console.log(`[Input] reattachIfNeeded #${this._reattachCount}: canvasSame=${same}, capturing=${this.isCapturing}, locked=${this.isLocked}`);
+        }
+        this.ensureCanvas();
+        if (this.canvas) {
+            this.canvas.focus();
+        }
+        if (!this._focusWatchdogId && this.isCapturing) {
+            this._startFocusWatchdog();
+        }
     },
 
     ensureCanvas() {
-        if (!this.canvas && this._activeSessionId) {
+        const current = document.getElementById('viewerCanvas');
+        if (current && current !== this.canvas) {
+            console.warn('[Input] Canvas DOM node changed — re-attaching listeners');
+            if (this.canvas) {
+                this.canvas.removeEventListener('mousemove', this._boundMouseMove);
+                this.canvas.removeEventListener('mousedown', this._boundMouseDown);
+                this.canvas.removeEventListener('mouseup', this._boundMouseUp);
+                this.canvas.removeEventListener('keydown', this._boundKeyDown);
+                this.canvas.removeEventListener('keyup', this._boundKeyUp);
+            }
+            this.canvas = current;
+            this.canvas.addEventListener('mousemove', this._boundMouseMove);
+            this.canvas.addEventListener('mousedown', this._boundMouseDown);
+            this.canvas.addEventListener('mouseup', this._boundMouseUp);
+            this.canvas.addEventListener('wheel', this._boundWheel, { passive: false });
+            this.canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+            this.canvas.tabIndex = 0;
+            this.canvas.style.outline = 'none';
+            this.canvas.addEventListener('keydown', this._boundKeyDown);
+            this.canvas.addEventListener('keyup', this._boundKeyUp);
+            this.isCapturing = true;
+            this.canvas.focus();
+        } else if (!this.canvas && this._activeSessionId) {
             this.canvas = document.getElementById('viewerCanvas');
         }
     },
+
+    // === PID Regulation Timer ===
+
+    _startRegulationTimer() {
+        this._stopRegulationTimer();
+        this._pidVelocity = 0;
+        this._pidIntegral = 0;
+        this._pidLastVelocity = 0;
+        this._pidLastEventTime = 0;
+        this._lastTimerSendTime = 0;
+        this._pidColdStartRemaining = 0;
+        this._regulationTimer = setInterval(async () => {
+            const c = this._bufferedMouseCoords;
+            if (!c || !this.dotNetRef || !this.isLocked) return;
+
+            const now = performance.now();
+            const elapsed = now - this._lastTimerSendTime;
+            // Dynamic cooldown: scales linearly with velocity
+            const t = Math.min(this._pidVelocity / this._pidVelocityCap, 1);
+            const cooldown = this._pidMinCooldown + (this._pidMaxCooldown - this._pidMinCooldown) * t;
+
+            if (elapsed < cooldown) return;
+
+            this._lastSentX = c.x;
+            this._lastSentY = c.y;
+            this._bufferedMouseCoords = null;
+            this._lastTimerSendTime = now;
+            try {
+                await this.dotNetRef.invokeMethodAsync('OnMouseMove', c.x, c.y, c.captureW, c.captureH);
+            } catch (err) { /* ignore sweep send errors */ }
+        }, 16); // Poll at 60Hz, actual send rate governed by dynamic cooldown
+    },
+
+    _stopRegulationTimer() {
+        if (this._regulationTimer) {
+            clearInterval(this._regulationTimer);
+            this._regulationTimer = null;
+        }
+        this._bufferedMouseCoords = null;
+        this._pidVelocity = 0;
+        this._pidIntegral = 0;
+        this._pidLastVelocity = 0;
+        this._pidLastEventTime = 0;
+        this._lastTimerSendTime = 0;
+    },
+
+    // === Coordinate Mapping ===
 
     getModifiers(e) {
         return { ctrl: e.ctrlKey, shift: e.shiftKey, alt: e.altKey, meta: e.metaKey };
@@ -508,10 +750,8 @@ window.SteamViewerInput = {
         if (e.deltaMode === 1) { dx *= 40; dy *= 40; }
         else if (e.deltaMode === 2) { dx *= 800; dy *= 800; }
         try { await this.dotNetRef.invokeMethodAsync('OnMouseWheel', dx, dy); }
-        catch (e) {}
+        catch (e) { /* disposed */ }
     },
-
-    handleContextMenu(e) { e.preventDefault(); },
 
     // === Keyboard Handlers ===
 
@@ -525,7 +765,7 @@ window.SteamViewerInput = {
                 await this.dotNetRef.invokeMethodAsync('OnClipboardPaste');
             } catch (err) {
                 try { await this.dotNetRef.invokeMethodAsync('OnKeyDown', e.key, this.getModifiers(e)); }
-                catch (e2) {}
+                catch (e2) { /* disposed */ }
             }
             return;
         }
@@ -534,23 +774,22 @@ window.SteamViewerInput = {
         if (e.ctrlKey && !e.altKey && !e.metaKey && (e.key === 'c' || e.key === 'x')) {
             try {
                 await this.dotNetRef.invokeMethodAsync('OnKeyDown', e.key, this.getModifiers(e));
-                // Request host clipboard after short delay
                 setTimeout(() => {
                     this.dotNetRef?.invokeMethodAsync('OnClipboardRequest').catch(() => {});
                 }, 150);
-            } catch (err) {}
+            } catch (err) { /* disposed */ }
             return;
         }
 
         try { await this.dotNetRef.invokeMethodAsync('OnKeyDown', e.key, this.getModifiers(e)); }
-        catch (err) {}
+        catch (err) { /* disposed */ }
     },
 
     async handleKeyUp(e) {
         if (!this.isCapturing || !this.isLocked || !this.dotNetRef) return;
         e.preventDefault();
         try { await this.dotNetRef.invokeMethodAsync('OnKeyUp', e.key, this.getModifiers(e)); }
-        catch (err) {}
+        catch (err) { /* disposed */ }
     }
 };
 
