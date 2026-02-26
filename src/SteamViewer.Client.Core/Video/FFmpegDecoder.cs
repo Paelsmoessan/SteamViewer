@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using FFmpeg.AutoGen;
 using Microsoft.Extensions.Logging;
@@ -13,6 +14,7 @@ namespace SteamViewer.Client.Core.Video;
 public sealed unsafe class FFmpegDecoder : IDisposable
 {
     private readonly ILogger _logger;
+    private readonly Stopwatch _decodeSw = new();
     private AVCodecContext* _codecCtx;
     private AVFrame* _frame;
     private AVPacket* _packet;
@@ -21,10 +23,18 @@ public sealed unsafe class FFmpegDecoder : IDisposable
     private int _width;
     private int _height;
     private bool _disposed;
+    private long _frameCount;
+    private long _totalBytesDecoded;
+    private double _lastDecodeMs;
 
     public int Width => _width;
     public int Height => _height;
     public bool IsInitialized => _codecCtx != null;
+
+    // Stats
+    public long FrameCount => _frameCount;
+    public long TotalBytesDecoded => _totalBytesDecoded;
+    public double LastDecodeMs => _lastDecodeMs;
 
     public FFmpegDecoder(ILogger logger)
     {
@@ -70,6 +80,8 @@ public sealed unsafe class FFmpegDecoder : IDisposable
     {
         if (_codecCtx == null || _frame == null || _packet == null)
             return null;
+
+        _decodeSw.Restart();
 
         // Feed NALUs to decoder
         fixed (byte* naluPtr = nalus)
@@ -124,6 +136,11 @@ public sealed unsafe class FFmpegDecoder : IDisposable
                 _frame->data, _frame->linesize, 0, frameHeight,
                 dstSlice, dstLinesize);
         }
+
+        _decodeSw.Stop();
+        _lastDecodeMs = _decodeSw.Elapsed.TotalMilliseconds;
+        _frameCount++;
+        _totalBytesDecoded += length;
 
         return (_bgraBuffer!, frameWidth, frameHeight, dstStride);
     }

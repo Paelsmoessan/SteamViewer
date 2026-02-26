@@ -27,6 +27,12 @@ public sealed class ViewerSession : IAsyncDisposable
     private DotNetObjectReference<ViewerSession>? _dotNetRef;
     private bool _disposed;
 
+    // Stats
+    private PeriodicTimer? _statsTimer;
+    private CancellationTokenSource? _statsCts;
+    private long _lastFrameCount;
+    private long _lastBytesDecoded;
+
     // Clipboard file transfer — viewer monitors clipboard and receives remote files
     private ClipboardMonitor? _clipboardMonitor;
     private ClipboardFileServer? _clipboardFileServer;
@@ -376,14 +382,71 @@ public sealed class ViewerSession : IAsyncDisposable
     }
 
     /// <summary>
-    /// Enable stats (placeholder — stats pushed from C# side now).
+    /// Start collecting and pushing stats every 1 second.
     /// </summary>
-    public Task EnableStatsRelayAsync() => Task.CompletedTask;
+    public Task EnableStatsRelayAsync()
+    {
+        if (_statsTimer != null) return Task.CompletedTask;
+
+        _statsCts = new CancellationTokenSource();
+        _statsTimer = new PeriodicTimer(TimeSpan.FromSeconds(1));
+        _lastFrameCount = _decoder?.FrameCount ?? 0;
+        _lastBytesDecoded = _decoder?.TotalBytesDecoded ?? 0;
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                while (await _statsTimer.WaitForNextTickAsync(_statsCts.Token))
+                {
+                    CollectAndPushStats();
+                }
+            }
+            catch (OperationCanceledException) { }
+        });
+
+        return Task.CompletedTask;
+    }
 
     /// <summary>
-    /// Disable stats (placeholder).
+    /// Stop stats collection.
     /// </summary>
-    public Task DisableStatsRelayAsync() => Task.CompletedTask;
+    public Task DisableStatsRelayAsync()
+    {
+        _statsCts?.Cancel();
+        _statsTimer?.Dispose();
+        _statsTimer = null;
+        _statsCts?.Dispose();
+        _statsCts = null;
+        return Task.CompletedTask;
+    }
+
+    private void CollectAndPushStats()
+    {
+        var frameCount = _decoder?.FrameCount ?? 0;
+        var bytesDecoded = _decoder?.TotalBytesDecoded ?? 0;
+        var decodeMs = _decoder?.LastDecodeMs ?? 0;
+        var width = _decoder?.Width ?? 0;
+        var height = _decoder?.Height ?? 0;
+
+        var fps = frameCount - _lastFrameCount; // frames in last 1 second
+        var bytesPerSec = bytesDecoded - _lastBytesDecoded;
+        _lastFrameCount = frameCount;
+        _lastBytesDecoded = bytesDecoded;
+
+        var json = JsonSerializer.Serialize(new
+        {
+            fps,
+            decodeMs = Math.Round(decodeMs, 1),
+            resolution = width > 0 ? $"{width}x{height}" : "?",
+            bitrateMbps = Math.Round(bytesPerSec * 8.0 / 1_000_000, 1),
+            totalFrames = frameCount,
+            totalBytes = bytesDecoded,
+            transport = "FFmpeg+Relay"
+        });
+
+        OnStatsUpdated?.Invoke(json);
+    }
 
     /// <summary>
     /// Disconnect this session.
@@ -816,6 +879,7 @@ public sealed class ViewerSession : IAsyncDisposable
         _disposed = true;
 
         StopClipboardFileTransfer();
+        _ = DisableStatsRelayAsync();
 
         _dotNetRef?.Dispose();
         _dotNetRef = null;

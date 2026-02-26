@@ -185,7 +185,6 @@
             <button class="tab-add" title="New connection" @onclick="OpenConnectionDialog"><Icon Name="AppIcon.Plus" Size="14" /></button>
         </div>
         <div class="canvas-container" id="canvasContainer">
-            <video id="viewerVideo" class="viewer-video" autoplay muted playsinline></video>
             <canvas id="viewerCanvas" class="@(_secureDesktopActive ? "canvas-dimmed" : "")"></canvas>
             <canvas id="secureDesktopOverlay" class="secure-desktop-overlay" style="display: @(_secureDesktopActive ? "block" : "none")"></canvas>
             @if (_secureDesktopActive)
@@ -1184,9 +1183,27 @@
             using var doc = System.Text.Json.JsonDocument.Parse(json);
             var r = doc.RootElement;
 
-            var fps = r.GetProperty("videoFps").GetDouble();
-            var mbps = r.GetProperty("bitrateMbps").GetDouble();
-            var res = r.GetProperty("resolution").GetString() ?? "?";
+            // FFmpeg transport stats
+            if (r.TryGetProperty("transport", out _))
+            {
+                var fps = r.GetProperty("fps").GetInt64();
+                var decodeMs = r.GetProperty("decodeMs").GetDouble();
+                var res = r.GetProperty("resolution").GetString() ?? "?";
+                var mbps = r.GetProperty("bitrateMbps").GetDouble();
+                var totalFrames = r.GetProperty("totalFrames").GetInt64();
+                var totalBytes = r.GetProperty("totalBytes").GetInt64();
+                var transport = r.GetProperty("transport").GetString() ?? "?";
+
+                return $"Video: {fps} FPS | {mbps:F1} Mbps | {res}\n"
+                     + $"Decode: {decodeMs:F1}ms\n"
+                     + $"Total: {totalFrames} frames | {FmtBytes(totalBytes)}\n"
+                     + $"Mode: [{transport}]";
+            }
+
+            // Legacy WebRTC stats
+            var wFps = r.GetProperty("videoFps").GetDouble();
+            var wMbps = r.GetProperty("bitrateMbps").GetDouble();
+            var wRes = r.GetProperty("resolution").GetString() ?? "?";
             var rtt = r.GetProperty("rttMs").GetDouble();
             var loss = r.GetProperty("lossPercent").GetDouble();
             var jb = r.TryGetProperty("jbAvgMs", out var jbEl) ? jbEl.GetDouble() : 0;
@@ -1198,7 +1215,7 @@
             var mode = r.GetProperty("qualityMode").GetString() ?? "HQ";
 
             var throttledStr = throttled > 0 ? $" ({throttled} throttled)" : "";
-            return $"Video: {fps:F0} FPS | {mbps:F1} Mbps | {res}\n"
+            return $"Video: {wFps:F0} FPS | {wMbps:F1} Mbps | {wRes}\n"
                  + $"Lat:   JB {jb:F0}ms | RTT {rtt:F0}ms | Loss {loss:F1}%\n"
                  + $"Input: {input} evt/s{throttledStr} | Buf: {bufKB:F0} KB\n"
                  + $"Data:  {FmtBytes(videoBytes)} video | {FmtBytes(ctrlBytes)} ctrl\n"
@@ -1859,14 +1876,6 @@
         align-items: stretch;
         justify-content: stretch;
         overflow: hidden;
-        background: #000;
-    }
-
-    .viewer-video {
-        position: absolute;
-        top: 0; left: 0;
-        width: 100%; height: 100%;
-        object-fit: contain;
         background: #000;
     }
 

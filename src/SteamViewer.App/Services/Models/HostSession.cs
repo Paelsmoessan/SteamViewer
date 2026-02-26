@@ -347,10 +347,18 @@ public sealed class HostSession : IAsyncDisposable
                 _encoder.ReinitializeIfNeeded(width, height);
             }
 
+            _encodeSw.Restart();
             var result = _encoder.EncodeFrame(bgraData, stride);
+            _encodeSw.Stop();
+
             if (result is var (naluData, naluLength))
             {
                 _transport.EnqueueVideoFrame(naluData, naluLength);
+
+                _encodeFrameCount++;
+                if (_encodeFrameCount % 300 == 0)
+                    _logger.LogInformation("Encode #{Count}: {Ms:F1}ms, {Size}KB",
+                        _encodeFrameCount, _encodeSw.Elapsed.TotalMilliseconds, naluLength / 1024);
             }
         }
         catch (Exception ex)
@@ -361,6 +369,8 @@ public sealed class HostSession : IAsyncDisposable
     }
 
     private int _encoderErrorCount;
+    private long _encodeFrameCount;
+    private readonly System.Diagnostics.Stopwatch _encodeSw = new();
 
     private string? _lastSentCursorShape;
 
