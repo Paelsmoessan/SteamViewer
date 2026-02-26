@@ -40,15 +40,26 @@ public sealed class NativeFrameBridge : IDisposable
     public bool IsInitialized => _initialized;
 
     /// <summary>
-    /// Initialize with CoreWebView2 from the host window's BlazorWebView.
+    /// Initialize with CoreWebView2 from a BlazorWebView window.
+    /// Can be called multiple times — if a different CoreWebView2 is passed (e.g. viewer window
+    /// replacing home window), old buffers are disposed and new ones created.
     /// Must be called after CoreWebView2 is ready (from BlazorWebViewInitialized handler).
     /// </summary>
     public void Initialize(CoreWebView2 coreWebView2)
     {
-        if (_initialized) return;
+        if (_initialized && _coreWebView2 == coreWebView2) return;
 
         try
         {
+            // Re-initializing with a different CoreWebView2 — dispose old buffers
+            if (_initialized)
+            {
+                _logger.LogInformation("NativeFrameBridge re-targeting to new CoreWebView2");
+                _bufferA?.Dispose();
+                _bufferB?.Dispose();
+                _initialized = false;
+            }
+
             _coreWebView2 = coreWebView2;
             _dispatcherQueue = DispatcherQueue.GetForCurrentThread();
             var env = coreWebView2.Environment;
