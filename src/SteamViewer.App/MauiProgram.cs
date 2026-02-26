@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Console;
 using SteamViewer.Client.Core.Capture;
 using SteamViewer.Client.Core.Elevation;
 using SteamViewer.Client.Core.Network;
@@ -44,9 +45,10 @@ public static class MauiProgram
         builder.Services.AddBlazorWebViewDeveloperTools();
         builder.Logging.AddDebug();
         builder.Logging.AddConsole();
-        // Maximum verbosity for debugging - shows EVERYTHING
-        builder.Logging.SetMinimumLevel(LogLevel.Trace);
-        builder.Logging.AddFilter("SteamViewer", LogLevel.Trace);
+        // File logger captures everything (Debug+). Console only shows Info+ to keep CMD clean.
+        builder.Logging.SetMinimumLevel(LogLevel.Debug);
+        builder.Logging.AddFilter("SteamViewer", LogLevel.Debug);
+        builder.Logging.AddFilter<ConsoleLoggerProvider>(null, LogLevel.Information);
         builder.Logging.AddFilter("Microsoft.AspNetCore", LogLevel.Warning); // Reduce noise from Blazor
 #endif
 

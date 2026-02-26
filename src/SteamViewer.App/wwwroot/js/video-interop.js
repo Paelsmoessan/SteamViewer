@@ -105,7 +105,6 @@ window.SteamViewerVideo = {
 
         session.canvas = canvas;
         session.ctx = canvas.getContext('2d', { alpha: false });
-        session.ctx.imageSmoothingEnabled = false;
         console.log(`[Video] Render target set: ${canvasId}`);
         return true;
     },
@@ -210,32 +209,22 @@ if (window.chrome?.webview) {
 
                 const canvas = session.canvas;
                 const ctx = session.ctx;
-                const dpr = window.devicePixelRatio || 1;
-                const rect = canvas.getBoundingClientRect();
-                const cw = Math.round(rect.width * dpr);
-                const ch = Math.round(rect.height * dpr);
 
-                // Resize canvas bitmap if container changed
-                if (canvas.width !== cw || canvas.height !== ch) {
-                    canvas.width = cw;
-                    canvas.height = ch;
-                    ctx.imageSmoothingEnabled = false; // resets on canvas resize
+                // Set canvas bitmap to video resolution — drawImage is 1:1 (zero interpolation).
+                // CSS object-fit: contain handles display scaling (single GPU-accelerated step).
+                if (canvas.width !== meta.w || canvas.height !== meta.h) {
+                    canvas.width = meta.w;
+                    canvas.height = meta.h;
                 }
 
-                // Recompute letterbox if video dims or canvas size changed
-                if (session.videoW !== meta.w || session.videoH !== meta.h ||
-                    session.lastCanvasW !== cw || session.lastCanvasH !== ch) {
-                    session.letterbox = computeLetterbox(cw, ch, meta.w, meta.h);
+                // Update session video dims for mouse coordinate mapping
+                if (session.videoW !== meta.w || session.videoH !== meta.h) {
                     session.videoW = meta.w;
                     session.videoH = meta.h;
-                    session.lastCanvasW = cw;
-                    session.lastCanvasH = ch;
                 }
 
-                const lb = session.letterbox;
-                ctx.fillStyle = '#000';
-                ctx.fillRect(0, 0, cw, ch);
-                ctx.drawImage(frame, lb.dx, lb.dy, lb.dw, lb.dh);
+                // 1:1 draw — no scaling, no letterbox (CSS handles both)
+                ctx.drawImage(frame, 0, 0);
                 frame.close();
             } else {
                 // JPEG fallback (if ever needed)
@@ -248,23 +237,15 @@ if (window.chrome?.webview) {
 
                     const canvas = session.canvas;
                     const ctx = session.ctx;
-                    const dpr = window.devicePixelRatio || 1;
-                    const rect = canvas.getBoundingClientRect();
-                    const cw = Math.round(rect.width * dpr);
-                    const ch = Math.round(rect.height * dpr);
 
-                    if (canvas.width !== cw || canvas.height !== ch) {
-                        canvas.width = cw; canvas.height = ch;
+                    // Match canvas bitmap to video resolution (1:1 draw, CSS scales)
+                    if (canvas.width !== meta.w || canvas.height !== meta.h) {
+                        canvas.width = meta.w; canvas.height = meta.h;
                     }
-
-                    const lb = computeLetterbox(cw, ch, meta.w, meta.h);
-                    session.letterbox = lb;
                     session.videoW = meta.w;
                     session.videoH = meta.h;
 
-                    ctx.fillStyle = '#000';
-                    ctx.fillRect(0, 0, cw, ch);
-                    ctx.drawImage(bitmap, lb.dx, lb.dy, lb.dw, lb.dh);
+                    ctx.drawImage(bitmap, 0, 0);
                     bitmap.close();
                 }).catch(() => {});
             }
@@ -624,31 +605,19 @@ window.SteamViewerInput = {
         }
         const coords = this.getScaledCoords(e);
         const session = window.SteamViewerVideo.sessions.get(this._activeSessionId);
-        const lb = session?.letterbox;
         return {
             x: coords.x, y: coords.y,
-            captureW: lb?.videoW || (this.canvas?.width || 1920),
-            captureH: lb?.videoH || (this.canvas?.height || 1080)
+            captureW: session?.videoW || (this.canvas?.width || 1920),
+            captureH: session?.videoH || (this.canvas?.height || 1080)
         };
     },
 
     getScaledCoords(e) {
+        // Canvas bitmap = video resolution, CSS object-fit: contain handles display.
+        // getScaledCoordsForCanvas computes the CSS-level object-fit offset correctly.
         const session = window.SteamViewerVideo.sessions.get(this._activeSessionId);
-        if (session?.letterbox?.videoW > 0) {
-            const lb = session.letterbox;
-            const canvas = session.canvas || this.canvas;
-            const rect = canvas.getBoundingClientRect();
-            const dpr = window.devicePixelRatio || 1;
-            const bitmapX = (e.clientX - rect.left) * dpr;
-            const bitmapY = (e.clientY - rect.top) * dpr;
-            const relX = bitmapX - lb.dx;
-            const relY = bitmapY - lb.dy;
-            return {
-                x: Math.max(0, Math.min(lb.videoW, relX * lb.videoW / lb.dw)),
-                y: Math.max(0, Math.min(lb.videoH, relY * lb.videoH / lb.dh))
-            };
-        }
-        return this.getScaledCoordsForCanvas(e, this.canvas);
+        const canvas = session?.canvas || this.canvas;
+        return this.getScaledCoordsForCanvas(e, canvas);
     },
 
     getScaledCoordsForCanvas(e, canvas) {
@@ -807,7 +776,6 @@ window.SteamViewerSecureDesktop = {
         this.canvas = document.getElementById(canvasId);
         if (this.canvas) {
             this.ctx = this.canvas.getContext('2d', { alpha: false });
-            this.ctx.imageSmoothingEnabled = false;
             this.isActive = true;
             console.log('[SD] Activated');
         }
