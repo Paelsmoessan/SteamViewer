@@ -39,7 +39,8 @@ public sealed class UdpTransportBackend : ITransportBackend
     private Timer? _cleanupTimer;
 
     private const int MaxFragmentPayload = 1100; // Leave room for UDP/IP headers + encryption overhead
-    private const int FragmentHeaderSize = 4;    // [2 msgId][1 fragIdx][1 totalFrags]
+    private const int FragmentHeaderSize = 6;    // [2 msgId][2 fragIdx][2 totalFrags]
+    private const int MaxMessageSize = 2 * 1024 * 1024; // 2MB sanity limit
 
     public event Action<byte[], int>? OnDataReceived;
     public event Action? OnDisconnected;
@@ -267,26 +268,37 @@ public sealed class UdpTransportBackend : ITransportBackend
     {
         if (_udpClient == null || _peerEndPoint == null || !_active) return;
 
+        if (length > MaxMessageSize)
+        {
+            _logger.LogError("UDP message too large: {Size}KB exceeds {Max}KB limit — dropping",
+                length / 1024, MaxMessageSize / 1024);
+            return;
+        }
+
         var msgId = _nextMessageId++;
         var totalFragments = (length + MaxFragmentPayload - 1) / MaxFragmentPayload;
-        if (totalFragments > 255) totalFragments = 255; // Cap at 255 fragments (281KB max message)
+
+        if (totalFragments > 10)
+            _logger.LogDebug("UDP sending {Size}KB message in {Fragments} fragments (msgId={MsgId})",
+                length / 1024, totalFragments, msgId);
 
         for (int i = 0; i < totalFragments; i++)
         {
             var fragOffset = i * MaxFragmentPayload;
             var fragLen = Math.Min(MaxFragmentPayload, length - fragOffset);
 
-            // Build fragment: [2 msgId][1 fragIdx][1 totalFrags][payload]
+            // Build fragment: [2 msgId][2 fragIdx][2 totalFrags][payload]
             var packet = new byte[FragmentHeaderSize + fragLen];
             packet[0] = (byte)(msgId >> 8);
             packet[1] = (byte)(msgId & 0xFF);
-            packet[2] = (byte)i;
-            packet[3] = (byte)totalFragments;
+            packet[2] = (byte)(i >> 8);
+            packet[3] = (byte)(i & 0xFF);
+            packet[4] = (byte)(totalFragments >> 8);
+            packet[5] = (byte)(totalFragments & 0xFF);
             Buffer.BlockCopy(data, offset + fragOffset, packet, FragmentHeaderSize, fragLen);
 
             if (_useTurnRelay && _turnServerEndPoint != null)
             {
-                // Wrap in TURN SendIndication
                 var sendInd = BuildSendIndication(_peerEndPoint, packet);
                 await _udpClient.SendAsync(sendInd, sendInd.Length, _turnServerEndPoint);
             }
@@ -319,10 +331,10 @@ public sealed class UdpTransportBackend : ITransportBackend
 
                 if (length < FragmentHeaderSize) continue;
 
-                // Parse fragment header
+                // Parse fragment header: [2 msgId][2 fragIdx][2 totalFrags]
                 var msgId = (ushort)((data[0] << 8) | data[1]);
-                var fragIndex = data[2];
-                var totalFrags = data[3];
+                var fragIndex = (data[2] << 8) | data[3];
+                var totalFrags = (data[4] << 8) | data[5];
                 var payload = new byte[length - FragmentHeaderSize];
                 Buffer.BlockCopy(data, FragmentHeaderSize, payload, 0, payload.Length);
 
@@ -387,7 +399,7 @@ public sealed class UdpTransportBackend : ITransportBackend
         var now = Environment.TickCount64;
         foreach (var kvp in _reassemblyBuffers)
         {
-            if (now - kvp.Value.CreatedAt > 200) // 200ms timeout
+            if (now - kvp.Value.CreatedAt > 500) // 500ms timeout (large keyframes need more time)
             {
                 _reassemblyBuffers.TryRemove(kvp.Key, out _);
             }

@@ -62,6 +62,8 @@ public sealed unsafe class FFmpegEncoder : IDisposable
         _codecCtx->max_b_frames = 0;   // Zero latency = no B-frames
         _codecCtx->thread_count = 4;
         _codecCtx->flags |= ffmpeg.AV_CODEC_FLAG_LOW_DELAY;
+        _codecCtx->rc_max_rate = bitrate;           // VBV: max instantaneous rate = target bitrate
+        _codecCtx->rc_buffer_size = (int)(bitrate / fps); // VBV: buffer = one frame worth (~667KB at 20Mbps/30fps)
 
         // H.264 High 4:4:4 Predictive profile (value = 244)
         _codecCtx->profile = 244; // FF_PROFILE_H264_HIGH_444_PREDICTIVE
