@@ -104,7 +104,8 @@ window.SteamViewerVideo = {
         if (!canvas) { console.warn(`[Video] Canvas not found: ${canvasId}`); return false; }
 
         session.canvas = canvas;
-        session.ctx = canvas.getContext('2d');
+        session.ctx = canvas.getContext('2d', { alpha: false });
+        session.ctx.imageSmoothingEnabled = false;
         console.log(`[Video] Render target set: ${canvasId}`);
         return true;
     },
@@ -218,6 +219,7 @@ if (window.chrome?.webview) {
                 if (canvas.width !== cw || canvas.height !== ch) {
                     canvas.width = cw;
                     canvas.height = ch;
+                    ctx.imageSmoothingEnabled = false; // resets on canvas resize
                 }
 
                 // Recompute letterbox if video dims or canvas size changed
@@ -804,7 +806,8 @@ window.SteamViewerSecureDesktop = {
     activate(canvasId) {
         this.canvas = document.getElementById(canvasId);
         if (this.canvas) {
-            this.ctx = this.canvas.getContext('2d');
+            this.ctx = this.canvas.getContext('2d', { alpha: false });
+            this.ctx.imageSmoothingEnabled = false;
             this.isActive = true;
             console.log('[SD] Activated');
         }

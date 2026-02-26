@@ -279,7 +279,7 @@ public sealed class UdpTransportBackend : ITransportBackend
         var totalFragments = (length + MaxFragmentPayload - 1) / MaxFragmentPayload;
 
         if (totalFragments > 10)
-            _logger.LogDebug("UDP sending {Size}KB message in {Fragments} fragments (msgId={MsgId})",
+            _logger.LogTrace("UDP sending {Size}KB message in {Fragments} fragments (msgId={MsgId})",
                 length / 1024, totalFragments, msgId);
 
         for (int i = 0; i < totalFragments; i++)
