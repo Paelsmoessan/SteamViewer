@@ -984,6 +984,16 @@
                     connectionState = ConnectionState.Registered;
                     break;
 
+                case SignalingMessage.TransportEndpoint endpoint:
+                    // Viewer's UDP candidate — forward to host session
+                    if (_hostSession != null)
+                    {
+                        Logger.LogInformation("Routing viewer TransportEndpoint to HostSession ({IpCount} IPs, port {Port})",
+                            endpoint.IPs.Length, endpoint.Port);
+                        _ = _hostSession.HandleViewerTransportEndpointAsync(endpoint.IPs, endpoint.Port);
+                    }
+                    break;
+
                 case SignalingMessage.Error error:
                     errorMessage = error.Message;
                     break;

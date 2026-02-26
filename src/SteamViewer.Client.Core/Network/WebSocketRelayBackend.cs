@@ -11,6 +11,7 @@ public sealed class WebSocketRelayBackend : ITransportBackend
     private bool _disposed;
 
     public event Action<byte[], int>? OnDataReceived;
+    public event Action? OnDisconnected;
     public bool IsActive => _active && !_disposed;
 
     public WebSocketRelayBackend(SignalingClient signalingClient)
@@ -22,6 +23,7 @@ public sealed class WebSocketRelayBackend : ITransportBackend
     public void Start()
     {
         _signalingClient.OnBinaryReceived += HandleBinaryReceived;
+        _signalingClient.OnDisconnected += HandleSignalingDisconnected;
         _active = true;
     }
 
@@ -37,12 +39,20 @@ public sealed class WebSocketRelayBackend : ITransportBackend
         OnDataReceived?.Invoke(data, length);
     }
 
+    private void HandleSignalingDisconnected(string? reason)
+    {
+        if (!_active || _disposed) return;
+        _active = false;
+        OnDisconnected?.Invoke();
+    }
+
     public ValueTask DisposeAsync()
     {
         if (_disposed) return ValueTask.CompletedTask;
         _disposed = true;
         _active = false;
         _signalingClient.OnBinaryReceived -= HandleBinaryReceived;
+        _signalingClient.OnDisconnected -= HandleSignalingDisconnected;
         return ValueTask.CompletedTask;
     }
 }

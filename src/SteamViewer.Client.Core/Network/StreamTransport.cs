@@ -31,6 +31,7 @@ public abstract class StreamTransport : IAsyncDisposable
     private Task? _videoSendTask;
     private bool _disposed;
     protected bool _connected;
+    private int _controlSendFailures;
 
     // Channel IDs for multiplexing over a single transport
     protected const byte ChannelControl = 0;
@@ -54,6 +55,9 @@ public abstract class StreamTransport : IAsyncDisposable
     public event Action<string>? OnConnectionStateChanged;
 
     public bool IsConnected => _connected && !_disposed;
+
+    /// <summary>Whether the transport is currently using a direct UDP backend (vs WebSocket relay).</summary>
+    public bool IsDirectUdp => _backend is UdpTransportBackend;
 
     protected StreamTransport(ILogger logger)
     {
@@ -130,7 +134,15 @@ public abstract class StreamTransport : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Frame send failed (channel {Channel})", channel);
+            _controlSendFailures++;
+            if (_controlSendFailures <= 3)
+                _logger.LogWarning(ex, "Frame send failed (channel {Channel})", channel);
+
+            if (_controlSendFailures >= 10)
+            {
+                _logger.LogError("Control send: {Count} consecutive failures — disconnecting", _controlSendFailures);
+                HandleBackendDisconnected();
+            }
             return false;
         }
     }
@@ -233,6 +245,7 @@ public abstract class StreamTransport : IAsyncDisposable
 
         // Subscribe to data from backend
         _backend.OnDataReceived += HandleDataReceived;
+        _backend.OnDisconnected += HandleBackendDisconnected;
 
         // Start video send loop (host only)
         if (enableVideoSend)
@@ -254,10 +267,12 @@ public abstract class StreamTransport : IAsyncDisposable
         if (oldBackend != null)
         {
             oldBackend.OnDataReceived -= HandleDataReceived;
+            oldBackend.OnDisconnected -= HandleBackendDisconnected;
         }
 
         _backend = newBackend;
         newBackend.OnDataReceived += HandleDataReceived;
+        newBackend.OnDisconnected += HandleBackendDisconnected;
 
         if (oldBackend != null)
         {
@@ -267,8 +282,19 @@ public abstract class StreamTransport : IAsyncDisposable
         _logger.LogInformation("Transport backend switched to {Backend}", newBackend.GetType().Name);
     }
 
+    private void HandleBackendDisconnected()
+    {
+        if (!_connected || _disposed) return;
+        _connected = false;
+        _logger.LogWarning("Transport backend disconnected");
+        _videoSendQueue.Writer.TryComplete();
+        _cts?.Cancel();
+        OnConnectionStateChanged?.Invoke("disconnected");
+    }
+
     private async Task VideoSendLoopAsync(CancellationToken ct)
     {
+        var consecutiveFailures = 0;
         try
         {
             await foreach (var (data, length) in _videoSendQueue.Reader.ReadAllAsync(ct))
@@ -295,11 +321,22 @@ public abstract class StreamTransport : IAsyncDisposable
                         await _backend.SendAsync(encrypted, 0, encrypted.Length, ct);
                     }
                     finally { _sendLock.Release(); }
+
+                    consecutiveFailures = 0;
                 }
                 catch (OperationCanceledException) { break; }
                 catch (Exception ex)
                 {
-                    _logger.LogWarning(ex, "Video send error");
+                    consecutiveFailures++;
+                    if (consecutiveFailures <= 3)
+                        _logger.LogWarning(ex, "Video send error ({Count})", consecutiveFailures);
+
+                    if (consecutiveFailures >= 10)
+                    {
+                        _logger.LogError("Video send: {Count} consecutive failures — disconnecting", consecutiveFailures);
+                        HandleBackendDisconnected();
+                        break;
+                    }
                 }
             }
         }

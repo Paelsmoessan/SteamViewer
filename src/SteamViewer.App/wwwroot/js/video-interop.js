@@ -218,8 +218,6 @@ if (window.chrome?.webview) {
                 if (canvas.width !== cw || canvas.height !== ch) {
                     canvas.width = cw;
                     canvas.height = ch;
-                    session.lastCanvasW = cw;
-                    session.lastCanvasH = ch;
                 }
 
                 // Recompute letterbox if video dims or canvas size changed

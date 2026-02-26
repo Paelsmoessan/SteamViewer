@@ -13,6 +13,9 @@ public interface ITransportBackend : IAsyncDisposable
     /// <summary>Raised when data is received from the peer. Parameters: (byte[] data, int length).</summary>
     event Action<byte[], int>? OnDataReceived;
 
+    /// <summary>Raised when the backend detects a disconnection.</summary>
+    event Action? OnDisconnected;
+
     /// <summary>Whether this backend is currently active and can send/receive.</summary>
     bool IsActive { get; }
 }

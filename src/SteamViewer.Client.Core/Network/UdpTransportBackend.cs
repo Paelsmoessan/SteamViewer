@@ -42,6 +42,7 @@ public sealed class UdpTransportBackend : ITransportBackend
     private const int FragmentHeaderSize = 4;    // [2 msgId][1 fragIdx][1 totalFrags]
 
     public event Action<byte[], int>? OnDataReceived;
+    public event Action? OnDisconnected;
     public bool IsActive => _active && !_disposed;
 
     /// <summary>Local endpoint that was bound.</summary>

@@ -195,6 +195,22 @@ public sealed class HostSession : IAsyncDisposable
         SetState(HostSessionState.WaitingForViewer);
     }
 
+    /// <summary>
+    /// Handle a TransportEndpoint from the viewer (their UDP candidate IPs/port).
+    /// Called from Home.razor when signaling routes TransportEndpoint to this session.
+    /// </summary>
+    public async Task HandleViewerTransportEndpointAsync(string[] ips, int port)
+    {
+        if (_transport == null)
+        {
+            _logger.LogWarning("Received viewer TransportEndpoint but transport is null");
+            return;
+        }
+
+        _logger.LogInformation("Host: Received viewer UDP endpoints ({Count} IPs, port {Port})", ips.Length, port);
+        await _transport.HandleViewerEndpointAsync(ips, port);
+    }
+
     private async Task HandleTransportConnected()
     {
         _logger.LogInformation("Host: Transport connected - ready for communication");
@@ -203,6 +219,23 @@ public sealed class HostSession : IAsyncDisposable
 
         // Start clipboard file monitoring (detect CF_HDROP on host clipboard)
         StartClipboardFileTransfer();
+
+        // Fire-and-forget UDP upgrade attempt (relay continues working in background)
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var turnUri = _configuration["TurnServer:Urls:0"];
+                var turnUser = _configuration["TurnServer:Username"];
+                var turnCred = _configuration["TurnServer:Credential"];
+                await _transport!.AttemptUdpUpgradeAsync(
+                    PeerId, _sendSignaling, turnUri, turnUser, turnCred);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "UDP upgrade attempt failed");
+            }
+        });
 
         // Send elevation status to viewer
         try

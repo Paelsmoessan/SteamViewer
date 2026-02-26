@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.JSInterop;
 using SteamViewer.App.Services;
@@ -19,6 +20,7 @@ public sealed class ViewerSession : IAsyncDisposable
     private IJSRuntime _jsRuntime;
     private readonly ILogger _logger;
     private readonly ILoggerFactory _loggerFactory;
+    private readonly IConfiguration _configuration;
     private readonly Func<SignalingMessage, Task> _sendSignaling;
     private readonly SignalingClient _signalingClient;
     private int _sdViewerFrameCount;
@@ -167,6 +169,7 @@ public sealed class ViewerSession : IAsyncDisposable
         string peerId,
         IJSRuntime jsRuntime,
         ILoggerFactory loggerFactory,
+        IConfiguration configuration,
         Func<SignalingMessage, Task> sendSignaling,
         SignalingClient signalingClient)
     {
@@ -176,6 +179,7 @@ public sealed class ViewerSession : IAsyncDisposable
         _jsRuntime = jsRuntime;
         _logger = loggerFactory.CreateLogger<ViewerSession>();
         _loggerFactory = loggerFactory;
+        _configuration = configuration;
         _sendSignaling = sendSignaling;
         _signalingClient = signalingClient;
     }
@@ -230,6 +234,23 @@ public sealed class ViewerSession : IAsyncDisposable
 
             // Start clipboard file monitoring
             StartClipboardFileTransfer();
+
+            // Fire-and-forget UDP upgrade attempt (relay continues working in background)
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    var turnUri = _configuration["TurnServer:Urls:0"];
+                    var turnUser = _configuration["TurnServer:Username"];
+                    var turnCred = _configuration["TurnServer:Credential"];
+                    await _transport!.AttemptUdpUpgradeAsync(
+                        _sendSignaling, PeerId, turnUri, turnUser, turnCred);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Session {SessionId}: UDP upgrade attempt failed", SessionId);
+                }
+            });
         }
         catch (Exception ex)
         {
@@ -242,13 +263,20 @@ public sealed class ViewerSession : IAsyncDisposable
     }
 
     /// <summary>
-    /// Handle TransportEndpoint from host — legacy, kept for backward compatibility.
-    /// Phase 2 direct UDP will reuse this.
+    /// Handle TransportEndpoint from host — contains host's UDP candidate IPs/port.
+    /// Probes each IP and switches to direct UDP if successful.
     /// </summary>
-    public Task HandleTransportEndpointAsync(string[] ips, int port)
+    public async Task HandleTransportEndpointAsync(string[] ips, int port)
     {
-        _logger.LogDebug("Session {SessionId}: Received TransportEndpoint (not used in relay mode)", SessionId);
-        return Task.CompletedTask;
+        if (_transport == null)
+        {
+            _logger.LogWarning("Session {SessionId}: Received TransportEndpoint but transport is null", SessionId);
+            return;
+        }
+
+        _logger.LogInformation("Session {SessionId}: Received host UDP endpoints ({Count} IPs, port {Port})",
+            SessionId, ips.Length, port);
+        await _transport.HandleHostEndpointAsync(ips, port);
     }
 
     /// <summary>
@@ -442,7 +470,7 @@ public sealed class ViewerSession : IAsyncDisposable
             bitrateMbps = Math.Round(bytesPerSec * 8.0 / 1_000_000, 1),
             totalFrames = frameCount,
             totalBytes = bytesDecoded,
-            transport = "FFmpeg+Relay"
+            transport = _transport?.IsDirectUdp == true ? "FFmpeg+Direct" : "FFmpeg+Relay"
         });
 
         OnStatsUpdated?.Invoke(json);

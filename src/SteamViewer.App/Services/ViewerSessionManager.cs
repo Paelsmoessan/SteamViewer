@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.JSInterop;
 using SteamViewer.App.Services.Models;
@@ -17,6 +18,7 @@ public sealed class ViewerSessionManager : IAsyncDisposable
 {
     private readonly ILogger<ViewerSessionManager> _logger;
     private readonly ILoggerFactory _loggerFactory;
+    private readonly IConfiguration _configuration;
     private readonly SignalingClient _signalingClient;
 
     private readonly ConcurrentDictionary<string, ViewerSession> _sessions = new();
@@ -62,10 +64,12 @@ public sealed class ViewerSessionManager : IAsyncDisposable
     public ViewerSessionManager(
         ILogger<ViewerSessionManager> logger,
         ILoggerFactory loggerFactory,
+        IConfiguration configuration,
         SignalingClient signalingClient)
     {
         _logger = logger;
         _loggerFactory = loggerFactory;
+        _configuration = configuration;
         _signalingClient = signalingClient;
     }
 
@@ -121,6 +125,7 @@ public sealed class ViewerSessionManager : IAsyncDisposable
             peerId,
             jsRuntime,
             _loggerFactory,
+            _configuration,
             SendSignalingMessage,
             _signalingClient);
         session.StoredPassword = password;
@@ -236,6 +241,7 @@ public sealed class ViewerSessionManager : IAsyncDisposable
             peerId,
             jsRuntime,
             _loggerFactory,
+            _configuration,
             SendSignalingMessage,
             _signalingClient);
         session.StoredPassword = password;
