@@ -254,32 +254,44 @@ public sealed class UdpTransportBackend : ITransportBackend
     {
         if (_udpClient == null) return false;
 
-        // Drain stale packets (STUN/TURN leftovers) so they don't interfere with probe
-        while (_udpClient.Available > 0)
-        {
-            try
-            {
-                using var drainCts = new CancellationTokenSource(1);
-                await _udpClient.ReceiveAsync(drainCts.Token);
-            }
-            catch { break; }
-        }
+        // No drain loop — all prior ReceiveAsync calls use CancellationTokens,
+        // so no abandoned tasks. Any stale packets in the kernel buffer are either
+        // small (peer's probe = success) or large (STUN/TURN = filtered below).
 
+        using var probeCts = new CancellationTokenSource(timeout);
         try
         {
-            // Send a small probe packet
-            var probe = new byte[] { 0xFF };
-            await _udpClient.SendAsync(probe, 1, endpoint);
+            // Send initial probe
+            await _udpClient.SendAsync(new byte[] { 0xFF }, 1, endpoint);
 
-            // Wait for any response (cancellable — no abandoned tasks on timeout)
-            using var probeCts = new CancellationTokenSource(timeout);
-            await _udpClient.ReceiveAsync(probeCts.Token);
-            _logger.LogInformation("UDP probe to {Endpoint} succeeded", endpoint);
-            return true;
+            while (!probeCts.Token.IsCancellationRequested)
+            {
+                // Wait for response, re-send probe every 200ms to cover timing race
+                // (peer may not have started listening when our first probe arrived)
+                using var subCts = CancellationTokenSource.CreateLinkedTokenSource(probeCts.Token);
+                subCts.CancelAfter(200);
+                try
+                {
+                    var result = await _udpClient.ReceiveAsync(subCts.Token);
+                    // Small packet = peer's probe or echo → success
+                    if (result.Buffer.Length <= 2)
+                    {
+                        _logger.LogInformation("UDP probe to {Endpoint} succeeded", endpoint);
+                        return true;
+                    }
+                    // Larger packet (stale STUN/TURN response) — ignore, keep waiting
+                }
+                catch (OperationCanceledException) when (!probeCts.Token.IsCancellationRequested)
+                {
+                    // 200ms sub-timeout expired, re-send probe
+                    try { await _udpClient.SendAsync(new byte[] { 0xFF }, 1, endpoint); }
+                    catch { /* best effort */ }
+                }
+            }
         }
         catch (OperationCanceledException)
         {
-            // Timeout — probe failed, no orphaned task left behind
+            // Overall timeout — probe failed
         }
         catch (Exception ex)
         {

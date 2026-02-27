@@ -580,8 +580,9 @@ public sealed class DxgiScreenCapture : IScreenCapture
 
             if (acquireResult.Failure)
             {
-                _logger.LogWarning("Failed to acquire next frame: {Error}", acquireResult.Description);
-                return null;
+                _logger.LogWarning("AcquireNextFrame failed: {Error} (0x{Code:X8}) — needs reinitialize",
+                    acquireResult.Description, acquireResult.Code);
+                throw new InvalidOperationException($"Desktop duplication access lost (0x{acquireResult.Code:X8})");
             }
 
             try

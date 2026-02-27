@@ -84,6 +84,9 @@ public sealed class InputMessageRouter : IDisposable
             var json = e.TryGetWebMessageAsString();
             if (string.IsNullOrEmpty(json)) return;
 
+            // Skip Blazor WebView internal messages (__bwv: prefix, not JSON)
+            if (json[0] != '{') return;
+
             using var doc = JsonDocument.Parse(json);
             var root = doc.RootElement;
 
