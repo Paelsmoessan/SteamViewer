@@ -994,6 +994,15 @@
                     }
                     break;
 
+                case SignalingMessage.TransportConfirmed confirmed:
+                    // Viewer confirmed UDP probe succeeded — forward to host session
+                    if (_hostSession != null)
+                    {
+                        Logger.LogInformation("Routing TransportConfirmed to HostSession");
+                        _ = _hostSession.HandleTransportConfirmedAsync();
+                    }
+                    break;
+
                 case SignalingMessage.Error error:
                     errorMessage = error.Message;
                     break;

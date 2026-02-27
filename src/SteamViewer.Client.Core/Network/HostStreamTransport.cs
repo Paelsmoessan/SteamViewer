@@ -13,12 +13,14 @@ namespace SteamViewer.Client.Core.Network;
 /// 1. Host approves incoming connection
 /// 2. StartRelayAsync(): WebSocket relay via signaling server (immediate)
 /// 3. In background: AttemptUdpUpgradeAsync() tries STUN/TURN for direct P2P
-/// 4. If UDP works → switch backend (transparent to upper layers)
+/// 4. If UDP probe succeeds → send TransportConfirmed, wait for peer confirmation → switch backend
 /// </summary>
 public sealed class HostStreamTransport : StreamTransport
 {
     private readonly SignalingClient _signalingClient;
     private UdpTransportBackend? _udpBackend;
+    private Func<SignalingMessage, Task>? _sendSignaling;
+    private string? _peerId;
 
     public HostStreamTransport(SignalingClient signalingClient, ILogger logger) : base(logger)
     {
@@ -56,12 +58,6 @@ public sealed class HostStreamTransport : StreamTransport
     /// Call after relay is established. Runs in background — does not block.
     /// If UDP upgrade fails, the WebSocket relay continues working.
     /// </summary>
-    /// <param name="peerId">Viewer's client ID.</param>
-    /// <param name="sendSignaling">Signaling callback.</param>
-    /// <param name="turnServerUri">TURN server URI (e.g., "turn:host:port").</param>
-    /// <param name="turnUsername">TURN username.</param>
-    /// <param name="turnCredential">TURN password.</param>
-    /// <param name="onEndpointReady">Called with local/reflexive/turn endpoints for signaling exchange.</param>
     public async Task AttemptUdpUpgradeAsync(
         string peerId,
         Func<SignalingMessage, Task> sendSignaling,
@@ -70,6 +66,10 @@ public sealed class HostStreamTransport : StreamTransport
         string? turnCredential = null,
         Func<string[], int, Task>? onEndpointReady = null)
     {
+        // Store for sending TransportConfirmed later
+        _sendSignaling = sendSignaling;
+        _peerId = peerId;
+
         try
         {
             _udpBackend = new UdpTransportBackend(_logger);
@@ -119,7 +119,8 @@ public sealed class HostStreamTransport : StreamTransport
 
     /// <summary>
     /// Handle a TransportEndpoint from the viewer (their UDP candidate).
-    /// Probes the endpoint and switches to UDP if successful.
+    /// Probes the endpoint. If successful, stores as pending and sends TransportConfirmed.
+    /// Actual switch happens only when both sides confirm.
     /// </summary>
     public async Task HandleViewerEndpointAsync(string[] viewerIPs, int viewerPort)
     {
@@ -134,8 +135,30 @@ public sealed class HostStreamTransport : StreamTransport
                 if (probeOk)
                 {
                     _udpBackend.ConnectToPeer(endpoint, useTurnRelay: false);
-                    await SwitchBackendAsync(_udpBackend);
-                    _logger.LogInformation("Host: switched to direct UDP via {Endpoint}", endpoint);
+
+                    // Store as pending — don't switch yet
+                    _pendingUdpBackend = _udpBackend;
+                    _localUdpReady = true;
+                    _logger.LogInformation("Host: UDP probe succeeded via {Endpoint} — waiting for peer confirmation", endpoint);
+
+                    // Send confirmation to viewer
+                    if (_sendSignaling != null && _peerId != null)
+                        await _sendSignaling(new SignalingMessage.TransportConfirmed(_peerId));
+
+                    // Check if peer already confirmed
+                    await TryCompleteSwitchAsync();
+
+                    // Start timeout — if peer doesn't confirm within 5s, stay on relay
+                    _ = Task.Run(async () =>
+                    {
+                        await Task.Delay(5000);
+                        if (_localUdpReady && !_remoteUdpReady && _pendingUdpBackend != null)
+                        {
+                            _logger.LogWarning("Host: peer did not confirm UDP within 5s — staying on relay");
+                            _localUdpReady = false;
+                            _pendingUdpBackend = null;
+                        }
+                    });
                     return;
                 }
             }
@@ -149,9 +172,6 @@ public sealed class HostStreamTransport : StreamTransport
         if (_udpBackend.TurnRelayEndPoint != null)
         {
             _logger.LogInformation("Host: direct UDP failed, trying TURN relay");
-            // For TURN, we'd send to the TURN server with SendIndication targeting the viewer's relay address
-            // This requires both sides to have allocated TURN and exchanged relay endpoints
-            // For now, log and stay on WebSocket relay
             _logger.LogInformation("Host: TURN relay upgrade not yet implemented — staying on WebSocket relay");
         }
         else
@@ -160,13 +180,24 @@ public sealed class HostStreamTransport : StreamTransport
         }
     }
 
+    /// <summary>
+    /// Handle TransportConfirmed from the viewer — viewer's probe also succeeded.
+    /// If our probe already succeeded, complete the switch.
+    /// </summary>
+    public async Task HandleTransportConfirmedAsync()
+    {
+        _remoteUdpReady = true;
+        _logger.LogInformation("Host: received UDP confirmation from viewer");
+        await TryCompleteSwitchAsync();
+    }
+
     public override async ValueTask DisposeAsync()
     {
-        if (_udpBackend != null)
+        if (_udpBackend != null && _udpBackend != _pendingUdpBackend)
         {
             await _udpBackend.DisposeAsync();
-            _udpBackend = null;
         }
+        _udpBackend = null;
         await base.DisposeAsync();
     }
 }

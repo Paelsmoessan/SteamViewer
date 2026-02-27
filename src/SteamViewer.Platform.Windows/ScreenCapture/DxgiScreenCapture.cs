@@ -153,6 +153,8 @@ public sealed class DxgiScreenCapture : IScreenCapture
         var jpegStream = new MemoryStream(512 * 1024); // Pre-allocate 512KB, reuse across frames
         var frameCount = 0;
         var consecutiveErrors = 0;
+        var reinitStartTicks = 0L; // Timestamp when reinitialize retries began
+        const long maxReinitDurationTicks = 120; // 2 minutes (compared against elapsed seconds)
         const int targetIntervalMs = 33; // ~30 FPS target
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var idleSw = System.Diagnostics.Stopwatch.StartNew(); // Tracks time since last frame fired
@@ -236,30 +238,43 @@ public sealed class DxgiScreenCapture : IScreenCapture
                         Thread.Sleep(sleepMs);
                 }
                 catch (InvalidOperationException ex) when (
-                    ex.Message.Contains("access lost", StringComparison.OrdinalIgnoreCase))
+                    ex.Message.Contains("access lost", StringComparison.OrdinalIgnoreCase) ||
+                    ex.Message.Contains("Not capturing", StringComparison.OrdinalIgnoreCase))
                 {
-                    // DXGI_ERROR_ACCESS_LOST — display mode change, hot-plug, lock screen
-                    // Must reinitialize the output duplication
+                    // DXGI_ERROR_ACCESS_LOST or resources released after failed reinitialize
+                    // Triggers: desktop switch (UAC Secure Desktop), hot-plug, lock screen, display mode change
                     consecutiveErrors++;
-                    _logger.LogWarning("DXGI access lost (attempt {Count}), reinitializing...", consecutiveErrors);
 
-                    if (consecutiveErrors > 10)
+                    // Start the reinit clock on first error
+                    if (consecutiveErrors == 1)
+                        reinitStartTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+
+                    var reinitElapsedSec = (System.Diagnostics.Stopwatch.GetTimestamp() - reinitStartTicks)
+                        / (double)System.Diagnostics.Stopwatch.Frequency;
+
+                    _logger.LogWarning("DXGI needs reinitialize: {Message} (attempt {Count}, {Elapsed:F0}s elapsed)",
+                        ex.Message, consecutiveErrors, reinitElapsedSec);
+
+                    if (reinitElapsedSec > maxReinitDurationTicks)
                     {
-                        _logger.LogError("Too many consecutive DXGI errors, stopping capture");
+                        _logger.LogError("DXGI reinitialize failed for over 2 minutes, stopping capture");
                         break;
                     }
 
-                    // Brief wait then reinitialize
-                    Thread.Sleep(500);
+                    // Wait then reinitialize — first attempt immediate, then 250ms between retries
+                    if (consecutiveErrors > 1)
+                        Thread.Sleep(250);
 
                     try
                     {
                         Reinitialize();
+                        // Success — reset for next desktop switch event
+                        consecutiveErrors = 0;
+                        _logger.LogInformation("DXGI reinitialize succeeded after {Elapsed:F1}s", reinitElapsedSec);
                     }
                     catch (Exception reinitEx)
                     {
                         _logger.LogWarning(reinitEx, "DXGI reinitialize failed, will retry");
-                        Thread.Sleep(1000);
                     }
                 }
                 catch (Exception ex)

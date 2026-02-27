@@ -84,11 +84,11 @@ public sealed class UdpTransportBackend : ITransportBackend
             var stunBytes = stunRequest.ToByteBuffer(null, false);
             await _udpClient.SendAsync(stunBytes, stunBytes.Length, stunServer);
 
-            // Wait for STUN response (2s timeout)
-            var receiveTask = _udpClient.ReceiveAsync();
-            if (await Task.WhenAny(receiveTask, Task.Delay(2000)) == receiveTask)
+            // Wait for STUN response (2s timeout, cancellable — no abandoned tasks)
+            using var stunCts = new CancellationTokenSource(2000);
+            try
             {
-                var result = await receiveTask;
+                var result = await _udpClient.ReceiveAsync(stunCts.Token);
                 var response = STUNMessage.ParseSTUNMessage(result.Buffer, result.Buffer.Length);
                 if (response != null)
                 {
@@ -102,7 +102,7 @@ public sealed class UdpTransportBackend : ITransportBackend
                     }
                 }
             }
-            else
+            catch (OperationCanceledException)
             {
                 _logger.LogWarning("STUN binding timed out");
             }
@@ -147,15 +147,21 @@ public sealed class UdpTransportBackend : ITransportBackend
         var allocateBytes = allocateReq.ToByteBuffer(null, false);
         await _udpClient!.SendAsync(allocateBytes, allocateBytes.Length, _turnServerEndPoint);
 
-        // Wait for 401 response with nonce/realm
-        var resp401Task = _udpClient.ReceiveAsync();
-        if (await Task.WhenAny(resp401Task, Task.Delay(3000)) != resp401Task)
+        // Wait for 401 response with nonce/realm (cancellable — no abandoned tasks)
+        UdpReceiveResult resp401;
+        using (var turn401Cts = new CancellationTokenSource(3000))
         {
-            _logger.LogWarning("TURN Allocate timed out waiting for 401");
-            return;
+            try
+            {
+                resp401 = await _udpClient.ReceiveAsync(turn401Cts.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                _logger.LogWarning("TURN Allocate timed out waiting for 401");
+                return;
+            }
         }
 
-        var resp401 = await resp401Task;
         var msg401 = STUNMessage.ParseSTUNMessage(resp401.Buffer, resp401.Buffer.Length);
         if (msg401 == null)
         {
@@ -185,15 +191,21 @@ public sealed class UdpTransportBackend : ITransportBackend
         var authBytes = allocateAuth.ToByteBufferStringKey(credential, false);
         await _udpClient.SendAsync(authBytes, authBytes.Length, _turnServerEndPoint);
 
-        // Wait for Allocate success
-        var respAllocTask = _udpClient.ReceiveAsync();
-        if (await Task.WhenAny(respAllocTask, Task.Delay(3000)) != respAllocTask)
+        // Wait for Allocate success (cancellable — no abandoned tasks)
+        UdpReceiveResult respAlloc;
+        using (var turnAllocCts = new CancellationTokenSource(3000))
         {
-            _logger.LogWarning("TURN: Authenticated Allocate timed out");
-            return;
+            try
+            {
+                respAlloc = await _udpClient.ReceiveAsync(turnAllocCts.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                _logger.LogWarning("TURN: Authenticated Allocate timed out");
+                return;
+            }
         }
 
-        var respAlloc = await respAllocTask;
         var msgAlloc = STUNMessage.ParseSTUNMessage(respAlloc.Buffer, respAlloc.Buffer.Length);
         if (msgAlloc?.Header.MessageType == STUNMessageTypesEnum.AllocateSuccessResponse)
         {
@@ -236,25 +248,38 @@ public sealed class UdpTransportBackend : ITransportBackend
 
     /// <summary>
     /// Probe the peer endpoint with a small packet. Returns true if a response is received within timeout.
+    /// Uses cancellable ReceiveAsync to avoid orphaned tasks that steal packets from subsequent probes.
     /// </summary>
     public async Task<bool> ProbeAsync(IPEndPoint endpoint, TimeSpan timeout)
     {
         if (_udpClient == null) return false;
 
+        // Drain stale packets (STUN/TURN leftovers) so they don't interfere with probe
+        while (_udpClient.Available > 0)
+        {
+            try
+            {
+                using var drainCts = new CancellationTokenSource(1);
+                await _udpClient.ReceiveAsync(drainCts.Token);
+            }
+            catch { break; }
+        }
+
         try
         {
-            // Send a small probe packet (just a zero byte)
+            // Send a small probe packet
             var probe = new byte[] { 0xFF };
             await _udpClient.SendAsync(probe, 1, endpoint);
 
-            // Wait for any response
-            var cts = new CancellationTokenSource(timeout);
-            var receiveTask = _udpClient.ReceiveAsync();
-            if (await Task.WhenAny(receiveTask, Task.Delay(timeout)) == receiveTask)
-            {
-                _logger.LogInformation("UDP probe to {Endpoint} succeeded", endpoint);
-                return true;
-            }
+            // Wait for any response (cancellable — no abandoned tasks on timeout)
+            using var probeCts = new CancellationTokenSource(timeout);
+            await _udpClient.ReceiveAsync(probeCts.Token);
+            _logger.LogInformation("UDP probe to {Endpoint} succeeded", endpoint);
+            return true;
+        }
+        catch (OperationCanceledException)
+        {
+            // Timeout — probe failed, no orphaned task left behind
         }
         catch (Exception ex)
         {

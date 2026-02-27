@@ -280,6 +280,21 @@ public sealed class ViewerSession : IAsyncDisposable
     }
 
     /// <summary>
+    /// Handle TransportConfirmed from host — host's UDP probe succeeded.
+    /// </summary>
+    public async Task HandleTransportConfirmedAsync()
+    {
+        if (_transport == null)
+        {
+            _logger.LogWarning("Session {SessionId}: Received TransportConfirmed but transport is null", SessionId);
+            return;
+        }
+
+        _logger.LogInformation("Session {SessionId}: Received TransportConfirmed from host", SessionId);
+        await _transport.HandleTransportConfirmedAsync();
+    }
+
+    /// <summary>
     /// Bind the session to a viewer window's JSRuntime.
     /// Sets up video rendering target (NativeFrameBridge) and input capture.
     /// </summary>
@@ -340,9 +355,22 @@ public sealed class ViewerSession : IAsyncDisposable
     /// Send an input event to the remote peer.
     /// All input goes over the control channel (TCP is already ordered/reliable).
     /// </summary>
+    private int _inputDropCount;
+
     public async Task SendInputAsync(InputEvent inputEvent)
     {
-        if (_transport == null || !_transport.IsConnected) return;
+        if (_transport == null)
+        {
+            if (++_inputDropCount <= 5)
+                _logger.LogWarning("Session {SessionId}: Input dropped — transport is null (drop #{Count})", SessionId, _inputDropCount);
+            return;
+        }
+        if (!_transport.IsConnected)
+        {
+            if (++_inputDropCount <= 5)
+                _logger.LogWarning("Session {SessionId}: Input dropped — transport not connected (drop #{Count})", SessionId, _inputDropCount);
+            return;
+        }
 
         try
         {

@@ -211,6 +211,22 @@ public sealed class HostSession : IAsyncDisposable
         await _transport.HandleViewerEndpointAsync(ips, port);
     }
 
+    /// <summary>
+    /// Handle TransportConfirmed from the viewer — viewer's UDP probe succeeded.
+    /// Called from Home.razor when signaling routes TransportConfirmed to this session.
+    /// </summary>
+    public async Task HandleTransportConfirmedAsync()
+    {
+        if (_transport == null)
+        {
+            _logger.LogWarning("Received TransportConfirmed but transport is null");
+            return;
+        }
+
+        _logger.LogInformation("Host: Received TransportConfirmed from viewer");
+        await _transport.HandleTransportConfirmedAsync();
+    }
+
     private async Task HandleTransportConnected()
     {
         _logger.LogInformation("Host: Transport connected - ready for communication");
@@ -371,7 +387,7 @@ public sealed class HostSession : IAsyncDisposable
             {
                 FFmpegInit.EnsureInitialized();
                 var encoder = new FFmpegEncoder(_loggerFactory.CreateLogger<FFmpegEncoder>());
-                encoder.Initialize(width, height, 30, 20_000_000); // 30fps, 20Mbps
+                encoder.Initialize(width, height, 30, 20_000_000, crf: 18); // 30fps, CRF 18 (visually lossless), VBV cap 20Mbps
                 _encoder = encoder; // Assign only after successful init
                 _logger.LogInformation("FFmpeg encoder initialized: {W}x{H}", width, height);
             }

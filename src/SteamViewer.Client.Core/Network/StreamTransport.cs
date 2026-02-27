@@ -33,6 +33,11 @@ public abstract class StreamTransport : IAsyncDisposable
     protected bool _connected;
     private int _controlSendFailures;
 
+    // Synchronized UDP switch state
+    protected ITransportBackend? _pendingUdpBackend;
+    protected bool _localUdpReady;
+    protected bool _remoteUdpReady;
+
     // Channel IDs for multiplexing over a single transport
     protected const byte ChannelControl = 0;
     protected const byte ChannelVideo = 1;
@@ -282,6 +287,21 @@ public abstract class StreamTransport : IAsyncDisposable
         _logger.LogInformation("Transport backend switched to {Backend}", newBackend.GetType().Name);
     }
 
+    /// <summary>
+    /// Check if both sides have confirmed UDP readiness and complete the switch if so.
+    /// Called after setting either _localUdpReady or _remoteUdpReady.
+    /// </summary>
+    protected async Task TryCompleteSwitchAsync()
+    {
+        if (_localUdpReady && _remoteUdpReady && _pendingUdpBackend != null)
+        {
+            var pending = _pendingUdpBackend;
+            _pendingUdpBackend = null;
+            await SwitchBackendAsync(pending);
+            _logger.LogInformation("Both sides confirmed UDP — backend switched to direct");
+        }
+    }
+
     private void HandleBackendDisconnected()
     {
         if (!_connected || _disposed) return;
@@ -354,6 +374,13 @@ public abstract class StreamTransport : IAsyncDisposable
         if (_disposed) return;
         _disposed = true;
         _connected = false;
+
+        // Dispose pending UDP backend if switch never completed
+        if (_pendingUdpBackend != null)
+        {
+            await _pendingUdpBackend.DisposeAsync();
+            _pendingUdpBackend = null;
+        }
 
         // Unsubscribe from backend
         if (_backend != null)

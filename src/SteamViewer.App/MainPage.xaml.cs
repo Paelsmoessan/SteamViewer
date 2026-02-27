@@ -43,6 +43,9 @@ public partial class MainPage : ContentPage
         {
             var bridge = MauiProgram.ServiceProvider?.GetService<Services.NativeFrameBridge>();
             bridge?.Initialize(coreWebView2);
+
+            var inputRouter = MauiProgram.ServiceProvider?.GetService<Services.InputMessageRouter>();
+            inputRouter?.Initialize(coreWebView2);
         }
         catch (Exception ex)
         {

@@ -249,9 +249,11 @@
     OnConnected="HandleConnected" />
 
 @code {
-    private DotNetObjectReference<RemoteViewer>? _dotNetRef;
     private DotNetObjectReference<RemoteViewer>? _tabDragRef;
     private DotNetObjectReference<RemoteViewer>? _loggerDotNetRef;
+#if WINDOWS
+    private Services.InputMessageRouter? _inputRouter;
+#endif
     private bool _canvasInitialized;
     private bool _inputInitialized;
     private bool _tabDragInitialized;
@@ -309,12 +311,24 @@
                 _canvasInitialized = true;
 
                 // Initialize input capture (without floating lock indicator - we have toolbar button)
-                _dotNetRef = DotNetObjectReference.Create(this);
+                // Input events route through WebView2 postMessage → InputMessageRouter (no dotNetRef needed)
                 _inputInitialized = await JSRuntime.InvokeAsync<bool>(
                     "SteamViewerInput.initialize",
                     "viewerCanvas",
-                    _dotNetRef,
                     new { showLockIndicator = false });
+
+#if WINDOWS
+                // Wire up InputMessageRouter for postMessage-based input
+                _inputRouter = MauiProgram.ServiceProvider?.GetService<Services.InputMessageRouter>();
+                if (_inputRouter != null)
+                {
+                    _inputRouter.OnCtrlAltDelRequested += HandleCtrlAltDelFromRouter;
+                    _inputRouter.OnClipboardPasteRequested += HandleClipboardPasteFromRouter;
+                    _inputRouter.OnLockChanged += HandleLockChangedFromRouter;
+                    if (_activeSession != null)
+                        _inputRouter.SetActiveSession(_activeSession);
+                }
+#endif
 
                 // Initialize tab drag functionality
                 _tabDragRef = DotNetObjectReference.Create(this);
@@ -450,6 +464,9 @@
         if (sessionId != null)
         {
             _activeSession = SessionManager.GetSession(sessionId);
+#if WINDOWS
+            _inputRouter?.SetActiveSession(_activeSession);
+#endif
             if (_activeSession != null)
             {
                 _activeSession.OnVideoStarted += HandleVideoStarted;
@@ -479,6 +496,9 @@
         else
         {
             _activeSession = null;
+#if WINDOWS
+            _inputRouter?.SetActiveSession(null);
+#endif
         }
 
         // Restore new tab's per-tab state
@@ -723,21 +743,7 @@
         StateHasChanged();
     }
 
-    [JSInvokable]
-    public void OnInputLockChanged(bool locked)
-    {
-        _inputLocked = locked;
-        if (locked)
-            SystemKeyInterceptor.Install();
-        else
-            SystemKeyInterceptor.Uninstall();
-
-        // Notify host so it can hide/show cursor in video stream
-        if (_activeSession != null)
-            _ = _activeSession.SendInputLockStateAsync(locked);
-
-        InvokeAsync(StateHasChanged);
-    }
+    // OnInputLockChanged: now routed through InputMessageRouter.OnLockChanged → HandleLockChangedFromRouter
 
     [JSInvokable]
     public void OnJSLog(string level, string message)
@@ -946,8 +952,7 @@
     /// Reads clipboard via native Win32 (WebView2 blocks clipboard API in keydown context).
     /// Sends clipboard_paste to host, or falls back to Ctrl+V keystroke if clipboard is empty.
     /// </summary>
-    [JSInvokable]
-    public async Task OnClipboardPaste()
+    private async Task OnClipboardPaste()
     {
         if (_activeSession == null) return;
 
@@ -1244,7 +1249,7 @@
         }
     }
 
-    #region Input Callbacks (relayed to main window or active session)
+    #region Input Callbacks
 
     private void SendInputToActiveSession(InputEvent inputEvent)
     {
@@ -1252,77 +1257,6 @@
         {
             _ = _activeSession.SendInputAsync(inputEvent);
         }
-    }
-
-    [JSInvokable]
-    public void OnMouseMove(double x, double y, int captureWidth = 0, int captureHeight = 0)
-    {
-        SendInputToActiveSession(new InputEvent.MouseMove(x, y, captureWidth, captureHeight));
-    }
-
-    [JSInvokable]
-    public void OnMouseDown(string button, double x, double y, int captureWidth = 0, int captureHeight = 0)
-    {
-        var mouseButton = ParseMouseButton(button);
-        SendInputToActiveSession(new InputEvent.MouseDown(mouseButton, x, y, captureWidth, captureHeight));
-    }
-
-    [JSInvokable]
-    public void OnMouseUp(string button, double x, double y, int captureWidth = 0, int captureHeight = 0)
-    {
-        var mouseButton = ParseMouseButton(button);
-        SendInputToActiveSession(new InputEvent.MouseUp(mouseButton, x, y, captureWidth, captureHeight));
-    }
-
-    private static MouseButton ParseMouseButton(string button) => button.ToLowerInvariant() switch
-    {
-        "left" => MouseButton.Left,
-        "right" => MouseButton.Right,
-        "middle" => MouseButton.Middle,
-        "xbutton1" => MouseButton.XButton1,
-        "xbutton2" => MouseButton.XButton2,
-        _ => MouseButton.Left
-    };
-
-    [JSInvokable]
-    public void OnMouseWheel(double deltaX, double deltaY)
-    {
-        SendInputToActiveSession(new InputEvent.MouseWheel(deltaX, deltaY));
-    }
-
-    [JSInvokable]
-    public void OnKeyDown(string key, System.Text.Json.JsonElement modifiers)
-    {
-        var (ctrl, shift, alt) = ParseModifiers(modifiers);
-
-        // Ctrl+Alt+End → Ctrl+Alt+Del (standard RDP convention)
-        if (key == "End" && ctrl && alt)
-        {
-            _ = SendCtrlAltDel();
-            return;
-        }
-
-
-        SendInputToActiveSession(new InputEvent.KeyDown(key, new KeyModifiers(ctrl, shift, alt, false)));
-    }
-
-    [JSInvokable]
-    public void OnKeyUp(string key, System.Text.Json.JsonElement modifiers)
-    {
-        var (ctrl, shift, alt) = ParseModifiers(modifiers);
-        if (key == "End" && ctrl && alt) return;
-        if (key == "m" && ctrl && !shift && !alt) return;
-
-        SendInputToActiveSession(new InputEvent.KeyUp(key, new KeyModifiers(ctrl, shift, alt, false)));
-    }
-
-    private (bool ctrl, bool shift, bool alt) ParseModifiers(System.Text.Json.JsonElement modifiers)
-    {
-        bool ctrl = false, shift = false, alt = false;
-        if (modifiers.TryGetProperty("ctrl", out var ctrlProp)) ctrl = ctrlProp.GetBoolean();
-        if (modifiers.TryGetProperty("shift", out var shiftProp)) shift = shiftProp.GetBoolean();
-        if (modifiers.TryGetProperty("alt", out var altProp)) alt = altProp.GetBoolean();
-        return (ctrl, shift, alt);
     }
 
     /// <summary>
@@ -1337,6 +1271,32 @@
             SendInputToActiveSession(new InputEvent.KeyDown(key, modifiers));
         else
             SendInputToActiveSession(new InputEvent.KeyUp(key, modifiers));
+    }
+
+    // --- InputMessageRouter event handlers (WebView2 postMessage → C#) ---
+
+    private void HandleCtrlAltDelFromRouter()
+    {
+        _ = SendCtrlAltDel();
+    }
+
+    private async Task HandleClipboardPasteFromRouter()
+    {
+        await InvokeAsync(async () => await OnClipboardPaste());
+    }
+
+    private void HandleLockChangedFromRouter(bool locked)
+    {
+        _inputLocked = locked;
+        if (locked)
+            SystemKeyInterceptor.Install();
+        else
+            SystemKeyInterceptor.Uninstall();
+
+        if (_activeSession != null)
+            _ = _activeSession.SendInputLockStateAsync(locked);
+
+        InvokeAsync(StateHasChanged);
     }
 
     #endregion
@@ -1417,8 +1377,11 @@
                 _activeSession.OnSecureDesktopFrame += HandleSecureDesktopFrame;
                 _activeSession.OnMonitorLayoutReceived += HandleMonitorLayoutReceived;
 
-                // Update JS input routing
+                // Update input routing
                 await JSRuntime.InvokeVoidAsync("SteamViewerInput.setActiveSession", newSession.SessionId);
+#if WINDOWS
+                _inputRouter?.SetActiveSession(_activeSession);
+#endif
 
                 // Bind new session's WebRTC to this viewer window and enable direct rendering
                 _ = BindAndEnableDirectRenderAsync(newSession.SessionId);
@@ -1500,9 +1463,18 @@
             _activeSession.OnMonitorLayoutReceived -= HandleMonitorLayoutReceived;
         }
 
-        _dotNetRef?.Dispose();
         _tabDragRef?.Dispose();
         _loggerDotNetRef?.Dispose();
+
+#if WINDOWS
+        if (_inputRouter != null)
+        {
+            _inputRouter.OnCtrlAltDelRequested -= HandleCtrlAltDelFromRouter;
+            _inputRouter.OnClipboardPasteRequested -= HandleClipboardPasteFromRouter;
+            _inputRouter.OnLockChanged -= HandleLockChangedFromRouter;
+            _inputRouter.SetActiveSession(null);
+        }
+#endif
 
         // Dispose tab drag JS
         if (_tabDragInitialized)

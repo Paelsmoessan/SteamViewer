@@ -40,7 +40,7 @@ public sealed unsafe class FFmpegEncoder : IDisposable
     /// Initialize the encoder for given dimensions.
     /// Must be called before EncodeFrame.
     /// </summary>
-    public void Initialize(int width, int height, int fps = 30, long bitrate = 20_000_000)
+    public void Initialize(int width, int height, int fps = 30, long maxBitrate = 20_000_000, int crf = 20)
     {
         FFmpegInit.EnsureInitialized();
 
@@ -57,20 +57,22 @@ public sealed unsafe class FFmpegEncoder : IDisposable
         _codecCtx->time_base = new AVRational { num = 1, den = fps };
         _codecCtx->framerate = new AVRational { num = fps, den = 1 };
         _codecCtx->pix_fmt = AVPixelFormat.AV_PIX_FMT_YUV444P; // 4:4:4 chroma — the whole point
-        _codecCtx->bit_rate = bitrate;
-        _codecCtx->gop_size = fps * 2; // Keyframe every 2 seconds
-        _codecCtx->max_b_frames = 0;   // Zero latency = no B-frames
+        _codecCtx->bit_rate = 0;                     // CRF mode — quality-based, not bitrate-based
+        _codecCtx->gop_size = fps;                    // Keyframe every 1 second (halves P-frame drift)
+        _codecCtx->max_b_frames = 0;                  // Zero latency = no B-frames
         _codecCtx->thread_count = 4;
         _codecCtx->flags |= ffmpeg.AV_CODEC_FLAG_LOW_DELAY;
-        _codecCtx->rc_max_rate = bitrate;           // VBV: max instantaneous rate = target bitrate
-        _codecCtx->rc_buffer_size = (int)(bitrate / fps); // VBV: buffer = one frame worth (~667KB at 20Mbps/30fps)
+        _codecCtx->rc_max_rate = maxBitrate;          // VBV cap: transport safety limit
+        _codecCtx->rc_buffer_size = (int)(maxBitrate / 2); // VBV buffer: half-second (~1.25MB at 20Mbps)
 
         // H.264 High 4:4:4 Predictive profile (value = 244)
         _codecCtx->profile = 244; // FF_PROFILE_H264_HIGH_444_PREDICTIVE
 
         // Encoder presets for low-latency screen sharing
-        ffmpeg.av_opt_set(_codecCtx->priv_data, "preset", "ultrafast", 0);
+        // superfast: CABAC + better prediction → less P-frame drift, ~1ms more than ultrafast
+        ffmpeg.av_opt_set(_codecCtx->priv_data, "preset", "superfast", 0);
         ffmpeg.av_opt_set(_codecCtx->priv_data, "tune", "zerolatency", 0);
+        ffmpeg.av_opt_set(_codecCtx->priv_data, "crf", crf.ToString(), 0);
 
         var ret = ffmpeg.avcodec_open2(_codecCtx, codec, null);
         if (ret < 0)
@@ -100,8 +102,8 @@ public sealed unsafe class FFmpegEncoder : IDisposable
         _height = height;
         _pts = 0;
 
-        _logger.LogInformation("FFmpeg encoder initialized: {W}x{H} @ {Fps}fps, {Bitrate}Mbps, libx264 high444",
-            width, height, fps, bitrate / 1_000_000.0);
+        _logger.LogInformation("FFmpeg encoder initialized: {W}x{H} @ {Fps}fps, CRF {Crf}, VBV cap {MaxBitrate}Mbps, superfast high444",
+            width, height, fps, crf, maxBitrate / 1_000_000.0);
     }
 
     /// <summary>
@@ -173,11 +175,11 @@ public sealed unsafe class FFmpegEncoder : IDisposable
     /// <summary>Force the next frame to be a keyframe (I-frame).</summary>
     public void ForceKeyframe() => _forceKeyframe = true;
 
-    /// <summary>Change bitrate dynamically.</summary>
-    public void SetBitrate(long bitsPerSecond)
+    /// <summary>Change VBV max rate cap dynamically (CRF mode — adjusts transport ceiling, not quality).</summary>
+    public void SetMaxBitrate(long bitsPerSecond)
     {
         if (_codecCtx != null)
-            _codecCtx->bit_rate = bitsPerSecond;
+            _codecCtx->rc_max_rate = bitsPerSecond;
     }
 
     private void Cleanup()

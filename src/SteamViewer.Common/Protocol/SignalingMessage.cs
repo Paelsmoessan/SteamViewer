@@ -36,6 +36,7 @@ namespace SteamViewer.Common.Protocol;
 // Direct transport endpoint exchange (FFmpeg transport, replaces SDP/ICE)
 [JsonDerivedType(typeof(TransportEndpoint), "transport_endpoint")]
 [JsonDerivedType(typeof(RelayReady), "relay_ready")]
+[JsonDerivedType(typeof(TransportConfirmed), "transport_confirmed")]
 // Mesh WebRTC signaling (within session)
 [JsonDerivedType(typeof(MeshSdpOffer), "mesh_sdp_offer")]
 [JsonDerivedType(typeof(MeshSdpAnswer), "mesh_sdp_answer")]
@@ -193,6 +194,14 @@ public abstract record SignalingMessage
     public sealed record RelayReady(
         [property: JsonPropertyName("target_id")] string TargetId,
         [property: JsonPropertyName("encryption_nonce")] string EncryptionNonce
+    ) : SignalingMessage;
+
+    /// <summary>
+    /// Confirms that a side's UDP probe succeeded and it is ready to switch.
+    /// Both sides must send this before either disposes the relay backend.
+    /// </summary>
+    public sealed record TransportConfirmed(
+        [property: JsonPropertyName("target_id")] string TargetId
     ) : SignalingMessage;
 
     // ==================== Mesh WebRTC Signaling ====================

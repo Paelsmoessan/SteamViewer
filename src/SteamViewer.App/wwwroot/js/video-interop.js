@@ -88,6 +88,10 @@ window.SteamViewerVideo = {
             videoH: 0,
             frameCount: 0,
             dotNetRef: null,
+            // Display tracking for downscale detection
+            lastDisplayW: 0,
+            lastDisplayH: 0,
+            isDownscaling: false,
             // Stats
             statsOverlayEl: null,
             statsVisible: false,
@@ -210,21 +214,56 @@ if (window.chrome?.webview) {
                 const canvas = session.canvas;
                 const ctx = session.ctx;
 
-                // Set canvas bitmap to video resolution — drawImage is 1:1 (zero interpolation).
-                // CSS object-fit: contain handles display scaling (single GPU-accelerated step).
-                if (canvas.width !== meta.w || canvas.height !== meta.h) {
-                    canvas.width = meta.w;
-                    canvas.height = meta.h;
-                }
-
                 // Update session video dims for mouse coordinate mapping
                 if (session.videoW !== meta.w || session.videoH !== meta.h) {
                     session.videoW = meta.w;
                     session.videoH = meta.h;
                 }
 
-                // 1:1 draw — no scaling, no letterbox (CSS handles both)
-                ctx.drawImage(frame, 0, 0);
+                // Detect display size for downscale vs upscale decision
+                const rect = canvas.getBoundingClientRect();
+                const dpr = window.devicePixelRatio || 1;
+                const displayW = Math.round(rect.width * dpr);
+                const displayH = Math.round(rect.height * dpr);
+
+                // Compute the fitted video dimensions within display area
+                const scale = Math.min(displayW / meta.w, displayH / meta.h);
+                const isDownscaling = scale < 0.95; // 5% margin to avoid thrashing
+
+                if (isDownscaling) {
+                    // DOWNSCALE: Canvas bitmap = display pixels, high-quality Canvas 2D scaling.
+                    // imageSmoothingQuality:'high' uses Skia Mitchell-Netravali (cubic) in Chromium
+                    // — significantly sharper for text than CSS compositor bilinear.
+                    const displayChanged = displayW !== session.lastDisplayW || displayH !== session.lastDisplayH;
+                    if (canvas.width !== displayW || canvas.height !== displayH || displayChanged) {
+                        canvas.width = displayW;
+                        canvas.height = displayH;
+                        ctx.imageSmoothingEnabled = true;
+                        ctx.imageSmoothingQuality = 'high';
+                        session.lastDisplayW = displayW;
+                        session.lastDisplayH = displayH;
+                    }
+                    // Letterbox: fit video into display area preserving aspect ratio
+                    const fitW = Math.round(meta.w * scale);
+                    const fitH = Math.round(meta.h * scale);
+                    const dx = Math.round((displayW - fitW) / 2);
+                    const dy = Math.round((displayH - fitH) / 2);
+                    // Clear for letterbox bars (only if aspect ratios differ)
+                    if (dx > 0 || dy > 0) ctx.clearRect(0, 0, displayW, displayH);
+                    ctx.drawImage(frame, dx, dy, fitW, fitH);
+                    session.isDownscaling = true;
+                } else {
+                    // UPSCALE or 1:1: Canvas = video resolution, drawImage 1:1.
+                    // CSS object-fit: contain handles display scaling (GPU compositor).
+                    if (canvas.width !== meta.w || canvas.height !== meta.h) {
+                        canvas.width = meta.w;
+                        canvas.height = meta.h;
+                        session.lastDisplayW = 0;
+                        session.lastDisplayH = 0;
+                    }
+                    ctx.drawImage(frame, 0, 0);
+                    session.isDownscaling = false;
+                }
                 frame.close();
             } else {
                 // JPEG fallback (if ever needed)
@@ -237,15 +276,33 @@ if (window.chrome?.webview) {
 
                     const canvas = session.canvas;
                     const ctx = session.ctx;
-
-                    // Match canvas bitmap to video resolution (1:1 draw, CSS scales)
-                    if (canvas.width !== meta.w || canvas.height !== meta.h) {
-                        canvas.width = meta.w; canvas.height = meta.h;
-                    }
                     session.videoW = meta.w;
                     session.videoH = meta.h;
 
-                    ctx.drawImage(bitmap, 0, 0);
+                    const rect = canvas.getBoundingClientRect();
+                    const dpr = window.devicePixelRatio || 1;
+                    const displayW = Math.round(rect.width * dpr);
+                    const displayH = Math.round(rect.height * dpr);
+                    const scale = Math.min(displayW / meta.w, displayH / meta.h);
+
+                    if (scale < 0.95) {
+                        if (canvas.width !== displayW || canvas.height !== displayH) {
+                            canvas.width = displayW; canvas.height = displayH;
+                            ctx.imageSmoothingEnabled = true;
+                            ctx.imageSmoothingQuality = 'high';
+                        }
+                        const fitW = Math.round(meta.w * scale);
+                        const fitH = Math.round(meta.h * scale);
+                        const dx = Math.round((displayW - fitW) / 2);
+                        const dy = Math.round((displayH - fitH) / 2);
+                        if (dx > 0 || dy > 0) ctx.clearRect(0, 0, displayW, displayH);
+                        ctx.drawImage(bitmap, dx, dy, fitW, fitH);
+                    } else {
+                        if (canvas.width !== meta.w || canvas.height !== meta.h) {
+                            canvas.width = meta.w; canvas.height = meta.h;
+                        }
+                        ctx.drawImage(bitmap, 0, 0);
+                    }
                     bitmap.close();
                 }).catch(() => {});
             }
@@ -271,7 +328,6 @@ if (window.chrome?.webview) {
 // (no SteamViewerWebRTC references, uses SteamViewerVideo for letterbox/session data)
 window.SteamViewerInput = {
     canvas: null,
-    dotNetRef: null,
     isCapturing: false,
     isLocked: false,
     showLockIndicator: false,
@@ -321,16 +377,16 @@ window.SteamViewerInput = {
 
     // === Lifecycle ===
 
-    initialize(canvasId, dotNetReference, options = {}) {
+    initialize(canvasId, options = {}) {
         const { showLockIndicator = true } = options;
+        const foundCanvas = document.getElementById(canvasId);
 
         // Clean up any previous instance
         if (this.canvas) {
             this.stop();
         }
 
-        this.canvas = document.getElementById(canvasId);
-        this.dotNetRef = dotNetReference;
+        this.canvas = foundCanvas;
         this.showLockIndicator = showLockIndicator;
 
         if (!this.canvas) {
@@ -412,7 +468,6 @@ window.SteamViewerInput = {
         }
 
         this.canvas = null;
-        this.dotNetRef = null;
         this._activeSessionId = null;
         console.log('[Input] Stopped');
     },
@@ -447,10 +502,10 @@ window.SteamViewerInput = {
     },
 
     notifyLockChange() {
-        if (this.dotNetRef) {
-            try {
-                this.dotNetRef.invokeMethodAsync('OnInputLockChanged', this.isLocked);
-            } catch (e) { /* disposed */ }
+        if (window.chrome?.webview) {
+            window.chrome.webview.postMessage(JSON.stringify({
+                type: 'input', method: 'lockChanged', locked: this.isLocked
+            }));
         }
     },
 
@@ -555,9 +610,9 @@ window.SteamViewerInput = {
         this._pidLastEventTime = 0;
         this._lastTimerSendTime = 0;
         this._pidColdStartRemaining = 0;
-        this._regulationTimer = setInterval(async () => {
+        this._regulationTimer = setInterval(() => {
             const c = this._bufferedMouseCoords;
-            if (!c || !this.dotNetRef || !this.isLocked) return;
+            if (!c || !window.chrome?.webview || !this.isLocked) return;
 
             const now = performance.now();
             const elapsed = now - this._lastTimerSendTime;
@@ -571,9 +626,10 @@ window.SteamViewerInput = {
             this._lastSentY = c.y;
             this._bufferedMouseCoords = null;
             this._lastTimerSendTime = now;
-            try {
-                await this.dotNetRef.invokeMethodAsync('OnMouseMove', c.x, c.y, c.captureW, c.captureH);
-            } catch (err) { /* ignore sweep send errors */ }
+            window.chrome.webview.postMessage(JSON.stringify({
+                type: 'input', method: 'mouseMove',
+                x: c.x, y: c.y, captureW: c.captureW, captureH: c.captureH
+            }));
         }, 16); // Poll at 60Hz, actual send rate governed by dynamic cooldown
     },
 
@@ -613,10 +669,30 @@ window.SteamViewerInput = {
     },
 
     getScaledCoords(e) {
-        // Canvas bitmap = video resolution, CSS object-fit: contain handles display.
-        // getScaledCoordsForCanvas computes the CSS-level object-fit offset correctly.
         const session = window.SteamViewerVideo.sessions.get(this._activeSessionId);
         const canvas = session?.canvas || this.canvas;
+
+        if (session?.isDownscaling && session.videoW && session.videoH) {
+            // Downscale mode: canvas bitmap = display pixels, video drawn with letterbox inside.
+            // Need to map mouse CSS position → canvas pixel → video pixel.
+            const rect = canvas.getBoundingClientRect();
+            const dpr = window.devicePixelRatio || 1;
+            const canvasX = (e.clientX - rect.left) * dpr;
+            const canvasY = (e.clientY - rect.top) * dpr;
+            // Recompute letterbox (same math as render path)
+            const scale = Math.min(canvas.width / session.videoW, canvas.height / session.videoH);
+            const fitW = session.videoW * scale;
+            const fitH = session.videoH * scale;
+            const dx = (canvas.width - fitW) / 2;
+            const dy = (canvas.height - fitH) / 2;
+            // Canvas pixel → video pixel
+            return {
+                x: Math.max(0, Math.min(session.videoW, (canvasX - dx) * session.videoW / fitW)),
+                y: Math.max(0, Math.min(session.videoH, (canvasY - dy) * session.videoH / fitH))
+            };
+        }
+
+        // Upscale/1:1: canvas = video resolution, CSS object-fit handles display
         return this.getScaledCoordsForCanvas(e, canvas);
     },
 
@@ -643,9 +719,9 @@ window.SteamViewerInput = {
 
     // === Mouse Handlers ===
 
-    async handleMouseMove(e) {
+    handleMouseMove(e) {
         this._rawEventCount++;
-        if (!this.isCapturing || !this.isLocked || !this.dotNetRef) return;
+        if (!this.isCapturing || !this.isLocked || !window.chrome?.webview) return;
         this._inputEventCount++;
         this.ensureCanvas();
         this._lastMouseDownCoords = null;
@@ -679,25 +755,27 @@ window.SteamViewerInput = {
         if (coldStart || score < this._pidSendThreshold) {
             this._lastSentX = x; this._lastSentY = y;
             this._bufferedMouseCoords = null;
-            try { await this.dotNetRef.invokeMethodAsync('OnMouseMove', x, y, captureW, captureH); }
-            catch (err) { console.error('[Input] OnMouseMove failed:', err); }
+            window.chrome.webview.postMessage(JSON.stringify({
+                type: 'input', method: 'mouseMove', x, y, captureW, captureH
+            }));
         } else {
             this._bufferedMouseCoords = { x, y, captureW, captureH };
         }
     },
 
-    async handleMouseDown(e) {
-        if (!this.isCapturing || !this.isLocked || !this.dotNetRef) return;
+    handleMouseDown(e) {
+        if (!this.isCapturing || !this.isLocked || !window.chrome?.webview) return;
         e.preventDefault();
         const { x, y, captureW, captureH } = this._getMouseCoords(e);
         const button = ['left', 'middle', 'right', 'XButton1', 'XButton2'][e.button] || 'left';
         this._lastMouseDownCoords = { x, y, captureW, captureH, button };
-        try { await this.dotNetRef.invokeMethodAsync('OnMouseDown', button, x, y, captureW, captureH); }
-        catch (err) { console.error('[Input] OnMouseDown failed:', err); }
+        window.chrome.webview.postMessage(JSON.stringify({
+            type: 'input', method: 'mouseDown', button, x, y, captureW, captureH
+        }));
     },
 
-    async handleMouseUp(e) {
-        if (!this.isCapturing || !this.isLocked || !this.dotNetRef) return;
+    handleMouseUp(e) {
+        if (!this.isCapturing || !this.isLocked || !window.chrome?.webview) return;
         e.preventDefault();
         const button = ['left', 'middle', 'right', 'XButton1', 'XButton2'][e.button] || 'left';
         let x, y, captureW, captureH;
@@ -708,57 +786,50 @@ window.SteamViewerInput = {
             ({ x, y, captureW, captureH } = this._getMouseCoords(e));
         }
         this._lastMouseDownCoords = null;
-        try { await this.dotNetRef.invokeMethodAsync('OnMouseUp', button, x, y, captureW, captureH); }
-        catch (err) { console.error('[Input] OnMouseUp failed:', err); }
+        window.chrome.webview.postMessage(JSON.stringify({
+            type: 'input', method: 'mouseUp', button, x, y, captureW, captureH
+        }));
     },
 
-    async handleWheel(e) {
-        if (!this.isCapturing || !this.isLocked || !this.dotNetRef) return;
+    handleWheel(e) {
+        if (!this.isCapturing || !this.isLocked || !window.chrome?.webview) return;
         e.preventDefault();
         let dx = e.deltaX, dy = e.deltaY;
         if (e.deltaMode === 1) { dx *= 40; dy *= 40; }
         else if (e.deltaMode === 2) { dx *= 800; dy *= 800; }
-        try { await this.dotNetRef.invokeMethodAsync('OnMouseWheel', dx, dy); }
-        catch (e) { /* disposed */ }
+        window.chrome.webview.postMessage(JSON.stringify({
+            type: 'input', method: 'mouseWheel', deltaX: dx, deltaY: dy
+        }));
     },
 
     // === Keyboard Handlers ===
 
-    async handleKeyDown(e) {
-        if (!this.isCapturing || !this.isLocked || !this.dotNetRef) return;
+    handleKeyDown(e) {
+        if (!this.isCapturing || !this.isLocked || !window.chrome?.webview) return;
         e.preventDefault();
 
         // Ctrl+V → clipboard paste through C#
         if (e.ctrlKey && !e.altKey && !e.metaKey && (e.key === 'v' || e.key === 'V')) {
-            try {
-                await this.dotNetRef.invokeMethodAsync('OnClipboardPaste');
-            } catch (err) {
-                try { await this.dotNetRef.invokeMethodAsync('OnKeyDown', e.key, this.getModifiers(e)); }
-                catch (e2) { /* disposed */ }
-            }
+            window.chrome.webview.postMessage(JSON.stringify({
+                type: 'input', method: 'clipboardPaste'
+            }));
             return;
         }
 
-        // Ctrl+C/X → send keystroke, then request host clipboard
-        if (e.ctrlKey && !e.altKey && !e.metaKey && (e.key === 'c' || e.key === 'x')) {
-            try {
-                await this.dotNetRef.invokeMethodAsync('OnKeyDown', e.key, this.getModifiers(e));
-                setTimeout(() => {
-                    this.dotNetRef?.invokeMethodAsync('OnClipboardRequest').catch(() => {});
-                }, 150);
-            } catch (err) { /* disposed */ }
-            return;
-        }
-
-        try { await this.dotNetRef.invokeMethodAsync('OnKeyDown', e.key, this.getModifiers(e)); }
-        catch (err) { /* disposed */ }
+        // Ctrl+C/X → send keystroke (host clipboard request handled by menu button)
+        window.chrome.webview.postMessage(JSON.stringify({
+            type: 'input', method: 'keyDown',
+            key: e.key, modifiers: this.getModifiers(e)
+        }));
     },
 
-    async handleKeyUp(e) {
-        if (!this.isCapturing || !this.isLocked || !this.dotNetRef) return;
+    handleKeyUp(e) {
+        if (!this.isCapturing || !this.isLocked || !window.chrome?.webview) return;
         e.preventDefault();
-        try { await this.dotNetRef.invokeMethodAsync('OnKeyUp', e.key, this.getModifiers(e)); }
-        catch (err) { /* disposed */ }
+        window.chrome.webview.postMessage(JSON.stringify({
+            type: 'input', method: 'keyUp',
+            key: e.key, modifiers: this.getModifiers(e)
+        }));
     }
 };
 
@@ -772,20 +843,27 @@ window.SteamViewerSecureDesktop = {
     _cursorX: 0,
     _cursorY: 0,
 
-    activate(canvasId) {
+    show(canvasId) {
         this.canvas = document.getElementById(canvasId);
         if (this.canvas) {
             this.ctx = this.canvas.getContext('2d', { alpha: false });
             this.isActive = true;
-            console.log('[SD] Activated');
+            console.log('[SD] Overlay shown');
         }
     },
 
-    deactivate() {
+    hide(canvasId) {
         this.isActive = false;
+        if (canvasId) {
+            const canvas = document.getElementById(canvasId);
+            if (canvas) {
+                const ctx = canvas.getContext('2d');
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+            }
+        }
         this.canvas = null;
         this.ctx = null;
-        console.log('[SD] Deactivated');
+        console.log('[SD] Overlay hidden');
     },
 
     renderFrame(base64Jpeg, width, height) {

@@ -301,6 +301,10 @@ public sealed class ViewerSessionManager : IAsyncDisposable
                 HandleTransportEndpoint(endpoint);
                 break;
 
+            case SignalingMessage.TransportConfirmed confirmed:
+                HandleTransportConfirmed(confirmed);
+                break;
+
             case SignalingMessage.Disconnected disconnected:
                 HandlePeerDisconnected(disconnected);
                 break;
@@ -416,6 +420,20 @@ public sealed class ViewerSessionManager : IAsyncDisposable
         _logger.LogInformation("Session {SessionId}: Received transport endpoint from {PeerId} ({IpCount} IPs, port {Port})",
             session.SessionId, endpoint.TargetId, endpoint.IPs.Length, endpoint.Port);
         _ = session.HandleTransportEndpointAsync(endpoint.IPs, endpoint.Port);
+    }
+
+    private void HandleTransportConfirmed(SignalingMessage.TransportConfirmed confirmed)
+    {
+        var session = GetSessionByPeerId(confirmed.TargetId);
+        if (session == null)
+        {
+            _logger.LogWarning("Received TransportConfirmed for unknown peer {PeerId}", confirmed.TargetId);
+            return;
+        }
+
+        _logger.LogInformation("Session {SessionId}: Received TransportConfirmed from {PeerId}",
+            session.SessionId, confirmed.TargetId);
+        _ = session.HandleTransportConfirmedAsync();
     }
 
     private void HandleSessionDisconnected(string sessionId, string? reason)

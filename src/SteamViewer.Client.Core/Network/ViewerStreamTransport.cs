@@ -12,12 +12,14 @@ namespace SteamViewer.Client.Core.Network;
 /// 1. Viewer receives RelayReady(nonce) from host via signaling
 /// 2. ConnectRelay(): WebSocket relay via signaling server (immediate)
 /// 3. In background: AttemptUdpUpgradeAsync() tries STUN/TURN for direct P2P
-/// 4. If UDP works → switch backend (transparent to upper layers)
+/// 4. If UDP probe succeeds → send TransportConfirmed, wait for peer confirmation → switch backend
 /// </summary>
 public sealed class ViewerStreamTransport : StreamTransport
 {
     private readonly SignalingClient _signalingClient;
     private UdpTransportBackend? _udpBackend;
+    private Func<SignalingMessage, Task>? _sendSignaling;
+    private string? _peerId;
 
     public ViewerStreamTransport(SignalingClient signalingClient, ILogger logger) : base(logger)
     {
@@ -55,6 +57,10 @@ public sealed class ViewerStreamTransport : StreamTransport
         string? turnUsername = null,
         string? turnCredential = null)
     {
+        // Store for sending TransportConfirmed later
+        _sendSignaling = sendSignaling;
+        _peerId = peerId;
+
         try
         {
             _udpBackend = new UdpTransportBackend(_logger);
@@ -98,7 +104,8 @@ public sealed class ViewerStreamTransport : StreamTransport
 
     /// <summary>
     /// Handle TransportEndpoint from the host (their UDP candidate).
-    /// Probes the endpoint and switches to UDP if successful.
+    /// Probes the endpoint. If successful, stores as pending and sends TransportConfirmed.
+    /// Actual switch happens only when both sides confirm.
     /// </summary>
     public async Task HandleHostEndpointAsync(string[] hostIPs, int hostPort)
     {
@@ -113,8 +120,31 @@ public sealed class ViewerStreamTransport : StreamTransport
                 if (probeOk)
                 {
                     _udpBackend.ConnectToPeer(endpoint, useTurnRelay: false);
-                    await SwitchBackendAsync(_udpBackend);
-                    _logger.LogInformation("Viewer: switched to direct UDP via {Endpoint}", endpoint);
+
+                    // Store as pending — don't switch yet
+                    _pendingUdpBackend = _udpBackend;
+                    _localUdpReady = true;
+                    _logger.LogInformation("Viewer: UDP probe succeeded via {Endpoint} — waiting for peer confirmation", endpoint);
+
+                    // Send confirmation to host
+                    if (_sendSignaling != null && _peerId != null)
+                        await _sendSignaling(new SignalingMessage.TransportConfirmed(_peerId));
+
+                    // Check if peer already confirmed
+                    await TryCompleteSwitchAsync();
+
+                    // Start timeout — if peer doesn't confirm within 5s, stay on relay
+                    _ = Task.Run(async () =>
+                    {
+                        await Task.Delay(5000);
+                        if (_localUdpReady && !_remoteUdpReady && _pendingUdpBackend != null)
+                        {
+                            _logger.LogWarning("Viewer: peer did not confirm UDP within 5s — staying on relay");
+                            _localUdpReady = false;
+                            _pendingUdpBackend = null;
+                            // Don't dispose _udpBackend — it may still be used if peer confirms late
+                        }
+                    });
                     return;
                 }
             }
@@ -127,13 +157,24 @@ public sealed class ViewerStreamTransport : StreamTransport
         _logger.LogInformation("Viewer: no UDP path available — staying on WebSocket relay");
     }
 
+    /// <summary>
+    /// Handle TransportConfirmed from the host — host's probe also succeeded.
+    /// If our probe already succeeded, complete the switch.
+    /// </summary>
+    public async Task HandleTransportConfirmedAsync()
+    {
+        _remoteUdpReady = true;
+        _logger.LogInformation("Viewer: received UDP confirmation from host");
+        await TryCompleteSwitchAsync();
+    }
+
     public override async ValueTask DisposeAsync()
     {
-        if (_udpBackend != null)
+        if (_udpBackend != null && _udpBackend != _pendingUdpBackend)
         {
             await _udpBackend.DisposeAsync();
-            _udpBackend = null;
         }
+        _udpBackend = null;
         await base.DisposeAsync();
     }
 }

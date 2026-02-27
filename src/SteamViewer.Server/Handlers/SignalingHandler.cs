@@ -216,6 +216,7 @@ public sealed class SignalingHandler
             SignalingMessage.Disconnect disconnect => HandleDisconnect(disconnect, currentClientId),
             SignalingMessage.TransportEndpoint endpoint => HandleTransportEndpoint(endpoint, currentClientId),
             SignalingMessage.RelayReady relayReady => HandleRelayReady(relayReady, currentClientId),
+            SignalingMessage.TransportConfirmed confirmed => HandleTransportConfirmed(confirmed, currentClientId),
             SignalingMessage.Ping => new SignalingMessage.Pong(),
             // Collaboration session messages
             SignalingMessage.CreateSession createSession => HandleCreateSession(createSession, currentClientId),
@@ -393,6 +394,18 @@ public sealed class SignalingHandler
         // Forward relay-ready to peer (swap target_id → fromId so peer knows who it's from)
         _registry.TrySendToClient(relayReady.TargetId, new SignalingMessage.RelayReady(fromId, relayReady.EncryptionNonce));
         _logger.LogInformation("Relay ready from {FromId} to {TargetId}", fromId, relayReady.TargetId);
+        return null;
+    }
+
+    private SignalingMessage? HandleTransportConfirmed(SignalingMessage.TransportConfirmed confirmed, string? fromId)
+    {
+        if (fromId == null)
+        {
+            return new SignalingMessage.Error("Not registered");
+        }
+
+        _registry.TrySendToClient(confirmed.TargetId, new SignalingMessage.TransportConfirmed(fromId));
+        _logger.LogDebug("Transport confirmed forwarded from {FromId} to {TargetId}", fromId, confirmed.TargetId);
         return null;
     }
 
