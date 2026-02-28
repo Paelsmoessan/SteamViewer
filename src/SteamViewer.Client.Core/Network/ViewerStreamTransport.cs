@@ -21,6 +21,11 @@ public sealed class ViewerStreamTransport : StreamTransport
     private Func<SignalingMessage, Task>? _sendSignaling;
     private string? _peerId;
 
+    // ICE candidate pair pattern — buffer both sides, probe when both ready
+    private string[]? _remoteCandidateIPs;
+    private int _remoteCandidatePort;
+    private bool _localCandidatesReady;
+
     public ViewerStreamTransport(SignalingClient signalingClient, ILogger logger) : base(logger)
     {
         _signalingClient = signalingClient;
@@ -90,6 +95,11 @@ public sealed class ViewerStreamTransport : StreamTransport
                 await sendSignaling(new SignalingMessage.TransportEndpoint(peerId, endpoints.ToArray(), port));
                 _logger.LogInformation("Viewer UDP endpoints sent: {Endpoints}:{Port}", string.Join(",", endpoints), port);
             }
+
+            // Local candidates ready — probe if remote already arrived (ICE pattern)
+            _localCandidatesReady = true;
+            _logger.LogDebug("[UDP-DIAG] Local candidates ready — checking for buffered remote candidates");
+            await TryProbeCandidatesAsync();
         }
         catch (Exception ex)
         {
@@ -104,21 +114,41 @@ public sealed class ViewerStreamTransport : StreamTransport
 
     /// <summary>
     /// Handle TransportEndpoint from the host (their UDP candidate).
-    /// Probes the endpoint. If successful, stores as pending and sends TransportConfirmed.
-    /// Actual switch happens only when both sides confirm.
+    /// Buffers remote candidates — probing happens when both local and remote are ready (ICE pattern).
     /// </summary>
     public async Task HandleHostEndpointAsync(string[] hostIPs, int hostPort)
     {
-        if (_udpBackend == null) return;
+        _logger.LogDebug("[UDP-DIAG] HandleHostEndpointAsync: received {Count} IPs on port {Port}: [{IPs}], localReady={LocalReady}",
+            hostIPs.Length, hostPort, string.Join(", ", hostIPs), _localCandidatesReady);
 
-        _logger.LogDebug("[UDP-DIAG] HandleHostEndpointAsync: probing {Count} IPs on port {Port}: [{IPs}]",
-            hostIPs.Length, hostPort, string.Join(", ", hostIPs));
+        // Buffer remote candidates
+        _remoteCandidateIPs = hostIPs;
+        _remoteCandidatePort = hostPort;
 
-        foreach (var ip in hostIPs)
+        // Probe if local socket is already initialized
+        await TryProbeCandidatesAsync();
+    }
+
+    /// <summary>
+    /// Probe remote candidates when both local socket and remote candidates are available.
+    /// Called from both AttemptUdpUpgradeAsync (local ready) and HandleHostEndpointAsync (remote ready).
+    /// </summary>
+    private async Task TryProbeCandidatesAsync()
+    {
+        if (!_localCandidatesReady || _remoteCandidateIPs == null || _udpBackend == null) return;
+
+        var remoteIPs = _remoteCandidateIPs;
+        var remotePort = _remoteCandidatePort;
+        _remoteCandidateIPs = null; // Consume — don't re-probe
+
+        _logger.LogDebug("[UDP-DIAG] TryProbeCandidatesAsync: probing {Count} IPs on port {Port}: [{IPs}]",
+            remoteIPs.Length, remotePort, string.Join(", ", remoteIPs));
+
+        foreach (var ip in remoteIPs)
         {
             try
             {
-                var endpoint = new IPEndPoint(IPAddress.Parse(ip), hostPort);
+                var endpoint = new IPEndPoint(IPAddress.Parse(ip), remotePort);
                 _logger.LogDebug("[UDP-DIAG] Starting probe to {Endpoint}", endpoint);
                 var probeOk = await _udpBackend.ProbeAsync(endpoint, TimeSpan.FromSeconds(2));
                 _logger.LogDebug("[UDP-DIAG] Probe to {Endpoint} result: {Result}", endpoint, probeOk);
@@ -147,7 +177,6 @@ public sealed class ViewerStreamTransport : StreamTransport
                             _logger.LogWarning("Viewer: peer did not confirm UDP within 5s — staying on relay");
                             _localUdpReady = false;
                             _pendingUdpBackend = null;
-                            // Don't dispose _udpBackend — it may still be used if peer confirms late
                         }
                     });
                     return;
@@ -155,7 +184,7 @@ public sealed class ViewerStreamTransport : StreamTransport
             }
             catch (Exception ex)
             {
-                _logger.LogDebug(ex, "Viewer: UDP probe to {IP}:{Port} failed", ip, hostPort);
+                _logger.LogDebug(ex, "Viewer: UDP probe to {IP}:{Port} failed", ip, remotePort);
             }
         }
 

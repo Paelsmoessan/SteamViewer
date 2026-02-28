@@ -22,6 +22,11 @@ public sealed class HostStreamTransport : StreamTransport
     private Func<SignalingMessage, Task>? _sendSignaling;
     private string? _peerId;
 
+    // ICE candidate pair pattern — buffer both sides, probe when both ready
+    private string[]? _remoteCandidateIPs;
+    private int _remoteCandidatePort;
+    private bool _localCandidatesReady;
+
     public HostStreamTransport(SignalingClient signalingClient, ILogger logger) : base(logger)
     {
         _signalingClient = signalingClient;
@@ -103,8 +108,10 @@ public sealed class HostStreamTransport : StreamTransport
                 _logger.LogInformation("Host UDP endpoints sent: {Endpoints}:{Port}", string.Join(",", endpoints), port);
             }
 
-            // The viewer will try to probe us. We wait for incoming data on UDP.
-            // For now, the upgrade is triggered when viewer sends TransportEndpoint back.
+            // Local candidates ready — probe if remote already arrived (ICE pattern)
+            _localCandidatesReady = true;
+            _logger.LogDebug("[UDP-DIAG] Local candidates ready — checking for buffered remote candidates");
+            await TryProbeCandidatesAsync();
         }
         catch (Exception ex)
         {
@@ -119,21 +126,41 @@ public sealed class HostStreamTransport : StreamTransport
 
     /// <summary>
     /// Handle a TransportEndpoint from the viewer (their UDP candidate).
-    /// Probes the endpoint. If successful, stores as pending and sends TransportConfirmed.
-    /// Actual switch happens only when both sides confirm.
+    /// Buffers remote candidates — probing happens when both local and remote are ready (ICE pattern).
     /// </summary>
     public async Task HandleViewerEndpointAsync(string[] viewerIPs, int viewerPort)
     {
-        if (_udpBackend == null) return;
+        _logger.LogDebug("[UDP-DIAG] HandleViewerEndpointAsync: received {Count} IPs on port {Port}: [{IPs}], localReady={LocalReady}",
+            viewerIPs.Length, viewerPort, string.Join(", ", viewerIPs), _localCandidatesReady);
 
-        _logger.LogDebug("[UDP-DIAG] HandleViewerEndpointAsync: probing {Count} IPs on port {Port}: [{IPs}]",
-            viewerIPs.Length, viewerPort, string.Join(", ", viewerIPs));
+        // Buffer remote candidates
+        _remoteCandidateIPs = viewerIPs;
+        _remoteCandidatePort = viewerPort;
 
-        foreach (var ip in viewerIPs)
+        // Probe if local socket is already initialized
+        await TryProbeCandidatesAsync();
+    }
+
+    /// <summary>
+    /// Probe remote candidates when both local socket and remote candidates are available.
+    /// Called from both AttemptUdpUpgradeAsync (local ready) and HandleViewerEndpointAsync (remote ready).
+    /// </summary>
+    private async Task TryProbeCandidatesAsync()
+    {
+        if (!_localCandidatesReady || _remoteCandidateIPs == null || _udpBackend == null) return;
+
+        var remoteIPs = _remoteCandidateIPs;
+        var remotePort = _remoteCandidatePort;
+        _remoteCandidateIPs = null; // Consume — don't re-probe
+
+        _logger.LogDebug("[UDP-DIAG] TryProbeCandidatesAsync: probing {Count} IPs on port {Port}: [{IPs}]",
+            remoteIPs.Length, remotePort, string.Join(", ", remoteIPs));
+
+        foreach (var ip in remoteIPs)
         {
             try
             {
-                var endpoint = new IPEndPoint(IPAddress.Parse(ip), viewerPort);
+                var endpoint = new IPEndPoint(IPAddress.Parse(ip), remotePort);
                 _logger.LogDebug("[UDP-DIAG] Starting probe to {Endpoint}", endpoint);
                 var probeOk = await _udpBackend.ProbeAsync(endpoint, TimeSpan.FromSeconds(2));
                 _logger.LogDebug("[UDP-DIAG] Probe to {Endpoint} result: {Result}", endpoint, probeOk);
@@ -169,7 +196,7 @@ public sealed class HostStreamTransport : StreamTransport
             }
             catch (Exception ex)
             {
-                _logger.LogDebug(ex, "Host: UDP probe to {IP}:{Port} failed", ip, viewerPort);
+                _logger.LogDebug(ex, "Host: UDP probe to {IP}:{Port} failed", ip, remotePort);
             }
         }
 
