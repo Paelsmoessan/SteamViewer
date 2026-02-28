@@ -121,7 +121,8 @@ public sealed class SignalingClient : IAsyncDisposable
         }
         finally { _writeLock.Release(); }
 
-        _logger.LogDebug("Sent message: {MessageType}", message.GetType().Name);
+        _logger.LogDebug("[SIG] Sent {MessageType}: {Json}", message.GetType().Name,
+            System.Text.Json.JsonSerializer.Serialize(message, message.GetType()));
     }
 
     /// <summary>
@@ -284,7 +285,7 @@ public sealed class SignalingClient : IAsyncDisposable
                         var message = SignalingSerializer.Deserialize(json);
                         if (message != null)
                         {
-                            _logger.LogDebug("Received message: {MessageType}", message.GetType().Name);
+                            _logger.LogDebug("[SIG] Received {MessageType}: {Json}", message.GetType().Name, json);
                             await _incomingMessages.Writer.WriteAsync(message, cancellationToken);
                             OnMessageReceived?.Invoke(message);
                         }

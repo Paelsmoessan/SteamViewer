@@ -243,6 +243,8 @@ public sealed class ViewerSession : IAsyncDisposable
                     var turnUri = _configuration["TurnServer:Urls:0"];
                     var turnUser = _configuration["TurnServer:Username"];
                     var turnCred = _configuration["TurnServer:Credential"];
+                    _logger.LogInformation("Session {SessionId}: Starting UDP upgrade (TURN uri={TurnUri}, user={TurnUser}, cred={HasCred})",
+                        SessionId, turnUri ?? "null", turnUser ?? "null", turnCred != null ? "yes" : "no");
                     await _transport!.AttemptUdpUpgradeAsync(
                         _sendSignaling, PeerId, turnUri, turnUser, turnCred);
                 }

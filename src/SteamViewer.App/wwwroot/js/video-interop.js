@@ -22,7 +22,7 @@ window.SteamViewerLogger = {
     log(level, message) {
         try {
             if (this.dotNetRef) {
-                this.dotNetRef.invokeMethodAsync('OnLog', level, this.peerName, message).catch(() => {});
+                this.dotNetRef.invokeMethodAsync('OnJSLog', level, `[${this.peerName}] ${message}`).catch(() => {});
             }
         } catch (e) {}
     },
@@ -31,7 +31,7 @@ window.SteamViewerLogger = {
         console.log(`[${from}] ${message}`);
         try {
             if (this.dotNetRef) {
-                this.dotNetRef.invokeMethodAsync('OnLog', level, from, message).catch(() => {});
+                this.dotNetRef.invokeMethodAsync('OnJSLog', level, `[${from}] ${message}`).catch(() => {});
             }
         } catch (e) {}
     }

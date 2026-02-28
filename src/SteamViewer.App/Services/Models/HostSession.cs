@@ -244,6 +244,8 @@ public sealed class HostSession : IAsyncDisposable
                 var turnUri = _configuration["TurnServer:Urls:0"];
                 var turnUser = _configuration["TurnServer:Username"];
                 var turnCred = _configuration["TurnServer:Credential"];
+                _logger.LogInformation("Host: Starting UDP upgrade (TURN uri={TurnUri}, user={TurnUser}, cred={HasCred})",
+                    turnUri ?? "null", turnUser ?? "null", turnCred != null ? "yes" : "no");
                 await _transport!.AttemptUdpUpgradeAsync(
                     PeerId, _sendSignaling, turnUri, turnUser, turnCred);
             }

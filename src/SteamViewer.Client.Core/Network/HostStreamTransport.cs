@@ -44,7 +44,7 @@ public sealed class HostStreamTransport : StreamTransport
         _encryption = new TransportEncryption(passwordHashHex, nonce, isHost: true);
 
         // Start with WebSocket relay backend
-        var relayBackend = new WebSocketRelayBackend(_signalingClient);
+        var relayBackend = new WebSocketRelayBackend(_signalingClient, _logger);
         relayBackend.Start();
         StartTransport(relayBackend, enableVideoSend: true);
 
@@ -126,12 +126,17 @@ public sealed class HostStreamTransport : StreamTransport
     {
         if (_udpBackend == null) return;
 
+        _logger.LogDebug("[UDP-DIAG] HandleViewerEndpointAsync: probing {Count} IPs on port {Port}: [{IPs}]",
+            viewerIPs.Length, viewerPort, string.Join(", ", viewerIPs));
+
         foreach (var ip in viewerIPs)
         {
             try
             {
                 var endpoint = new IPEndPoint(IPAddress.Parse(ip), viewerPort);
+                _logger.LogDebug("[UDP-DIAG] Starting probe to {Endpoint}", endpoint);
                 var probeOk = await _udpBackend.ProbeAsync(endpoint, TimeSpan.FromSeconds(2));
+                _logger.LogDebug("[UDP-DIAG] Probe to {Endpoint} result: {Result}", endpoint, probeOk);
                 if (probeOk)
                 {
                     _udpBackend.ConnectToPeer(endpoint, useTurnRelay: false);

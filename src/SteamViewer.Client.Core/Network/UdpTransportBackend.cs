@@ -124,6 +124,10 @@ public sealed class UdpTransportBackend : ITransportBackend
                 _logger.LogWarning(ex, "TURN allocation failed");
             }
         }
+
+        // Diagnostic: how many bytes sitting in kernel buffer after STUN/TURN
+        if (_udpClient != null)
+            _logger.LogDebug("[UDP-DIAG] Post-STUN/TURN kernel buffer: {Available} bytes available", _udpClient.Available);
     }
 
     private async Task AllocateTurnAsync(string turnUri, string username, string credential)
@@ -243,6 +247,7 @@ public sealed class UdpTransportBackend : ITransportBackend
         _cleanupTimer = new Timer(CleanupStaleBuffers, null, 1000, 1000);
 
         _active = true;
+        _logger.LogDebug("[UDP-DIAG] ConnectToPeer: receive loop started, will consume all packets from now");
         _logger.LogInformation("UDP transport connected to peer {Peer} (turnRelay={Turn})", peerEndPoint, useTurnRelay);
     }
 
@@ -254,48 +259,55 @@ public sealed class UdpTransportBackend : ITransportBackend
     {
         if (_udpClient == null) return false;
 
-        // No drain loop — all prior ReceiveAsync calls use CancellationTokens,
-        // so no abandoned tasks. Any stale packets in the kernel buffer are either
-        // small (peer's probe = success) or large (STUN/TURN = filtered below).
+        var localEp = _udpClient.Client.LocalEndPoint as IPEndPoint;
+        _logger.LogDebug("[UDP-DIAG] ProbeAsync START: local={Local}, target={Target}, timeout={Timeout}ms, kernelBuffer={Available}bytes",
+            localEp, endpoint, timeout.TotalMilliseconds, _udpClient.Available);
 
         using var probeCts = new CancellationTokenSource(timeout);
+        var attempt = 0;
         try
         {
             // Send initial probe
+            attempt++;
             await _udpClient.SendAsync(new byte[] { 0xFF }, 1, endpoint);
+            _logger.LogDebug("[UDP-DIAG] Probe #{Attempt} sent 0xFF to {Target}", attempt, endpoint);
 
             while (!probeCts.Token.IsCancellationRequested)
             {
                 // Wait for response, re-send probe every 200ms to cover timing race
-                // (peer may not have started listening when our first probe arrived)
                 using var subCts = CancellationTokenSource.CreateLinkedTokenSource(probeCts.Token);
                 subCts.CancelAfter(200);
                 try
                 {
                     var result = await _udpClient.ReceiveAsync(subCts.Token);
+                    _logger.LogDebug("[UDP-DIAG] Probe received {Len}bytes from {Source} (first byte=0x{First:X2})",
+                        result.Buffer.Length, result.RemoteEndPoint, result.Buffer.Length > 0 ? result.Buffer[0] : 0);
+
                     // Small packet = peer's probe or echo → success
                     if (result.Buffer.Length <= 2)
                     {
-                        _logger.LogInformation("UDP probe to {Endpoint} succeeded", endpoint);
+                        _logger.LogInformation("UDP probe to {Endpoint} succeeded (attempt #{Attempt})", endpoint, attempt);
                         return true;
                     }
-                    // Larger packet (stale STUN/TURN response) — ignore, keep waiting
+                    _logger.LogDebug("[UDP-DIAG] Ignoring large packet ({Len}bytes) — likely stale STUN/TURN", result.Buffer.Length);
                 }
                 catch (OperationCanceledException) when (!probeCts.Token.IsCancellationRequested)
                 {
                     // 200ms sub-timeout expired, re-send probe
+                    attempt++;
+                    _logger.LogDebug("[UDP-DIAG] Probe #{Attempt} — no response after 200ms, resending to {Target}", attempt, endpoint);
                     try { await _udpClient.SendAsync(new byte[] { 0xFF }, 1, endpoint); }
-                    catch { /* best effort */ }
+                    catch (Exception sendEx) { _logger.LogDebug("[UDP-DIAG] Resend failed: {Error}", sendEx.Message); }
                 }
             }
         }
         catch (OperationCanceledException)
         {
-            // Overall timeout — probe failed
+            _logger.LogDebug("[UDP-DIAG] ProbeAsync TIMEOUT after {Attempts} attempts to {Target}", attempt, endpoint);
         }
         catch (Exception ex)
         {
-            _logger.LogDebug(ex, "UDP probe to {Endpoint} failed", endpoint);
+            _logger.LogDebug(ex, "[UDP-DIAG] ProbeAsync EXCEPTION to {Target} after {Attempts} attempts", endpoint, attempt);
         }
 
         return false;
@@ -357,7 +369,12 @@ public sealed class UdpTransportBackend : ITransportBackend
                 var length = data.Length;
 
                 // Skip probe responses (single byte)
-                if (length <= 1) continue;
+                if (length <= 1)
+                {
+                    _logger.LogDebug("[UDP-DIAG] ReceiveLoop got {Len}byte packet from {Source} (byte=0x{Val:X2}) — skipping",
+                        length, result.RemoteEndPoint, length > 0 ? data[0] : 0);
+                    continue;
+                }
 
                 // Check if this is a TURN DataIndication (unwrap it)
                 if (length > 20 && IsTurnDataIndication(data))

@@ -32,6 +32,7 @@ public abstract class StreamTransport : IAsyncDisposable
     private bool _disposed;
     protected bool _connected;
     private int _controlSendFailures;
+    private bool _firstDataLogged;
 
     // Synchronized UDP switch state
     protected ITransportBackend? _pendingUdpBackend;
@@ -160,6 +161,13 @@ public abstract class StreamTransport : IAsyncDisposable
     {
         if (_disposed || !_connected) return;
 
+        if (!_firstDataLogged)
+        {
+            _firstDataLogged = true;
+            _logger.LogInformation("[TRANSPORT] First data received: {Length} bytes via {Backend}",
+                length, _backend?.GetType().Name ?? "null");
+        }
+
         try
         {
             // Decrypt
@@ -269,6 +277,9 @@ public abstract class StreamTransport : IAsyncDisposable
     protected async Task SwitchBackendAsync(ITransportBackend newBackend)
     {
         var oldBackend = _backend;
+        _logger.LogInformation("[TRANSPORT] Switching backend: {Old} → {New}",
+            oldBackend?.GetType().Name ?? "null", newBackend.GetType().Name);
+
         if (oldBackend != null)
         {
             oldBackend.OnDataReceived -= HandleDataReceived;
@@ -276,6 +287,7 @@ public abstract class StreamTransport : IAsyncDisposable
         }
 
         _backend = newBackend;
+        _firstDataLogged = false; // Log first data on new backend too
         newBackend.OnDataReceived += HandleDataReceived;
         newBackend.OnDisconnected += HandleBackendDisconnected;
 
@@ -284,7 +296,7 @@ public abstract class StreamTransport : IAsyncDisposable
             await oldBackend.DisposeAsync();
         }
 
-        _logger.LogInformation("Transport backend switched to {Backend}", newBackend.GetType().Name);
+        _logger.LogInformation("[TRANSPORT] Backend switch complete → {Backend}", newBackend.GetType().Name);
     }
 
     /// <summary>
