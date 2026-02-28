@@ -23,7 +23,7 @@ public sealed class ClipboardFileServer : IDisposable
     private readonly Timer _idleTimer;
 
     private const int IdleTimeoutMs = 30_000; // Close idle file handles after 30s
-    private const int MaxChunkSize = 196_608;  // 192KB — 3x fewer JSInterop calls, still under SCTP 256KB limit
+    private const int MaxChunkSize = 32_768;   // 32KB — ~23 UDP fragments, fits in kernel receive buffer (64KB default)
     private const int ProgressIntervalMs = 500; // Send progress every 500ms
     private const int AckWindowSize = 4;        // Allow 4 chunks in flight (~768KB)
     private const int AckTimeoutMs = 10_000;    // Timeout waiting for ACK

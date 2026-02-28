@@ -157,8 +157,9 @@ public sealed class ClipboardFileWriter : IDisposable
                 stream.AcceptPushChunk(data);
                 TrackReceiveProgress(data.Length);
             }
-            // Send ACK back to sender for flow control
-            SendPushAck(id);
+            // Send ACK back to sender for flow control — only when data was stored
+            if (stream != null)
+                SendPushAck(id);
             return;
         }
 

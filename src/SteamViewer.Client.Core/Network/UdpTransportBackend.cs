@@ -70,6 +70,7 @@ public sealed class UdpTransportBackend : ITransportBackend
     public async Task InitializeAsync(string? turnServerUri = null, string? username = null, string? credential = null)
     {
         _udpClient = new UdpClient(0); // Bind to ephemeral port
+        _udpClient.Client.ReceiveBufferSize = 2 * 1024 * 1024; // 2MB — handles file transfer + video bursts
         var localPort = ((IPEndPoint)_udpClient.Client.LocalEndPoint!).Port;
         _logger.LogInformation("UDP transport bound to local port {Port}", localPort);
 
