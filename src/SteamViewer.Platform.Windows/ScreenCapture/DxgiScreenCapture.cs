@@ -174,7 +174,7 @@ public sealed class DxgiScreenCapture : IScreenCapture
 
                 try
                 {
-                    var frame = CaptureFrameAsync().GetAwaiter().GetResult();
+                    var frame = CaptureFrameCore();
 
                     if (frame == null)
                     {
@@ -451,7 +451,7 @@ public sealed class DxgiScreenCapture : IScreenCapture
 
     #region IScreenCapture Implementation (single-frame API, used internally by capture loop)
 
-    public async Task InitializeAsync(uint monitorId, CancellationToken cancellationToken = default)
+    public Task InitializeAsync(uint monitorId, CancellationToken cancellationToken = default)
     {
         if (_isCapturing)
         {
@@ -551,10 +551,24 @@ public sealed class DxgiScreenCapture : IScreenCapture
         _logger.LogInformation("DXGI desktop duplication initialized for {MonitorId} ({Width}x{Height})",
             _monitorId, _width, _height);
 
-        await Task.CompletedTask;
+        return Task.CompletedTask;
     }
 
-    public async Task<CapturedFrame?> CaptureFrameAsync(CancellationToken cancellationToken = default)
+    public Task<CapturedFrame?> CaptureFrameAsync(CancellationToken cancellationToken = default)
+    {
+        // Thin async wrapper for IScreenCapture interface contract.
+        // Actual work is synchronous COM calls — avoid async state machine overhead.
+        return Task.FromResult(CaptureFrameCore());
+    }
+
+    /// <summary>
+    /// Synchronous frame capture. Called directly from CaptureLoopInner (dedicated thread)
+    /// and wrapped in Task.FromResult for the async IScreenCapture interface.
+    /// Keeping this non-async ensures exceptions propagate directly to the capture loop's
+    /// catch blocks (async state machines can interfere with exception propagation via
+    /// .GetAwaiter().GetResult()).
+    /// </summary>
+    private CapturedFrame? CaptureFrameCore()
     {
         if (!_isCapturing || _duplication == null || _device == null || _context == null || _stagingTexture == null)
         {
