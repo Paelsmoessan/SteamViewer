@@ -1122,7 +1122,7 @@
             InvokeAsync(StateHasChanged); // Update banner text from "Waiting..." to "Secure Desktop (UAC)"
         }
 
-        _ = JSRuntime.InvokeVoidAsync("SteamViewerSecureDesktop.renderFrame", "secureDesktopOverlay", base64Jpeg, width, height);
+        _ = JSRuntime.InvokeVoidAsync("SteamViewerSecureDesktop.renderFrame", base64Jpeg, width, height);
     }
 
     #endregion
