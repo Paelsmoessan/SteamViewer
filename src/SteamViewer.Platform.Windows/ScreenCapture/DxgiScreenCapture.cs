@@ -174,7 +174,16 @@ public sealed class DxgiScreenCapture : IScreenCapture
 
                 try
                 {
-                    var frame = CaptureFrameCore();
+                    CapturedFrame? frame;
+                    try
+                    {
+                        frame = CaptureFrameCore();
+                    }
+                    catch (Exception trapEx)
+                    {
+                        _logger.LogWarning("[DXGI-TRAP] CaptureFrameCore threw {Type}: {Message}", trapEx.GetType().Name, trapEx.Message);
+                        throw; // Re-throw for the outer catch blocks
+                    }
 
                     if (frame == null)
                     {
@@ -241,6 +250,7 @@ public sealed class DxgiScreenCapture : IScreenCapture
                     ex.Message.Contains("access lost", StringComparison.OrdinalIgnoreCase) ||
                     ex.Message.Contains("Not capturing", StringComparison.OrdinalIgnoreCase))
                 {
+                    _logger.LogWarning("[DXGI-TRAP] Caught InvalidOperationException in reinit handler: {Message}", ex.Message);
                     // DXGI_ERROR_ACCESS_LOST or resources released after failed reinitialize
                     // Triggers: desktop switch (UAC Secure Desktop), hot-plug, lock screen, display mode change
                     consecutiveErrors++;
@@ -279,6 +289,7 @@ public sealed class DxgiScreenCapture : IScreenCapture
                 }
                 catch (Exception ex)
                 {
+                    _logger.LogWarning("[DXGI-TRAP] Caught generic Exception: {Type}: {Message}", ex.GetType().Name, ex.Message);
                     consecutiveErrors++;
                     _logger.LogWarning(ex, "DXGI capture loop error (attempt {Count})", consecutiveErrors);
 
