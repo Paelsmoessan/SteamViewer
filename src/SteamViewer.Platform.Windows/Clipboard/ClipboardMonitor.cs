@@ -23,6 +23,11 @@ public sealed class ClipboardMonitor : IDisposable
     /// </summary>
     public event Action<ClipboardFileInfo[], string[]>? ClipboardFilesDetected;
 
+    /// <summary>
+    /// Fired when text is detected on the clipboard (and no files are present).
+    /// </summary>
+    public event Action<string>? ClipboardTextDetected;
+
     public ClipboardMonitor(ILogger logger)
     {
         _logger = logger;
@@ -165,44 +170,85 @@ public sealed class ClipboardMonitor : IDisposable
 
         try
         {
-            if (!IsClipboardFormatAvailable(CF_HDROP))
-                return;
-
-            var files = ReadFileDropList();
-            if (files == null || files.Count == 0)
-                return;
-
-            _logger.LogInformation("Clipboard has {Count} file(s)", files.Count);
-
-            var fileInfos = new ClipboardFileInfo[files.Count];
-            var localPaths = new string[files.Count];
-
-            for (int i = 0; i < files.Count; i++)
+            // Check for files first (CF_HDROP) — files take priority over text
+            if (IsClipboardFormatAvailable(CF_HDROP))
             {
-                localPaths[i] = files[i];
-                try
+                var files = ReadFileDropList();
+                if (files != null && files.Count > 0)
                 {
-                    var fi = new FileInfo(files[i]);
-                    fileInfos[i] = new ClipboardFileInfo(
-                        fi.Name,
-                        fi.Exists ? fi.Length : 0,
-                        (uint)fi.Attributes,
-                        fi.Exists ? fi.LastWriteTimeUtc.ToFileTimeUtc() : 0);
-                }
-                catch
-                {
-                    // File may not be accessible — send what we can
-                    fileInfos[i] = new ClipboardFileInfo(
-                        Path.GetFileName(files[i]), 0, 0, 0);
+                    _logger.LogInformation("Clipboard has {Count} file(s)", files.Count);
+
+                    var fileInfos = new ClipboardFileInfo[files.Count];
+                    var localPaths = new string[files.Count];
+
+                    for (int i = 0; i < files.Count; i++)
+                    {
+                        localPaths[i] = files[i];
+                        try
+                        {
+                            var fi = new FileInfo(files[i]);
+                            fileInfos[i] = new ClipboardFileInfo(
+                                fi.Name,
+                                fi.Exists ? fi.Length : 0,
+                                (uint)fi.Attributes,
+                                fi.Exists ? fi.LastWriteTimeUtc.ToFileTimeUtc() : 0);
+                        }
+                        catch
+                        {
+                            // File may not be accessible — send what we can
+                            fileInfos[i] = new ClipboardFileInfo(
+                                Path.GetFileName(files[i]), 0, 0, 0);
+                        }
+                    }
+
+                    ClipboardFilesDetected?.Invoke(fileInfos, localPaths);
+                    return; // Files found — don't also send text
                 }
             }
 
-            ClipboardFilesDetected?.Invoke(fileInfos, localPaths);
+            // Check for text (CF_UNICODETEXT) — only if no files
+            if (IsClipboardFormatAvailable(CF_UNICODETEXT))
+            {
+                var text = ReadClipboardText();
+                if (!string.IsNullOrEmpty(text))
+                {
+                    _logger.LogDebug("Clipboard has text: {Length} chars", text.Length);
+                    ClipboardTextDetected?.Invoke(text);
+                }
+            }
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error processing clipboard change");
         }
+    }
+
+    private static string? ReadClipboardText()
+    {
+        for (int attempt = 0; attempt < 3; attempt++)
+        {
+            if (OpenClipboard(IntPtr.Zero))
+            {
+                try
+                {
+                    var hData = GetClipboardData(CF_UNICODETEXT);
+                    if (hData == IntPtr.Zero) return null;
+                    var pData = GlobalLock(hData);
+                    if (pData == IntPtr.Zero) return null;
+                    try
+                    {
+                        return Marshal.PtrToStringUni(pData);
+                    }
+                    finally { GlobalUnlock(hData); }
+                }
+                finally
+                {
+                    CloseClipboard();
+                }
+            }
+            Thread.Sleep(33);
+        }
+        return null;
     }
 
     private static List<string>? ReadFileDropList()
@@ -253,6 +299,7 @@ public sealed class ClipboardMonitor : IDisposable
 
     #region Win32 Constants
 
+    private const uint CF_UNICODETEXT = 13;
     private const uint CF_HDROP = 15;
     private const uint WM_CLIPBOARDUPDATE = 0x031D;
     private const uint WM_QUIT = 0x0012;
@@ -358,6 +405,13 @@ public sealed class ClipboardMonitor : IDisposable
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
     private static extern IntPtr GetModuleHandle(string? lpModuleName);
+
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr GlobalLock(IntPtr hMem);
+
+    [DllImport("kernel32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GlobalUnlock(IntPtr hMem);
 
     #endregion
 }

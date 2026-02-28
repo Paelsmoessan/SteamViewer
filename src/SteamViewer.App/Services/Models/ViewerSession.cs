@@ -822,7 +822,8 @@ public sealed class ViewerSession : IAsyncDisposable
                 {
                     var json = JsonSerializer.Serialize<ClipboardFileMessage>(stopMsg);
                     await _transport.SendFileSignalingAsync(json);
-                });
+                },
+                async (data) => await _transport!.SendFileDataAsync(data));
             _clipboardFileWriter.Start();
 
             _logger.LogInformation("Session {SessionId}: Clipboard file transfer initialized", SessionId);
@@ -906,6 +907,17 @@ public sealed class ViewerSession : IAsyncDisposable
 
     private Task HandleFileDataBinary(byte[] data)
     {
+        // Route ACKs to file server (sender), everything else to file writer (receiver)
+        if (data.Length >= 8)
+        {
+            int flags = System.Buffers.Binary.BinaryPrimitives.ReadInt32BigEndian(data.AsSpan(4, 4));
+            if (flags == ClipboardFileServer.FlagPushAck)
+            {
+                int fileIndex = System.Buffers.Binary.BinaryPrimitives.ReadInt32BigEndian(data.AsSpan(0, 4));
+                _clipboardFileServer?.HandlePushAck(fileIndex);
+                return Task.CompletedTask;
+            }
+        }
         _clipboardFileWriter?.HandleBinaryFileContentsResponse(data);
         return Task.CompletedTask;
     }

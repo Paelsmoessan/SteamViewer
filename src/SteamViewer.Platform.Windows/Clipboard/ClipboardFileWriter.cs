@@ -20,6 +20,7 @@ public sealed class ClipboardFileWriter : IDisposable
 {
     private readonly ILogger _logger;
     private readonly Func<ClipboardFileMessage.FileContentsRequest, Task> _sendRequest;
+    private readonly Func<byte[], Task<bool>>? _sendBinaryAsync;
     private readonly Func<ClipboardFileMessage.StartStreaming, Task>? _sendStartStreaming;
     private readonly Func<ClipboardFileMessage.StopStreaming, Task>? _sendStopStreaming;
     private readonly ClipboardMonitor? _clipboardMonitor;
@@ -57,13 +58,15 @@ public sealed class ClipboardFileWriter : IDisposable
         Func<ClipboardFileMessage.FileContentsRequest, Task> sendRequest,
         ClipboardMonitor? clipboardMonitor = null,
         Func<ClipboardFileMessage.StartStreaming, Task>? sendStartStreaming = null,
-        Func<ClipboardFileMessage.StopStreaming, Task>? sendStopStreaming = null)
+        Func<ClipboardFileMessage.StopStreaming, Task>? sendStopStreaming = null,
+        Func<byte[], Task<bool>>? sendBinaryAsync = null)
     {
         _logger = logger;
         _sendRequest = sendRequest;
         _clipboardMonitor = clipboardMonitor;
         _sendStartStreaming = sendStartStreaming;
         _sendStopStreaming = sendStopStreaming;
+        _sendBinaryAsync = sendBinaryAsync;
     }
 
     /// <summary>
@@ -154,6 +157,8 @@ public sealed class ClipboardFileWriter : IDisposable
                 stream.AcceptPushChunk(data);
                 TrackReceiveProgress(data.Length);
             }
+            // Send ACK back to sender for flow control
+            SendPushAck(id);
             return;
         }
 
@@ -194,6 +199,15 @@ public sealed class ClipboardFileWriter : IDisposable
                 tcs.TrySetResult(null);
                 break;
         }
+    }
+
+    private void SendPushAck(int fileIndex)
+    {
+        if (_sendBinaryAsync == null) return;
+        var ack = new byte[8];
+        BinaryPrimitives.WriteInt32BigEndian(ack.AsSpan(0, 4), fileIndex);
+        BinaryPrimitives.WriteInt32BigEndian(ack.AsSpan(4, 4), ClipboardFileServer.FlagPushAck);
+        _ = _sendBinaryAsync(ack);
     }
 
     private void TrackReceiveProgress(int bytesReceived)

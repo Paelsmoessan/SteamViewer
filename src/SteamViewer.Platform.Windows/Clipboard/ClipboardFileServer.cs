@@ -19,20 +19,24 @@ public sealed class ClipboardFileServer : IDisposable
     private readonly ConcurrentDictionary<int, CachedFileHandle> _fileHandles = new();
     private readonly ConcurrentDictionary<int, TransferTracker> _transferTrackers = new();
     private readonly ConcurrentDictionary<int, CancellationTokenSource> _streamingCts = new();
+    private readonly ConcurrentDictionary<int, SemaphoreSlim> _ackSemaphores = new();
     private readonly Timer _idleTimer;
 
     private const int IdleTimeoutMs = 30_000; // Close idle file handles after 30s
     private const int MaxChunkSize = 196_608;  // 192KB — 3x fewer JSInterop calls, still under SCTP 256KB limit
     private const int ProgressIntervalMs = 500; // Send progress every 500ms
+    private const int AckWindowSize = 4;        // Allow 4 chunks in flight (~768KB)
+    private const int AckTimeoutMs = 10_000;    // Timeout waiting for ACK
 
     // Binary response flags (in 4-byte flags field)
     // Pull-mode (request-response): [4B streamId][4B flags][data]
-    internal const int FlagSuccess = 0x00;
-    internal const int FlagError = 0x01;
-    internal const int FlagEof = 0x02;
+    public const int FlagSuccess = 0x00;
+    public const int FlagError = 0x01;
+    public const int FlagEof = 0x02;
     // Push-mode (streaming): [4B fileIndex][4B flags][data]
-    internal const int FlagPushChunk = 0x10;
-    internal const int FlagPushEof = 0x12;
+    public const int FlagPushChunk = 0x10;
+    public const int FlagPushAck = 0x11;
+    public const int FlagPushEof = 0x12;
 
     public ClipboardFileServer(ILogger logger, Func<byte[], Task<bool>> sendBinaryAsync, Func<string, Task>? sendProgressAsync = null)
     {
@@ -161,6 +165,10 @@ public sealed class ClipboardFileServer : IDisposable
         var path = _currentPaths[fileIndex];
         _logger.LogInformation("Push streaming started for file {Index}: {Path}", fileIndex, Path.GetFileName(path));
 
+        // Create ACK semaphore with sliding window
+        var semaphore = new SemaphoreSlim(AckWindowSize, AckWindowSize);
+        _ackSemaphores[fileIndex] = semaphore;
+
         try
         {
             using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: MaxChunkSize);
@@ -172,16 +180,15 @@ public sealed class ClipboardFileServer : IDisposable
                 int bytesRead = await fs.ReadAsync(buffer.AsMemory(0, MaxChunkSize), ct);
                 if (bytesRead == 0) break;
 
-                var data = bytesRead == buffer.Length ? buffer : buffer[..bytesRead];
-
-                // Send with backpressure retry — JS returns false when DC buffer > 1MB
-                while (!ct.IsCancellationRequested)
+                // Wait for ACK window — paces sends to receiver speed
+                if (!await semaphore.WaitAsync(AckTimeoutMs, ct))
                 {
-                    if (await SendPushChunk(fileIndex, data))
-                        break;
-                    // Buffer full — wait briefly and retry
-                    await Task.Delay(10, ct);
+                    _logger.LogWarning("Push streaming ACK timeout for file {Index} at position {Position}", fileIndex, position);
+                    break;
                 }
+
+                var data = bytesRead == buffer.Length ? buffer : buffer[..bytesRead];
+                await SendPushChunk(fileIndex, data);
 
                 position += bytesRead;
 
@@ -207,6 +214,20 @@ public sealed class ClipboardFileServer : IDisposable
         finally
         {
             _streamingCts.TryRemove(fileIndex, out _);
+            if (_ackSemaphores.TryRemove(fileIndex, out var sem))
+                sem.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Called when receiver ACKs a push chunk — releases one semaphore slot.
+    /// </summary>
+    public void HandlePushAck(int fileIndex)
+    {
+        if (_ackSemaphores.TryGetValue(fileIndex, out var semaphore))
+        {
+            try { semaphore.Release(); }
+            catch (SemaphoreFullException) { } // Extra ACK — ignore
         }
     }
 
