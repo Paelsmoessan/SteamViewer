@@ -368,11 +368,17 @@ public sealed class UdpTransportBackend : ITransportBackend
                 var data = result.Buffer;
                 var length = data.Length;
 
-                // Skip probe responses (single byte)
+                // Handle probe/echo packets (single byte)
                 if (length <= 1)
                 {
-                    _logger.LogDebug("[UDP-DIAG] ReceiveLoop got {Len}byte packet from {Source} (byte=0x{Val:X2}) — skipping",
-                        length, result.RemoteEndPoint, length > 0 ? data[0] : 0);
+                    // Echo probe packets (0xFF) so peer's ProbeAsync succeeds
+                    // Use 0xFE for echo to prevent infinite loop between two ReceiveLoops
+                    if (length == 1 && data[0] == 0xFF && _udpClient != null)
+                    {
+                        _logger.LogDebug("[UDP-DIAG] ReceiveLoop echoing probe from {Source}", result.RemoteEndPoint);
+                        try { await _udpClient.SendAsync(new byte[] { 0xFE }, 1, result.RemoteEndPoint); }
+                        catch { }
+                    }
                     continue;
                 }
 
