@@ -379,7 +379,7 @@ public sealed unsafe class FFmpegEncoder : IDisposable
         var ctx = ffmpeg.sws_getContext(
             srcW, srcH, AVPixelFormat.AV_PIX_FMT_BGRA,
             dstW, dstH, AVPixelFormat.AV_PIX_FMT_BGRA,
-            (int)(SwsFlags.SWS_LANCZOS | SwsFlags.SWS_ACCURATE_RND), null, null, null);
+            (int)(SwsFlags.SWS_BICUBIC | SwsFlags.SWS_ACCURATE_RND), null, null, null);
 
         if (ctx == null)
             throw new InvalidOperationException("Failed to create sws_scale context for lossless downscale");
