@@ -779,6 +779,17 @@ public sealed class ViewerSession : IAsyncDisposable
                         }
                         break;
 
+                    case "encodeInfo":
+                        var encW = root.TryGetProperty("width", out var ewProp) ? ewProp.GetInt32() : 0;
+                        var encH = root.TryGetProperty("height", out var ehProp) ? ehProp.GetInt32() : 0;
+                        if (encW > 0 && encH > 0)
+                        {
+                            _logger.LogInformation("Session {SessionId}: Host encode resolution {W}x{H}", SessionId, encW, encH);
+                            try { _ = _jsRuntime.InvokeVoidAsync("SteamViewerVideo.setEncodeResolution", SessionId, encW, encH); }
+                            catch { /* JS not ready yet — next frame will use fallback path */ }
+                        }
+                        break;
+
                     case "secureDesktopActive":
                         IsSecureDesktopActive = true;
                         OnSecureDesktopStateChanged?.Invoke(true);

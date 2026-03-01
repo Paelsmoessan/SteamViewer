@@ -207,6 +207,16 @@ window.SteamViewerVideo = {
         return [Math.round(rect.width * dpr), Math.round(rect.height * dpr)];
     },
 
+    /// Set the host's actual encode resolution for a session.
+    /// Viewer sets canvas to this exact size → 1:1 pixel mapping, no fractional scaling.
+    setEncodeResolution(sessionId, encW, encH) {
+        const session = this.sessions.get(sessionId);
+        if (!session) return;
+        session.encodeW = encW;
+        session.encodeH = encH;
+        console.log(`[Video] Session ${sessionId}: encodeResolution ${encW}x${encH}`);
+    },
+
     /// Start a debounced resize listener that sends resolution updates via postMessage.
     /// The C# side picks this up through the InputMessageRouter.
     _resizeDebounceTimer: null,
@@ -315,49 +325,57 @@ if (window.chrome?.webview) {
                     session.videoH = meta.h;
                 }
 
-                // Detect display size for downscale vs upscale decision
-                const rect = canvas.getBoundingClientRect();
-                const dpr = window.devicePixelRatio || 1;
-                const displayW = Math.round(rect.width * dpr);
-                const displayH = Math.round(rect.height * dpr);
+                // When encodeResolution is known, canvas = video resolution → 1:1 drawImage.
+                // CSS object-fit: contain handles display scaling (GPU compositor).
+                // Host already downscaled to near-display size, so CSS upscale is ≤7px (imperceptible).
+                const use1to1 = session.encodeW > 0 && session.encodeH > 0 &&
+                    meta.w === session.encodeW && meta.h === session.encodeH;
 
-                // Compute the fitted video dimensions within display area
-                const scale = Math.min(displayW / meta.w, displayH / meta.h);
-                const isDownscaling = scale < 0.95; // 5% margin to avoid thrashing
-
-                if (isDownscaling) {
-                    // DOWNSCALE: Canvas bitmap = display pixels, high-quality Canvas 2D scaling.
-                    // imageSmoothingQuality:'high' uses Skia Mitchell-Netravali (cubic) in Chromium
-                    // — significantly sharper for text than CSS compositor bilinear.
-                    const displayChanged = displayW !== session.lastDisplayW || displayH !== session.lastDisplayH;
-                    if (canvas.width !== displayW || canvas.height !== displayH || displayChanged) {
-                        canvas.width = displayW;
-                        canvas.height = displayH;
-                        ctx.imageSmoothingEnabled = true;
-                        ctx.imageSmoothingQuality = 'high';
-                        session.lastDisplayW = displayW;
-                        session.lastDisplayH = displayH;
-                    }
-                    // Letterbox: fit video into display area preserving aspect ratio
-                    const fitW = Math.round(meta.w * scale);
-                    const fitH = Math.round(meta.h * scale);
-                    const dx = Math.round((displayW - fitW) / 2);
-                    const dy = Math.round((displayH - fitH) / 2);
-                    // Clear for letterbox bars (only if aspect ratios differ)
-                    if (dx > 0 || dy > 0) ctx.clearRect(0, 0, displayW, displayH);
-                    ctx.drawImage(frame, dx, dy, fitW, fitH);
-                    session.isDownscaling = true;
-                } else {
-                    // UPSCALE or 1:1: Canvas = video resolution, drawImage 1:1.
-                    // CSS object-fit: contain handles display scaling (GPU compositor).
+                if (use1to1) {
+                    // 1:1 pixel-perfect: canvas = encode resolution, CSS handles display fit
                     if (canvas.width !== meta.w || canvas.height !== meta.h) {
                         canvas.width = meta.w;
                         canvas.height = meta.h;
-                        session.lastDisplayW = 0;
-                        session.lastDisplayH = 0;
                     }
                     ctx.drawImage(frame, 0, 0);
                     session.isDownscaling = false;
+                } else {
+                    // Fallback: display-pixel canvas with Canvas 2D scaling
+                    // (before encodeInfo arrives, or if frame doesn't match encode resolution)
+                    const rect = canvas.getBoundingClientRect();
+                    const dpr = window.devicePixelRatio || 1;
+                    const displayW = Math.round(rect.width * dpr);
+                    const displayH = Math.round(rect.height * dpr);
+                    const scale = Math.min(displayW / meta.w, displayH / meta.h);
+                    const isDownscaling = scale < 0.95;
+
+                    if (isDownscaling) {
+                        const displayChanged = displayW !== session.lastDisplayW || displayH !== session.lastDisplayH;
+                        if (canvas.width !== displayW || canvas.height !== displayH || displayChanged) {
+                            canvas.width = displayW;
+                            canvas.height = displayH;
+                            ctx.imageSmoothingEnabled = true;
+                            ctx.imageSmoothingQuality = 'high';
+                            session.lastDisplayW = displayW;
+                            session.lastDisplayH = displayH;
+                        }
+                        const fitW = Math.round(meta.w * scale);
+                        const fitH = Math.round(meta.h * scale);
+                        const dx = Math.round((displayW - fitW) / 2);
+                        const dy = Math.round((displayH - fitH) / 2);
+                        if (dx > 0 || dy > 0) ctx.clearRect(0, 0, displayW, displayH);
+                        ctx.drawImage(frame, dx, dy, fitW, fitH);
+                        session.isDownscaling = true;
+                    } else {
+                        if (canvas.width !== meta.w || canvas.height !== meta.h) {
+                            canvas.width = meta.w;
+                            canvas.height = meta.h;
+                            session.lastDisplayW = 0;
+                            session.lastDisplayH = 0;
+                        }
+                        ctx.drawImage(frame, 0, 0);
+                        session.isDownscaling = false;
+                    }
                 }
                 frame.close();
             } else {
