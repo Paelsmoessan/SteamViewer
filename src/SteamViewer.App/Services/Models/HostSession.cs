@@ -396,13 +396,19 @@ public sealed class HostSession : IAsyncDisposable
     /// DXGI raw BGRA frame → FFmpeg encode → transport.
     /// Called from DXGI capture thread — must not block.
     /// </summary>
+    private byte[]? _lastSeenFrameRef; // Track frame identity to detect refires vs real changes
+
     private void OnDxgiRawFrameCaptured(byte[] bgraData, int width, int height, int stride)
     {
         if (_transport == null || !_transport.IsConnected || !_isNativeCapture) return;
 
-        // Screen changed — reset settle counter, allow new lossless request
-        _consecutiveNullFrames = 0;
-        _losslessSent = false;
+        // Only reset lossless state on genuinely NEW frames (not refired cached frames)
+        if (!ReferenceEquals(bgraData, _lastSeenFrameRef))
+        {
+            _lastSeenFrameRef = bgraData;
+            _consecutiveNullFrames = 0;
+            _losslessSent = false;
+        }
 
         try
         {
@@ -1625,6 +1631,7 @@ public sealed class HostSession : IAsyncDisposable
         if (rawFrame == null || rawW <= 0 || rawH <= 0) return;
 
         _losslessSent = true;
+        _losslessRequested = false; // One-shot — viewer must explicitly re-request
 
         // Encode and send on a background thread to avoid blocking capture loop
         var frameCopy = new byte[rawFrame.Length];

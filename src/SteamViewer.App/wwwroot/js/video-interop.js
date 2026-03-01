@@ -254,7 +254,9 @@ if (window.chrome?.webview) {
             }
 
             if (meta.lossless) {
-                // Lossless QOI-decoded BGRA frame — paint with same scaling as H.264
+                // Lossless QOI-decoded BGRA frame — paint into existing canvas (no resize!)
+                // Dimensions match H.264 (viewer requests at decoder resolution), so
+                // we paint exactly like the last H.264 frame but with nearest-neighbor.
                 const bgraCopy = new Uint8Array(buf, 0, meta.len).slice();
                 chrome.webview.releaseBuffer(buf);
 
@@ -268,44 +270,28 @@ if (window.chrome?.webview) {
                 const canvas = session.canvas;
                 const ctx = session.ctx;
 
-                // Use same display logic as H.264 — match current canvas scaling mode
-                const rect = canvas.getBoundingClientRect();
-                const dpr = window.devicePixelRatio || 1;
-                const displayW = Math.round(rect.width * dpr);
-                const displayH = Math.round(rect.height * dpr);
-                const scale = Math.min(displayW / meta.w, displayH / meta.h);
-                const isDownscaling = scale < 0.95;
+                // Paint into current canvas — never resize (prevents jitter)
+                const savedSmoothing = ctx.imageSmoothingEnabled;
+                ctx.imageSmoothingEnabled = false;
 
-                if (isDownscaling) {
-                    if (canvas.width !== displayW || canvas.height !== displayH) {
-                        canvas.width = displayW;
-                        canvas.height = displayH;
-                    }
-                    // Use nearest-neighbor for lossless — preserves pixel-perfect text
-                    ctx.imageSmoothingEnabled = false;
+                if (session.isDownscaling) {
+                    // Canvas is at display pixels — use same letterbox as H.264
+                    const scale = Math.min(canvas.width / meta.w, canvas.height / meta.h);
                     const fitW = Math.round(meta.w * scale);
                     const fitH = Math.round(meta.h * scale);
-                    const dx = Math.round((displayW - fitW) / 2);
-                    const dy = Math.round((displayH - fitH) / 2);
-                    if (dx > 0 || dy > 0) ctx.clearRect(0, 0, displayW, displayH);
+                    const dx = Math.round((canvas.width - fitW) / 2);
+                    const dy = Math.round((canvas.height - fitH) / 2);
+                    if (dx > 0 || dy > 0) ctx.clearRect(0, 0, canvas.width, canvas.height);
                     ctx.drawImage(frame, dx, dy, fitW, fitH);
-                    // Restore smoothing for next H.264 frame
-                    ctx.imageSmoothingEnabled = true;
-                    ctx.imageSmoothingQuality = 'high';
                 } else {
-                    if (canvas.width !== meta.w || canvas.height !== meta.h) {
-                        canvas.width = meta.w;
-                        canvas.height = meta.h;
-                    }
-                    ctx.imageSmoothingEnabled = false;
+                    // Canvas is at video resolution — draw 1:1
                     ctx.drawImage(frame, 0, 0);
                 }
-                frame.close();
 
-                session.videoW = meta.w;
-                session.videoH = meta.h;
+                ctx.imageSmoothingEnabled = savedSmoothing;
+                frame.close();
                 session.frameCount++;
-                return; // Don't count lossless in first-frame callback
+                return;
             }
 
             if (meta.raw) {

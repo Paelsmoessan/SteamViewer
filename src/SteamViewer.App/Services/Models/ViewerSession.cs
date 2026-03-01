@@ -843,12 +843,15 @@ public sealed class ViewerSession : IAsyncDisposable
     {
         if (_transport == null || !_transport.IsConnected) return;
 
+        // Use decoder dimensions — matches H.264 encode resolution (8-aligned)
+        // This ensures lossless and H.264 frames are identical size → no canvas resize
+        var w = _decoder?.Width ?? 0;
+        var h = _decoder?.Height ?? 0;
+        if (w <= 0 || h <= 0) return;
+
         _losslessRequestPending = true;
         try
         {
-            // Request at canvas physical pixel size (set by SendDesiredResolutionAsync)
-            var w = CaptureWidth > 0 ? CaptureWidth : 1920;
-            var h = CaptureHeight > 0 ? CaptureHeight : 1080;
             var json = JsonSerializer.Serialize(new { type = "requestLosslessFrame", width = w, height = h });
             await _transport.SendControlAsync(json);
         }
@@ -862,6 +865,11 @@ public sealed class ViewerSession : IAsyncDisposable
     private void HandleLosslessFrame(byte[] qoiData, int length)
     {
         _losslessRequestPending = false;
+
+        // Discard if input resumed while frame was in-flight (race: encode takes 50-100ms)
+        if ((DateTime.UtcNow - _lastInputTime).TotalMilliseconds < 150)
+            return;
+
         _losslessActive = true;
 
         try
