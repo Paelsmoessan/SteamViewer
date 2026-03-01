@@ -226,6 +226,85 @@ public sealed class NativeFrameBridge : IDisposable
         }
     }
 
+    /// <summary>
+    /// Push a lossless QOI-decoded BGRA frame to JS via SharedBuffer.
+    /// Same as PushRawFrame but includes lossless flag so JS knows to paint 1:1.
+    /// </summary>
+    public void PushLosslessFrame(byte[] bgraData, int width, int height, int stride, string sessionId)
+    {
+        if (!_initialized || _coreWebView2 == null || _dispatcherQueue == null) return;
+
+        // Don't drop lossless frames — they are one-shot and important
+        // Wait briefly for previous frame to complete
+        SpinWait.SpinUntil(() => Interlocked.CompareExchange(ref _frameInFlight, 1, 0) == 0, 50);
+        if (_frameInFlight == 0)
+        {
+            // Timed out — force proceed
+            Interlocked.Exchange(ref _frameInFlight, 1);
+        }
+
+        var buffer = _useBufferA ? _bufferA : _bufferB;
+        if (buffer == null) { Interlocked.Exchange(ref _frameInFlight, 0); return; }
+
+        _useBufferA = !_useBufferA;
+
+        try
+        {
+            int rowBytes = width * 4;
+            int dataLen = width * height * 4;
+
+            using (var winrtStream = buffer.OpenStream())
+            using (var stream = winrtStream.AsStreamForWrite())
+            {
+                stream.Position = 0;
+                if (stride == rowBytes)
+                {
+                    stream.Write(bgraData, 0, dataLen);
+                }
+                else
+                {
+                    for (int y = 0; y < height; y++)
+                        stream.Write(bgraData, y * stride, rowBytes);
+                }
+                stream.Flush();
+            }
+
+            var len = dataLen;
+            var w = width;
+            var h = height;
+            var sid = sessionId;
+            var buf = buffer;
+            var webview = _coreWebView2;
+
+            _dispatcherQueue.TryEnqueue(() =>
+            {
+                try
+                {
+                    var metadata = $"{{\"len\":{len},\"w\":{w},\"h\":{h},\"raw\":true,\"lossless\":true,\"sid\":\"{sid}\"}}";
+                    webview.PostSharedBufferToScript(
+                        buf,
+                        CoreWebView2SharedBufferAccess.ReadOnly,
+                        metadata);
+                }
+                catch (Exception ex)
+                {
+                    if (_logCounter++ % 300 == 0)
+                        _logger.LogWarning(ex, "PostSharedBufferToScript lossless error (sample)");
+                }
+                finally
+                {
+                    Interlocked.Exchange(ref _frameInFlight, 0);
+                }
+            });
+        }
+        catch (Exception ex)
+        {
+            Interlocked.Exchange(ref _frameInFlight, 0);
+            if (_logCounter++ % 300 == 0)
+                _logger.LogWarning(ex, "NativeFrameBridge.PushLosslessFrame error (sample)");
+        }
+    }
+
     private int _logCounter;
 
     public void Dispose()

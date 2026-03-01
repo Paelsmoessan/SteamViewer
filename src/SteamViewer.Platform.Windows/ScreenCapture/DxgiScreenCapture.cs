@@ -65,6 +65,21 @@ public sealed class DxgiScreenCapture : IScreenCapture
     /// <summary>Raised when the host cursor shape changes. Parameter: CSS cursor value (e.g. "default", "text", "pointer").</summary>
     public event Action<string>? OnCursorShapeChanged;
 
+    /// <summary>Raised when AcquireNextFrame reports no desktop change (screen is static).</summary>
+    public event Action? OnFrameUnchanged;
+
+    // Last captured raw frame — exposed for lossless settle snapshot
+    private byte[]? _lastRawFrame;
+    private int _lastRawWidth;
+    private int _lastRawHeight;
+    private int _lastRawStride;
+
+    /// <summary>Last captured BGRA frame data. Null if no frame captured yet.</summary>
+    public byte[]? LastRawFrame => _lastRawFrame;
+    public int LastRawWidth => _lastRawWidth;
+    public int LastRawHeight => _lastRawHeight;
+    public int LastRawStride => _lastRawStride;
+
     // Cursor shape tracking
     private IntPtr _lastCursorHandle;
     private Dictionary<IntPtr, string>? _standardCursors;
@@ -190,6 +205,9 @@ public sealed class DxgiScreenCapture : IScreenCapture
                         // Cursor shape can change even when screen is static (hovering over UI)
                         DetectCursorShapeChange();
 
+                        // Notify listeners that screen is unchanged (for lossless settle detection)
+                        OnFrameUnchanged?.Invoke();
+
                         // Desktop unchanged — re-fire last frame at ~30fps to keep WebRTC JB calibrated
                         if (idleSw.ElapsedMilliseconds >= targetIntervalMs)
                         {
@@ -237,6 +255,12 @@ public sealed class DxgiScreenCapture : IScreenCapture
                         {
                             lastJpegData = jpegStream.ToArray();
                         }
+
+                        // Expose last frame for lossless settle snapshot
+                        _lastRawFrame = frame.Data;
+                        _lastRawWidth = frame.Width;
+                        _lastRawHeight = frame.Height;
+                        _lastRawStride = frame.Stride;
                     }
                     idleSw.Restart();
 

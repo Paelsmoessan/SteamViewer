@@ -40,6 +40,11 @@ public sealed class ViewerSession : IAsyncDisposable
     private ClipboardFileServer? _clipboardFileServer;
     private ClipboardFileWriter? _clipboardFileWriter;
 
+    // Lossless settle — request QOI snapshot when input is idle and screen is static
+    private DateTime _lastInputTime = DateTime.UtcNow;
+    private bool _losslessActive;
+    private bool _losslessRequestPending;
+
 #if WINDOWS
     private Services.NativeFrameBridge? _frameBridge;
 #endif
@@ -224,6 +229,7 @@ public sealed class ViewerSession : IAsyncDisposable
             _transport = new ViewerStreamTransport(_signalingClient, _loggerFactory.CreateLogger<ViewerStreamTransport>());
             _transport.OnControlMessage += HandleControlMessage;
             _transport.OnVideoData += HandleVideoData;
+            _transport.OnLosslessFrame += HandleLosslessFrame;
             _transport.OnFileData += HandleFileDataBinary;
             _transport.OnFileSignalingMessage += HandleFileChannelMessage;
             _transport.OnConnectionStateChanged += HandleTransportStateChanged;
@@ -384,6 +390,14 @@ public sealed class ViewerSession : IAsyncDisposable
             if (++_inputDropCount <= 5)
                 _logger.LogWarning("Session {SessionId}: Input dropped — transport not connected (drop #{Count})", SessionId, _inputDropCount);
             return;
+        }
+
+        // Track input activity for lossless settle
+        _lastInputTime = DateTime.UtcNow;
+        if (_losslessActive)
+        {
+            _losslessActive = false;
+            _losslessRequestPending = false;
         }
 
         try
@@ -549,6 +563,7 @@ public sealed class ViewerSession : IAsyncDisposable
         {
             _transport.OnControlMessage -= HandleControlMessage;
             _transport.OnVideoData -= HandleVideoData;
+            _transport.OnLosslessFrame -= HandleLosslessFrame;
             _transport.OnFileData -= HandleFileDataBinary;
             _transport.OnFileSignalingMessage -= HandleFileChannelMessage;
             _transport.OnConnectionStateChanged -= HandleTransportStateChanged;
@@ -806,6 +821,13 @@ public sealed class ViewerSession : IAsyncDisposable
                     _frameBridge.PushRawFrame(bgraData, width, height, stride, SessionId);
                 }
 #endif
+
+                // Check if we should request a lossless frame (input idle)
+                if (!_losslessActive && !_losslessRequestPending
+                    && (DateTime.UtcNow - _lastInputTime).TotalMilliseconds > 150)
+                {
+                    RequestLosslessFrame();
+                }
             }
         }
         catch (Exception ex)
@@ -816,6 +838,69 @@ public sealed class ViewerSession : IAsyncDisposable
     }
 
     private int _decodeErrorCount;
+
+    private async void RequestLosslessFrame()
+    {
+        if (_transport == null || !_transport.IsConnected) return;
+
+        // Use decoder dimensions — matches H.264 encode resolution (8-aligned)
+        // This ensures lossless and H.264 frames are identical size → no canvas resize
+        var w = _decoder?.Width ?? 0;
+        var h = _decoder?.Height ?? 0;
+        if (w <= 0 || h <= 0) return;
+
+        _losslessRequestPending = true;
+        try
+        {
+            var json = JsonSerializer.Serialize(new { type = "requestLosslessFrame", width = w, height = h });
+            await _transport.SendControlAsync(json);
+        }
+        catch (Exception ex)
+        {
+            _losslessRequestPending = false;
+            _logger.LogWarning(ex, "Session {SessionId}: Failed to request lossless frame", SessionId);
+        }
+    }
+
+    private void HandleLosslessFrame(byte[] qoiData, int length)
+    {
+        _losslessRequestPending = false;
+
+        // Discard if input resumed while frame was in-flight (race: encode takes 50-100ms)
+        if ((DateTime.UtcNow - _lastInputTime).TotalMilliseconds < 150)
+            return;
+
+        _losslessActive = true;
+
+        try
+        {
+            // Decode QOI to BGRA
+            var actualData = qoiData;
+            if (length < qoiData.Length)
+            {
+                actualData = new byte[length];
+                Buffer.BlockCopy(qoiData, 0, actualData, 0, length);
+            }
+
+            var bgra = QoiCodec.Decode(actualData, out int w, out int h);
+
+#if WINDOWS
+            // Push lossless BGRA to JS canvas via SharedBuffer with lossless flag
+            if (_frameBridge?.IsInitialized == true)
+            {
+                _frameBridge.PushLosslessFrame(bgra, w, h, w * 4, SessionId);
+            }
+#endif
+
+            _logger.LogInformation("Session {SessionId}: Lossless frame rendered: {W}x{H}, QOI={Size}KB",
+                SessionId, w, h, length / 1024);
+        }
+        catch (Exception ex)
+        {
+            _losslessActive = false;
+            _logger.LogWarning(ex, "Session {SessionId}: Failed to decode/render lossless frame", SessionId);
+        }
+    }
 
     private void HandleTransportStateChanged(string state)
     {
@@ -1038,6 +1123,7 @@ public sealed class ViewerSession : IAsyncDisposable
         {
             _transport.OnControlMessage -= HandleControlMessage;
             _transport.OnVideoData -= HandleVideoData;
+            _transport.OnLosslessFrame -= HandleLosslessFrame;
             _transport.OnFileData -= HandleFileDataBinary;
             _transport.OnFileSignalingMessage -= HandleFileChannelMessage;
             _transport.OnConnectionStateChanged -= HandleTransportStateChanged;

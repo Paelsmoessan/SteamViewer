@@ -253,6 +253,47 @@ if (window.chrome?.webview) {
                 return;
             }
 
+            if (meta.lossless) {
+                // Lossless QOI-decoded BGRA frame — paint into existing canvas (no resize!)
+                // Dimensions match H.264 (viewer requests at decoder resolution), so
+                // we paint exactly like the last H.264 frame but with nearest-neighbor.
+                const bgraCopy = new Uint8Array(buf, 0, meta.len).slice();
+                chrome.webview.releaseBuffer(buf);
+
+                const frame = new VideoFrame(bgraCopy, {
+                    format: 'BGRA',
+                    codedWidth: meta.w,
+                    codedHeight: meta.h,
+                    timestamp: performance.now() * 1000,
+                });
+
+                const canvas = session.canvas;
+                const ctx = session.ctx;
+
+                // Paint into current canvas — never resize (prevents jitter)
+                const savedSmoothing = ctx.imageSmoothingEnabled;
+                ctx.imageSmoothingEnabled = false;
+
+                if (session.isDownscaling) {
+                    // Canvas is at display pixels — use same letterbox as H.264
+                    const scale = Math.min(canvas.width / meta.w, canvas.height / meta.h);
+                    const fitW = Math.round(meta.w * scale);
+                    const fitH = Math.round(meta.h * scale);
+                    const dx = Math.round((canvas.width - fitW) / 2);
+                    const dy = Math.round((canvas.height - fitH) / 2);
+                    if (dx > 0 || dy > 0) ctx.clearRect(0, 0, canvas.width, canvas.height);
+                    ctx.drawImage(frame, dx, dy, fitW, fitH);
+                } else {
+                    // Canvas is at video resolution — draw 1:1
+                    ctx.drawImage(frame, 0, 0);
+                }
+
+                ctx.imageSmoothingEnabled = savedSmoothing;
+                frame.close();
+                session.frameCount++;
+                return;
+            }
+
             if (meta.raw) {
                 // Raw BGRA path — VideoFrame directly from pixel data
                 const bgraCopy = new Uint8Array(buf, 0, meta.len).slice();

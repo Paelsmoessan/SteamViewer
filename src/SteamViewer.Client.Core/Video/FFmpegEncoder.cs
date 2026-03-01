@@ -367,6 +367,49 @@ public sealed unsafe class FFmpegEncoder : IDisposable
             _codecCtx->rc_max_rate = bitsPerSecond;
     }
 
+    /// <summary>
+    /// Static helper: downscale a BGRA frame using sws_scale Lanczos.
+    /// Used by lossless settle to match viewer display resolution.
+    /// Caller owns the returned buffer.
+    /// </summary>
+    public static byte[] DownscaleBgra(byte[] srcBgra, int srcW, int srcH, int srcStride, int dstW, int dstH)
+    {
+        FFmpegInit.EnsureInitialized();
+
+        var ctx = ffmpeg.sws_getContext(
+            srcW, srcH, AVPixelFormat.AV_PIX_FMT_BGRA,
+            dstW, dstH, AVPixelFormat.AV_PIX_FMT_BGRA,
+            (int)(SwsFlags.SWS_BICUBIC | SwsFlags.SWS_ACCURATE_RND), null, null, null);
+
+        if (ctx == null)
+            throw new InvalidOperationException("Failed to create sws_scale context for lossless downscale");
+
+        try
+        {
+            var dstStridePx = dstW * 4;
+            var dst = new byte[dstStridePx * dstH];
+
+            fixed (byte* srcPtr = srcBgra)
+            fixed (byte* dstPtr = dst)
+            {
+                var srcSlice = new byte_ptrArray4 { [0] = srcPtr };
+                var srcStrides = new int_array4 { [0] = srcStride };
+                var dstSlice = new byte_ptrArray4 { [0] = dstPtr };
+                var dstStrides = new int_array4 { [0] = dstStridePx };
+
+                ffmpeg.sws_scale(ctx,
+                    srcSlice, srcStrides, 0, srcH,
+                    dstSlice, dstStrides);
+            }
+
+            return dst;
+        }
+        finally
+        {
+            ffmpeg.sws_freeContext(ctx);
+        }
+    }
+
     private void Cleanup()
     {
         if (_downscaleCtx != null) { ffmpeg.sws_freeContext(_downscaleCtx); _downscaleCtx = null; }
