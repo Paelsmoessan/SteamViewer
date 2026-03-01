@@ -131,9 +131,21 @@ public sealed class ViewerSession : IAsyncDisposable
     public event Action<string, int, int>? OnSecureDesktopFrame;
 
     /// <summary>
+    /// Raised when host sends capture dimensions (on first frame + capture change).
+    /// Viewer should constrain canvas to this AR for 1:1 pixel mapping.
+    /// </summary>
+    public event Action<int, int>? OnCaptureInfoReceived;
+
+    /// <summary>
     /// Whether the Secure Desktop is currently active on the host.
     /// </summary>
     public bool IsSecureDesktopActive { get; private set; }
+
+    /// <summary>
+    /// Host capture dimensions (for AR-aware canvas sizing).
+    /// </summary>
+    public int CaptureWidth { get; private set; }
+    public int CaptureHeight { get; private set; }
 
     /// <summary>
     /// The host's monitor layout.
@@ -507,13 +519,41 @@ public sealed class ViewerSession : IAsyncDisposable
     }
 
     /// <summary>
-    /// Disconnect this session.
+    /// Disconnect this session. Cleans up all state so reconnect works without app restart.
     /// </summary>
     public async Task DisconnectAsync()
     {
+        _logger.LogInformation("Session {SessionId}: DisconnectAsync — cleaning up", SessionId);
+
+        // Stop clipboard file transfer
+        StopClipboardFileTransfer();
+
+        // Stop stats relay
+        _ = DisableStatsRelayAsync();
+
+        // Dispose decoder (will be recreated on reconnect)
+        _decoder?.Dispose();
+        _decoder = null;
+
+#if WINDOWS
+        // Clear frame bridge reference (will be re-bound on reconnect)
+        _frameBridge = null;
+#endif
+
+        // Dispose DotNetRef (will be recreated on reconnect)
+        _dotNetRef?.Dispose();
+        _dotNetRef = null;
+
+        // Unsubscribe and dispose transport
         if (_transport != null)
         {
+            _transport.OnControlMessage -= HandleControlMessage;
+            _transport.OnVideoData -= HandleVideoData;
+            _transport.OnFileData -= HandleFileDataBinary;
+            _transport.OnFileSignalingMessage -= HandleFileChannelMessage;
+            _transport.OnConnectionStateChanged -= HandleTransportStateChanged;
             await _transport.DisposeAsync();
+            _transport = null;
         }
 
         SetState(ViewerSessionState.Disconnected);
@@ -571,6 +611,28 @@ public sealed class ViewerSession : IAsyncDisposable
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Session {SessionId}: Failed to send switch display request", SessionId);
+        }
+    }
+
+    /// <summary>
+    /// Send desired encode resolution to host. Host will downscale using Lanczos
+    /// before encoding, so viewer receives frames at exact display size (zero scaling blur).
+    /// Call on connect and on window resize (debounced).
+    /// </summary>
+    public async Task SendDesiredResolutionAsync(int width, int height)
+    {
+        if (_transport == null || !_transport.IsConnected) return;
+        if (width <= 0 || height <= 0) return;
+
+        try
+        {
+            var json = JsonSerializer.Serialize(new { type = "setResolution", width, height });
+            await _transport.SendControlAsync(json);
+            _logger.LogInformation("Session {SessionId}: Sent desired resolution {W}x{H}", SessionId, width, height);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Session {SessionId}: Failed to send resolution", SessionId);
         }
     }
 
@@ -688,6 +750,18 @@ public sealed class ViewerSession : IAsyncDisposable
                         var cbData = root.TryGetProperty("data", out var dProp) ? dProp.GetString() : null;
                         if (cbFormat != null && cbData != null)
                             OnClipboardReceived?.Invoke(cbFormat, cbData);
+                        break;
+
+                    case "captureInfo":
+                        var capW = root.TryGetProperty("width", out var cwProp) ? cwProp.GetInt32() : 0;
+                        var capH = root.TryGetProperty("height", out var chProp) ? chProp.GetInt32() : 0;
+                        if (capW > 0 && capH > 0)
+                        {
+                            CaptureWidth = capW;
+                            CaptureHeight = capH;
+                            _logger.LogInformation("Session {SessionId}: Host capture {W}x{H}", SessionId, capW, capH);
+                            OnCaptureInfoReceived?.Invoke(capW, capH);
+                        }
                         break;
 
                     case "secureDesktopActive":
@@ -914,7 +988,10 @@ public sealed class ViewerSession : IAsyncDisposable
             if (flags == ClipboardFileServer.FlagPushAck)
             {
                 int fileIndex = System.Buffers.Binary.BinaryPrimitives.ReadInt32BigEndian(data.AsSpan(0, 4));
-                _clipboardFileServer?.HandlePushAck(fileIndex);
+                long bytesAcked = data.Length >= 16
+                    ? System.Buffers.Binary.BinaryPrimitives.ReadInt64BigEndian(data.AsSpan(8, 8))
+                    : 0;
+                _clipboardFileServer?.HandlePushAck(fileIndex, bytesAcked);
                 return Task.CompletedTask;
             }
         }

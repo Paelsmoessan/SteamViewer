@@ -106,10 +106,13 @@ public sealed unsafe class FFmpegDecoder : IDisposable
             if (_swsCtx != null)
                 ffmpeg.sws_freeContext(_swsCtx);
 
+            // SWS_POINT: direct pixel-level color matrix, no filter kernel. Avoids sws_scale phase
+            // accumulator drift that causes left-right asymmetry with SWS_LANCZOS/FAST_BILINEAR.
+            // Same-size conversion needs no interpolation — SWS_POINT is mathematically correct.
             _swsCtx = ffmpeg.sws_getContext(
                 frameWidth, frameHeight, pixFmt,
-                frameWidth, frameHeight, AVPixelFormat.AV_PIX_FMT_BGRA,
-                (int)SwsFlags.SWS_FAST_BILINEAR, null, null, null);
+                frameWidth, frameHeight, AVPixelFormat.AV_PIX_FMT_BGR0,
+                (int)SwsFlags.SWS_POINT, null, null, null);
 
             if (_swsCtx == null)
             {

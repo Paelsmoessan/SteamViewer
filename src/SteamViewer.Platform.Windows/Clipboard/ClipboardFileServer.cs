@@ -19,14 +19,14 @@ public sealed class ClipboardFileServer : IDisposable
     private readonly ConcurrentDictionary<int, CachedFileHandle> _fileHandles = new();
     private readonly ConcurrentDictionary<int, TransferTracker> _transferTrackers = new();
     private readonly ConcurrentDictionary<int, CancellationTokenSource> _streamingCts = new();
-    private readonly ConcurrentDictionary<int, SemaphoreSlim> _ackSemaphores = new();
+    private readonly ConcurrentDictionary<int, AckTracker> _ackTrackers = new();
     private readonly Timer _idleTimer;
 
-    private const int IdleTimeoutMs = 30_000; // Close idle file handles after 30s
-    private const int MaxChunkSize = 32_768;   // 32KB — ~23 UDP fragments, fits in kernel receive buffer (64KB default)
-    private const int ProgressIntervalMs = 500; // Send progress every 500ms
-    private const int AckWindowSize = 4;        // Allow 4 chunks in flight (~768KB)
-    private const int AckTimeoutMs = 10_000;    // Timeout waiting for ACK
+    private const int IdleTimeoutMs = 30_000;       // Close idle file handles after 30s
+    private const int MaxChunkSize = 131_072;      // 128KB — large chunks for throughput
+    private const int ProgressIntervalMs = 500;    // Send progress every 500ms
+    private const long WindowBytes = 2 * 1024 * 1024; // 2MB sliding window — ~15 chunks in flight
+    private const int AckTimeoutMs = 10_000;       // Timeout waiting for window space
 
     // Binary response flags (in 4-byte flags field)
     // Pull-mode (request-response): [4B streamId][4B flags][data]
@@ -163,36 +163,40 @@ public sealed class ClipboardFileServer : IDisposable
     private async Task PushStreamLoopAsync(int fileIndex, CancellationToken ct)
     {
         var path = _currentPaths[fileIndex];
-        _logger.LogInformation("Push streaming started for file {Index}: {Path}", fileIndex, Path.GetFileName(path));
+        var fileName = Path.GetFileName(path);
+        _logger.LogInformation("Push streaming started for file {Index}: {Path} (chunk={ChunkKB}KB, window={WindowMB}MB)",
+            fileIndex, fileName, MaxChunkSize / 1024, WindowBytes / (1024 * 1024));
 
-        // Create ACK semaphore with sliding window
-        var semaphore = new SemaphoreSlim(AckWindowSize, AckWindowSize);
-        _ackSemaphores[fileIndex] = semaphore;
+        var tracker = new AckTracker();
+        _ackTrackers[fileIndex] = tracker;
 
         try
         {
-            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: MaxChunkSize);
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: MaxChunkSize * 4);
             var buffer = new byte[MaxChunkSize];
-            long position = 0;
 
             while (!ct.IsCancellationRequested)
             {
                 int bytesRead = await fs.ReadAsync(buffer.AsMemory(0, MaxChunkSize), ct);
                 if (bytesRead == 0) break;
 
-                // Wait for ACK window — paces sends to receiver speed
-                if (!await semaphore.WaitAsync(AckTimeoutMs, ct))
+                // Sliding window: wait until in-flight bytes < WindowBytes
+                long inFlight = tracker.BytesSent - tracker.BytesAcked;
+                if (inFlight >= WindowBytes)
                 {
-                    _logger.LogWarning("Push streaming ACK timeout for file {Index} at position {Position}", fileIndex, position);
-                    break;
+                    if (!tracker.WaitForSpace(AckTimeoutMs, ct))
+                    {
+                        _logger.LogWarning("Push streaming window timeout for file {Index} at {Sent} (acked={Acked}, inflight={InFlight})",
+                            fileIndex, tracker.BytesSent, tracker.BytesAcked, inFlight);
+                        break;
+                    }
                 }
 
                 var data = bytesRead == buffer.Length ? buffer : buffer[..bytesRead];
                 await SendPushChunk(fileIndex, data);
+                tracker.AddSent(bytesRead);
 
-                position += bytesRead;
-
-                // Track progress (reuse existing tracker)
+                // Track progress
                 await TrackProgressAsync(fileIndex, bytesRead);
             }
 
@@ -200,7 +204,7 @@ public sealed class ClipboardFileServer : IDisposable
             if (!ct.IsCancellationRequested)
             {
                 await SendPushEof(fileIndex);
-                _logger.LogInformation("Push streaming completed for file {Index}: {Path}", fileIndex, Path.GetFileName(path));
+                _logger.LogInformation("Push streaming completed for file {Index}: {Path}", fileIndex, fileName);
             }
         }
         catch (OperationCanceledException)
@@ -214,20 +218,19 @@ public sealed class ClipboardFileServer : IDisposable
         finally
         {
             _streamingCts.TryRemove(fileIndex, out _);
-            if (_ackSemaphores.TryRemove(fileIndex, out var sem))
-                sem.Dispose();
+            _ackTrackers.TryRemove(fileIndex, out _);
         }
     }
 
     /// <summary>
-    /// Called when receiver ACKs a push chunk — releases one semaphore slot.
+    /// Called when receiver sends cumulative ACK — updates acked byte count and signals window space.
+    /// ACK payload: [4B fileIndex BE][4B flags BE][8B totalBytesReceived BE]
     /// </summary>
-    public void HandlePushAck(int fileIndex)
+    public void HandlePushAck(int fileIndex, long bytesAcked)
     {
-        if (_ackSemaphores.TryGetValue(fileIndex, out var semaphore))
+        if (_ackTrackers.TryGetValue(fileIndex, out var tracker))
         {
-            try { semaphore.Release(); }
-            catch (SemaphoreFullException) { } // Extra ACK — ignore
+            tracker.UpdateAcked(bytesAcked);
         }
     }
 
@@ -406,6 +409,50 @@ public sealed class ClipboardFileServer : IDisposable
                 return true;
             }
             return false;
+        }
+    }
+
+    /// <summary>
+    /// Tracks bytes sent vs bytes acked for sliding window flow control.
+    /// Sender blocks when in-flight > WindowBytes; receiver ACKs cumulatively.
+    /// </summary>
+    private sealed class AckTracker
+    {
+        private long _bytesSent;
+        private long _bytesAcked;
+        private readonly ManualResetEventSlim _spaceAvailable = new(true);
+
+        public long BytesSent => Volatile.Read(ref _bytesSent);
+        public long BytesAcked => Volatile.Read(ref _bytesAcked);
+
+        public void AddSent(int bytes)
+        {
+            Interlocked.Add(ref _bytesSent, bytes);
+
+            // If window is now full, reset the signal
+            if (Volatile.Read(ref _bytesSent) - Volatile.Read(ref _bytesAcked) >= WindowBytes)
+                _spaceAvailable.Reset();
+        }
+
+        public void UpdateAcked(long totalAcked)
+        {
+            long prev = Volatile.Read(ref _bytesAcked);
+            if (totalAcked > prev)
+            {
+                Interlocked.Exchange(ref _bytesAcked, totalAcked);
+
+                // Signal sender if window now has space
+                if (Volatile.Read(ref _bytesSent) - totalAcked < WindowBytes)
+                    _spaceAvailable.Set();
+            }
+        }
+
+        /// <summary>
+        /// Block until window has space or timeout.
+        /// </summary>
+        public bool WaitForSpace(int timeoutMs, CancellationToken ct)
+        {
+            return _spaceAvailable.Wait(timeoutMs, ct);
         }
     }
 }

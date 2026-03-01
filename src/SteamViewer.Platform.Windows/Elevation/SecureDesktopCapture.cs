@@ -221,10 +221,10 @@ public sealed class SecureDesktopCapture : IDisposable
         IntPtr hOldBitmap = IntPtr.Zero;
         int cachedWidth = 0, cachedHeight = 0;
 
-        // JPEG encoder params (quality 65%)
+        // JPEG encoder params (quality 85% — UAC/lock screens are mostly flat color, higher quality preserves text edges)
         var jpegEncoder = GetEncoder(ImageFormat.Jpeg);
         var encoderParams = new EncoderParameters(1);
-        encoderParams.Param[0] = new EncoderParameter(Encoder.Quality, 65L);
+        encoderParams.Param[0] = new EncoderParameter(Encoder.Quality, 85L);
 
         try
         {
@@ -336,8 +336,8 @@ public sealed class SecureDesktopCapture : IDisposable
                             DebugLog($"JPEG encode error: {ex.Message}");
                         }
 
-                        // ~15 FPS
-                        Thread.Sleep(66);
+                        // ~30 FPS (smoother UAC/lock screen interaction)
+                        Thread.Sleep(33);
                         continue; // Skip the 150ms poll sleep
                     }
                     else if (!string.Equals(desktopName, "Winlogon", StringComparison.OrdinalIgnoreCase) && wasActive)

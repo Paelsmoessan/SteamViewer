@@ -389,17 +389,17 @@ public sealed class HostSession : IAsyncDisposable
             {
                 FFmpegInit.EnsureInitialized();
                 var encoder = new FFmpegEncoder(_loggerFactory.CreateLogger<FFmpegEncoder>());
-                encoder.Initialize(width, height, 30, 20_000_000, crf: 18); // 30fps, CRF 18 (visually lossless), VBV cap 20Mbps
+                encoder.Initialize(width, height, 30, 20_000_000, crf: 14); // 30fps, CRF 14 (near-lossless text), VBV cap 20Mbps
                 _encoder = encoder; // Assign only after successful init
                 _logger.LogInformation("FFmpeg encoder initialized: {W}x{H}", width, height);
-            }
-            else
-            {
-                _encoder.ReinitializeIfNeeded(width, height);
+                SendCaptureInfoIfChanged(width, height);
             }
 
+            // Notify viewer if capture dims changed (monitor switch, resolution change)
+            SendCaptureInfoIfChanged(width, height);
+
             _encodeSw.Restart();
-            var result = _encoder.EncodeFrame(bgraData, stride);
+            var result = _encoder.EncodeFrame(bgraData, stride, width, height);
             _encodeSw.Stop();
 
             if (result is var (naluData, naluLength))
@@ -422,6 +422,41 @@ public sealed class HostSession : IAsyncDisposable
     private int _encoderErrorCount;
     private long _encodeFrameCount;
     private readonly System.Diagnostics.Stopwatch _encodeSw = new();
+    private int _lastSentCaptureW;
+    private int _lastSentCaptureH;
+
+    private void SendCaptureInfoIfChanged(int width, int height)
+    {
+        if (width == _lastSentCaptureW && height == _lastSentCaptureH) return;
+        _lastSentCaptureW = width;
+        _lastSentCaptureH = height;
+        _logger.LogInformation("Sending captureInfo to viewer: {W}x{H}", width, height);
+        _ = _transport?.SendControlAsync(JsonSerializer.Serialize(new
+        {
+            type = "captureInfo",
+            width,
+            height
+        }));
+    }
+
+    /// <summary>
+    /// Handle viewer resolution request — encoder will downscale using Bicubic
+    /// so viewer receives frames at its exact display size (zero viewer-side scaling).
+    /// </summary>
+    private void HandleSetResolution(JsonElement root)
+    {
+        var w = root.TryGetProperty("width", out var wp) ? wp.GetInt32() : 0;
+        var h = root.TryGetProperty("height", out var hp) ? hp.GetInt32() : 0;
+
+        if (w <= 0 || h <= 0)
+        {
+            _logger.LogWarning("Invalid resolution request: {W}x{H}", w, h);
+            return;
+        }
+
+        _logger.LogInformation("Viewer requested encode resolution: {W}x{H}", w, h);
+        _encoder?.SetRequestedResolution(w, h);
+    }
 
     private string? _lastSentCursorShape;
 
@@ -568,6 +603,10 @@ public sealed class HostSession : IAsyncDisposable
                         _logger.LogInformation("Peer stopped sharing their screen");
                         IsPeerSharingScreen = false;
                         OnPeerSharingChanged?.Invoke(false);
+                        return;
+
+                    case "setResolution":
+                        HandleSetResolution(root);
                         return;
                 }
             }
@@ -1178,7 +1217,10 @@ public sealed class HostSession : IAsyncDisposable
             if (flags == ClipboardFileServer.FlagPushAck)
             {
                 int fileIndex = System.Buffers.Binary.BinaryPrimitives.ReadInt32BigEndian(data.AsSpan(0, 4));
-                _clipboardFileServer?.HandlePushAck(fileIndex);
+                long bytesAcked = data.Length >= 16
+                    ? System.Buffers.Binary.BinaryPrimitives.ReadInt64BigEndian(data.AsSpan(8, 8))
+                    : 0;
+                _clipboardFileServer?.HandlePushAck(fileIndex, bytesAcked);
                 return Task.CompletedTask;
             }
         }

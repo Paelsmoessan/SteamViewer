@@ -185,7 +185,8 @@
             <button class="tab-add" title="New connection" @onclick="OpenConnectionDialog"><Icon Name="AppIcon.Plus" Size="14" /></button>
         </div>
         <div class="canvas-container" id="canvasContainer">
-            <canvas id="viewerCanvas" class="@(_secureDesktopActive ? "canvas-dimmed" : "")"></canvas>
+            <canvas id="viewerCanvas" class="@(_secureDesktopActive ? "canvas-dimmed" : "")"
+                    style="@(string.IsNullOrEmpty(_canvasAspectRatio) ? "" : $"aspect-ratio: {_canvasAspectRatio}; height: auto; max-height: 100%;")"></canvas>
             <canvas id="secureDesktopOverlay" class="secure-desktop-overlay" style="display: @(_secureDesktopActive ? "block" : "none")"></canvas>
             @if (_secureDesktopActive)
             {
@@ -277,6 +278,7 @@
     private bool _hasReceivedFrame;
     private bool _secureDesktopActive;
     private bool _secureDesktopFrameReceived;
+    private string _canvasAspectRatio = "";
     private List<MonitorInfo>? _hostMonitors;
     private int _activeMonitorId;
 
@@ -442,6 +444,7 @@
             _activeSession.OnSecureDesktopStateChanged -= HandleSecureDesktopStateChanged;
             _activeSession.OnSecureDesktopFrame -= HandleSecureDesktopFrame;
             _activeSession.OnMonitorLayoutReceived -= HandleMonitorLayoutReceived;
+            _activeSession.OnCaptureInfoReceived -= HandleCaptureInfoReceived;
             if (_statsVisible) _ = _activeSession.DisableStatsRelayAsync();
             _ = JSRuntime.InvokeVoidAsync("SteamViewerVideo.dispose", oldSessionId);
         }
@@ -477,6 +480,7 @@
                 _activeSession.OnSecureDesktopStateChanged += HandleSecureDesktopStateChanged;
                 _activeSession.OnSecureDesktopFrame += HandleSecureDesktopFrame;
                 _activeSession.OnMonitorLayoutReceived += HandleMonitorLayoutReceived;
+                _activeSession.OnCaptureInfoReceived += HandleCaptureInfoReceived;
 
                 // Restore cached monitor layout from session (survives tab switches)
                 _hostMonitors = _activeSession.HostMonitors;
@@ -628,13 +632,61 @@
             var enabled = await session.TryEnableDirectRenderingAsync("viewerCanvas", JSRuntime);
 
             if (enabled)
+            {
                 Console.WriteLine($"[DirectRender] Session {sessionId}: active");
+                // Send viewer display resolution to host for server-side downscaling
+                await SendDisplayResolutionAsync(session);
+                // Start resize listener to update resolution on window resize
+                await StartResizeListenerAsync();
+            }
             else
                 Console.WriteLine($"[DirectRender] Session {sessionId}: FAILED — no video rendering available");
         }
         catch (Exception ex)
         {
             Console.WriteLine($"[BindAndRender] Failed: {ex.Message}");
+        }
+    }
+
+    private System.Timers.Timer? _resizeDebounceTimer;
+
+    /// <summary>
+    /// Send the current canvas display resolution to the host.
+    /// Host will encode at this resolution using Lanczos downscale.
+    /// </summary>
+    private async Task SendDisplayResolutionAsync(ViewerSession? session = null)
+    {
+        session ??= _activeSession;
+        if (session == null) return;
+
+        try
+        {
+            // Get canvas display size in physical pixels from JS
+            var dims = await JSRuntime.InvokeAsync<int[]>("SteamViewerVideo.getDisplaySize", "viewerCanvas");
+            if (dims != null && dims.Length >= 2 && dims[0] > 0 && dims[1] > 0)
+            {
+                await session.SendDesiredResolutionAsync(dims[0], dims[1]);
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Resolution] Failed to send display resolution: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Start a JS window resize listener that calls back to send resolution updates.
+    /// Debounced to avoid spamming encoder reinits.
+    /// </summary>
+    private async Task StartResizeListenerAsync()
+    {
+        try
+        {
+            await JSRuntime.InvokeVoidAsync("SteamViewerVideo.startResizeListener", "viewerCanvas");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[ResizeListener] Failed to start: {ex.Message}");
         }
     }
 
@@ -1082,6 +1134,18 @@
 
     private int _sdRazorFrameCount;
 
+    private void HandleCaptureInfoReceived(int width, int height)
+    {
+        if (width <= 0 || height <= 0) return;
+        _canvasAspectRatio = $"{width} / {height}";
+        InvokeAsync(async () =>
+        {
+            StateHasChanged();
+            // Re-send display resolution now that canvas is AR-constrained
+            await SendDisplayResolutionAsync();
+        });
+    }
+
     private void HandleSecureDesktopStateChanged(bool active)
     {
         FileLogger.Log("INFO", "RemoteViewer", $"HandleSecureDesktopStateChanged: active={active}");
@@ -1362,6 +1426,7 @@
                 _activeSession.OnSecureDesktopStateChanged -= HandleSecureDesktopStateChanged;
                 _activeSession.OnSecureDesktopFrame -= HandleSecureDesktopFrame;
                 _activeSession.OnMonitorLayoutReceived -= HandleMonitorLayoutReceived;
+                _activeSession.OnCaptureInfoReceived -= HandleCaptureInfoReceived;
 
                 // Update references (session ID stays the same for tab tracking)
                 _activeSessionId = newSession.SessionId;
@@ -1376,6 +1441,7 @@
                 _activeSession.OnSecureDesktopStateChanged += HandleSecureDesktopStateChanged;
                 _activeSession.OnSecureDesktopFrame += HandleSecureDesktopFrame;
                 _activeSession.OnMonitorLayoutReceived += HandleMonitorLayoutReceived;
+                _activeSession.OnCaptureInfoReceived += HandleCaptureInfoReceived;
 
                 // Update input routing
                 await JSRuntime.InvokeVoidAsync("SteamViewerInput.setActiveSession", newSession.SessionId);
@@ -1461,6 +1527,7 @@
             _activeSession.OnSecureDesktopStateChanged -= HandleSecureDesktopStateChanged;
             _activeSession.OnSecureDesktopFrame -= HandleSecureDesktopFrame;
             _activeSession.OnMonitorLayoutReceived -= HandleMonitorLayoutReceived;
+            _activeSession.OnCaptureInfoReceived -= HandleCaptureInfoReceived;
         }
 
         _tabDragRef?.Dispose();
@@ -1845,15 +1912,13 @@
         right: 0;
         bottom: 0;
         display: flex;
-        align-items: stretch;
-        justify-content: stretch;
+        align-items: center;
+        justify-content: center;
         overflow: hidden;
         background: #000;
     }
 
     .canvas-container canvas {
-        position: absolute;
-        top: 0; left: 0;
         width: 100%;
         height: 100%;
         object-fit: contain;

@@ -90,7 +90,24 @@ public sealed class InputMessageRouter : IDisposable
             using var doc = JsonDocument.Parse(json);
             var root = doc.RootElement;
 
-            if (!root.TryGetProperty("type", out var typeProp) || typeProp.GetString() != "input")
+            if (!root.TryGetProperty("type", out var typeProp))
+                return;
+
+            var messageType = typeProp.GetString();
+
+            // Handle resolution update from window resize
+            if (messageType == "resolution")
+            {
+                var w = root.TryGetProperty("width", out var wp) ? wp.GetInt32() : 0;
+                var h = root.TryGetProperty("height", out var hp) ? hp.GetInt32() : 0;
+                if (w > 0 && h > 0 && _activeSession != null)
+                {
+                    _ = _activeSession.SendDesiredResolutionAsync(w, h);
+                }
+                return;
+            }
+
+            if (messageType != "input")
                 return;
 
             if (!root.TryGetProperty("method", out var methodProp))

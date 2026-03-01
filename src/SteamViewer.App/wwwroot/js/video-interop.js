@@ -77,7 +77,11 @@ window.SteamViewerVideo = {
     sessions: new Map(),
 
     initialize(sessionId) {
-        if (this.sessions.has(sessionId)) return;
+        // Force-reset if session already exists (reconnect scenario — stale canvas/context)
+        if (this.sessions.has(sessionId)) {
+            console.log(`[Video] Session ${sessionId} re-initializing (clearing stale state)`);
+            this.dispose(sessionId);
+        }
         this.sessions.set(sessionId, {
             canvas: null,
             ctx: null,
@@ -176,6 +180,40 @@ window.SteamViewerVideo = {
         this._removeStatsOverlay(sessionId);
         this.sessions.delete(sessionId);
         console.log(`[Video] Session ${sessionId} disposed`);
+    },
+
+    /// Returns [width, height] of the canvas display area in physical pixels (for resolution negotiation).
+    getDisplaySize(canvasId) {
+        const canvas = document.getElementById(canvasId);
+        if (!canvas) return [0, 0];
+        const rect = canvas.getBoundingClientRect();
+        const dpr = window.devicePixelRatio || 1;
+        return [Math.round(rect.width * dpr), Math.round(rect.height * dpr)];
+    },
+
+    /// Start a debounced resize listener that sends resolution updates via postMessage.
+    /// The C# side picks this up through the InputMessageRouter.
+    _resizeDebounceTimer: null,
+    _resizeCanvasId: null,
+    startResizeListener(canvasId) {
+        this._resizeCanvasId = canvasId;
+        // Remove any previous listener
+        if (this._resizeHandler) window.removeEventListener('resize', this._resizeHandler);
+
+        this._resizeHandler = () => {
+            clearTimeout(this._resizeDebounceTimer);
+            this._resizeDebounceTimer = setTimeout(() => {
+                const dims = this.getDisplaySize(this._resizeCanvasId);
+                if (dims[0] > 0 && dims[1] > 0 && window.chrome?.webview) {
+                    window.chrome.webview.postMessage(JSON.stringify({
+                        type: 'resolution', width: dims[0], height: dims[1]
+                    }));
+                    console.log(`[Video] Resize → resolution ${dims[0]}x${dims[1]}`);
+                }
+            }, 300); // 300ms debounce
+        };
+        window.addEventListener('resize', this._resizeHandler);
+        console.log(`[Video] Resize listener started for ${canvasId}`);
     }
 };
 
@@ -870,12 +908,36 @@ window.SteamViewerSecureDesktop = {
         if (!this.isActive || !this.ctx) return;
         this._width = width;
         this._height = height;
-        if (this.canvas.width !== width) this.canvas.width = width;
-        if (this.canvas.height !== height) this.canvas.height = height;
 
         const img = new Image();
         img.onload = () => {
-            this.ctx.drawImage(img, 0, 0, width, height);
+            // Apply same high-quality scaling as normal video path
+            const rect = this.canvas.getBoundingClientRect();
+            const dpr = window.devicePixelRatio || 1;
+            const displayW = Math.round(rect.width * dpr);
+            const displayH = Math.round(rect.height * dpr);
+            const scale = Math.min(displayW / width, displayH / height);
+
+            if (scale < 0.95) {
+                // Downscale: canvas = display pixels, Mitchell-Netravali cubic
+                if (this.canvas.width !== displayW || this.canvas.height !== displayH) {
+                    this.canvas.width = displayW;
+                    this.canvas.height = displayH;
+                    this.ctx.imageSmoothingEnabled = true;
+                    this.ctx.imageSmoothingQuality = 'high';
+                }
+                const fitW = Math.round(width * scale);
+                const fitH = Math.round(height * scale);
+                const dx = Math.round((displayW - fitW) / 2);
+                const dy = Math.round((displayH - fitH) / 2);
+                if (dx > 0 || dy > 0) this.ctx.clearRect(0, 0, displayW, displayH);
+                this.ctx.drawImage(img, dx, dy, fitW, fitH);
+            } else {
+                // 1:1 or upscale
+                if (this.canvas.width !== width) this.canvas.width = width;
+                if (this.canvas.height !== height) this.canvas.height = height;
+                this.ctx.drawImage(img, 0, 0, width, height);
+            }
             this._drawCursor();
         };
         img.src = 'data:image/jpeg;base64,' + base64Jpeg;

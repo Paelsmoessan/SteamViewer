@@ -44,6 +44,8 @@ public sealed class ClipboardFileWriter : IDisposable
     private long _receiveBytesTotal;
     private long _lastReceiveReportTick;
     private const int ReceiveProgressIntervalMs = 500;
+    private int _pushChunksSinceAck;
+    private const int AckIntervalChunks = 4; // Send cumulative ACK every N chunks
 
     /// <summary>
     /// Fired periodically during file receive with (fileIndex, bytesReceived, totalBytes, speedMBps).
@@ -124,6 +126,7 @@ public sealed class ClipboardFileWriter : IDisposable
         // Reset receive tracking for new transfer
         Interlocked.Exchange(ref _receiveBytesTotal, 0);
         Interlocked.Exchange(ref _receiveStartTick, 0);
+        _pushChunksSinceAck = 0;
 
         _pendingClipboardSets.Enqueue(files);
         PostMessage(_hwnd, WM_SET_CLIPBOARD, IntPtr.Zero, IntPtr.Zero);
@@ -156,15 +159,26 @@ public sealed class ClipboardFileWriter : IDisposable
             {
                 stream.AcceptPushChunk(data);
                 TrackReceiveProgress(data.Length);
+
+                // Send cumulative ACK every N chunks (reduces per-chunk overhead)
+                _pushChunksSinceAck++;
+                if (_pushChunksSinceAck >= AckIntervalChunks)
+                {
+                    _pushChunksSinceAck = 0;
+                    SendPushAck(id, Interlocked.Read(ref _receiveBytesTotal));
+                }
             }
-            // Send ACK back to sender for flow control — only when data was stored
-            if (stream != null)
-                SendPushAck(id);
             return;
         }
 
         if (flags == ClipboardFileServer.FlagPushEof)
         {
+            // Send final ACK so sender doesn't stall waiting for window space
+            if (_pushChunksSinceAck > 0)
+            {
+                _pushChunksSinceAck = 0;
+                SendPushAck(id, Interlocked.Read(ref _receiveBytesTotal));
+            }
             var stream = _currentDataObject?.GetStream(id);
             stream?.AcceptPushEof();
             return;
@@ -202,12 +216,16 @@ public sealed class ClipboardFileWriter : IDisposable
         }
     }
 
-    private void SendPushAck(int fileIndex)
+    /// <summary>
+    /// Send cumulative ACK: [4B fileIndex BE][4B FlagPushAck BE][8B totalBytesReceived BE]
+    /// </summary>
+    private void SendPushAck(int fileIndex, long totalBytesReceived)
     {
         if (_sendBinaryAsync == null) return;
-        var ack = new byte[8];
+        var ack = new byte[16];
         BinaryPrimitives.WriteInt32BigEndian(ack.AsSpan(0, 4), fileIndex);
         BinaryPrimitives.WriteInt32BigEndian(ack.AsSpan(4, 4), ClipboardFileServer.FlagPushAck);
+        BinaryPrimitives.WriteInt64BigEndian(ack.AsSpan(8, 8), totalBytesReceived);
         _ = _sendBinaryAsync(ack);
     }
 
