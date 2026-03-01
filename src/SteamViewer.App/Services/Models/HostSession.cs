@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
@@ -66,6 +67,13 @@ public sealed class HostSession : IAsyncDisposable
     private ClipboardMonitor? _clipboardMonitor;
     private ClipboardFileServer? _clipboardFileServer;
     private ClipboardFileWriter? _clipboardFileWriter;
+
+    // Lossless settle — QOI snapshot when screen stops changing
+    private int _consecutiveNullFrames;
+    private bool _losslessRequested;
+    private int _losslessRequestW;
+    private int _losslessRequestH;
+    private bool _losslessSent;
 
     /// <summary>Session ID for JS interop — always "host".</summary>
     public string SessionId => "host";
@@ -312,9 +320,13 @@ public sealed class HostSession : IAsyncDisposable
                 // Subscribe to DXGI frame events — raw BGRA → FFmpeg encode → transport
                 dxgi.OnRawFrameCaptured += OnDxgiRawFrameCaptured;
                 dxgi.OnCursorShapeChanged += OnCursorShapeChanged;
+                dxgi.OnFrameUnchanged += OnDxgiFrameUnchanged;
 
                 // Start DXGI capture loop (~30 FPS)
                 dxgi.StartCaptureLoop(targetOutput);
+
+                // Prevent host from sleeping/screen-off while sharing
+                SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
 
                 _isNativeCapture = true;
                 _activeDxgi = dxgi;
@@ -330,7 +342,9 @@ public sealed class HostSession : IAsyncDisposable
                 _logger.LogError(ex, "DXGI capture + FFmpeg encoding failed");
                 try { dxgi.OnRawFrameCaptured -= OnDxgiRawFrameCaptured; } catch { }
                 try { dxgi.OnCursorShapeChanged -= OnCursorShapeChanged; } catch { }
+                try { dxgi.OnFrameUnchanged -= OnDxgiFrameUnchanged; } catch { }
                 try { dxgi.StopCaptureLoop(); } catch { }
+                SetThreadExecutionState(ES_CONTINUOUS); // Clear sleep prevention
                 _isNativeCapture = false;
                 _encoder?.Dispose();
                 _encoder = null;
@@ -355,12 +369,16 @@ public sealed class HostSession : IAsyncDisposable
             {
                 dxgi.OnRawFrameCaptured -= OnDxgiRawFrameCaptured;
                 dxgi.OnCursorShapeChanged -= OnCursorShapeChanged;
+                dxgi.OnFrameUnchanged -= OnDxgiFrameUnchanged;
                 dxgi.StopCaptureLoop();
                 _isNativeCapture = false;
             }
 
             _encoder?.Dispose();
             _encoder = null;
+
+            // Clear sleep prevention
+            SetThreadExecutionState(ES_CONTINUOUS);
 
             IsSharingScreen = false;
             _inputInjector.ClearCapturedMonitor();
@@ -381,6 +399,10 @@ public sealed class HostSession : IAsyncDisposable
     private void OnDxgiRawFrameCaptured(byte[] bgraData, int width, int height, int stride)
     {
         if (_transport == null || !_transport.IsConnected || !_isNativeCapture) return;
+
+        // Screen changed — reset settle counter, allow new lossless request
+        _consecutiveNullFrames = 0;
+        _losslessSent = false;
 
         try
         {
@@ -607,6 +629,10 @@ public sealed class HostSession : IAsyncDisposable
 
                     case "setResolution":
                         HandleSetResolution(root);
+                        return;
+
+                    case "requestLosslessFrame":
+                        HandleRequestLosslessFrame(root);
                         return;
                 }
             }
@@ -874,6 +900,7 @@ public sealed class HostSession : IAsyncDisposable
                     // Clean up dead state
                     dxgi.OnRawFrameCaptured -= OnDxgiRawFrameCaptured;
                     dxgi.OnCursorShapeChanged -= OnCursorShapeChanged;
+                    dxgi.OnFrameUnchanged -= OnDxgiFrameUnchanged;
                     _encoder?.Dispose();
                     _encoder = null;
                     _isNativeCapture = false;
@@ -1553,6 +1580,120 @@ public sealed class HostSession : IAsyncDisposable
 
     #endregion
 
+    #region Lossless Settle
+
+    private void HandleRequestLosslessFrame(JsonElement root)
+    {
+        var w = root.TryGetProperty("width", out var wp) ? wp.GetInt32() : 0;
+        var h = root.TryGetProperty("height", out var hp) ? hp.GetInt32() : 0;
+
+        if (w <= 0 || h <= 0)
+        {
+            _logger.LogWarning("Invalid lossless frame request: {W}x{H}", w, h);
+            return;
+        }
+
+        _losslessRequestW = w;
+        _losslessRequestH = h;
+        _losslessRequested = true;
+        _losslessSent = false;
+        _logger.LogDebug("Viewer requested lossless frame: {W}x{H}", w, h);
+
+        // If screen is already settled, fulfill immediately
+        if (_consecutiveNullFrames >= 3)
+            FulfillLosslessRequest();
+    }
+
+    private void OnDxgiFrameUnchanged()
+    {
+        _consecutiveNullFrames++;
+        if (!_losslessRequested || _losslessSent) return;
+        if (_consecutiveNullFrames < 3) return; // Wait 3 unchanged frames (~100ms at 30fps)
+
+        FulfillLosslessRequest();
+    }
+
+    private void FulfillLosslessRequest()
+    {
+        if (_activeDxgi == null || _transport == null || !_transport.IsConnected) return;
+
+        var rawFrame = _activeDxgi.LastRawFrame;
+        var rawW = _activeDxgi.LastRawWidth;
+        var rawH = _activeDxgi.LastRawHeight;
+        var rawStride = _activeDxgi.LastRawStride;
+
+        if (rawFrame == null || rawW <= 0 || rawH <= 0) return;
+
+        _losslessSent = true;
+
+        // Encode and send on a background thread to avoid blocking capture loop
+        var frameCopy = new byte[rawFrame.Length];
+        Buffer.BlockCopy(rawFrame, 0, frameCopy, 0, rawFrame.Length);
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                byte[] bgraToEncode = frameCopy;
+                int encodeW = rawW, encodeH = rawH, encodeStride = rawStride;
+
+                // If viewer requested different size, downscale using sws_scale
+                if (_losslessRequestW != rawW || _losslessRequestH != rawH)
+                {
+                    bgraToEncode = DownscaleBgra(frameCopy, rawW, rawH, rawStride,
+                        _losslessRequestW, _losslessRequestH);
+                    encodeW = _losslessRequestW;
+                    encodeH = _losslessRequestH;
+                    encodeStride = encodeW * 4;
+                }
+
+                var sw = Stopwatch.StartNew();
+                var qoiData = QoiCodec.Encode(bgraToEncode, encodeW, encodeH, encodeStride);
+                sw.Stop();
+
+                var sent = await _transport!.SendLosslessFrameAsync(qoiData, 0, qoiData.Length);
+                _logger.LogInformation("Lossless QOI frame: {W}x{H}, {Size}KB, encode={Ms:F1}ms, sent={Sent}",
+                    encodeW, encodeH, qoiData.Length / 1024, sw.Elapsed.TotalMilliseconds, sent);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to encode/send lossless frame");
+            }
+        });
+    }
+
+    /// <summary>
+    /// Downscale BGRA frame using sws_scale (Lanczos) for lossless settle frames.
+    /// Falls back to nearest-neighbor if FFmpeg is unavailable.
+    /// </summary>
+    private byte[] DownscaleBgra(byte[] srcBgra, int srcW, int srcH, int srcStride, int dstW, int dstH)
+    {
+        try
+        {
+            // Use FFmpegEncoder's static downscale helper if available
+            return FFmpegEncoder.DownscaleBgra(srcBgra, srcW, srcH, srcStride, dstW, dstH);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "sws_scale downscale failed — sending at capture resolution");
+            // Return source unchanged rather than corrupting
+            return srcBgra;
+        }
+    }
+
+    #endregion
+
+    #region Sleep Prevention
+
+    private const uint ES_CONTINUOUS = 0x80000000;
+    private const uint ES_SYSTEM_REQUIRED = 0x00000001;
+    private const uint ES_DISPLAY_REQUIRED = 0x00000002;
+
+    [DllImport("kernel32.dll")]
+    private static extern uint SetThreadExecutionState(uint esFlags);
+
+    #endregion
+
     private void SetState(HostSessionState newState)
     {
         if (State != newState)
@@ -1593,12 +1734,16 @@ public sealed class HostSession : IAsyncDisposable
         {
             dxgi.OnRawFrameCaptured -= OnDxgiRawFrameCaptured;
             dxgi.OnCursorShapeChanged -= OnCursorShapeChanged;
+            dxgi.OnFrameUnchanged -= OnDxgiFrameUnchanged;
             dxgi.StopCaptureLoop();
             _isNativeCapture = false;
         }
 
         _encoder?.Dispose();
         _encoder = null;
+
+        // Clear sleep prevention
+        SetThreadExecutionState(ES_CONTINUOUS);
 
         if (_transport != null)
         {

@@ -253,6 +253,61 @@ if (window.chrome?.webview) {
                 return;
             }
 
+            if (meta.lossless) {
+                // Lossless QOI-decoded BGRA frame — paint with same scaling as H.264
+                const bgraCopy = new Uint8Array(buf, 0, meta.len).slice();
+                chrome.webview.releaseBuffer(buf);
+
+                const frame = new VideoFrame(bgraCopy, {
+                    format: 'BGRA',
+                    codedWidth: meta.w,
+                    codedHeight: meta.h,
+                    timestamp: performance.now() * 1000,
+                });
+
+                const canvas = session.canvas;
+                const ctx = session.ctx;
+
+                // Use same display logic as H.264 — match current canvas scaling mode
+                const rect = canvas.getBoundingClientRect();
+                const dpr = window.devicePixelRatio || 1;
+                const displayW = Math.round(rect.width * dpr);
+                const displayH = Math.round(rect.height * dpr);
+                const scale = Math.min(displayW / meta.w, displayH / meta.h);
+                const isDownscaling = scale < 0.95;
+
+                if (isDownscaling) {
+                    if (canvas.width !== displayW || canvas.height !== displayH) {
+                        canvas.width = displayW;
+                        canvas.height = displayH;
+                    }
+                    // Use nearest-neighbor for lossless — preserves pixel-perfect text
+                    ctx.imageSmoothingEnabled = false;
+                    const fitW = Math.round(meta.w * scale);
+                    const fitH = Math.round(meta.h * scale);
+                    const dx = Math.round((displayW - fitW) / 2);
+                    const dy = Math.round((displayH - fitH) / 2);
+                    if (dx > 0 || dy > 0) ctx.clearRect(0, 0, displayW, displayH);
+                    ctx.drawImage(frame, dx, dy, fitW, fitH);
+                    // Restore smoothing for next H.264 frame
+                    ctx.imageSmoothingEnabled = true;
+                    ctx.imageSmoothingQuality = 'high';
+                } else {
+                    if (canvas.width !== meta.w || canvas.height !== meta.h) {
+                        canvas.width = meta.w;
+                        canvas.height = meta.h;
+                    }
+                    ctx.imageSmoothingEnabled = false;
+                    ctx.drawImage(frame, 0, 0);
+                }
+                frame.close();
+
+                session.videoW = meta.w;
+                session.videoH = meta.h;
+                session.frameCount++;
+                return; // Don't count lossless in first-frame callback
+            }
+
             if (meta.raw) {
                 // Raw BGRA path — VideoFrame directly from pixel data
                 const bgraCopy = new Uint8Array(buf, 0, meta.len).slice();

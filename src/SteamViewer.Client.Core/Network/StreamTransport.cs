@@ -17,6 +17,7 @@ namespace SteamViewer.Client.Core.Network;
 /// Channel 1 = H.264 video NALUs (host → viewer only)
 /// Channel 2 = Binary file data
 /// Channel 3 = JSON file signaling
+/// Channel 4 = Lossless QOI frame (host → viewer, one-shot on screen settle)
 ///
 /// Each frame is AES-256-GCM encrypted before sending through the backend.
 /// </summary>
@@ -44,12 +45,16 @@ public abstract class StreamTransport : IAsyncDisposable
     protected const byte ChannelVideo = 1;
     protected const byte ChannelFileData = 2;
     protected const byte ChannelFileSignaling = 3;
+    protected const byte ChannelLossless = 4;
 
     /// <summary>Raised when a JSON control message is received.</summary>
     public event Func<string, Task>? OnControlMessage;
 
     /// <summary>Raised when H.264 video frame NALUs are received.</summary>
     public event Action<byte[], int>? OnVideoData;
+
+    /// <summary>Raised when a lossless QOI frame is received (screen settle snapshot).</summary>
+    public event Action<byte[], int>? OnLosslessFrame;
 
     /// <summary>Raised when binary file data is received.</summary>
     public event Func<byte[], Task>? OnFileData;
@@ -91,6 +96,12 @@ public abstract class StreamTransport : IAsyncDisposable
     public async ValueTask<bool> SendFileDataAsync(byte[] data)
     {
         return await SendFrameAsync(ChannelFileData, data, 0, data.Length);
+    }
+
+    /// <summary>Send a lossless QOI frame (host → viewer, one-shot on screen settle).</summary>
+    public async ValueTask<bool> SendLosslessFrameAsync(byte[] data, int offset, int length)
+    {
+        return await SendFrameAsync(ChannelLossless, data, offset, length);
     }
 
     /// <summary>Send JSON file signaling message (FormatList, FileContentsRequest, etc.).</summary>
@@ -203,6 +214,14 @@ public abstract class StreamTransport : IAsyncDisposable
                     var videoData = new byte[videoLen];
                     Buffer.BlockCopy(plaintext, 1, videoData, 0, videoLen);
                     OnVideoData?.Invoke(videoData, videoLen);
+                    break;
+                }
+                case ChannelLossless:
+                {
+                    var losslessLen = plaintext.Length - 1;
+                    var losslessData = new byte[losslessLen];
+                    Buffer.BlockCopy(plaintext, 1, losslessData, 0, losslessLen);
+                    OnLosslessFrame?.Invoke(losslessData, losslessLen);
                     break;
                 }
                 case ChannelFileData:
