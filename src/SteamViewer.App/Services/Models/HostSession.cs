@@ -857,6 +857,44 @@ public sealed class HostSession : IAsyncDisposable
 
             _logger.LogInformation("Sent {Type} to viewer",
                 active ? "secureDesktopActive" : "secureDesktopInactive");
+
+            // When leaving Secure Desktop, DXGI capture may have died (2min E_ACCESSDENIED timeout).
+            // Restart capture if it's no longer running but we're still sharing.
+            if (!active && IsSharingScreen && _isNativeCapture && _screenCapture is DxgiScreenCapture dxgi)
+            {
+                if (dxgi.IsCapturing)
+                {
+                    _logger.LogInformation("DXGI capture still running after SD — no restart needed");
+                }
+                else
+                {
+                    _logger.LogInformation("DXGI capture died during SD — restarting capture");
+                    // Stop capture loop first to clear _captureThread (thread self-exited but didn't null it)
+                    dxgi.StopCaptureLoop();
+                    // Clean up dead state
+                    dxgi.OnRawFrameCaptured -= OnDxgiRawFrameCaptured;
+                    dxgi.OnCursorShapeChanged -= OnCursorShapeChanged;
+                    _encoder?.Dispose();
+                    _encoder = null;
+                    _isNativeCapture = false;
+
+                    // Restart
+                    _ = Task.Run(async () =>
+                    {
+                        // Brief delay for desktop switch to complete
+                        await Task.Delay(500);
+                        try
+                        {
+                            await StartScreenShareAsync(_activeDxgi != null ? (uint?)0 : null);
+                            _logger.LogInformation("DXGI capture restarted after SD");
+                        }
+                        catch (Exception restartEx)
+                        {
+                            _logger.LogWarning(restartEx, "Failed to restart DXGI capture after SD");
+                        }
+                    });
+                }
+            }
         }
         catch (Exception ex)
         {

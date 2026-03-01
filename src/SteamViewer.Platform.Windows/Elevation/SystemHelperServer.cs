@@ -892,6 +892,7 @@ public static class SystemHelperServer
     /// SetThreadDesktop works because this thread never creates windows.
     /// </summary>
     private static int _sdInputLogCount;
+    private static int _sdInputFailCount;
 
     private static void InputThreadProc()
     {
@@ -910,6 +911,10 @@ public static class SystemHelperServer
                 DebugLog($"Input thread OpenInputDesktop failed (error {Marshal.GetLastWin32Error()})");
             }
 
+            // Cached Winlogon desktop handle — kept open during SD active to avoid per-event churn
+            IntPtr hCachedWinlogon = IntPtr.Zero;
+            bool wasOnSecureDesktop = false;
+
             // Process input commands from queue
             foreach (var (json, sw, sh) in _inputQueue!.GetConsumingEnumerable())
             {
@@ -917,33 +922,93 @@ public static class SystemHelperServer
                 {
                     var onSecureDesktop = _capture != null && _capture.IsActive;
 
-                    IntPtr hWinlogon = IntPtr.Zero;
-                    if (onSecureDesktop)
+                    // Transition: normal → SD — acquire Winlogon desktop handle
+                    if (onSecureDesktop && !wasOnSecureDesktop)
                     {
-                        // Use explicit desktop name — OpenInputDesktop may not return Winlogon desktop
-                        hWinlogon = OpenDesktop("Winlogon", 0, false, GENERIC_ALL);
-                        _sdInputLogCount++;
-                        if (_sdInputLogCount <= 5 || _sdInputLogCount % 50 == 0)
-                            DebugLog($"SD input #{_sdInputLogCount}: OpenDesktop(Winlogon)={hWinlogon != IntPtr.Zero} (err {Marshal.GetLastWin32Error()})");
-
-                        if (hWinlogon != IntPtr.Zero)
+                        _sdInputLogCount = 0;
+                        _sdInputFailCount = 0;
+                        // OpenInputDesktop gets the CURRENT input desktop (more robust than hardcoded "Winlogon")
+                        hCachedWinlogon = OpenInputDesktop(0, false, GENERIC_ALL);
+                        if (hCachedWinlogon == IntPtr.Zero)
                         {
-                            var switched = SetThreadDesktop(hWinlogon);
-                            if (!switched)
-                            {
-                                DebugLog($"SD input: SetThreadDesktop(Winlogon) failed (error {Marshal.GetLastWin32Error()})");
-                                CloseDesktop(hWinlogon);
-                                continue;
-                            }
-                            if (_sdInputLogCount <= 5)
-                                DebugLog("SD input: SetThreadDesktop(Winlogon) succeeded");
+                            // Fallback to explicit name
+                            hCachedWinlogon = OpenDesktop("Winlogon", 0, false, GENERIC_ALL);
+                            DebugLog($"SD input: OpenInputDesktop failed, OpenDesktop(Winlogon)={hCachedWinlogon != IntPtr.Zero} (err {Marshal.GetLastWin32Error()})");
                         }
                         else
                         {
-                            if (_sdInputLogCount <= 5)
-                                DebugLog("SD input: Can't open Winlogon desktop — skipping event");
+                            DebugLog($"SD input: OpenInputDesktop succeeded for SD transition");
+                        }
+
+                        if (hCachedWinlogon != IntPtr.Zero)
+                        {
+                            var switched = SetThreadDesktop(hCachedWinlogon);
+                            DebugLog($"SD input: SetThreadDesktop(Winlogon) on transition: {switched} (err {Marshal.GetLastWin32Error()})");
+                            if (!switched)
+                            {
+                                CloseDesktop(hCachedWinlogon);
+                                hCachedWinlogon = IntPtr.Zero;
+                            }
+                        }
+                        wasOnSecureDesktop = true;
+                    }
+                    // Transition: SD → normal — release Winlogon handle, re-acquire Default, switch back
+                    else if (!onSecureDesktop && wasOnSecureDesktop)
+                    {
+                        if (hCachedWinlogon != IntPtr.Zero)
+                        {
+                            // Re-acquire Default desktop handle — old one is stale after SD round-trip
+                            var hNewDefault = OpenInputDesktop(0, false, DESKTOP_SWITCHDESKTOP);
+                            if (hNewDefault != IntPtr.Zero)
+                            {
+                                if (hDefaultDesk != IntPtr.Zero)
+                                    CloseDesktop(hDefaultDesk);
+                                hDefaultDesk = hNewDefault;
+                                DebugLog($"SD input: re-acquired Default desktop handle on SD→normal transition");
+                            }
+                            else
+                            {
+                                DebugLog($"SD input: WARNING — failed to re-acquire Default desktop (err {Marshal.GetLastWin32Error()}), using old handle");
+                            }
+
+                            var switchedBack = SetThreadDesktop(hDefaultDesk);
+                            DebugLog($"SD input: leaving SD, SetThreadDesktop(Default)={switchedBack}, total SD events={_sdInputLogCount}, failures={_sdInputFailCount}");
+                            CloseDesktop(hCachedWinlogon);
+                            hCachedWinlogon = IntPtr.Zero;
+                        }
+                        wasOnSecureDesktop = false;
+                    }
+
+                    // If on SD but no valid handle, try to re-acquire
+                    if (onSecureDesktop && hCachedWinlogon == IntPtr.Zero)
+                    {
+                        hCachedWinlogon = OpenInputDesktop(0, false, GENERIC_ALL);
+                        if (hCachedWinlogon == IntPtr.Zero)
+                            hCachedWinlogon = OpenDesktop("Winlogon", 0, false, GENERIC_ALL);
+                        if (hCachedWinlogon != IntPtr.Zero)
+                        {
+                            var switched = SetThreadDesktop(hCachedWinlogon);
+                            DebugLog($"SD input: re-acquired desktop handle, SetThreadDesktop={switched}");
+                            if (!switched)
+                            {
+                                CloseDesktop(hCachedWinlogon);
+                                hCachedWinlogon = IntPtr.Zero;
+                            }
+                        }
+                        else
+                        {
+                            _sdInputFailCount++;
+                            if (_sdInputFailCount <= 10 || _sdInputFailCount % 100 == 0)
+                                DebugLog($"SD input: can't open Winlogon desktop (fail #{_sdInputFailCount}, err {Marshal.GetLastWin32Error()})");
                             continue;
                         }
+                    }
+
+                    _sdInputLogCount++;
+                    if (_sdInputLogCount <= 3 || _sdInputLogCount % 200 == 0)
+                    {
+                        if (onSecureDesktop)
+                            DebugLog($"SD input #{_sdInputLogCount}: injecting on Winlogon");
                     }
 
                     // Parse and inject input
@@ -989,14 +1054,6 @@ public static class SystemHelperServer
                             break;
                     }
 
-                    // Switch back to Default desktop after SD input
-                    if (onSecureDesktop && hWinlogon != IntPtr.Zero)
-                    {
-                        var switchedBack = SetThreadDesktop(hDefaultDesk);
-                        if (_sdInputLogCount <= 5)
-                            DebugLog($"SD input: SetThreadDesktop(Default) back={switchedBack}");
-                        CloseDesktop(hWinlogon);
-                    }
                 }
                 catch (Exception ex)
                 {
@@ -1005,6 +1062,8 @@ public static class SystemHelperServer
             }
 
             // Cleanup
+            if (hCachedWinlogon != IntPtr.Zero)
+                CloseDesktop(hCachedWinlogon);
             if (hDefaultDesk != IntPtr.Zero)
                 CloseDesktop(hDefaultDesk);
         }

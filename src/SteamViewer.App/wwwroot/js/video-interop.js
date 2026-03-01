@@ -129,8 +129,24 @@ window.SteamViewerVideo = {
         session.statsData = JSON.parse(statsJson);
         if (session.statsOverlayEl) {
             const s = session.statsData;
+            const videoInfo = s.resolution || '?';
+            // Canvas and display dimensions for diagnostics
+            let canvasInfo = '?', displayInfo = '?', scaleStr = '?';
+            if (session.canvas) {
+                canvasInfo = `${session.canvas.width}x${session.canvas.height}`;
+                const rect = session.canvas.getBoundingClientRect();
+                const dpr = window.devicePixelRatio || 1;
+                const dw = Math.round(rect.width * dpr);
+                const dh = Math.round(rect.height * dpr);
+                displayInfo = `${dw}x${dh}`;
+                if (session.videoW && session.videoH) {
+                    const scale = Math.min(dw / session.videoW, dh / session.videoH);
+                    scaleStr = `${scale.toFixed(2)}x${session.isDownscaling ? ' ↓' : ''}`;
+                }
+            }
             const lines = [
-                `Video: ${s.fps?.toFixed(0) || '?'} FPS | ${s.bitrateMbps?.toFixed(1) || '?'} Mbps | ${s.resolution || '?'}`,
+                `Video: ${s.fps?.toFixed(0) || '?'} FPS | ${s.bitrateMbps?.toFixed(1) || '?'} Mbps`,
+                `Src:   ${videoInfo} | Canvas: ${canvasInfo} | Display: ${displayInfo} | Scale: ${scaleStr}`,
                 `Lat:   Enc ${s.encodeMs?.toFixed(0) || '?'}ms | Dec ${s.decodeMs?.toFixed(0) || '?'}ms`,
                 `Net:   ${s.bytesSent ? fmtBytes(s.bytesSent) : '?'} sent | ${s.bytesReceived ? fmtBytes(s.bytesReceived) : '?'} rcvd`,
             ];
@@ -694,7 +710,28 @@ window.SteamViewerInput = {
         const sd = window.SteamViewerSecureDesktop;
         const sdActive = sd?.isActive && sd._width && sd._height && sd.canvas;
         if (sdActive) {
-            const coords = this.getScaledCoordsForCanvas(e, sd.canvas);
+            // SD canvas may be sized to display pixels (downscaling) — need letterbox mapping
+            const canvas = sd.canvas;
+            const rect = canvas.getBoundingClientRect();
+            const dpr = window.devicePixelRatio || 1;
+            const displayW = Math.round(rect.width * dpr);
+            const displayH = Math.round(rect.height * dpr);
+            const scale = Math.min(displayW / sd._width, displayH / sd._height);
+            if (scale < 0.95 && canvas.width === displayW && canvas.height === displayH) {
+                // Downscale: canvas = display pixels, SD frame drawn with letterbox
+                const canvasX = (e.clientX - rect.left) * dpr;
+                const canvasY = (e.clientY - rect.top) * dpr;
+                const fitW = sd._width * scale;
+                const fitH = sd._height * scale;
+                const dx = (displayW - fitW) / 2;
+                const dy = (displayH - fitH) / 2;
+                return {
+                    x: Math.max(0, Math.min(sd._width, (canvasX - dx) * sd._width / fitW)),
+                    y: Math.max(0, Math.min(sd._height, (canvasY - dy) * sd._height / fitH)),
+                    captureW: sd._width, captureH: sd._height
+                };
+            }
+            const coords = this.getScaledCoordsForCanvas(e, canvas);
             return { x: coords.x, y: coords.y, captureW: sd._width, captureH: sd._height };
         }
         const coords = this.getScaledCoords(e);
