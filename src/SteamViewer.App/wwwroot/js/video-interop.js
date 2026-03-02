@@ -144,9 +144,11 @@ window.SteamViewerVideo = {
                     scaleStr = `${scale.toFixed(2)}x${session.isDownscaling ? ' ↓' : ''}`;
                 }
             }
+            const encInfo = (session.encodeW && session.encodeH)
+                ? `${session.encodeW}x${session.encodeH}` : '?';
             const lines = [
                 `Video: ${s.fps?.toFixed(0) || '?'} FPS | ${s.bitrateMbps?.toFixed(1) || '?'} Mbps`,
-                `Src:   ${videoInfo} | Canvas: ${canvasInfo} | Display: ${displayInfo} | Scale: ${scaleStr}`,
+                `Src:   ${videoInfo} | Enc: ${encInfo} | Canvas: ${canvasInfo} | Disp: ${displayInfo} | Scale: ${scaleStr}`,
                 `Lat:   Enc ${s.encodeMs?.toFixed(0) || '?'}ms | Dec ${s.decodeMs?.toFixed(0) || '?'}ms`,
                 `Net:   ${s.bytesSent ? fmtBytes(s.bytesSent) : '?'} sent | ${s.bytesReceived ? fmtBytes(s.bytesReceived) : '?'} rcvd`,
             ];
@@ -198,17 +200,36 @@ window.SteamViewerVideo = {
         console.log(`[Video] Session ${sessionId} disposed`);
     },
 
-    /// Returns [width, height] of the canvas display area in physical pixels (for resolution negotiation).
+    /// Returns [width, height] of the available display area in physical pixels (for resolution negotiation).
+    /// Reads the parent container size, not the canvas — canvas may be smaller after encodeInfo convergence.
     getDisplaySize(canvasId) {
         const canvas = document.getElementById(canvasId);
         if (!canvas) return [0, 0];
-        const rect = canvas.getBoundingClientRect();
+        const container = canvas.parentElement;
+        const rect = container.getBoundingClientRect();
         const dpr = window.devicePixelRatio || 1;
         return [Math.round(rect.width * dpr), Math.round(rect.height * dpr)];
     },
 
+    /// Set capture aspect ratio for pre-encodeInfo AR constraint.
+    /// Once 1:1 path takes over (encodeW set), this is cleared automatically.
+    setCaptureAspectRatio(sessionId, w, h) {
+        const session = this.sessions.get(sessionId);
+        if (!session) return;
+        session.captureW = w;
+        session.captureH = h;
+        // Only apply AR constraint if 1:1 path hasn't set explicit dims yet
+        const canvas = session.canvas;
+        if (canvas && !session.encodeW) {
+            canvas.style.aspectRatio = `${w} / ${h}`;
+            canvas.style.height = 'auto';
+            canvas.style.maxHeight = '100%';
+        }
+        console.log(`[Video] Session ${sessionId}: captureAspectRatio ${w}/${h}`);
+    },
+
     /// Set the host's actual encode resolution for a session.
-    /// Viewer sets canvas to this exact size → 1:1 pixel mapping, no fractional scaling.
+    /// Stores dims only — CSS resize deferred to 1:1 render path so CSS always matches actual frame bitmap.
     setEncodeResolution(sessionId, encW, encH) {
         const session = this.sessions.get(sessionId);
         if (!session) return;
@@ -229,12 +250,19 @@ window.SteamViewerVideo = {
         this._resizeHandler = () => {
             clearTimeout(this._resizeDebounceTimer);
             this._resizeDebounceTimer = setTimeout(() => {
-                const dims = this.getDisplaySize(this._resizeCanvasId);
-                if (dims[0] > 0 && dims[1] > 0 && window.chrome?.webview) {
+                // Read parent container (available space), not canvas (may be converged smaller)
+                const canvas = document.getElementById(this._resizeCanvasId);
+                if (!canvas) return;
+                const container = canvas.parentElement;
+                const rect = container.getBoundingClientRect();
+                const dpr = window.devicePixelRatio || 1;
+                const w = Math.round(rect.width * dpr);
+                const h = Math.round(rect.height * dpr);
+                if (w > 0 && h > 0 && window.chrome?.webview) {
                     window.chrome.webview.postMessage(JSON.stringify({
-                        type: 'resolution', width: dims[0], height: dims[1]
+                        type: 'resolution', width: w, height: h
                     }));
-                    console.log(`[Video] Resize → resolution ${dims[0]}x${dims[1]}`);
+                    console.log(`[Video] Resize → resolution ${w}x${h}`);
                 }
             }, 300); // 300ms debounce
         };
@@ -332,10 +360,22 @@ if (window.chrome?.webview) {
                     meta.w === session.encodeW && meta.h === session.encodeH;
 
                 if (use1to1) {
-                    // 1:1 pixel-perfect: canvas = encode resolution, CSS handles display fit
+                    // 1:1 pixel-perfect: canvas bitmap = encode resolution
                     if (canvas.width !== meta.w || canvas.height !== meta.h) {
                         canvas.width = meta.w;
                         canvas.height = meta.h;
+                    }
+                    // Sync CSS to bitmap — deferred from setEncodeResolution so CSS
+                    // never leads the frame data (eliminates race → no fractional smear)
+                    const dpr = window.devicePixelRatio || 1;
+                    const targetCssW = `${meta.w / dpr}px`;
+                    const targetCssH = `${meta.h / dpr}px`;
+                    if (canvas.style.width !== targetCssW || canvas.style.height !== targetCssH) {
+                        canvas.style.width = targetCssW;
+                        canvas.style.height = targetCssH;
+                        canvas.style.objectFit = '';
+                        canvas.style.aspectRatio = '';
+                        canvas.style.maxHeight = '';
                     }
                     ctx.drawImage(frame, 0, 0);
                     session.isDownscaling = false;
