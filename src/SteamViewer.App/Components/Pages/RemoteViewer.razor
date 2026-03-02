@@ -185,8 +185,7 @@
             <button class="tab-add" title="New connection" @onclick="OpenConnectionDialog"><Icon Name="AppIcon.Plus" Size="14" /></button>
         </div>
         <div class="canvas-container" id="canvasContainer">
-            <canvas id="viewerCanvas" class="@(_secureDesktopActive ? "canvas-dimmed" : "")"
-                    style="@(string.IsNullOrEmpty(_canvasAspectRatio) ? "" : $"aspect-ratio: {_canvasAspectRatio}; height: auto; max-height: 100%;")"></canvas>
+            <canvas id="viewerCanvas" class="@(_secureDesktopActive ? "canvas-dimmed" : "")"></canvas>
             <canvas id="secureDesktopOverlay" class="secure-desktop-overlay" style="display: @(_secureDesktopActive ? "block" : "none")"></canvas>
             @if (_secureDesktopActive)
             {
@@ -278,7 +277,6 @@
     private bool _hasReceivedFrame;
     private bool _secureDesktopActive;
     private bool _secureDesktopFrameReceived;
-    private string _canvasAspectRatio = "";
     private List<MonitorInfo>? _hostMonitors;
     private int _activeMonitorId;
 
@@ -1137,11 +1135,11 @@
     private void HandleCaptureInfoReceived(int width, int height)
     {
         if (width <= 0 || height <= 0) return;
-        _canvasAspectRatio = $"{width} / {height}";
         InvokeAsync(async () =>
         {
-            StateHasChanged();
-            // Re-send display resolution now that canvas is AR-constrained
+            // Set AR via JS (not Blazor style) to avoid Blazor/JS style conflicts
+            await JSRuntime.InvokeVoidAsync("SteamViewerVideo.setCaptureAspectRatio",
+                _activeSession?.SessionId ?? "", width, height);
             await SendDisplayResolutionAsync();
         });
     }
@@ -1162,6 +1160,13 @@
             {
                 _secureDesktopFrameReceived = false;
                 await JSRuntime.InvokeVoidAsync("SteamViewerSecureDesktop.hide", "secureDesktopOverlay");
+                // Re-negotiate resolution after SD — desktop switch may have changed capture state
+                // Brief delay for desktop switch to settle
+                _ = Task.Run(async () =>
+                {
+                    await Task.Delay(200);
+                    await InvokeAsync(async () => await SendDisplayResolutionAsync());
+                });
             }
             StateHasChanged();
             _ = RefocusCanvasAsync();
@@ -1922,6 +1927,11 @@
         width: 100%;
         height: 100%;
         object-fit: contain;
+        /* After encodeInfo: JS sets explicit width/height and clears object-fit.
+           max-width/max-height prevent overflow when encode res = capture res at fullscreen. */
+        max-width: 100%;
+        max-height: 100%;
+        background: #000;
     }
 
     /* Secure Desktop - dimmed canvas when UAC active */

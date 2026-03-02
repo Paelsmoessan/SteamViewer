@@ -144,9 +144,11 @@ window.SteamViewerVideo = {
                     scaleStr = `${scale.toFixed(2)}x${session.isDownscaling ? ' ↓' : ''}`;
                 }
             }
+            const encInfo = (session.encodeW && session.encodeH)
+                ? `${session.encodeW}x${session.encodeH}` : '?';
             const lines = [
                 `Video: ${s.fps?.toFixed(0) || '?'} FPS | ${s.bitrateMbps?.toFixed(1) || '?'} Mbps`,
-                `Src:   ${videoInfo} | Canvas: ${canvasInfo} | Display: ${displayInfo} | Scale: ${scaleStr}`,
+                `Src:   ${videoInfo} | Enc: ${encInfo} | Canvas: ${canvasInfo} | Disp: ${displayInfo} | Scale: ${scaleStr}`,
                 `Lat:   Enc ${s.encodeMs?.toFixed(0) || '?'}ms | Dec ${s.decodeMs?.toFixed(0) || '?'}ms`,
                 `Net:   ${s.bytesSent ? fmtBytes(s.bytesSent) : '?'} sent | ${s.bytesReceived ? fmtBytes(s.bytesReceived) : '?'} rcvd`,
             ];
@@ -198,13 +200,42 @@ window.SteamViewerVideo = {
         console.log(`[Video] Session ${sessionId} disposed`);
     },
 
-    /// Returns [width, height] of the canvas display area in physical pixels (for resolution negotiation).
+    /// Returns [width, height] of the available display area in physical pixels (for resolution negotiation).
+    /// Reads the parent container size, not the canvas — canvas may be smaller after encodeInfo convergence.
     getDisplaySize(canvasId) {
         const canvas = document.getElementById(canvasId);
         if (!canvas) return [0, 0];
-        const rect = canvas.getBoundingClientRect();
+        const container = canvas.parentElement;
+        const rect = container.getBoundingClientRect();
         const dpr = window.devicePixelRatio || 1;
         return [Math.round(rect.width * dpr), Math.round(rect.height * dpr)];
+    },
+
+    /// Set capture aspect ratio for pre-encodeInfo AR constraint.
+    /// Once 1:1 path takes over (encodeW set), this is cleared automatically.
+    setCaptureAspectRatio(sessionId, w, h) {
+        const session = this.sessions.get(sessionId);
+        if (!session) return;
+        session.captureW = w;
+        session.captureH = h;
+        // Only apply AR constraint if 1:1 path hasn't set explicit dims yet
+        const canvas = session.canvas;
+        if (canvas && !session.encodeW) {
+            canvas.style.aspectRatio = `${w} / ${h}`;
+            canvas.style.height = 'auto';
+            canvas.style.maxHeight = '100%';
+        }
+        console.log(`[Video] Session ${sessionId}: captureAspectRatio ${w}/${h}`);
+    },
+
+    /// Set the host's actual encode resolution for a session.
+    /// Stores dims only — CSS resize deferred to 1:1 render path so CSS always matches actual frame bitmap.
+    setEncodeResolution(sessionId, encW, encH) {
+        const session = this.sessions.get(sessionId);
+        if (!session) return;
+        session.encodeW = encW;
+        session.encodeH = encH;
+        console.log(`[Video] Session ${sessionId}: encodeResolution ${encW}x${encH}`);
     },
 
     /// Start a debounced resize listener that sends resolution updates via postMessage.
@@ -219,12 +250,19 @@ window.SteamViewerVideo = {
         this._resizeHandler = () => {
             clearTimeout(this._resizeDebounceTimer);
             this._resizeDebounceTimer = setTimeout(() => {
-                const dims = this.getDisplaySize(this._resizeCanvasId);
-                if (dims[0] > 0 && dims[1] > 0 && window.chrome?.webview) {
+                // Read parent container (available space), not canvas (may be converged smaller)
+                const canvas = document.getElementById(this._resizeCanvasId);
+                if (!canvas) return;
+                const container = canvas.parentElement;
+                const rect = container.getBoundingClientRect();
+                const dpr = window.devicePixelRatio || 1;
+                const w = Math.round(rect.width * dpr);
+                const h = Math.round(rect.height * dpr);
+                if (w > 0 && h > 0 && window.chrome?.webview) {
                     window.chrome.webview.postMessage(JSON.stringify({
-                        type: 'resolution', width: dims[0], height: dims[1]
+                        type: 'resolution', width: w, height: h
                     }));
-                    console.log(`[Video] Resize → resolution ${dims[0]}x${dims[1]}`);
+                    console.log(`[Video] Resize → resolution ${w}x${h}`);
                 }
             }, 300); // 300ms debounce
         };
@@ -315,49 +353,69 @@ if (window.chrome?.webview) {
                     session.videoH = meta.h;
                 }
 
-                // Detect display size for downscale vs upscale decision
-                const rect = canvas.getBoundingClientRect();
-                const dpr = window.devicePixelRatio || 1;
-                const displayW = Math.round(rect.width * dpr);
-                const displayH = Math.round(rect.height * dpr);
+                // When encodeResolution is known, canvas = video resolution → 1:1 drawImage.
+                // CSS object-fit: contain handles display scaling (GPU compositor).
+                // Host already downscaled to near-display size, so CSS upscale is ≤7px (imperceptible).
+                const use1to1 = session.encodeW > 0 && session.encodeH > 0 &&
+                    meta.w === session.encodeW && meta.h === session.encodeH;
 
-                // Compute the fitted video dimensions within display area
-                const scale = Math.min(displayW / meta.w, displayH / meta.h);
-                const isDownscaling = scale < 0.95; // 5% margin to avoid thrashing
-
-                if (isDownscaling) {
-                    // DOWNSCALE: Canvas bitmap = display pixels, high-quality Canvas 2D scaling.
-                    // imageSmoothingQuality:'high' uses Skia Mitchell-Netravali (cubic) in Chromium
-                    // — significantly sharper for text than CSS compositor bilinear.
-                    const displayChanged = displayW !== session.lastDisplayW || displayH !== session.lastDisplayH;
-                    if (canvas.width !== displayW || canvas.height !== displayH || displayChanged) {
-                        canvas.width = displayW;
-                        canvas.height = displayH;
-                        ctx.imageSmoothingEnabled = true;
-                        ctx.imageSmoothingQuality = 'high';
-                        session.lastDisplayW = displayW;
-                        session.lastDisplayH = displayH;
-                    }
-                    // Letterbox: fit video into display area preserving aspect ratio
-                    const fitW = Math.round(meta.w * scale);
-                    const fitH = Math.round(meta.h * scale);
-                    const dx = Math.round((displayW - fitW) / 2);
-                    const dy = Math.round((displayH - fitH) / 2);
-                    // Clear for letterbox bars (only if aspect ratios differ)
-                    if (dx > 0 || dy > 0) ctx.clearRect(0, 0, displayW, displayH);
-                    ctx.drawImage(frame, dx, dy, fitW, fitH);
-                    session.isDownscaling = true;
-                } else {
-                    // UPSCALE or 1:1: Canvas = video resolution, drawImage 1:1.
-                    // CSS object-fit: contain handles display scaling (GPU compositor).
+                if (use1to1) {
+                    // 1:1 pixel-perfect: canvas bitmap = encode resolution
                     if (canvas.width !== meta.w || canvas.height !== meta.h) {
                         canvas.width = meta.w;
                         canvas.height = meta.h;
-                        session.lastDisplayW = 0;
-                        session.lastDisplayH = 0;
+                    }
+                    // Sync CSS to bitmap — deferred from setEncodeResolution so CSS
+                    // never leads the frame data (eliminates race → no fractional smear)
+                    const dpr = window.devicePixelRatio || 1;
+                    const targetCssW = `${meta.w / dpr}px`;
+                    const targetCssH = `${meta.h / dpr}px`;
+                    if (canvas.style.width !== targetCssW || canvas.style.height !== targetCssH) {
+                        canvas.style.width = targetCssW;
+                        canvas.style.height = targetCssH;
+                        canvas.style.objectFit = '';
+                        canvas.style.aspectRatio = '';
+                        canvas.style.maxHeight = '';
                     }
                     ctx.drawImage(frame, 0, 0);
                     session.isDownscaling = false;
+                } else {
+                    // Fallback: display-pixel canvas with Canvas 2D scaling
+                    // (before encodeInfo arrives, or if frame doesn't match encode resolution)
+                    const rect = canvas.getBoundingClientRect();
+                    const dpr = window.devicePixelRatio || 1;
+                    const displayW = Math.round(rect.width * dpr);
+                    const displayH = Math.round(rect.height * dpr);
+                    const scale = Math.min(displayW / meta.w, displayH / meta.h);
+                    const isDownscaling = scale < 0.95;
+
+                    if (isDownscaling) {
+                        const displayChanged = displayW !== session.lastDisplayW || displayH !== session.lastDisplayH;
+                        if (canvas.width !== displayW || canvas.height !== displayH || displayChanged) {
+                            canvas.width = displayW;
+                            canvas.height = displayH;
+                            ctx.imageSmoothingEnabled = true;
+                            ctx.imageSmoothingQuality = 'high';
+                            session.lastDisplayW = displayW;
+                            session.lastDisplayH = displayH;
+                        }
+                        const fitW = Math.round(meta.w * scale);
+                        const fitH = Math.round(meta.h * scale);
+                        const dx = Math.round((displayW - fitW) / 2);
+                        const dy = Math.round((displayH - fitH) / 2);
+                        if (dx > 0 || dy > 0) ctx.clearRect(0, 0, displayW, displayH);
+                        ctx.drawImage(frame, dx, dy, fitW, fitH);
+                        session.isDownscaling = true;
+                    } else {
+                        if (canvas.width !== meta.w || canvas.height !== meta.h) {
+                            canvas.width = meta.w;
+                            canvas.height = meta.h;
+                            session.lastDisplayW = 0;
+                            session.lastDisplayH = 0;
+                        }
+                        ctx.drawImage(frame, 0, 0);
+                        session.isDownscaling = false;
+                    }
                 }
                 frame.close();
             } else {

@@ -150,8 +150,9 @@ public sealed unsafe class FFmpegEncoder : IDisposable
 
         if (encW == _width && encH == _height) return;
 
-        _logger.LogInformation("Encoder resolution changed: {OldW}x{OldH} → {NewW}x{NewH} (capture: {CW}x{CH})",
-            _width, _height, encW, encH, captureWidth, captureHeight);
+        var arError = captureHeight > 0 ? Math.Abs((double)encW / encH - (double)captureWidth / captureHeight) : 0;
+        _logger.LogInformation("Encoder resolution changed: {OldW}x{OldH} → {NewW}x{NewH} (capture: {CW}x{CH}, AR error: {Err:F6})",
+            _width, _height, encW, encH, captureWidth, captureHeight, arError);
 
         Cleanup();
         Initialize(encW, encH);
@@ -207,10 +208,38 @@ public sealed unsafe class FFmpegEncoder : IDisposable
             encW = (int)(encH * captureAspect);
         }
 
-        // Align to 8 — sws_scale SIMD (SSE/AVX) processes 8 pixels at a time,
-        // non-8-aligned widths cause right-side blur/artifacts
-        encW &= ~7;
-        encH &= ~7;
+        // 8-align using 3×3 grid search for best AR match.
+        // sws_scale SIMD processes pixels in 8-wide blocks — non-mod-8 widths cause
+        // visible left-to-right quality gradient from scalar fallback on tail pixels.
+        // SWS_ACCURATE_RND alone is insufficient (tested: blurrier + L-R drift).
+        double captureAr = (double)captureW / captureH;
+        int baseW = encW & ~7;
+        int baseH = encH & ~7;
+
+        int bestW = baseW, bestH = baseH;
+        double bestError = double.MaxValue;
+
+        for (int dw = -8; dw <= 8; dw += 8)
+        {
+            for (int dh = -8; dh <= 8; dh += 8)
+            {
+                int cw = baseW + dw;
+                int ch = baseH + dh;
+                if (cw > _requestedWidth || ch > _requestedHeight) continue;
+                if (cw <= 0 || ch <= 0) continue;
+                double ar = (double)cw / ch;
+                double error = Math.Abs(ar - captureAr);
+                if (error < bestError)
+                {
+                    bestError = error;
+                    bestW = cw;
+                    bestH = ch;
+                }
+            }
+        }
+
+        encW = bestW;
+        encH = bestH;
 
         // Minimum encode resolution
         if (encW < 320) encW = 320;
@@ -279,8 +308,11 @@ public sealed unsafe class FFmpegEncoder : IDisposable
             var (encW, encH) = ComputeEncodeResolution(captureWidth, captureHeight);
             if (encW != _width || encH != _height)
             {
-                _logger.LogInformation("Re-initializing encoder for new resolution: {W}x{H} (capture: {CW}x{CH})",
-                    encW, encH, captureWidth, captureHeight);
+                var arError = captureHeight > 0
+                    ? Math.Abs((double)encW / encH - (double)captureWidth / captureHeight) : 0;
+                _logger.LogInformation(
+                    "Re-initializing encoder for new resolution: {W}x{H} (capture: {CW}x{CH}, AR error: {Err:F6})",
+                    encW, encH, captureWidth, captureHeight, arError);
                 Cleanup();
                 Initialize(encW, encH);
                 RebuildDownscaleContext(captureWidth, captureHeight, encW, encH);

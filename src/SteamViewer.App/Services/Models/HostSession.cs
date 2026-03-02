@@ -430,6 +430,9 @@ public sealed class HostSession : IAsyncDisposable
             var result = _encoder.EncodeFrame(bgraData, stride, width, height);
             _encodeSw.Stop();
 
+            // Notify viewer of actual encode resolution (for 1:1 canvas sizing)
+            SendEncodeInfoIfChanged();
+
             if (result is var (naluData, naluLength))
             {
                 _transport.EnqueueVideoFrame(naluData, naluLength);
@@ -452,6 +455,25 @@ public sealed class HostSession : IAsyncDisposable
     private readonly System.Diagnostics.Stopwatch _encodeSw = new();
     private int _lastSentCaptureW;
     private int _lastSentCaptureH;
+    private int _lastSentEncodeW;
+    private int _lastSentEncodeH;
+
+    private void SendEncodeInfoIfChanged()
+    {
+        var w = _encoder?.Width ?? 0;
+        var h = _encoder?.Height ?? 0;
+        if (w <= 0 || h <= 0) return;
+        if (w == _lastSentEncodeW && h == _lastSentEncodeH) return;
+        _lastSentEncodeW = w;
+        _lastSentEncodeH = h;
+        _logger.LogInformation("Sending encodeInfo to viewer: {W}x{H}", w, h);
+        _ = _transport?.SendControlAsync(JsonSerializer.Serialize(new
+        {
+            type = "encodeInfo",
+            width = w,
+            height = h
+        }));
+    }
 
     private void SendCaptureInfoIfChanged(int width, int height)
     {
