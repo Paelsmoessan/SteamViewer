@@ -136,6 +136,7 @@ public static class SystemHelperServer
     private static Thread? _inputThread;
 
     private static string? _debugPath;
+    private static string? _debugPathLocal;
     private static SecureDesktopCapture? _capture;
 
     // Video pipe for binary JPEG frames (server → client)
@@ -155,6 +156,7 @@ public static class SystemHelperServer
         var line = $"[{DateTime.Now:HH:mm:ss.fff}] {message}";
         Console.WriteLine($"[SystemHelper] {message}");
         try { if (_debugPath != null) File.AppendAllText(_debugPath, line + "\n"); } catch { }
+        try { if (_debugPathLocal != null) File.AppendAllText(_debugPathLocal, line + "\n"); } catch { }
     }
 
     /// <summary>
@@ -168,6 +170,14 @@ public static class SystemHelperServer
             Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
             "SteamViewer", "system-helper-debug.txt");
         try { Directory.CreateDirectory(Path.GetDirectoryName(_debugPath)!); } catch { }
+
+        // Also log next to exe (readable via network share from Dev PC)
+        var exeDir = Path.GetDirectoryName(Environment.ProcessPath);
+        if (exeDir != null)
+        {
+            _debugPathLocal = Path.Combine(exeDir, "logs", "system-helper-debug.txt");
+            try { Directory.CreateDirectory(Path.GetDirectoryName(_debugPathLocal)!); } catch { }
+        }
 
         DebugLog($"Starting SYSTEM pipe server: {pipeName} (PID {Environment.ProcessId})");
         DebugLog($"Running as: {Environment.UserName} (SYSTEM expected)");
