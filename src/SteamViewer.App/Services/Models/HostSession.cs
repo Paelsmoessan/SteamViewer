@@ -442,17 +442,28 @@ public sealed class HostSession : IAsyncDisposable
                     _logger.LogInformation("Encode #{Count}: {Ms:F1}ms, {Size}KB",
                         _encodeFrameCount, _encodeSw.Elapsed.TotalMilliseconds, naluLength / 1024);
             }
+
+            // Heartbeat: prove the encode pipeline is alive (every 60s)
+            if (_heartbeatSw.ElapsedMilliseconds >= 60_000)
+            {
+                _logger.LogInformation("Encode heartbeat: #{Count} frames, encoder {W}x{H}",
+                    _encodeFrameCount, _encoder?.Width ?? 0, _encoder?.Height ?? 0);
+                _heartbeatSw.Restart();
+            }
         }
         catch (Exception ex)
         {
-            if (_encoderErrorCount++ % 300 == 0)
-                _logger.LogWarning(ex, "FFmpeg encode error (sample)");
+            // Log EVERY error on first occurrence, then sample
+            if (_encoderErrorCount == 0 || _encoderErrorCount % 300 == 0)
+                _logger.LogError(ex, "FFmpeg encode error #{Count}", _encoderErrorCount);
+            _encoderErrorCount++;
         }
     }
 
     private int _encoderErrorCount;
     private long _encodeFrameCount;
     private readonly System.Diagnostics.Stopwatch _encodeSw = new();
+    private readonly System.Diagnostics.Stopwatch _heartbeatSw = System.Diagnostics.Stopwatch.StartNew();
     private int _lastSentCaptureW;
     private int _lastSentCaptureH;
     private int _lastSentEncodeW;

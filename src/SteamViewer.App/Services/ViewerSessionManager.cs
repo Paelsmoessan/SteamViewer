@@ -384,8 +384,19 @@ public sealed class ViewerSessionManager : IAsyncDisposable
     private void HandleError(SignalingMessage.Error error)
     {
         _logger.LogWarning("Signaling error: {Message}", error.Message);
-        // Try to find which session this error relates to
-        // For now, just log it
+
+        // Server error likely means connection request failed (e.g. "Target client X is not online").
+        // Clean up any sessions that haven't established transport yet — they're the ones that failed.
+        var staleSessionIds = _sessions
+            .Where(kvp => !kvp.Value.IsInitialized)
+            .Select(kvp => kvp.Key)
+            .ToList();
+
+        foreach (var sessionId in staleSessionIds)
+        {
+            _logger.LogInformation("Cleaning up stale session {SessionId} after signaling error", sessionId);
+            _ = RemoveSessionAsync(sessionId);
+        }
     }
 
     private void HandleSessionStateChanged(string sessionId, ViewerSessionState state)

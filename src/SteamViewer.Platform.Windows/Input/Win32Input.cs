@@ -452,6 +452,28 @@ internal static class Win32Input
         {
             AddKeyInput(inputs, vk, isDown);
         }
+        else if (key.Length == 1)
+        {
+            // Unknown VK but single character — use KEYEVENTF_UNICODE to type it directly.
+            // This handles non-US layout characters (æ, ø, å, ö, etc.) that have no VK mapping.
+            // JS e.key already resolves the viewer's keyboard layout for us.
+            var flags = KEYEVENTF_UNICODE | (isDown ? 0u : KEYEVENTF_KEYUP);
+            inputs.Add(new INPUT
+            {
+                type = INPUT_KEYBOARD,
+                union = new InputUnion
+                {
+                    ki = new KEYBDINPUT
+                    {
+                        wVk = 0,
+                        wScan = (ushort)key[0],
+                        dwFlags = flags,
+                        time = 0,
+                        dwExtraInfo = IntPtr.Zero
+                    }
+                }
+            });
+        }
 
         if (!isDown)
         {
@@ -574,6 +596,7 @@ internal static class Win32Input
     internal const uint MOUSEEVENTF_VIRTUALDESK = 0x4000;
 
     internal const uint KEYEVENTF_KEYUP = 0x0002;
+    internal const uint KEYEVENTF_UNICODE = 0x0004;
 
     internal const int WHEEL_DELTA = 120;
     internal const uint XBUTTON1 = 0x0001;
