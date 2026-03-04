@@ -923,6 +923,14 @@ public sealed class HostSession : IAsyncDisposable
             _logger.LogInformation("Sent {Type} to viewer",
                 active ? "secureDesktopActive" : "secureDesktopInactive");
 
+            // When leaving Secure Desktop, force re-send encodeInfo so viewer canvas re-syncs CSS.
+            // Without this, SendEncodeInfoIfChanged() sees same resolution → skips → canvas stays stale.
+            if (!active)
+            {
+                _lastSentEncodeW = 0;
+                _lastSentEncodeH = 0;
+            }
+
             // When leaving Secure Desktop, DXGI capture may have died (2min E_ACCESSDENIED timeout).
             // Restart capture if it's no longer running but we're still sharing.
             if (!active && IsSharingScreen && _isNativeCapture && _screenCapture is DxgiScreenCapture dxgi)

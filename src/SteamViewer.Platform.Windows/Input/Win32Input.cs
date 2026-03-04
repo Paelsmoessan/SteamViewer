@@ -439,24 +439,14 @@ internal static class Win32Input
     {
         var inputs = new List<INPUT>();
 
-        if (isDown)
-        {
-            if (modifiers.Ctrl) AddKeyInput(inputs, VK_CONTROL, isDown: true);
-            if (modifiers.Alt) AddKeyInput(inputs, VK_MENU, isDown: true);
-            if (modifiers.Shift) AddKeyInput(inputs, VK_SHIFT, isDown: true);
-            if (modifiers.Meta) AddKeyInput(inputs, VK_LWIN, isDown: true);
-        }
+        // AltGr detection: Nordic/European keyboards send Ctrl+Alt for AltGr characters (\ @ { } [ ] etc.)
+        // JS e.key resolves to the actual character — use UNICODE path directly, skip modifier injection.
+        // Sending Ctrl+Alt key presses before the character makes Windows interpret it as a shortcut.
+        var isAltGr = key.Length == 1 && modifiers.Ctrl && modifiers.Alt && !modifiers.Meta;
 
-        var vk = KeyToVirtualKey(key);
-        if (vk != 0)
+        if (isAltGr)
         {
-            AddKeyInput(inputs, vk, isDown);
-        }
-        else if (key.Length == 1)
-        {
-            // Unknown VK but single character — use KEYEVENTF_UNICODE to type it directly.
-            // This handles non-US layout characters (æ, ø, å, ö, etc.) that have no VK mapping.
-            // JS e.key already resolves the viewer's keyboard layout for us.
+            // AltGr character — UNICODE path only, no modifiers
             var flags = KEYEVENTF_UNICODE | (isDown ? 0u : KEYEVENTF_KEYUP);
             inputs.Add(new INPUT
             {
@@ -474,13 +464,51 @@ internal static class Win32Input
                 }
             });
         }
-
-        if (!isDown)
+        else
         {
-            if (modifiers.Meta) AddKeyInput(inputs, VK_LWIN, isDown: false);
-            if (modifiers.Shift) AddKeyInput(inputs, VK_SHIFT, isDown: false);
-            if (modifiers.Alt) AddKeyInput(inputs, VK_MENU, isDown: false);
-            if (modifiers.Ctrl) AddKeyInput(inputs, VK_CONTROL, isDown: false);
+            if (isDown)
+            {
+                if (modifiers.Ctrl) AddKeyInput(inputs, VK_CONTROL, isDown: true);
+                if (modifiers.Alt) AddKeyInput(inputs, VK_MENU, isDown: true);
+                if (modifiers.Shift) AddKeyInput(inputs, VK_SHIFT, isDown: true);
+                if (modifiers.Meta) AddKeyInput(inputs, VK_LWIN, isDown: true);
+            }
+
+            var vk = KeyToVirtualKey(key);
+            if (vk != 0)
+            {
+                AddKeyInput(inputs, vk, isDown);
+            }
+            else if (key.Length == 1)
+            {
+                // Unknown VK but single character — use KEYEVENTF_UNICODE to type it directly.
+                // This handles non-US layout characters (æ, ø, å, ö, etc.) that have no VK mapping.
+                // JS e.key already resolves the viewer's keyboard layout for us.
+                var flags = KEYEVENTF_UNICODE | (isDown ? 0u : KEYEVENTF_KEYUP);
+                inputs.Add(new INPUT
+                {
+                    type = INPUT_KEYBOARD,
+                    union = new InputUnion
+                    {
+                        ki = new KEYBDINPUT
+                        {
+                            wVk = 0,
+                            wScan = (ushort)key[0],
+                            dwFlags = flags,
+                            time = 0,
+                            dwExtraInfo = IntPtr.Zero
+                        }
+                    }
+                });
+            }
+
+            if (!isDown)
+            {
+                if (modifiers.Meta) AddKeyInput(inputs, VK_LWIN, isDown: false);
+                if (modifiers.Shift) AddKeyInput(inputs, VK_SHIFT, isDown: false);
+                if (modifiers.Alt) AddKeyInput(inputs, VK_MENU, isDown: false);
+                if (modifiers.Ctrl) AddKeyInput(inputs, VK_CONTROL, isDown: false);
+            }
         }
 
         if (inputs.Count > 0)
@@ -489,8 +517,33 @@ internal static class Win32Input
         }
     }
 
+    // Extended keys require KEYEVENTF_EXTENDEDKEY flag — without it, SendInput ignores or
+    // misinterprets them (e.g. NumLock toggle, navigation keys, right-side modifiers).
+    private static readonly HashSet<ushort> _extendedKeys = new()
+    {
+        0x2D, // VK_INSERT
+        0x2E, // VK_DELETE
+        0x24, // VK_HOME
+        0x23, // VK_END
+        0x21, // VK_PRIOR (PageUp)
+        0x22, // VK_NEXT (PageDown)
+        0x26, // VK_UP
+        0x28, // VK_DOWN
+        0x25, // VK_LEFT
+        0x27, // VK_RIGHT
+        0x90, // VK_NUMLOCK
+        0x2C, // VK_SNAPSHOT (PrintScreen)
+        0xA3, // VK_RCONTROL
+        0xA5, // VK_RMENU (Right Alt)
+        0x5B, // VK_LWIN
+        0x5C, // VK_RWIN
+    };
+
     private static void AddKeyInput(List<INPUT> inputs, ushort vk, bool isDown)
     {
+        var flags = isDown ? 0u : KEYEVENTF_KEYUP;
+        if (_extendedKeys.Contains(vk)) flags |= KEYEVENTF_EXTENDEDKEY;
+
         inputs.Add(new INPUT
         {
             type = INPUT_KEYBOARD,
@@ -500,7 +553,7 @@ internal static class Win32Input
                 {
                     wVk = vk,
                     wScan = 0,
-                    dwFlags = isDown ? 0u : KEYEVENTF_KEYUP,
+                    dwFlags = flags,
                     time = 0,
                     dwExtraInfo = IntPtr.Zero
                 }
@@ -595,6 +648,7 @@ internal static class Win32Input
     internal const uint MOUSEEVENTF_ABSOLUTE = 0x8000;
     internal const uint MOUSEEVENTF_VIRTUALDESK = 0x4000;
 
+    internal const uint KEYEVENTF_EXTENDEDKEY = 0x0001;
     internal const uint KEYEVENTF_KEYUP = 0x0002;
     internal const uint KEYEVENTF_UNICODE = 0x0004;
 
