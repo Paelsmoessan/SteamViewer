@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text.Json;
@@ -74,6 +75,9 @@ public sealed class HostSession : IAsyncDisposable
     private int _losslessRequestW;
     private int _losslessRequestH;
     private bool _losslessSent;
+
+    // ACK+retry for critical control messages over UDP
+    private readonly ConcurrentDictionary<string, bool> _pendingAcks = new();
 
     /// <summary>Session ID for JS interop — always "host".</summary>
     public string SessionId => "host";
@@ -673,6 +677,12 @@ public sealed class HostSession : IAsyncDisposable
                     case "requestLosslessFrame":
                         HandleRequestLosslessFrame(root);
                         return;
+
+                    case "ack":
+                        var ackType = root.TryGetProperty("ackType", out var ackProp) ? ackProp.GetString() : null;
+                        if (ackType != null)
+                            _pendingAcks[ackType] = true;
+                        return;
                 }
             }
 
@@ -914,14 +924,13 @@ public sealed class HostSession : IAsyncDisposable
 
         try
         {
-            var message = active
-                ? JsonSerializer.Serialize(new { type = "secureDesktopActive" })
-                : JsonSerializer.Serialize(new { type = "secureDesktopInactive" });
+            var messageType = active ? "secureDesktopActive" : "secureDesktopInactive";
+            var message = JsonSerializer.Serialize(new { type = messageType });
 
-            _ = _transport.SendControlAsync(message);
+            // Send with ACK+retry — critical state change that can't be lost over UDP
+            _ = SendWithAckAsync(message, messageType);
 
-            _logger.LogInformation("Sent {Type} to viewer",
-                active ? "secureDesktopActive" : "secureDesktopInactive");
+            _logger.LogInformation("Sent {Type} to viewer (with ACK+retry)", messageType);
 
             // When leaving Secure Desktop, force re-send encodeInfo so viewer canvas re-syncs CSS.
             // Without this, SendEncodeInfoIfChanged() sees same resolution → skips → canvas stays stale.
@@ -974,6 +983,34 @@ public sealed class HostSession : IAsyncDisposable
         {
             _logger.LogWarning(ex, "Failed to send secure desktop state change");
         }
+    }
+
+    /// <summary>
+    /// Send a critical control message with ACK+retry. Resends until viewer ACKs or max retries reached.
+    /// Use for infrequent state-change messages that can't tolerate loss over UDP.
+    /// </summary>
+    private async Task SendWithAckAsync(string json, string ackType, int retryIntervalMs = 500, int maxRetries = 5)
+    {
+        _pendingAcks[ackType] = false;
+
+        for (int i = 0; i <= maxRetries; i++)
+        {
+            if (_transport == null || !IsDataChannelReady) break;
+
+            await _transport.SendControlAsync(json);
+            if (i > 0) _logger.LogDebug("Resending {Type} (retry {N})", ackType, i);
+
+            await Task.Delay(retryIntervalMs);
+            if (_pendingAcks.TryGetValue(ackType, out var acked) && acked)
+            {
+                _pendingAcks.TryRemove(ackType, out _);
+                _logger.LogDebug("ACK received for {Type}", ackType);
+                return;
+            }
+        }
+
+        _logger.LogWarning("No ACK for {Type} after {N} retries", ackType, maxRetries);
+        _pendingAcks.TryRemove(ackType, out _);
     }
 
     private void HandleSystemStateChanged(bool connected)

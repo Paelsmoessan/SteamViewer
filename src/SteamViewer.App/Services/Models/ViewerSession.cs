@@ -793,11 +793,15 @@ public sealed class ViewerSession : IAsyncDisposable
                     case "secureDesktopActive":
                         IsSecureDesktopActive = true;
                         OnSecureDesktopStateChanged?.Invoke(true);
+                        _ = _transport?.SendControlAsync(
+                            JsonSerializer.Serialize(new { type = "ack", ackType = "secureDesktopActive" }));
                         break;
 
                     case "secureDesktopInactive":
                         IsSecureDesktopActive = false;
                         OnSecureDesktopStateChanged?.Invoke(false);
+                        _ = _transport?.SendControlAsync(
+                            JsonSerializer.Serialize(new { type = "ack", ackType = "secureDesktopInactive" }));
                         break;
 
                     case "secureDesktopFrame":
