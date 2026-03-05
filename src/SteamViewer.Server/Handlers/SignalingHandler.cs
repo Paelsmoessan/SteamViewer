@@ -379,8 +379,8 @@ public sealed class SignalingHandler
             return new SignalingMessage.Error("Not registered");
         }
 
-        _registry.TrySendToClient(endpoint.TargetId, new SignalingMessage.TransportEndpoint(fromId, endpoint.IPs, endpoint.Port));
-        _logger.LogDebug("Transport endpoint forwarded from {FromId} to {TargetId}", fromId, endpoint.TargetId);
+        _registry.TrySendToClient(endpoint.TargetId, new SignalingMessage.TransportEndpoint(fromId, endpoint.Candidates));
+        _logger.LogDebug("Transport endpoint forwarded from {FromId} to {TargetId} ({CandidateCount} candidates)", fromId, endpoint.TargetId, endpoint.Candidates.Length);
         return null;
     }
 

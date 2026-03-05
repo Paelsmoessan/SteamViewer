@@ -176,14 +176,13 @@ public abstract record SignalingMessage
     // ==================== Direct Transport Endpoint Exchange ====================
 
     /// <summary>
-    /// Host sends transport endpoint to viewer after approving connection.
-    /// Used for Phase 2 direct UDP connection (IPs + port).
-    /// Phase 1 WebSocket relay doesn't need IPs/port but uses the encryption nonce.
+    /// Sends transport candidates to peer for UDP hole-punching.
+    /// Each candidate carries its own (ip, port, type) — local IPs use the local port,
+    /// reflexive uses the STUN-mapped port, relay uses the TURN-allocated port.
     /// </summary>
     public sealed record TransportEndpoint(
         [property: JsonPropertyName("target_id")] string TargetId,
-        [property: JsonPropertyName("ips")] string[] IPs,
-        [property: JsonPropertyName("port")] int Port
+        [property: JsonPropertyName("candidates")] TransportCandidate[] Candidates
     ) : SignalingMessage;
 
     /// <summary>
@@ -226,6 +225,16 @@ public abstract record SignalingMessage
         [property: JsonPropertyName("sdp_m_line_index")] ushort? SdpMLineIndex
     ) : SignalingMessage;
 }
+
+/// <summary>
+/// A single transport candidate with its own IP, port, and type.
+/// Types: "host" (local LAN), "srflx" (STUN reflexive), "relay" (TURN allocated).
+/// </summary>
+public sealed record TransportCandidate(
+    [property: JsonPropertyName("ip")] string IP,
+    [property: JsonPropertyName("port")] int Port,
+    [property: JsonPropertyName("type")] string Type
+);
 
 /// <summary>
 /// JSON serialization options for signaling messages.
