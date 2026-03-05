@@ -293,7 +293,7 @@ public abstract class StreamTransport : IAsyncDisposable
     /// Switch to a different transport backend (e.g., upgrade from WebSocket relay to direct UDP).
     /// The old backend is disposed after switching.
     /// </summary>
-    protected async Task SwitchBackendAsync(ITransportBackend newBackend)
+    protected Task SwitchBackendAsync(ITransportBackend newBackend)
     {
         var oldBackend = _backend;
         _logger.LogInformation("[TRANSPORT] Switching backend: {Old} → {New}",
@@ -310,12 +310,23 @@ public abstract class StreamTransport : IAsyncDisposable
         newBackend.OnDataReceived += HandleDataReceived;
         newBackend.OnDisconnected += HandleBackendDisconnected;
 
+        // Don't dispose old backend immediately — keep it alive as safety net.
+        // If the peer hasn't switched yet, they may still be sending on the old transport.
         if (oldBackend != null)
         {
-            await oldBackend.DisposeAsync();
+            _ = DisposeAfterGracePeriodAsync(oldBackend);
         }
 
         _logger.LogInformation("[TRANSPORT] Backend switch complete → {Backend}", newBackend.GetType().Name);
+        return Task.CompletedTask;
+    }
+
+    private async Task DisposeAfterGracePeriodAsync(ITransportBackend oldBackend)
+    {
+        await Task.Delay(10_000);
+        try { await oldBackend.DisposeAsync(); }
+        catch { }
+        _logger.LogDebug("[TRANSPORT] Old backend disposed after 10s grace period");
     }
 
     /// <summary>

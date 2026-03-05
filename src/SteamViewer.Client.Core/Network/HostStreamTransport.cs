@@ -191,13 +191,25 @@ public sealed class HostStreamTransport : StreamTransport
                     // Check if peer already confirmed
                     await TryCompleteSwitchAsync();
 
-                    // Start timeout — if peer doesn't confirm within 5s, stay on relay
+                    // Retry TransportConfirmed every 3s — peer may have missed it
                     _ = Task.Run(async () =>
                     {
-                        await Task.Delay(5000);
+                        for (int i = 0; i < 5; i++)
+                        {
+                            await Task.Delay(3000);
+                            if (_remoteUdpReady || _pendingUdpBackend == null) return;
+
+                            if (_sendSignaling != null && _peerId != null)
+                            {
+                                _logger.LogDebug("Host: re-sending TransportConfirmed (retry {Retry})", i + 1);
+                                try { await _sendSignaling(new SignalingMessage.TransportConfirmed(_peerId)); }
+                                catch { }
+                            }
+                        }
+
                         if (_localUdpReady && !_remoteUdpReady && _pendingUdpBackend != null)
                         {
-                            _logger.LogWarning("Host: peer did not confirm UDP within 5s — staying on relay");
+                            _logger.LogWarning("Host: peer did not confirm UDP within 15s — staying on relay");
                             _localUdpReady = false;
                             _pendingUdpBackend = null;
                         }
