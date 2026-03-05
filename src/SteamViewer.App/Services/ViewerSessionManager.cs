@@ -428,9 +428,9 @@ public sealed class ViewerSessionManager : IAsyncDisposable
             return;
         }
 
-        _logger.LogInformation("Session {SessionId}: Received transport endpoint from {PeerId} ({IpCount} IPs, port {Port})",
-            session.SessionId, endpoint.TargetId, endpoint.IPs.Length, endpoint.Port);
-        _ = session.HandleTransportEndpointAsync(endpoint.IPs, endpoint.Port);
+        _logger.LogInformation("Session {SessionId}: Received transport endpoint from {PeerId} ({CandidateCount} candidates)",
+            session.SessionId, endpoint.TargetId, endpoint.Candidates.Length);
+        _ = session.HandleTransportEndpointAsync(endpoint.Candidates);
     }
 
     private void HandleTransportConfirmed(SignalingMessage.TransportConfirmed confirmed)

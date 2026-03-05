@@ -22,8 +22,7 @@ public sealed class ViewerStreamTransport : StreamTransport
     private string? _peerId;
 
     // ICE candidate pair pattern — buffer both sides, probe when both ready
-    private string[]? _remoteCandidateIPs;
-    private int _remoteCandidatePort;
+    private TransportCandidate[]? _remoteCandidates;
     private bool _localCandidatesReady;
 
     public ViewerStreamTransport(SignalingClient signalingClient, ILogger logger) : base(logger)
@@ -71,29 +70,42 @@ public sealed class ViewerStreamTransport : StreamTransport
             _udpBackend = new UdpTransportBackend(_logger);
             await _udpBackend.InitializeAsync(turnServerUri, turnUsername, turnCredential);
 
-            // Gather endpoints
-            var endpoints = new List<string>();
+            // Gather candidates: local IPs (host) + reflexive (srflx) + TURN relay
+            var candidates = new List<TransportCandidate>();
+            var localPort = _udpBackend.LocalEndPoint?.Port ?? 0;
+
+            // Local IPs — each uses the local socket port
             try
             {
                 var host = Dns.GetHostEntry(Dns.GetHostName());
                 foreach (var ip in host.AddressList)
                 {
-                    if (ip.AddressFamily == AddressFamily.InterNetwork)
-                        endpoints.Add(ip.ToString());
+                    if (ip.AddressFamily == AddressFamily.InterNetwork && localPort > 0)
+                        candidates.Add(new TransportCandidate(ip.ToString(), localPort, "host"));
                 }
             }
             catch { }
 
+            // Reflexive endpoint from STUN — uses the NAT-mapped port
             if (_udpBackend.ReflexiveEndPoint != null)
-                endpoints.Add(_udpBackend.ReflexiveEndPoint.Address.ToString());
+                candidates.Add(new TransportCandidate(
+                    _udpBackend.ReflexiveEndPoint.Address.ToString(),
+                    _udpBackend.ReflexiveEndPoint.Port,
+                    "srflx"));
 
-            var port = _udpBackend.LocalEndPoint?.Port ?? 0;
+            // TURN relay endpoint
+            if (_udpBackend.TurnRelayEndPoint != null)
+                candidates.Add(new TransportCandidate(
+                    _udpBackend.TurnRelayEndPoint.Address.ToString(),
+                    _udpBackend.TurnRelayEndPoint.Port,
+                    "relay"));
 
-            // Send our endpoints to host
-            if (endpoints.Count > 0 && port > 0)
+            // Send our candidates to host
+            if (candidates.Count > 0)
             {
-                await sendSignaling(new SignalingMessage.TransportEndpoint(peerId, endpoints.ToArray(), port));
-                _logger.LogInformation("Viewer UDP endpoints sent: {Endpoints}:{Port}", string.Join(",", endpoints), port);
+                await sendSignaling(new SignalingMessage.TransportEndpoint(peerId, candidates.ToArray()));
+                _logger.LogInformation("Viewer UDP candidates sent: {Candidates}",
+                    string.Join(", ", candidates.Select(c => $"{c.Type}={c.IP}:{c.Port}")));
             }
 
             // Local candidates ready — probe if remote already arrived (ICE pattern)
@@ -113,17 +125,18 @@ public sealed class ViewerStreamTransport : StreamTransport
     }
 
     /// <summary>
-    /// Handle TransportEndpoint from the host (their UDP candidate).
+    /// Handle TransportEndpoint from the host (their UDP candidates).
     /// Buffers remote candidates — probing happens when both local and remote are ready (ICE pattern).
     /// </summary>
-    public async Task HandleHostEndpointAsync(string[] hostIPs, int hostPort)
+    public async Task HandleHostEndpointAsync(TransportCandidate[] hostCandidates)
     {
-        _logger.LogDebug("[UDP-DIAG] HandleHostEndpointAsync: received {Count} IPs on port {Port}: [{IPs}], localReady={LocalReady}",
-            hostIPs.Length, hostPort, string.Join(", ", hostIPs), _localCandidatesReady);
+        _logger.LogDebug("[UDP-DIAG] HandleHostEndpointAsync: received {Count} candidates: [{Candidates}], localReady={LocalReady}",
+            hostCandidates.Length,
+            string.Join(", ", hostCandidates.Select(c => $"{c.Type}={c.IP}:{c.Port}")),
+            _localCandidatesReady);
 
         // Buffer remote candidates
-        _remoteCandidateIPs = hostIPs;
-        _remoteCandidatePort = hostPort;
+        _remoteCandidates = hostCandidates;
 
         // Probe if local socket is already initialized
         await TryProbeCandidatesAsync();
@@ -135,21 +148,23 @@ public sealed class ViewerStreamTransport : StreamTransport
     /// </summary>
     private async Task TryProbeCandidatesAsync()
     {
-        if (!_localCandidatesReady || _remoteCandidateIPs == null || _udpBackend == null) return;
+        if (!_localCandidatesReady || _remoteCandidates == null || _udpBackend == null) return;
 
-        var remoteIPs = _remoteCandidateIPs;
-        var remotePort = _remoteCandidatePort;
-        _remoteCandidateIPs = null; // Consume — don't re-probe
+        var candidates = _remoteCandidates;
+        _remoteCandidates = null; // Consume — don't re-probe
 
-        _logger.LogDebug("[UDP-DIAG] TryProbeCandidatesAsync: probing {Count} IPs on port {Port}: [{IPs}]",
-            remoteIPs.Length, remotePort, string.Join(", ", remoteIPs));
+        _logger.LogDebug("[UDP-DIAG] TryProbeCandidatesAsync: probing {Count} candidates: [{Candidates}]",
+            candidates.Length, string.Join(", ", candidates.Select(c => $"{c.Type}={c.IP}:{c.Port}")));
 
-        foreach (var ip in remoteIPs)
+        // Probe host and srflx candidates first (direct), relay last
+        foreach (var candidate in candidates.OrderBy(c => c.Type == "relay" ? 1 : 0))
         {
+            if (candidate.Type == "relay") continue; // Phase 4 handles relay candidates
+
             try
             {
-                var endpoint = new IPEndPoint(IPAddress.Parse(ip), remotePort);
-                _logger.LogDebug("[UDP-DIAG] Starting probe to {Endpoint}", endpoint);
+                var endpoint = new IPEndPoint(IPAddress.Parse(candidate.IP), candidate.Port);
+                _logger.LogDebug("[UDP-DIAG] Starting probe to {Type} {Endpoint}", candidate.Type, endpoint);
                 var probeOk = await _udpBackend.ProbeAsync(endpoint, TimeSpan.FromSeconds(2));
                 _logger.LogDebug("[UDP-DIAG] Probe to {Endpoint} result: {Result}", endpoint, probeOk);
                 if (probeOk)
@@ -184,7 +199,7 @@ public sealed class ViewerStreamTransport : StreamTransport
             }
             catch (Exception ex)
             {
-                _logger.LogDebug(ex, "Viewer: UDP probe to {IP}:{Port} failed", ip, remotePort);
+                _logger.LogDebug(ex, "Viewer: UDP probe to {Type} {IP}:{Port} failed", candidate.Type, candidate.IP, candidate.Port);
             }
         }
 

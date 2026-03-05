@@ -204,10 +204,10 @@ public sealed class HostSession : IAsyncDisposable
     }
 
     /// <summary>
-    /// Handle a TransportEndpoint from the viewer (their UDP candidate IPs/port).
+    /// Handle a TransportEndpoint from the viewer (their UDP candidates).
     /// Called from Home.razor when signaling routes TransportEndpoint to this session.
     /// </summary>
-    public async Task HandleViewerTransportEndpointAsync(string[] ips, int port)
+    public async Task HandleViewerTransportEndpointAsync(TransportCandidate[] candidates)
     {
         if (_transport == null)
         {
@@ -215,8 +215,8 @@ public sealed class HostSession : IAsyncDisposable
             return;
         }
 
-        _logger.LogInformation("Host: Received viewer UDP endpoints ({Count} IPs, port {Port})", ips.Length, port);
-        await _transport.HandleViewerEndpointAsync(ips, port);
+        _logger.LogInformation("Host: Received viewer UDP candidates ({Count} candidates)", candidates.Length);
+        await _transport.HandleViewerEndpointAsync(candidates);
     }
 
     /// <summary>

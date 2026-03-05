@@ -1,6 +1,8 @@
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
+using System.Security.Cryptography;
+using System.Text;
 using Microsoft.Extensions.Logging;
 using SIPSorcery.Net;
 
@@ -31,7 +33,9 @@ public sealed class UdpTransportBackend : ITransportBackend
     private bool _active;
     private bool _disposed;
     private CancellationTokenSource? _cts;
+    private CancellationTokenSource? _echoCts;
     private Task? _receiveTask;
+    private Task? _echoTask;
     private ushort _nextMessageId;
 
     // Reassembly buffer: msgId -> (fragments received, total expected, fragment data)
@@ -129,6 +133,28 @@ public sealed class UdpTransportBackend : ITransportBackend
         // Diagnostic: how many bytes sitting in kernel buffer after STUN/TURN
         if (_udpClient != null)
             _logger.LogDebug("[UDP-DIAG] Post-STUN/TURN kernel buffer: {Available} bytes available", _udpClient.Available);
+
+        // Start lightweight echo loop — echoes 0xFF probes from peer before our own probes complete.
+        // This is critical for simultaneous hole-punching: peer's probe arrives, we echo it,
+        // which creates the NAT binding for their return path.
+        StartEchoLoop();
+    }
+
+    /// <summary>
+    /// Receive a UDP packet from the TURN server only (filters by source endpoint).
+    /// Discards stale STUN packets from other sources that may sit in the kernel buffer.
+    /// </summary>
+    private async Task<UdpReceiveResult> ReceiveFromTurnAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            var result = await _udpClient!.ReceiveAsync(ct);
+            if (_turnServerEndPoint != null && result.RemoteEndPoint.Equals(_turnServerEndPoint))
+                return result;
+            _logger.LogDebug("[UDP-DIAG] TURN: discarding {Len}byte packet from {Source} (expected {Expected})",
+                result.Buffer.Length, result.RemoteEndPoint, _turnServerEndPoint);
+        }
+        throw new OperationCanceledException();
     }
 
     private async Task AllocateTurnAsync(string turnUri, string username, string credential)
@@ -152,13 +178,13 @@ public sealed class UdpTransportBackend : ITransportBackend
         var allocateBytes = allocateReq.ToByteBuffer(null, false);
         await _udpClient!.SendAsync(allocateBytes, allocateBytes.Length, _turnServerEndPoint);
 
-        // Wait for 401 response with nonce/realm (cancellable — no abandoned tasks)
+        // Wait for 401 response with nonce/realm — filter by TURN server source
         UdpReceiveResult resp401;
         using (var turn401Cts = new CancellationTokenSource(3000))
         {
             try
             {
-                resp401 = await _udpClient.ReceiveAsync(turn401Cts.Token);
+                resp401 = await ReceiveFromTurnAsync(turn401Cts.Token);
             }
             catch (OperationCanceledException)
             {
@@ -183,26 +209,30 @@ public sealed class UdpTransportBackend : ITransportBackend
             return;
         }
 
-        var nonce = System.Text.Encoding.UTF8.GetString(nonceAttr.Value);
-        var realm = System.Text.Encoding.UTF8.GetString(realmAttr.Value);
+        var nonce = Encoding.UTF8.GetString(nonceAttr.Value);
+        var realm = Encoding.UTF8.GetString(realmAttr.Value);
+
+        _logger.LogDebug("TURN: Got 401 with realm={Realm}, nonce={Nonce}", realm, nonce[..Math.Min(8, nonce.Length)] + "...");
 
         // Retry Allocate with auth credentials
         var allocateAuth = new STUNMessage(STUNMessageTypesEnum.Allocate);
         allocateAuth.Attributes.Add(new STUNAttribute(STUNAttributeTypesEnum.RequestedTransport, new byte[] { 17, 0, 0, 0 }));
-        allocateAuth.Attributes.Add(new STUNAttribute(STUNAttributeTypesEnum.Username, System.Text.Encoding.UTF8.GetBytes(username)));
-        allocateAuth.Attributes.Add(new STUNAttribute(STUNAttributeTypesEnum.Nonce, System.Text.Encoding.UTF8.GetBytes(nonce)));
-        allocateAuth.Attributes.Add(new STUNAttribute(STUNAttributeTypesEnum.Realm, System.Text.Encoding.UTF8.GetBytes(realm)));
+        allocateAuth.Attributes.Add(new STUNAttribute(STUNAttributeTypesEnum.Username, Encoding.UTF8.GetBytes(username)));
+        allocateAuth.Attributes.Add(new STUNAttribute(STUNAttributeTypesEnum.Nonce, Encoding.UTF8.GetBytes(nonce)));
+        allocateAuth.Attributes.Add(new STUNAttribute(STUNAttributeTypesEnum.Realm, Encoding.UTF8.GetBytes(realm)));
 
-        var authBytes = allocateAuth.ToByteBufferStringKey(credential, false);
+        // RFC 5389 §15.4: long-term credential key = MD5(username:realm:password)
+        var hmacKey = MD5.HashData(Encoding.UTF8.GetBytes($"{username}:{realm}:{credential}"));
+        var authBytes = allocateAuth.ToByteBuffer(hmacKey, false);
         await _udpClient.SendAsync(authBytes, authBytes.Length, _turnServerEndPoint);
 
-        // Wait for Allocate success (cancellable — no abandoned tasks)
+        // Wait for Allocate success — filter by TURN server source
         UdpReceiveResult respAlloc;
         using (var turnAllocCts = new CancellationTokenSource(3000))
         {
             try
             {
-                respAlloc = await _udpClient.ReceiveAsync(turnAllocCts.Token);
+                respAlloc = await ReceiveFromTurnAsync(turnAllocCts.Token);
             }
             catch (OperationCanceledException)
             {
@@ -225,7 +255,68 @@ public sealed class UdpTransportBackend : ITransportBackend
         }
         else
         {
-            _logger.LogWarning("TURN Allocate failed: {Type}", msgAlloc?.Header.MessageType);
+            // Extract error code for diagnostics
+            var errorAttr = msgAlloc?.Attributes
+                .FirstOrDefault(a => a.AttributeType == STUNAttributeTypesEnum.ErrorCode);
+            if (errorAttr != null)
+            {
+                // ErrorCode attribute: first 4 bytes = reserved(2) + class(1) + number(1)
+                var errorCode = errorAttr.Value.Length >= 4
+                    ? (errorAttr.Value[2] * 100 + errorAttr.Value[3])
+                    : 0;
+                var reason = errorAttr.Value.Length > 4
+                    ? Encoding.UTF8.GetString(errorAttr.Value, 4, errorAttr.Value.Length - 4)
+                    : "unknown";
+                _logger.LogWarning("TURN Allocate error {Code}: {Reason}", errorCode, reason);
+            }
+            else
+            {
+                _logger.LogWarning("TURN Allocate failed: {Type}", msgAlloc?.Header.MessageType);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Start a lightweight echo loop that only responds to 0xFF probe packets.
+    /// This runs before ConnectToPeer — it enables simultaneous hole-punching by
+    /// echoing the peer's probes (creating a NAT binding) before our own probes complete.
+    /// </summary>
+    private void StartEchoLoop()
+    {
+        if (_udpClient == null) return;
+        _echoCts = new CancellationTokenSource();
+        _echoTask = Task.Run(() => EchoLoopAsync(_echoCts.Token));
+        _logger.LogDebug("[UDP-DIAG] Echo loop started — will echo 0xFF probes from peer");
+    }
+
+    private async Task EchoLoopAsync(CancellationToken ct)
+    {
+        try
+        {
+            while (!ct.IsCancellationRequested && _udpClient != null)
+            {
+                var result = await _udpClient.ReceiveAsync(ct);
+                if (result.Buffer.Length == 1 && result.Buffer[0] == 0xFF)
+                {
+                    _logger.LogDebug("[UDP-DIAG] EchoLoop: echoing probe from {Source}", result.RemoteEndPoint);
+                    try { await _udpClient.SendAsync(new byte[] { 0xFE }, 1, result.RemoteEndPoint); }
+                    catch { }
+                }
+                else if (result.Buffer.Length <= 2)
+                {
+                    // Echo response (0xFE) or other small packet — ignore in echo loop
+                }
+                else
+                {
+                    _logger.LogDebug("[UDP-DIAG] EchoLoop: ignoring {Len}byte packet from {Source}", result.Buffer.Length, result.RemoteEndPoint);
+                }
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (SocketException) { }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "[UDP-DIAG] Echo loop ended");
         }
     }
 
@@ -237,18 +328,21 @@ public sealed class UdpTransportBackend : ITransportBackend
     /// <param name="useTurnRelay">If true, wrap data in TURN SendIndication.</param>
     public void ConnectToPeer(IPEndPoint peerEndPoint, bool useTurnRelay = false)
     {
+        // Cancel the echo loop — the full receive loop takes over
+        _echoCts?.Cancel();
+
         _peerEndPoint = peerEndPoint;
         _useTurnRelay = useTurnRelay;
         _cts = new CancellationTokenSource();
 
-        // Start receive loop
+        // Start full receive loop
         _receiveTask = Task.Run(() => ReceiveLoopAsync(_cts.Token));
 
         // Start cleanup timer for stale reassembly buffers
         _cleanupTimer = new Timer(CleanupStaleBuffers, null, 1000, 1000);
 
         _active = true;
-        _logger.LogDebug("[UDP-DIAG] ConnectToPeer: receive loop started, will consume all packets from now");
+        _logger.LogDebug("[UDP-DIAG] ConnectToPeer: echo loop cancelled, full receive loop started");
         _logger.LogInformation("UDP transport connected to peer {Peer} (turnRelay={Turn})", peerEndPoint, useTurnRelay);
     }
 
@@ -260,22 +354,45 @@ public sealed class UdpTransportBackend : ITransportBackend
     {
         if (_udpClient == null) return false;
 
+        // Cancel echo loop during probing — we'll consume packets directly via ReceiveAsync
+        _echoCts?.Cancel();
+
         var localEp = _udpClient.Client.LocalEndPoint as IPEndPoint;
         _logger.LogDebug("[UDP-DIAG] ProbeAsync START: local={Local}, target={Target}, timeout={Timeout}ms, kernelBuffer={Available}bytes",
             localEp, endpoint, timeout.TotalMilliseconds, _udpClient.Available);
 
         using var probeCts = new CancellationTokenSource(timeout);
         var attempt = 0;
+        var rng = new Random();
         try
         {
-            // Send initial probe
-            attempt++;
-            await _udpClient.SendAsync(new byte[] { 0xFF }, 1, endpoint);
-            _logger.LogDebug("[UDP-DIAG] Probe #{Attempt} sent 0xFF to {Target}", attempt, endpoint);
+            // Burst phase: send 3 probes at ~0ms, ~15ms, ~30ms with jitter
+            // Jitter prevents correlated timing where both sides' probes arrive before NAT bindings form
+            for (int burst = 0; burst < 3; burst++)
+            {
+                attempt++;
+                await _udpClient.SendAsync(new byte[] { 0xFF }, 1, endpoint);
+                _logger.LogDebug("[UDP-DIAG] Probe #{Attempt} (burst) sent 0xFF to {Target}", attempt, endpoint);
 
+                // Check for immediate response between burst probes
+                using var burstCts = CancellationTokenSource.CreateLinkedTokenSource(probeCts.Token);
+                burstCts.CancelAfter(10 + rng.Next(10)); // 10-20ms jitter between bursts
+                try
+                {
+                    var result = await _udpClient.ReceiveAsync(burstCts.Token);
+                    if (result.Buffer.Length <= 2)
+                    {
+                        _logger.LogInformation("UDP probe to {Endpoint} succeeded (burst #{Attempt})", endpoint, attempt);
+                        StartEchoLoop(); // Restart echo loop for other candidates
+                        return true;
+                    }
+                }
+                catch (OperationCanceledException) when (!probeCts.Token.IsCancellationRequested) { }
+            }
+
+            // Slow retry phase: re-send every 200ms until overall timeout
             while (!probeCts.Token.IsCancellationRequested)
             {
-                // Wait for response, re-send probe every 200ms to cover timing race
                 using var subCts = CancellationTokenSource.CreateLinkedTokenSource(probeCts.Token);
                 subCts.CancelAfter(200);
                 try
@@ -284,17 +401,16 @@ public sealed class UdpTransportBackend : ITransportBackend
                     _logger.LogDebug("[UDP-DIAG] Probe received {Len}bytes from {Source} (first byte=0x{First:X2})",
                         result.Buffer.Length, result.RemoteEndPoint, result.Buffer.Length > 0 ? result.Buffer[0] : 0);
 
-                    // Small packet = peer's probe or echo → success
                     if (result.Buffer.Length <= 2)
                     {
                         _logger.LogInformation("UDP probe to {Endpoint} succeeded (attempt #{Attempt})", endpoint, attempt);
+                        StartEchoLoop();
                         return true;
                     }
                     _logger.LogDebug("[UDP-DIAG] Ignoring large packet ({Len}bytes) — likely stale STUN/TURN", result.Buffer.Length);
                 }
                 catch (OperationCanceledException) when (!probeCts.Token.IsCancellationRequested)
                 {
-                    // 200ms sub-timeout expired, re-send probe
                     attempt++;
                     _logger.LogDebug("[UDP-DIAG] Probe #{Attempt} — no response after 200ms, resending to {Target}", attempt, endpoint);
                     try { await _udpClient.SendAsync(new byte[] { 0xFF }, 1, endpoint); }
@@ -311,6 +427,7 @@ public sealed class UdpTransportBackend : ITransportBackend
             _logger.LogDebug(ex, "[UDP-DIAG] ProbeAsync EXCEPTION to {Target} after {Attempts} attempts", endpoint, attempt);
         }
 
+        StartEchoLoop(); // Restart echo loop for other candidates
         return false;
     }
 
@@ -474,12 +591,16 @@ public sealed class UdpTransportBackend : ITransportBackend
         _active = false;
 
         _cleanupTimer?.Dispose();
+        _echoCts?.Cancel();
         _cts?.Cancel();
 
+        if (_echoTask != null)
+            try { await _echoTask; } catch { }
         if (_receiveTask != null)
             try { await _receiveTask; } catch { }
 
         _udpClient?.Dispose();
+        _echoCts?.Dispose();
         _cts?.Dispose();
     }
 

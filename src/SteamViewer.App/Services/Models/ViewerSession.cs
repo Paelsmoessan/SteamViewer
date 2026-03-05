@@ -283,10 +283,10 @@ public sealed class ViewerSession : IAsyncDisposable
     }
 
     /// <summary>
-    /// Handle TransportEndpoint from host — contains host's UDP candidate IPs/port.
-    /// Probes each IP and switches to direct UDP if successful.
+    /// Handle TransportEndpoint from host — contains host's UDP candidates.
+    /// Probes each candidate and switches to direct UDP if successful.
     /// </summary>
-    public async Task HandleTransportEndpointAsync(string[] ips, int port)
+    public async Task HandleTransportEndpointAsync(TransportCandidate[] candidates)
     {
         if (_transport == null)
         {
@@ -294,9 +294,9 @@ public sealed class ViewerSession : IAsyncDisposable
             return;
         }
 
-        _logger.LogInformation("Session {SessionId}: Received host UDP endpoints ({Count} IPs, port {Port})",
-            SessionId, ips.Length, port);
-        await _transport.HandleHostEndpointAsync(ips, port);
+        _logger.LogInformation("Session {SessionId}: Received host UDP candidates ({Count} candidates)",
+            SessionId, candidates.Length);
+        await _transport.HandleHostEndpointAsync(candidates);
     }
 
     /// <summary>
