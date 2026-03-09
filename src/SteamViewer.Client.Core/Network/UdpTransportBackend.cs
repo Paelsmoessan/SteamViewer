@@ -29,6 +29,10 @@ public sealed class UdpTransportBackend : ITransportBackend
     private IPEndPoint? _peerEndPoint;
     private IPEndPoint? _turnServerEndPoint;
     private IPEndPoint? _turnRelayEndPoint;
+    private byte[]? _turnHmacKey;
+    private string? _turnNonce;
+    private string? _turnRealm;
+    private string? _turnUsername;
     private bool _useTurnRelay;
     private bool _active;
     private bool _disposed;
@@ -58,6 +62,9 @@ public sealed class UdpTransportBackend : ITransportBackend
 
     /// <summary>TURN relay endpoint (if allocated).</summary>
     public IPEndPoint? TurnRelayEndPoint => _turnRelayEndPoint;
+
+    /// <summary>Last endpoint that sent us a probe packet (0xFF). Used for asymmetric NAT recovery.</summary>
+    public IPEndPoint? LastProbeReceivedFrom { get; private set; }
 
     public UdpTransportBackend(ILogger logger)
     {
@@ -223,6 +230,10 @@ public sealed class UdpTransportBackend : ITransportBackend
 
         // RFC 5389 §15.4: long-term credential key = MD5(username:realm:password)
         var hmacKey = MD5.HashData(Encoding.UTF8.GetBytes($"{username}:{realm}:{credential}"));
+        _turnHmacKey = hmacKey;
+        _turnNonce = nonce;
+        _turnRealm = realm;
+        _turnUsername = username;
         var authBytes = allocateAuth.ToByteBuffer(hmacKey, false);
         await _udpClient.SendAsync(authBytes, authBytes.Length, _turnServerEndPoint);
 
@@ -298,6 +309,7 @@ public sealed class UdpTransportBackend : ITransportBackend
                 var result = await _udpClient.ReceiveAsync(ct);
                 if (result.Buffer.Length == 1 && result.Buffer[0] == 0xFF)
                 {
+                    LastProbeReceivedFrom = result.RemoteEndPoint;
                     _logger.LogDebug("[UDP-DIAG] EchoLoop: echoing probe from {Source}", result.RemoteEndPoint);
                     try { await _udpClient.SendAsync(new byte[] { 0xFE }, 1, result.RemoteEndPoint); }
                     catch { }
@@ -390,11 +402,11 @@ public sealed class UdpTransportBackend : ITransportBackend
                 catch (OperationCanceledException) when (!probeCts.Token.IsCancellationRequested) { }
             }
 
-            // Slow retry phase: re-send every 200ms until overall timeout
+            // Slow retry phase: re-send every 150ms until overall timeout
             while (!probeCts.Token.IsCancellationRequested)
             {
                 using var subCts = CancellationTokenSource.CreateLinkedTokenSource(probeCts.Token);
-                subCts.CancelAfter(200);
+                subCts.CancelAfter(150);
                 try
                 {
                     var result = await _udpClient.ReceiveAsync(subCts.Token);
@@ -412,7 +424,7 @@ public sealed class UdpTransportBackend : ITransportBackend
                 catch (OperationCanceledException) when (!probeCts.Token.IsCancellationRequested)
                 {
                     attempt++;
-                    _logger.LogDebug("[UDP-DIAG] Probe #{Attempt} — no response after 200ms, resending to {Target}", attempt, endpoint);
+                    _logger.LogDebug("[UDP-DIAG] Probe #{Attempt} — no response after 150ms, resending to {Target}", attempt, endpoint);
                     try { await _udpClient.SendAsync(new byte[] { 0xFF }, 1, endpoint); }
                     catch (Exception sendEx) { _logger.LogDebug("[UDP-DIAG] Resend failed: {Error}", sendEx.Message); }
                 }
@@ -493,6 +505,7 @@ public sealed class UdpTransportBackend : ITransportBackend
                     // Use 0xFE for echo to prevent infinite loop between two ReceiveLoops
                     if (length == 1 && data[0] == 0xFF && _udpClient != null)
                     {
+                        LastProbeReceivedFrom = result.RemoteEndPoint;
                         _logger.LogDebug("[UDP-DIAG] ReceiveLoop echoing probe from {Source}", result.RemoteEndPoint);
                         try { await _udpClient.SendAsync(new byte[] { 0xFE }, 1, result.RemoteEndPoint); }
                         catch { }
@@ -542,6 +555,113 @@ public sealed class UdpTransportBackend : ITransportBackend
         {
             _logger.LogWarning(ex, "UDP receive loop error");
         }
+    }
+
+    /// <summary>
+    /// Create a TURN permission for the peer's relay address, then probe via TURN SendIndication.
+    /// Returns true if the peer responds through the TURN relay.
+    /// </summary>
+    public async Task<bool> ProbeViaTurnRelayAsync(IPEndPoint peerRelayEndPoint, TimeSpan timeout)
+    {
+        if (_udpClient == null || _turnServerEndPoint == null || _turnHmacKey == null) return false;
+
+        _logger.LogDebug("[UDP-DIAG] TURN relay probe: creating permission for {Peer}", peerRelayEndPoint);
+
+        // Send CreatePermission for peer's relay address
+        var permReq = new STUNMessage(STUNMessageTypesEnum.CreatePermission);
+        permReq.Attributes.Add(new STUNXORAddressAttribute(STUNAttributeTypesEnum.XORPeerAddress, peerRelayEndPoint.Port, peerRelayEndPoint.Address));
+        if (_turnUsername != null)
+            permReq.Attributes.Add(new STUNAttribute(STUNAttributeTypesEnum.Username, Encoding.UTF8.GetBytes(_turnUsername)));
+        if (_turnNonce != null)
+            permReq.Attributes.Add(new STUNAttribute(STUNAttributeTypesEnum.Nonce, Encoding.UTF8.GetBytes(_turnNonce)));
+        if (_turnRealm != null)
+            permReq.Attributes.Add(new STUNAttribute(STUNAttributeTypesEnum.Realm, Encoding.UTF8.GetBytes(_turnRealm)));
+
+        var permBytes = permReq.ToByteBuffer(_turnHmacKey, false);
+        await _udpClient.SendAsync(permBytes, permBytes.Length, _turnServerEndPoint);
+
+        // Wait for CreatePermission response
+        using var permCts = new CancellationTokenSource(2000);
+        try
+        {
+            var permResp = await ReceiveFromTurnAsync(permCts.Token);
+            var permMsg = STUNMessage.ParseSTUNMessage(permResp.Buffer, permResp.Buffer.Length);
+            if (permMsg?.Header.MessageType != STUNMessageTypesEnum.CreatePermissionSuccessResponse)
+            {
+                _logger.LogWarning("TURN CreatePermission failed: {Type}", permMsg?.Header.MessageType);
+                return false;
+            }
+            _logger.LogDebug("[UDP-DIAG] TURN CreatePermission succeeded for {Peer}", peerRelayEndPoint);
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogWarning("TURN CreatePermission timed out");
+            return false;
+        }
+
+        // Now probe via SendIndication
+        _echoCts?.Cancel();
+        using var probeCts = new CancellationTokenSource(timeout);
+        var attempt = 0;
+        try
+        {
+            // Send 3 probe bursts via TURN
+            for (int burst = 0; burst < 3; burst++)
+            {
+                attempt++;
+                var probeInd = BuildSendIndication(peerRelayEndPoint, new byte[] { 0xFF });
+                await _udpClient.SendAsync(probeInd, probeInd.Length, _turnServerEndPoint);
+                _logger.LogDebug("[UDP-DIAG] TURN probe #{Attempt} sent to {Peer} via {Turn}", attempt, peerRelayEndPoint, _turnServerEndPoint);
+
+                using var burstCts = CancellationTokenSource.CreateLinkedTokenSource(probeCts.Token);
+                burstCts.CancelAfter(200);
+                try
+                {
+                    var result = await _udpClient.ReceiveAsync(burstCts.Token);
+                    // Could be a DataIndication containing the echo, or a direct echo
+                    if (result.Buffer.Length <= 2 ||
+                        (IsTurnDataIndication(result.Buffer) && result.Buffer.Length < 40))
+                    {
+                        _logger.LogInformation("TURN relay probe to {Peer} succeeded", peerRelayEndPoint);
+                        StartEchoLoop();
+                        return true;
+                    }
+                }
+                catch (OperationCanceledException) when (!probeCts.Token.IsCancellationRequested) { }
+            }
+
+            // Slow retry
+            while (!probeCts.Token.IsCancellationRequested)
+            {
+                using var subCts = CancellationTokenSource.CreateLinkedTokenSource(probeCts.Token);
+                subCts.CancelAfter(300);
+                try
+                {
+                    var result = await _udpClient.ReceiveAsync(subCts.Token);
+                    if (result.Buffer.Length <= 2 ||
+                        (IsTurnDataIndication(result.Buffer) && result.Buffer.Length < 40))
+                    {
+                        _logger.LogInformation("TURN relay probe to {Peer} succeeded (attempt #{Attempt})", peerRelayEndPoint, attempt);
+                        StartEchoLoop();
+                        return true;
+                    }
+                }
+                catch (OperationCanceledException) when (!probeCts.Token.IsCancellationRequested)
+                {
+                    attempt++;
+                    var probeInd = BuildSendIndication(peerRelayEndPoint, new byte[] { 0xFF });
+                    try { await _udpClient.SendAsync(probeInd, probeInd.Length, _turnServerEndPoint); }
+                    catch { }
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogDebug("[UDP-DIAG] TURN probe TIMEOUT after {Attempts} attempts to {Peer}", attempt, peerRelayEndPoint);
+        }
+
+        StartEchoLoop();
+        return false;
     }
 
     private static byte[] BuildSendIndication(IPEndPoint peer, byte[] data)
