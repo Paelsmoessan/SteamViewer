@@ -129,6 +129,71 @@ public static class Program
         });
     }
 
+    /// <summary>
+    /// Kill all child processes (WebView2, etc.) using Toolhelp32 snapshot.
+    /// Call before Environment.Exit to prevent orphaned msedgewebview2.exe processes.
+    /// </summary>
+    public static void KillChildProcesses()
+    {
+        try
+        {
+            var parentPid = (uint)Environment.ProcessId;
+            var snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if (snap == INVALID_HANDLE_VALUE) return;
+
+            try
+            {
+                var entry = new PROCESSENTRY32 { dwSize = (uint)Marshal.SizeOf<PROCESSENTRY32>() };
+                if (!Process32First(snap, ref entry)) return;
+
+                do
+                {
+                    if (entry.th32ParentProcessID == parentPid)
+                    {
+                        try
+                        {
+                            System.Diagnostics.Process.GetProcessById((int)entry.th32ProcessID).Kill(entireProcessTree: true);
+                        }
+                        catch { }
+                    }
+                } while (Process32Next(snap, ref entry));
+            }
+            finally { CloseHandle(snap); }
+        }
+        catch { /* best effort */ }
+    }
+
+    private const uint TH32CS_SNAPPROCESS = 0x00000002;
+    private static readonly IntPtr INVALID_HANDLE_VALUE = new(-1);
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
+    private struct PROCESSENTRY32
+    {
+        public uint dwSize;
+        public uint cntUsage;
+        public uint th32ProcessID;
+        public IntPtr th32DefaultHeapID;
+        public uint th32ModuleID;
+        public uint cntThreads;
+        public uint th32ParentProcessID;
+        public int pcPriClassBase;
+        public uint dwFlags;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+        public string szExeFile;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr CreateToolhelp32Snapshot(uint dwFlags, uint th32ProcessID);
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+    private static extern bool Process32First(IntPtr hSnapshot, ref PROCESSENTRY32 lppe);
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+    private static extern bool Process32Next(IntPtr hSnapshot, ref PROCESSENTRY32 lppe);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr hObject);
+
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool SetProcessDpiAwarenessContext(IntPtr dpiContext);
 

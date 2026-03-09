@@ -53,10 +53,11 @@ public partial class App : Application
             Y = y
         };
 
-        // Save window state and kill process on close
+        // Save window state, kill child processes, and exit on close
         _mainWindow.Destroying += (s, e) =>
         {
             SaveWindowState();
+            WinUI.Program.KillChildProcesses();
             Environment.Exit(0);
         };
 
