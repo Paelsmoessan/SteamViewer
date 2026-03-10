@@ -24,7 +24,7 @@ public sealed class WindowsInputInjector : IInputInjector
         $"input-{Environment.MachineName}.log");
     private static readonly object LogLock = new();
     private int _logCount;
-    private const int MaxLogEntries = 100;
+    private const int MaxLogEntries = 500;
 
     public WindowsInputInjector(ILogger<WindowsInputInjector> logger)
     {
