@@ -277,6 +277,7 @@
     private bool _hasReceivedFrame;
     private bool _secureDesktopActive;
     private bool _secureDesktopFrameReceived;
+    private CancellationTokenSource? _sdGraceCts;
     private List<MonitorInfo>? _hostMonitors;
     private int _activeMonitorId;
 
@@ -1149,24 +1150,51 @@
         FileLogger.Log("INFO", "RemoteViewer", $"HandleSecureDesktopStateChanged: active={active}");
         InvokeAsync(async () =>
         {
-            _secureDesktopActive = active;
-            FileLogger.Log("INFO", "RemoteViewer", $"Calling JS SteamViewerSecureDesktop.{(active ? "show" : "hide")}");
             if (active)
             {
+                // Cancel any pending grace timer — SD is active again
+                _sdGraceCts?.Cancel();
+                _sdGraceCts = null;
+
+                _secureDesktopActive = true;
                 _secureDesktopFrameReceived = false;
+                FileLogger.Log("INFO", "RemoteViewer", "Calling JS SteamViewerSecureDesktop.show");
                 await JSRuntime.InvokeVoidAsync("SteamViewerSecureDesktop.show", "secureDesktopOverlay");
             }
             else
             {
-                _secureDesktopFrameReceived = false;
-                await JSRuntime.InvokeVoidAsync("SteamViewerSecureDesktop.hide", "secureDesktopOverlay");
-                // Re-negotiate resolution after SD — desktop switch may have changed capture state
-                // Brief delay for desktop switch to settle
+                // Don't hide immediately — SD frames may still be in flight via UDP
+                // Start a grace period; hide only if no new frames arrive
+                FileLogger.Log("INFO", "RemoteViewer", "SD inactive signaled — starting 1.5s grace period before hiding overlay");
+                _sdGraceCts?.Cancel();
+                var cts = new CancellationTokenSource();
+                _sdGraceCts = cts;
+
                 _ = Task.Run(async () =>
                 {
-                    await Task.Delay(200);
-                    await InvokeAsync(async () => await SendDisplayResolutionAsync());
+                    try
+                    {
+                        await Task.Delay(1500, cts.Token);
+                        // Grace period expired with no new frames — hide overlay
+                        await InvokeAsync(async () =>
+                        {
+                            _secureDesktopActive = false;
+                            _secureDesktopFrameReceived = false;
+                            FileLogger.Log("INFO", "RemoteViewer", "SD grace period expired — hiding overlay");
+                            await JSRuntime.InvokeVoidAsync("SteamViewerSecureDesktop.hide", "secureDesktopOverlay");
+                            StateHasChanged();
+                            _ = RefocusCanvasAsync();
+                        });
+                        // Re-negotiate resolution after SD — desktop switch may have changed capture state
+                        await Task.Delay(200, CancellationToken.None);
+                        await InvokeAsync(async () => await SendDisplayResolutionAsync());
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        // Grace timer cancelled — new SD frame arrived, overlay stays visible
+                    }
                 });
+                return; // Don't call StateHasChanged/RefocusCanvas yet — grace timer handles it
             }
             StateHasChanged();
             _ = RefocusCanvasAsync();
@@ -1179,10 +1207,47 @@
         if (_sdRazorFrameCount <= 3 || _sdRazorFrameCount % 100 == 0)
             FileLogger.Log("INFO", "RemoteViewer", $"SD frame #{_sdRazorFrameCount}: {base64Jpeg.Length} chars, {width}x{height}, active={_secureDesktopActive}");
 
+        // SD frame arrival is proof that SD is (or was just) active — never drop frames.
+        // The race condition: secureDesktopInactive arrives via WS before buffered SD frames via UDP.
+        // Reset grace timer if one is running (SD still producing frames)
+        if (_sdGraceCts != null)
+        {
+            FileLogger.Log("DEBUG", "RemoteViewer", "SD frame during grace period — resetting timer");
+            _sdGraceCts.Cancel();
+            var cts = new CancellationTokenSource();
+            _sdGraceCts = cts;
+
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await Task.Delay(1500, cts.Token);
+                    await InvokeAsync(async () =>
+                    {
+                        _secureDesktopActive = false;
+                        _secureDesktopFrameReceived = false;
+                        FileLogger.Log("INFO", "RemoteViewer", "SD grace period expired (reset) — hiding overlay");
+                        await JSRuntime.InvokeVoidAsync("SteamViewerSecureDesktop.hide", "secureDesktopOverlay");
+                        StateHasChanged();
+                        _ = RefocusCanvasAsync();
+                    });
+                    await Task.Delay(200, CancellationToken.None);
+                    await InvokeAsync(async () => await SendDisplayResolutionAsync());
+                }
+                catch (OperationCanceledException) { }
+            });
+        }
+
+        // Auto-show overlay if not already visible (frame IS proof of SD)
         if (!_secureDesktopActive)
         {
-            FileLogger.Log("WARN", "RemoteViewer", "SD frame received but _secureDesktopActive=false — dropping");
-            return;
+            FileLogger.Log("INFO", "RemoteViewer", "SD frame arrived while overlay hidden — auto-showing");
+            _secureDesktopActive = true;
+            InvokeAsync(async () =>
+            {
+                await JSRuntime.InvokeVoidAsync("SteamViewerSecureDesktop.show", "secureDesktopOverlay");
+                StateHasChanged();
+            });
         }
 
         if (!_secureDesktopFrameReceived)
