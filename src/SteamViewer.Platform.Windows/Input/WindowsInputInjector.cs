@@ -185,6 +185,20 @@ public sealed class WindowsInputInjector : IInputInjector
             LogCoordinateConversion(move.X, move.Y, screenWidth, screenHeight);
         }
 
+        // Debug logging for keyboard events
+        if (_logCount < MaxLogEntries)
+        {
+            switch (inputEvent)
+            {
+                case InputEvent.KeyDown kd:
+                    LogKeyEvent(kd.Key, isDown: true, kd.Modifiers);
+                    break;
+                case InputEvent.KeyUp ku:
+                    LogKeyEvent(ku.Key, isDown: false, ku.Modifiers);
+                    break;
+            }
+        }
+
         Win32Input.InjectInputEvent(inputEvent, screenWidth, screenHeight);
     }
 
@@ -203,6 +217,39 @@ public sealed class WindowsInputInjector : IInputInjector
                         $"INPUT: x={x:F1}, y={y:F1}, captureSize={screenWidth}x{screenHeight} | " +
                         $"VIRTUAL: {vsWidth}x{vsHeight} | " +
                         $"ABS: x={absX}, y={absY} (0-65535 range)\n";
+                    File.AppendAllText(DebugLogPath, logLine);
+                    _logCount++;
+
+                    if (_logCount == MaxLogEntries)
+                    {
+                        File.AppendAllText(DebugLogPath,
+                            $"\n=== Max log entries ({MaxLogEntries}) reached, logging stopped ===\n");
+                    }
+                }
+            }
+        }
+        catch
+        {
+            // Ignore logging errors to not disrupt input
+        }
+    }
+
+    private void LogKeyEvent(string key, bool isDown, Common.Protocol.KeyModifiers modifiers)
+    {
+        try
+        {
+            lock (LogLock)
+            {
+                if (_logCount < MaxLogEntries)
+                {
+                    var mods = new System.Text.StringBuilder();
+                    if (modifiers.Ctrl) mods.Append("Ctrl+");
+                    if (modifiers.Shift) mods.Append("Shift+");
+                    if (modifiers.Alt) mods.Append("Alt+");
+                    if (modifiers.Meta) mods.Append("Meta+");
+
+                    var logLine = $"[{DateTime.Now:HH:mm:ss.fff}] " +
+                        $"KEY: {(isDown ? "DOWN" : "UP  ")} key=\"{key}\" mods=[{mods}]\n";
                     File.AppendAllText(DebugLogPath, logLine);
                     _logCount++;
 
