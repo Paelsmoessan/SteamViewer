@@ -50,6 +50,12 @@ public sealed class UdpTransportBackend : ITransportBackend
     private const int FragmentHeaderSize = 6;    // [2 msgId][2 fragIdx][2 totalFrags]
     private const int MaxMessageSize = 2 * 1024 * 1024; // 2MB sanity limit
 
+    // FEC: 2D XOR matrix (SMPTE 2022-1 / SRT pattern)
+    // FEC packets reuse standard header with fragIdx >= totalDataFrags
+    // Payload: [1 cols][1 rows][3 totalMsgLen_BE][parity data padded to MaxFragmentPayload]
+    private const int FecMinFragments = 10;
+    private const int FecMetaSize = 5; // cols(1) + rows(1) + totalMsgLen(3)
+
     public event Action<byte[], int>? OnDataReceived;
     public event Action? OnDisconnected;
     public bool IsActive => _active && !_disposed;
@@ -461,6 +467,7 @@ public sealed class UdpTransportBackend : ITransportBackend
             _logger.LogTrace("UDP sending {Size}KB message in {Fragments} fragments (msgId={MsgId})",
                 length / 1024, totalFragments, msgId);
 
+        // Send data fragments
         for (int i = 0; i < totalFragments; i++)
         {
             var fragOffset = i * MaxFragmentPayload;
@@ -468,24 +475,118 @@ public sealed class UdpTransportBackend : ITransportBackend
 
             // Build fragment: [2 msgId][2 fragIdx][2 totalFrags][payload]
             var packet = new byte[FragmentHeaderSize + fragLen];
-            packet[0] = (byte)(msgId >> 8);
-            packet[1] = (byte)(msgId & 0xFF);
-            packet[2] = (byte)(i >> 8);
-            packet[3] = (byte)(i & 0xFF);
-            packet[4] = (byte)(totalFragments >> 8);
-            packet[5] = (byte)(totalFragments & 0xFF);
+            WriteFragmentHeader(packet, msgId, i, totalFragments);
             Buffer.BlockCopy(data, offset + fragOffset, packet, FragmentHeaderSize, fragLen);
 
-            if (_useTurnRelay && _turnServerEndPoint != null)
+            await SendRawPacketAsync(packet);
+        }
+
+        // Generate and send FEC parity (2D XOR matrix)
+        if (totalFragments >= FecMinFragments)
+        {
+            var (rows, cols) = ChooseFecMatrix(totalFragments);
+            _logger.LogTrace("FEC: {Rows}x{Cols} matrix for {Frags} fragments (+{Extra} parity)",
+                rows, cols, totalFragments, rows + cols);
+
+            // Row parity — interleaved with column parity for burst protection
+            var rowParities = new byte[rows][];
+            for (int r = 0; r < rows; r++)
             {
-                var sendInd = BuildSendIndication(_peerEndPoint, packet);
-                await _udpClient.SendAsync(sendInd, sendInd.Length, _turnServerEndPoint);
+                var parity = new byte[MaxFragmentPayload];
+                for (int c = 0; c < cols; c++)
+                {
+                    var idx = r * cols + c;
+                    if (idx >= totalFragments) break;
+                    XorFragmentFromSource(parity, data, offset, length, idx);
+                }
+                rowParities[r] = parity;
             }
-            else
+
+            var colParities = new byte[cols][];
+            for (int c = 0; c < cols; c++)
             {
-                await _udpClient.SendAsync(packet, packet.Length, _peerEndPoint);
+                var parity = new byte[MaxFragmentPayload];
+                for (int r = 0; r < rows; r++)
+                {
+                    var idx = r * cols + c;
+                    if (idx >= totalFragments) break;
+                    XorFragmentFromSource(parity, data, offset, length, idx);
+                }
+                colParities[c] = parity;
+            }
+
+            // Send interleaved: RF0, CF0, RF1, CF1, ... (remaining RF/CF after shorter list ends)
+            var maxPairs = Math.Max(rows, cols);
+            for (int i = 0; i < maxPairs; i++)
+            {
+                if (i < rows)
+                {
+                    var fecPkt = BuildFecPacket(msgId, totalFragments + i, totalFragments,
+                        (byte)cols, (byte)rows, length, rowParities[i]);
+                    await SendRawPacketAsync(fecPkt);
+                }
+                if (i < cols)
+                {
+                    var fecPkt = BuildFecPacket(msgId, totalFragments + rows + i, totalFragments,
+                        (byte)cols, (byte)rows, length, colParities[i]);
+                    await SendRawPacketAsync(fecPkt);
+                }
             }
         }
+    }
+
+    private async Task SendRawPacketAsync(byte[] packet)
+    {
+        if (_useTurnRelay && _turnServerEndPoint != null)
+        {
+            var sendInd = BuildSendIndication(_peerEndPoint!, packet);
+            await _udpClient!.SendAsync(sendInd, sendInd.Length, _turnServerEndPoint);
+        }
+        else
+        {
+            await _udpClient!.SendAsync(packet, packet.Length, _peerEndPoint!);
+        }
+    }
+
+    private static void WriteFragmentHeader(byte[] packet, ushort msgId, int fragIdx, int totalFrags)
+    {
+        packet[0] = (byte)(msgId >> 8);
+        packet[1] = (byte)(msgId & 0xFF);
+        packet[2] = (byte)(fragIdx >> 8);
+        packet[3] = (byte)(fragIdx & 0xFF);
+        packet[4] = (byte)(totalFrags >> 8);
+        packet[5] = (byte)(totalFrags & 0xFF);
+    }
+
+    private static byte[] BuildFecPacket(ushort msgId, int fecFragIdx, int totalDataFrags,
+        byte cols, byte rows, int totalMsgLen, byte[] parity)
+    {
+        var packet = new byte[FragmentHeaderSize + FecMetaSize + parity.Length];
+        WriteFragmentHeader(packet, msgId, fecFragIdx, totalDataFrags);
+        packet[FragmentHeaderSize] = cols;
+        packet[FragmentHeaderSize + 1] = rows;
+        packet[FragmentHeaderSize + 2] = (byte)(totalMsgLen >> 16);
+        packet[FragmentHeaderSize + 3] = (byte)(totalMsgLen >> 8);
+        packet[FragmentHeaderSize + 4] = (byte)(totalMsgLen & 0xFF);
+        Buffer.BlockCopy(parity, 0, packet, FragmentHeaderSize + FecMetaSize, parity.Length);
+        return packet;
+    }
+
+    private static void XorFragmentFromSource(byte[] parity, byte[] data, int dataOffset, int dataLength, int fragIdx)
+    {
+        var srcOffset = dataOffset + fragIdx * MaxFragmentPayload;
+        var fragLen = Math.Min(MaxFragmentPayload, dataLength - fragIdx * MaxFragmentPayload);
+        if (fragLen <= 0) return;
+        for (int b = 0; b < fragLen; b++)
+            parity[b] ^= data[srcOffset + b];
+    }
+
+    private static (int rows, int cols) ChooseFecMatrix(int fragmentCount)
+    {
+        var cols = (int)Math.Ceiling(Math.Sqrt(fragmentCount));
+        cols = Math.Clamp(cols, 2, 30);
+        var rows = (int)Math.Ceiling((double)fragmentCount / cols);
+        return (rows, cols);
     }
 
     private async Task ReceiveLoopAsync(CancellationToken ct)
@@ -526,26 +627,55 @@ public sealed class UdpTransportBackend : ITransportBackend
                 var msgId = (ushort)((data[0] << 8) | data[1]);
                 var fragIndex = (data[2] << 8) | data[3];
                 var totalFrags = (data[4] << 8) | data[5];
-                var payload = new byte[length - FragmentHeaderSize];
-                Buffer.BlockCopy(data, FragmentHeaderSize, payload, 0, payload.Length);
 
-                if (totalFrags == 1)
+                // Single fragment — deliver immediately (no FEC possible)
+                if (fragIndex == 0 && totalFrags == 1)
                 {
-                    // Single fragment — deliver immediately
+                    var payload = new byte[length - FragmentHeaderSize];
+                    Buffer.BlockCopy(data, FragmentHeaderSize, payload, 0, payload.Length);
                     OnDataReceived?.Invoke(payload, payload.Length);
+                    continue;
+                }
+
+                var buffer = _reassemblyBuffers.GetOrAdd(msgId, _ => new FragmentBuffer(totalFrags));
+
+                if (fragIndex >= totalFrags)
+                {
+                    // FEC parity packet — extract meta + parity data
+                    if (length >= FragmentHeaderSize + FecMetaSize)
+                    {
+                        var fecIdx = fragIndex - totalFrags;
+                        var cols = data[FragmentHeaderSize];
+                        var rows = data[FragmentHeaderSize + 1];
+                        var totalMsgLen = (data[FragmentHeaderSize + 2] << 16)
+                            | (data[FragmentHeaderSize + 3] << 8)
+                            | data[FragmentHeaderSize + 4];
+                        var parityLen = length - FragmentHeaderSize - FecMetaSize;
+                        var parityData = new byte[parityLen];
+                        Buffer.BlockCopy(data, FragmentHeaderSize + FecMetaSize, parityData, 0, parityLen);
+
+                        // Validate matrix dimensions
+                        if (cols > 0 && cols <= 30 && rows > 0 && rows <= 30 && (int)rows * cols >= totalFrags)
+                            buffer.AddFecPacket(fecIdx, parityData, cols, rows, totalMsgLen);
+                    }
                 }
                 else
                 {
-                    // Multi-fragment — add to reassembly buffer
-                    var buffer = _reassemblyBuffers.GetOrAdd(msgId, _ => new FragmentBuffer(totalFrags));
+                    // Data fragment
+                    var payload = new byte[length - FragmentHeaderSize];
+                    Buffer.BlockCopy(data, FragmentHeaderSize, payload, 0, payload.Length);
                     buffer.AddFragment(fragIndex, payload);
+                }
 
-                    if (buffer.IsComplete)
-                    {
-                        _reassemblyBuffers.TryRemove(msgId, out _);
-                        var assembled = buffer.Assemble();
-                        OnDataReceived?.Invoke(assembled, assembled.Length);
-                    }
+                // Check if message is ready (direct completion or FEC recovery)
+                if (buffer.IsComplete || buffer.TryRecover())
+                {
+                    _reassemblyBuffers.TryRemove(msgId, out _);
+                    var assembled = buffer.Assemble();
+                    if (buffer.WasRecovered)
+                        _logger.LogDebug("FEC recovered message {MsgId} ({Size}KB, {Frags} fragments)",
+                            msgId, assembled.Length / 1024, totalFrags);
+                    OnDataReceived?.Invoke(assembled, assembled.Length);
                 }
             }
         }
@@ -731,7 +861,16 @@ public sealed class UdpTransportBackend : ITransportBackend
         private int _receivedCount;
         public long CreatedAt { get; } = Environment.TickCount64;
 
+        // FEC state
+        private byte[]?[]? _rowParity;
+        private byte[]?[]? _colParity;
+        private int _matrixCols;
+        private int _matrixRows;
+        private int _totalMsgLen;
+        private bool _hasFec;
+
         public bool IsComplete => _receivedCount >= _totalFragments;
+        public bool WasRecovered { get; private set; }
 
         public FragmentBuffer(int totalFragments)
         {
@@ -749,18 +888,154 @@ public sealed class UdpTransportBackend : ITransportBackend
             }
         }
 
+        public void AddFecPacket(int fecIndex, byte[] parityData, byte cols, byte rows, int totalMsgLen)
+        {
+            if (!_hasFec)
+            {
+                _matrixCols = cols;
+                _matrixRows = rows;
+                _totalMsgLen = totalMsgLen;
+                _rowParity = new byte[rows][];
+                _colParity = new byte[cols][];
+                _hasFec = true;
+            }
+
+            if (fecIndex < _matrixRows)
+                _rowParity![fecIndex] = parityData;
+            else if (fecIndex - _matrixRows < _matrixCols)
+                _colParity![fecIndex - _matrixRows] = parityData;
+        }
+
+        /// <summary>
+        /// Attempt 2D XOR recovery. Iterates row then column recovery until
+        /// no more progress or all fragments recovered.
+        /// </summary>
+        public bool TryRecover()
+        {
+            if (!_hasFec || IsComplete) return IsComplete;
+
+            bool progress;
+            do
+            {
+                progress = false;
+
+                // Row recovery
+                for (int r = 0; r < _matrixRows; r++)
+                {
+                    if (_rowParity?[r] == null) continue;
+                    int missingIdx = -1, missingCount = 0;
+                    for (int c = 0; c < _matrixCols; c++)
+                    {
+                        var idx = r * _matrixCols + c;
+                        if (idx >= _totalFragments) break;
+                        if (_fragments[idx] == null)
+                        {
+                            missingIdx = idx;
+                            if (++missingCount > 1) break;
+                        }
+                    }
+                    if (missingCount == 1 && missingIdx >= 0)
+                    {
+                        var recovered = (byte[])_rowParity[r]!.Clone();
+                        for (int c = 0; c < _matrixCols; c++)
+                        {
+                            var idx = r * _matrixCols + c;
+                            if (idx >= _totalFragments) break;
+                            if (idx == missingIdx) continue;
+                            XorInto(recovered, _fragments[idx]!);
+                        }
+                        TrimRecoveredFragment(ref recovered, missingIdx);
+                        _fragments[missingIdx] = recovered;
+                        Interlocked.Increment(ref _receivedCount);
+                        progress = true;
+                        WasRecovered = true;
+                    }
+                }
+
+                // Column recovery
+                for (int c = 0; c < _matrixCols; c++)
+                {
+                    if (_colParity?[c] == null) continue;
+                    int missingIdx = -1, missingCount = 0;
+                    for (int r = 0; r < _matrixRows; r++)
+                    {
+                        var idx = r * _matrixCols + c;
+                        if (idx >= _totalFragments) break;
+                        if (_fragments[idx] == null)
+                        {
+                            missingIdx = idx;
+                            if (++missingCount > 1) break;
+                        }
+                    }
+                    if (missingCount == 1 && missingIdx >= 0)
+                    {
+                        var recovered = (byte[])_colParity[c]!.Clone();
+                        for (int r = 0; r < _matrixRows; r++)
+                        {
+                            var idx = r * _matrixCols + c;
+                            if (idx >= _totalFragments) break;
+                            if (idx == missingIdx) continue;
+                            XorInto(recovered, _fragments[idx]!);
+                        }
+                        TrimRecoveredFragment(ref recovered, missingIdx);
+                        _fragments[missingIdx] = recovered;
+                        Interlocked.Increment(ref _receivedCount);
+                        progress = true;
+                        WasRecovered = true;
+                    }
+                }
+            } while (progress && !IsComplete);
+
+            return IsComplete;
+        }
+
+        /// <summary>
+        /// Trim recovered fragment to correct size. The last fragment may be shorter
+        /// than MaxFragmentPayload; recovered parity data is always MaxFragmentPayload.
+        /// </summary>
+        private void TrimRecoveredFragment(ref byte[] recovered, int fragIdx)
+        {
+            if (_totalMsgLen <= 0 || fragIdx != _totalFragments - 1) return;
+            var expectedLen = _totalMsgLen - fragIdx * MaxFragmentPayload;
+            if (expectedLen > 0 && expectedLen < recovered.Length)
+                Array.Resize(ref recovered, expectedLen);
+        }
+
+        private static void XorInto(byte[] target, byte[] source)
+        {
+            var len = Math.Min(target.Length, source.Length);
+            for (int i = 0; i < len; i++)
+                target[i] ^= source[i];
+        }
+
         public byte[] Assemble()
         {
+            // Use totalMsgLen if available (FEC recovery may have padded fragments)
+            if (WasRecovered && _totalMsgLen > 0)
+            {
+                var result = new byte[_totalMsgLen];
+                var offset = 0;
+                foreach (var frag in _fragments)
+                {
+                    if (frag == null) continue;
+                    var copyLen = Math.Min(frag.Length, _totalMsgLen - offset);
+                    if (copyLen <= 0) break;
+                    Buffer.BlockCopy(frag, 0, result, offset, copyLen);
+                    offset += copyLen;
+                }
+                return result;
+            }
+
             var totalLen = _fragments.Where(f => f != null).Sum(f => f!.Length);
-            var result = new byte[totalLen];
-            var offset = 0;
+            var buf = new byte[totalLen];
+            var off = 0;
             foreach (var frag in _fragments)
             {
                 if (frag == null) continue;
-                Buffer.BlockCopy(frag, 0, result, offset, frag.Length);
-                offset += frag.Length;
+                Buffer.BlockCopy(frag, 0, buf, off, frag.Length);
+                off += frag.Length;
             }
-            return result;
+            return buf;
         }
     }
 }
