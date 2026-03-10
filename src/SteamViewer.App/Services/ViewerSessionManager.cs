@@ -89,12 +89,12 @@ public sealed class ViewerSessionManager : IAsyncDisposable
             return null;
         }
 
-        // Check if already connected to this peer
-        if (_peerToSession.ContainsKey(peerId))
+        // If a stale session exists for this peer, clean it up first
+        if (_peerToSession.TryGetValue(peerId, out var existingSessionId))
         {
-            _logger.LogWarning("Already connected to peer {PeerId}", peerId);
-            OnConnectionFailed?.Invoke(peerId, "Already connected to this peer");
-            return null;
+            _logger.LogWarning("Stale session {SessionId} for peer {PeerId} — cleaning up before reconnect",
+                existingSessionId, peerId);
+            await RemoveSessionAsync(existingSessionId);
         }
 
         EnsureSignalingSubscribed();
