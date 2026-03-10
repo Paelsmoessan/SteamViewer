@@ -900,14 +900,7 @@ public sealed class HostSession : IAsyncDisposable
 
         try
         {
-            var base64 = Convert.ToBase64String(jpegData);
-            _ = _transport.SendControlAsync(JsonSerializer.Serialize(new
-            {
-                type = "secureDesktopFrame",
-                data = base64,
-                width,
-                height
-            }));
+            _ = _transport.SendSecureDesktopAsync(jpegData, width, height);
         }
         catch (Exception ex)
         {

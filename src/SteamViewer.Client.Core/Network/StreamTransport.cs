@@ -18,6 +18,7 @@ namespace SteamViewer.Client.Core.Network;
 /// Channel 2 = Binary file data
 /// Channel 3 = JSON file signaling
 /// Channel 4 = Lossless QOI frame (host → viewer, one-shot on screen settle)
+/// Channel 5 = Binary Secure Desktop JPEG frame (host → viewer)
 ///
 /// Each frame is AES-256-GCM encrypted before sending through the backend.
 /// </summary>
@@ -46,6 +47,7 @@ public abstract class StreamTransport : IAsyncDisposable
     protected const byte ChannelFileData = 2;
     protected const byte ChannelFileSignaling = 3;
     protected const byte ChannelLossless = 4;
+    protected const byte ChannelSecureDesktop = 5;
 
     /// <summary>Raised when a JSON control message is received.</summary>
     public event Func<string, Task>? OnControlMessage;
@@ -55,6 +57,9 @@ public abstract class StreamTransport : IAsyncDisposable
 
     /// <summary>Raised when a lossless QOI frame is received (screen settle snapshot).</summary>
     public event Action<byte[], int>? OnLosslessFrame;
+
+    /// <summary>Raised when a binary Secure Desktop JPEG frame is received.</summary>
+    public event Action<byte[], int, int>? OnSecureDesktopFrame;
 
     /// <summary>Raised when binary file data is received.</summary>
     public event Func<byte[], Task>? OnFileData;
@@ -102,6 +107,17 @@ public abstract class StreamTransport : IAsyncDisposable
     public async ValueTask<bool> SendLosslessFrameAsync(byte[] data, int offset, int length)
     {
         return await SendFrameAsync(ChannelLossless, data, offset, length);
+    }
+
+    /// <summary>Send a binary Secure Desktop JPEG frame (host → viewer).</summary>
+    public async ValueTask<bool> SendSecureDesktopAsync(byte[] jpegData, int width, int height)
+    {
+        // Binary header: [4 bytes width][4 bytes height][JPEG data]
+        var payload = new byte[8 + jpegData.Length];
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32BigEndian(payload.AsSpan(0, 4), width);
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32BigEndian(payload.AsSpan(4, 4), height);
+        Buffer.BlockCopy(jpegData, 0, payload, 8, jpegData.Length);
+        return await SendFrameAsync(ChannelSecureDesktop, payload, 0, payload.Length);
     }
 
     /// <summary>Send JSON file signaling message (FormatList, FileContentsRequest, etc.).</summary>
@@ -245,6 +261,16 @@ public abstract class StreamTransport : IAsyncDisposable
                             try { await OnFileSignalingMessage.Invoke(json); }
                             catch (Exception ex) { _logger.LogWarning(ex, "File signaling handler error"); }
                         });
+                    break;
+                }
+                case ChannelSecureDesktop:
+                {
+                    if (plaintext.Length < 9) break; // 1 channel + 4 width + 4 height minimum
+                    int sdWidth = System.Buffers.Binary.BinaryPrimitives.ReadInt32BigEndian(plaintext.AsSpan(1, 4));
+                    int sdHeight = System.Buffers.Binary.BinaryPrimitives.ReadInt32BigEndian(plaintext.AsSpan(5, 4));
+                    var jpegData = new byte[plaintext.Length - 9];
+                    Buffer.BlockCopy(plaintext, 9, jpegData, 0, jpegData.Length);
+                    OnSecureDesktopFrame?.Invoke(jpegData, sdWidth, sdHeight);
                     break;
                 }
                 default:

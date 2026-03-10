@@ -232,6 +232,7 @@ public sealed class ViewerSession : IAsyncDisposable
             _transport.OnLosslessFrame += HandleLosslessFrame;
             _transport.OnFileData += HandleFileDataBinary;
             _transport.OnFileSignalingMessage += HandleFileChannelMessage;
+            _transport.OnSecureDesktopFrame += HandleSecureDesktopFrameBinary;
             _transport.OnConnectionStateChanged += HandleTransportStateChanged;
 
             // Connect relay (derives encryption key, subscribes to binary messages)
@@ -566,6 +567,7 @@ public sealed class ViewerSession : IAsyncDisposable
             _transport.OnLosslessFrame -= HandleLosslessFrame;
             _transport.OnFileData -= HandleFileDataBinary;
             _transport.OnFileSignalingMessage -= HandleFileChannelMessage;
+            _transport.OnSecureDesktopFrame -= HandleSecureDesktopFrameBinary;
             _transport.OnConnectionStateChanged -= HandleTransportStateChanged;
             await _transport.DisposeAsync();
             _transport = null;
@@ -805,6 +807,7 @@ public sealed class ViewerSession : IAsyncDisposable
                         break;
 
                     case "secureDesktopFrame":
+                        // Legacy JSON path (kept for backward compat, binary channel 5 is preferred)
                         _sdViewerFrameCount++;
                         var frameData = root.TryGetProperty("data", out var frameProp) ? frameProp.GetString() : null;
                         var frameW = root.TryGetProperty("width", out var fwProp) ? fwProp.GetInt32() : 0;
@@ -818,6 +821,15 @@ public sealed class ViewerSession : IAsyncDisposable
         catch (JsonException) { }
 
         await Task.CompletedTask;
+    }
+
+    /// <summary>Handle binary Secure Desktop JPEG frame from Channel 5.</summary>
+    private void HandleSecureDesktopFrameBinary(byte[] jpegData, int width, int height)
+    {
+        _sdViewerFrameCount++;
+        // Convert to base64 for JS Image element (network saved the base64 overhead, convert only on viewer)
+        var base64 = Convert.ToBase64String(jpegData);
+        OnSecureDesktopFrame?.Invoke(base64, width, height);
     }
 
     private void HandleVideoData(byte[] data, int length)
@@ -1141,6 +1153,7 @@ public sealed class ViewerSession : IAsyncDisposable
             _transport.OnLosslessFrame -= HandleLosslessFrame;
             _transport.OnFileData -= HandleFileDataBinary;
             _transport.OnFileSignalingMessage -= HandleFileChannelMessage;
+            _transport.OnSecureDesktopFrame -= HandleSecureDesktopFrameBinary;
             _transport.OnConnectionStateChanged -= HandleTransportStateChanged;
             await _transport.DisposeAsync();
             _transport = null;
