@@ -676,6 +676,10 @@ public sealed class DxgiScreenCapture : IScreenCapture
         // Get IDXGIOutput1 for desktop duplication
         using var output1 = output.QueryInterface<IDXGIOutput1>();
 
+        // Sync thread to current input desktop before DuplicateOutput
+        // (matches Microsoft sample + Sunshine pattern — prevents E_ACCESSDENIED after SD)
+        SyncThreadDesktop();
+
         // Create desktop duplication
         try
         {
