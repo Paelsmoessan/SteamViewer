@@ -295,16 +295,26 @@ public sealed class DxgiScreenCapture : IScreenCapture
                         break;
                     }
 
-                    // Wait then reinitialize — first attempt immediate, then 250ms between retries
+                    // Adaptive backoff: fast initial retries, then slower
+                    // First 5 attempts: 100ms. After that: 500ms.
+                    var sleepMs = consecutiveErrors <= 5 ? 100 : 500;
                     if (consecutiveErrors > 1)
-                        Thread.Sleep(250);
+                        Thread.Sleep(sleepMs);
 
                     try
                     {
-                        Reinitialize();
+                        // Try light reinit first (just DuplicateOutput, keep D3D device)
+                        // Falls back to full reinit if light reinit fails
+                        bool success = TryReinitDuplication();
+                        if (!success)
+                        {
+                            _logger.LogDebug("Light DXGI reinit failed, trying full reinitialize");
+                            Reinitialize();
+                        }
                         // Success — reset for next desktop switch event
                         consecutiveErrors = 0;
-                        _logger.LogInformation("DXGI reinitialize succeeded after {Elapsed:F1}s", reinitElapsedSec);
+                        _logger.LogInformation("DXGI reinitialize succeeded after {Elapsed:F1}s ({Method})",
+                            reinitElapsedSec, success ? "light" : "full");
                     }
                     catch (Exception reinitEx)
                     {
@@ -396,6 +406,47 @@ public sealed class DxgiScreenCapture : IScreenCapture
         InitializeAsync(_currentOutputIndex).GetAwaiter().GetResult();
         _logger.LogInformation("DXGI reinitialized on output {Output} ({W}x{H})",
             _currentOutputIndex, _width, _height);
+    }
+
+    /// <summary>
+    /// Light reinit: only retry DuplicateOutput on existing D3D device.
+    /// Much faster than full Reinitialize() which recreates the D3D device.
+    /// Returns true on success.
+    /// </summary>
+    private bool TryReinitDuplication()
+    {
+        if (_device == null)
+            return false;
+
+        try
+        {
+            _duplication?.Dispose();
+            _duplication = null;
+
+            var (adapterIndex, outputIndex) = ParseMonitorId(_currentOutputIndex);
+            using var factory = DXGIFactory.CreateDXGIFactory1<IDXGIFactory1>();
+            var adapterResult = factory.EnumAdapters1((int)adapterIndex, out var adapter);
+            if (adapterResult.Failure || adapter == null)
+                return false;
+
+            using (adapter)
+            {
+                var outputResult = adapter.EnumOutputs((int)outputIndex, out var output);
+                if (outputResult.Failure || output == null)
+                    return false;
+
+                using (output)
+                using (var output1 = output.QueryInterface<IDXGIOutput1>())
+                {
+                    _duplication = output1.DuplicateOutput(_device);
+                    return _duplication != null;
+                }
+            }
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     /// <summary>
