@@ -336,8 +336,8 @@ public sealed class SecureDesktopCapture : IDisposable
                             DebugLog($"JPEG encode error: {ex.Message}");
                         }
 
-                        // ~30 FPS (smoother UAC/lock screen interaction)
-                        Thread.Sleep(33);
+                        // ~10 FPS (SD content is mostly static — UAC/lock screen)
+                        Thread.Sleep(100);
                         continue; // Skip the 150ms poll sleep
                     }
                     else if (!string.Equals(desktopName, "Winlogon", StringComparison.OrdinalIgnoreCase) && wasActive)
