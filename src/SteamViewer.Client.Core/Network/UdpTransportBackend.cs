@@ -46,6 +46,13 @@ public sealed class UdpTransportBackend : ITransportBackend
     private readonly ConcurrentDictionary<ushort, FragmentBuffer> _reassemblyBuffers = new();
     private Timer? _cleanupTimer;
 
+    // Keepalive: detect dead UDP transport (silent network drops)
+    // 0xFD = keepalive ping, 0xFC = keepalive pong
+    private Timer? _keepaliveTimer;
+    private long _lastReceivedTick;
+    private const int KeepaliveIntervalMs = 2000;
+    private const int DeadTimeoutMs = 8000;
+
     private const int MaxFragmentPayload = 1100; // Leave room for UDP/IP headers + encryption overhead
     private const int FragmentHeaderSize = 6;    // [2 msgId][2 fragIdx][2 totalFrags]
     private const int MaxMessageSize = 2 * 1024 * 1024; // 2MB sanity limit
@@ -313,16 +320,27 @@ public sealed class UdpTransportBackend : ITransportBackend
             while (!ct.IsCancellationRequested && _udpClient != null)
             {
                 var result = await _udpClient.ReceiveAsync(ct);
-                if (result.Buffer.Length == 1 && result.Buffer[0] == 0xFF)
+                if (result.Buffer.Length == 1)
                 {
-                    LastProbeReceivedFrom = result.RemoteEndPoint;
-                    _logger.LogDebug("[UDP-DIAG] EchoLoop: echoing probe from {Source}", result.RemoteEndPoint);
-                    try { await _udpClient.SendAsync(new byte[] { 0xFE }, 1, result.RemoteEndPoint); }
-                    catch { }
+                    switch (result.Buffer[0])
+                    {
+                        case 0xFF: // Probe
+                            LastProbeReceivedFrom = result.RemoteEndPoint;
+                            _logger.LogDebug("[UDP-DIAG] EchoLoop: echoing probe from {Source}", result.RemoteEndPoint);
+                            try { await _udpClient.SendAsync(new byte[] { 0xFE }, 1, result.RemoteEndPoint); }
+                            catch { }
+                            break;
+                        case 0xFD: // Keepalive ping — respond with pong
+                            try { await _udpClient.SendAsync(new byte[] { 0xFC }, 1, result.RemoteEndPoint); }
+                            catch { }
+                            break;
+                        default: // 0xFE echo, 0xFC pong, other — ignore
+                            break;
+                    }
                 }
                 else if (result.Buffer.Length <= 2)
                 {
-                    // Echo response (0xFE) or other small packet — ignore in echo loop
+                    // Small packet — ignore in echo loop
                 }
                 else
                 {
@@ -358,6 +376,10 @@ public sealed class UdpTransportBackend : ITransportBackend
 
         // Start cleanup timer for stale reassembly buffers
         _cleanupTimer = new Timer(CleanupStaleBuffers, null, 1000, 1000);
+
+        // Start keepalive timer for dead connection detection
+        _lastReceivedTick = Environment.TickCount64;
+        _keepaliveTimer = new Timer(KeepaliveTimerCallback, null, KeepaliveIntervalMs, KeepaliveIntervalMs);
 
         _active = true;
         _logger.LogDebug("[UDP-DIAG] ConnectToPeer: echo loop cancelled, full receive loop started");
@@ -599,17 +621,30 @@ public sealed class UdpTransportBackend : ITransportBackend
                 var data = result.Buffer;
                 var length = data.Length;
 
-                // Handle probe/echo packets (single byte)
-                if (length <= 1)
+                // Update keepalive timestamp on any received data
+                _lastReceivedTick = Environment.TickCount64;
+
+                // Handle probe/echo/keepalive packets (single byte)
+                if (length <= 2)
                 {
-                    // Echo probe packets (0xFF) so peer's ProbeAsync succeeds
-                    // Use 0xFE for echo to prevent infinite loop between two ReceiveLoops
-                    if (length == 1 && data[0] == 0xFF && _udpClient != null)
+                    if (length == 1 && _udpClient != null)
                     {
-                        LastProbeReceivedFrom = result.RemoteEndPoint;
-                        _logger.LogDebug("[UDP-DIAG] ReceiveLoop echoing probe from {Source}", result.RemoteEndPoint);
-                        try { await _udpClient.SendAsync(new byte[] { 0xFE }, 1, result.RemoteEndPoint); }
-                        catch { }
+                        switch (data[0])
+                        {
+                            case 0xFF: // Probe — echo back
+                                LastProbeReceivedFrom = result.RemoteEndPoint;
+                                _logger.LogDebug("[UDP-DIAG] ReceiveLoop echoing probe from {Source}", result.RemoteEndPoint);
+                                try { await _udpClient.SendAsync(new byte[] { 0xFE }, 1, result.RemoteEndPoint); }
+                                catch { }
+                                break;
+                            case 0xFD: // Keepalive ping — respond with pong
+                                try { await _udpClient.SendAsync(new byte[] { 0xFC }, 1, result.RemoteEndPoint); }
+                                catch { }
+                                break;
+                            case 0xFE: // Probe echo — handled
+                            case 0xFC: // Keepalive pong — timestamp already updated above
+                                break;
+                        }
                     }
                     continue;
                 }
@@ -834,12 +869,43 @@ public sealed class UdpTransportBackend : ITransportBackend
         }
     }
 
+    private void KeepaliveTimerCallback(object? state)
+    {
+        if (!_active || _disposed || _udpClient == null || _peerEndPoint == null) return;
+
+        // Send keepalive ping
+        try
+        {
+            if (_useTurnRelay && _turnServerEndPoint != null)
+            {
+                var sendInd = BuildSendIndication(_peerEndPoint, new byte[] { 0xFD });
+                _udpClient.Send(sendInd, sendInd.Length, _turnServerEndPoint);
+            }
+            else
+            {
+                _udpClient.Send(new byte[] { 0xFD }, 1, _peerEndPoint);
+            }
+        }
+        catch { }
+
+        // Check for dead connection
+        var elapsed = Environment.TickCount64 - _lastReceivedTick;
+        if (elapsed > DeadTimeoutMs)
+        {
+            _logger.LogWarning("UDP keepalive: no data received for {Elapsed}ms — connection dead", elapsed);
+            _keepaliveTimer?.Dispose();
+            _keepaliveTimer = null;
+            OnDisconnected?.Invoke();
+        }
+    }
+
     public async ValueTask DisposeAsync()
     {
         if (_disposed) return;
         _disposed = true;
         _active = false;
 
+        _keepaliveTimer?.Dispose();
         _cleanupTimer?.Dispose();
         _echoCts?.Cancel();
         _cts?.Cancel();
