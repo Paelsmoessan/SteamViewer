@@ -26,6 +26,7 @@ public sealed unsafe class FFmpegDecoder : IDisposable
     private long _frameCount;
     private long _totalBytesDecoded;
     private double _lastDecodeMs;
+    private bool _gotKeyframe;
 
     public int Width => _width;
     public int Height => _height;
@@ -95,6 +96,16 @@ public sealed unsafe class FFmpegDecoder : IDisposable
 
         ret = ffmpeg.avcodec_receive_frame(_codecCtx, _frame);
         if (ret < 0) return null; // EAGAIN or error
+
+        // Suppress output until first keyframe decoded — prevents green flash artifacts
+        // from incomplete reference frames on initial connect
+        if (!_gotKeyframe)
+        {
+            if ((_frame->flags & ffmpeg.AV_FRAME_FLAG_KEY) != 0)
+                _gotKeyframe = true;
+            else
+                return null;
+        }
 
         var frameWidth = _frame->width;
         var frameHeight = _frame->height;
