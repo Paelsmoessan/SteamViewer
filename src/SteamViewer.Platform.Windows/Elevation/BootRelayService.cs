@@ -21,6 +21,7 @@ namespace SteamViewer.Platform.Windows.Elevation;
 public static class BootRelayService
 {
     private static string? _debugPath;
+    private static string? _debugPathLocal;
     private static SecureDesktopCapture? _capture;
     private static RTCPeerConnection? _peerConnection;
     private static RTCDataChannel? _dataChannel;
@@ -80,6 +81,7 @@ public static class BootRelayService
         var line = $"[{DateTime.Now:HH:mm:ss.fff}] [BootRelay] {message}";
         Console.WriteLine(line);
         try { if (_debugPath != null) File.AppendAllText(_debugPath, line + "\n"); } catch { }
+        try { if (_debugPathLocal != null) File.AppendAllText(_debugPathLocal, line + "\n"); } catch { }
     }
 
     /// <summary>
@@ -92,6 +94,14 @@ public static class BootRelayService
             Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
             "SteamViewer", "boot-relay-debug.txt");
         try { Directory.CreateDirectory(Path.GetDirectoryName(_debugPath)!); } catch { }
+
+        // Also log next to exe (readable via network share from Dev PC)
+        var exeDir = Path.GetDirectoryName(Environment.ProcessPath);
+        if (exeDir != null)
+        {
+            _debugPathLocal = Path.Combine(exeDir, "logs", "boot-relay-debug.txt");
+            try { Directory.CreateDirectory(Path.GetDirectoryName(_debugPathLocal)!); } catch { }
+        }
 
         DebugLog($"Starting boot relay (PID {Environment.ProcessId}, User: {Environment.UserName})");
 

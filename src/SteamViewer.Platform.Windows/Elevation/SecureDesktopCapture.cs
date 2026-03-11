@@ -51,6 +51,7 @@ public sealed class SecureDesktopCapture : IDisposable
     }
 
     private static readonly string? DebugPath;
+    private static readonly string? DebugPathLocal;
 
     static SecureDesktopCapture()
     {
@@ -63,6 +64,19 @@ public sealed class SecureDesktopCapture : IDisposable
             DebugPath = Path.Combine(dir, "secure-desktop-debug.txt");
         }
         catch { }
+
+        // Also log next to exe (readable via network share from Dev PC)
+        try
+        {
+            var exeDir = Path.GetDirectoryName(Environment.ProcessPath);
+            if (exeDir != null)
+            {
+                var localDir = Path.Combine(exeDir, "logs");
+                Directory.CreateDirectory(localDir);
+                DebugPathLocal = Path.Combine(localDir, "secure-desktop-debug.txt");
+            }
+        }
+        catch { }
     }
 
     private static void DebugLog(string message)
@@ -70,6 +84,7 @@ public sealed class SecureDesktopCapture : IDisposable
         var line = $"[{DateTime.Now:HH:mm:ss.fff}] [SecureDesktop] {message}";
         Console.WriteLine(line);
         try { if (DebugPath != null) File.AppendAllText(DebugPath, line + "\n"); } catch { }
+        try { if (DebugPathLocal != null) File.AppendAllText(DebugPathLocal, line + "\n"); } catch { }
     }
 
     /// <summary>Whether the Secure Desktop (Winlogon) is currently active.</summary>
@@ -351,20 +366,33 @@ public sealed class SecureDesktopCapture : IDisposable
                         var sleepMs = 1000 / _targetFps;
 
                         // Delta detection — skip unchanged frames (SD is mostly static)
-                        var frameHash = HashFrameRows(hMemDC, hBitmap, _desktopWidth, _desktopHeight);
+                        // GetDIBits requires bitmap NOT selected into DC (MS docs contract)
+                        SelectObject(hMemDC, hOldBitmap); // deselect
+                        var frameHash = HashFrameRows(hDesktopDC, hBitmap, _desktopWidth, _desktopHeight);
+                        SelectObject(hMemDC, hBitmap);    // reselect for next BitBlt
                         if (frameHash == _lastFrameHash)
                         {
                             _skippedFrames++;
-                            if (_skippedFrames == 1 || _skippedFrames % 100 == 0)
-                                DebugLog($"Delta skip #{_skippedFrames} (frame unchanged)");
-                            Thread.Sleep(sleepMs);
-                            continue;
-                        }
-                        _lastFrameHash = frameHash;
-                        if (_skippedFrames > 0)
-                        {
-                            DebugLog($"Frame changed after {_skippedFrames} skipped frames");
+                            // Force send every ~3s even if unchanged (viewer may have missed frames)
+                            if (_skippedFrames < 30)
+                            {
+                                if (_skippedFrames == 1 || _skippedFrames % 100 == 0)
+                                    DebugLog($"Delta skip #{_skippedFrames} (frame unchanged)");
+                                Thread.Sleep(sleepMs);
+                                continue;
+                            }
+                            DebugLog($"Force send after {_skippedFrames} skipped frames");
                             _skippedFrames = 0;
+                            // fall through to encode + send
+                        }
+                        else
+                        {
+                            _lastFrameHash = frameHash;
+                            if (_skippedFrames > 0)
+                            {
+                                DebugLog($"Frame changed after {_skippedFrames} skipped frames");
+                                _skippedFrames = 0;
+                            }
                         }
 
                         // Rebuild encoder params if quality changed (adaptive network feedback)

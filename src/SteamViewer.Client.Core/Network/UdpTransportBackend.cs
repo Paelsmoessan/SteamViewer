@@ -72,7 +72,8 @@ public sealed class UdpTransportBackend : ITransportBackend
     public bool IsActive => _active && !_disposed;
 
     /// <summary>
-    /// Read and reset message loss stats. Returns loss rate (0.0-1.0).
+    /// Read and reset message loss stats. Returns loss rate (0.0-1.0), or -1 if insufficient data.
+    /// Requires at least 5 messages to avoid wild oscillation on tiny samples.
     /// Thread-safe — uses interlocked exchange.
     /// </summary>
     public double GetAndResetLossRate()
@@ -80,7 +81,7 @@ public sealed class UdpTransportBackend : ITransportBackend
         var completed = Interlocked.Exchange(ref _messagesCompleted, 0);
         var expired = Interlocked.Exchange(ref _messagesExpired, 0);
         var total = completed + expired;
-        return total > 0 ? (double)expired / total : 0.0;
+        return total >= 5 ? (double)expired / total : -1.0;
     }
 
     /// <summary>Local endpoint that was bound.</summary>

@@ -289,12 +289,19 @@ public sealed class ViewerStreamTransport : StreamTransport
 
         try
         {
-            var lossRate = udp.GetAndResetLossRate();
-            // Only send when there's meaningful data (avoid spamming on idle connections)
-            if (lossRate < 0.001 && _lastReportedLossRate < 0.001) return;
-            _lastReportedLossRate = lossRate;
+            var rawLoss = udp.GetAndResetLossRate();
+            if (rawLoss < 0) return; // insufficient data (< 5 messages in window)
 
-            var json = JsonSerializer.Serialize(new { type = "networkStats", lossRate });
+            // EMA smoothing (alpha=0.3) to prevent wild oscillation from single bad windows
+            _smoothedLossRate = _smoothedLossRate < 0
+                ? rawLoss
+                : _smoothedLossRate * 0.7 + rawLoss * 0.3;
+
+            // Only send when there's meaningful data (avoid spamming on idle connections)
+            if (_smoothedLossRate < 0.001 && _lastReportedLossRate < 0.001) return;
+            _lastReportedLossRate = _smoothedLossRate;
+
+            var json = JsonSerializer.Serialize(new { type = "networkStats", lossRate = _smoothedLossRate });
             await SendControlAsync(json);
         }
         catch (Exception ex)
@@ -303,6 +310,7 @@ public sealed class ViewerStreamTransport : StreamTransport
         }
     }
 
+    private double _smoothedLossRate = -1;
     private double _lastReportedLossRate;
 
     public override async ValueTask DisposeAsync()
