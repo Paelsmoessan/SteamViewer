@@ -63,9 +63,25 @@ public sealed class UdpTransportBackend : ITransportBackend
     private const int FecMinFragments = 10;
     private const int FecMetaSize = 5; // cols(1) + rows(1) + totalMsgLen(3)
 
+    // Network loss tracking (for adaptive quality feedback)
+    private int _messagesCompleted;
+    private int _messagesExpired;
+
     public event Action<byte[], int>? OnDataReceived;
     public event Action? OnDisconnected;
     public bool IsActive => _active && !_disposed;
+
+    /// <summary>
+    /// Read and reset message loss stats. Returns loss rate (0.0-1.0).
+    /// Thread-safe — uses interlocked exchange.
+    /// </summary>
+    public double GetAndResetLossRate()
+    {
+        var completed = Interlocked.Exchange(ref _messagesCompleted, 0);
+        var expired = Interlocked.Exchange(ref _messagesExpired, 0);
+        var total = completed + expired;
+        return total > 0 ? (double)expired / total : 0.0;
+    }
 
     /// <summary>Local endpoint that was bound.</summary>
     public IPEndPoint? LocalEndPoint => _udpClient?.Client.LocalEndPoint as IPEndPoint;
@@ -605,7 +621,9 @@ public sealed class UdpTransportBackend : ITransportBackend
 
     private static (int rows, int cols) ChooseFecMatrix(int fragmentCount)
     {
-        var cols = (int)Math.Ceiling(Math.Sqrt(fragmentCount));
+        // 1.3x wider matrix → ~22-25% parity overhead (up from ~17%)
+        // SRT recommends 25% for mobile/5G networks
+        var cols = (int)Math.Ceiling(Math.Sqrt(fragmentCount) * 1.3);
         cols = Math.Clamp(cols, 2, 30);
         var rows = (int)Math.Ceiling((double)fragmentCount / cols);
         return (rows, cols);
@@ -706,6 +724,7 @@ public sealed class UdpTransportBackend : ITransportBackend
                 if (buffer.IsComplete || buffer.TryRecover())
                 {
                     _reassemblyBuffers.TryRemove(msgId, out _);
+                    Interlocked.Increment(ref _messagesCompleted);
                     var assembled = buffer.Assemble();
                     if (buffer.WasRecovered)
                         _logger.LogDebug("FEC recovered message {MsgId} ({Size}KB, {Frags} fragments)",
@@ -864,7 +883,8 @@ public sealed class UdpTransportBackend : ITransportBackend
         {
             if (now - kvp.Value.CreatedAt > 500) // 500ms timeout (large keyframes need more time)
             {
-                _reassemblyBuffers.TryRemove(kvp.Key, out _);
+                if (_reassemblyBuffers.TryRemove(kvp.Key, out _))
+                    Interlocked.Increment(ref _messagesExpired);
             }
         }
     }

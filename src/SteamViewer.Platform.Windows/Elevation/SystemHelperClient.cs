@@ -291,6 +291,27 @@ public sealed class SystemHelperClient : IAsyncDisposable
     }
 
     /// <summary>
+    /// Set Secure Desktop capture quality (fire-and-forget, like input injection).
+    /// Adjusts FPS and JPEG quality on the SYSTEM helper's SecureDesktopCapture.
+    /// </summary>
+    public async Task SetCaptureQualityAsync(int targetFps, long jpegQuality)
+    {
+        if (_writer == null || !IsConnected) return;
+
+        await _writeLock.WaitAsync();
+        try
+        {
+            await _writer.WriteLineAsync(
+                $"{{\"command\":\"setCaptureQuality\",\"fps\":{targetFps},\"quality\":{jpegQuality}}}");
+        }
+        catch { }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    /// <summary>
     /// Send an input event to the SYSTEM helper for injection (fire-and-forget).
     /// </summary>
     public async Task SendInputEventAsync(string inputJson, int screenWidth, int screenHeight)

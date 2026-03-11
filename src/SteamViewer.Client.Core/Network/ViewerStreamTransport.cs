@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Sockets;
+using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using SteamViewer.Common.Protocol;
 
@@ -20,6 +21,7 @@ public sealed class ViewerStreamTransport : StreamTransport
     private UdpTransportBackend? _udpBackend;
     private Func<SignalingMessage, Task>? _sendSignaling;
     private string? _peerId;
+    private Timer? _networkStatsTimer;
 
     // ICE candidate pair pattern — buffer both sides, probe when both ready
     private TransportCandidate[]? _remoteCandidates;
@@ -218,7 +220,11 @@ public sealed class ViewerStreamTransport : StreamTransport
             _ = _sendSignaling(new SignalingMessage.TransportConfirmed(_peerId));
 
         // Check if peer already confirmed
-        _ = TryCompleteSwitchAsync();
+        _ = TryCompleteSwitchAsync().ContinueWith(_ =>
+        {
+            if (IsDirectUdp && _networkStatsTimer == null)
+                StartNetworkStatsTimer();
+        }, TaskScheduler.Default);
 
         // Retry TransportConfirmed every 3s — peer may have missed it
         _ = Task.Run(async () =>
@@ -265,10 +271,47 @@ public sealed class ViewerStreamTransport : StreamTransport
 
         _remoteUdpReady = true;
         await TryCompleteSwitchAsync();
+
+        // Start network stats reporting once UDP is active
+        if (IsDirectUdp && _networkStatsTimer == null)
+            StartNetworkStatsTimer();
     }
+
+    private void StartNetworkStatsTimer()
+    {
+        _networkStatsTimer = new Timer(SendNetworkStats, null, 2000, 2000);
+        _logger.LogDebug("Network stats timer started (2s interval)");
+    }
+
+    private async void SendNetworkStats(object? state)
+    {
+        if (_backend is not UdpTransportBackend udp || !IsConnected) return;
+
+        try
+        {
+            var lossRate = udp.GetAndResetLossRate();
+            // Only send when there's meaningful data (avoid spamming on idle connections)
+            if (lossRate < 0.001 && _lastReportedLossRate < 0.001) return;
+            _lastReportedLossRate = lossRate;
+
+            var json = JsonSerializer.Serialize(new { type = "networkStats", lossRate });
+            await SendControlAsync(json);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to send network stats");
+        }
+    }
+
+    private double _lastReportedLossRate;
 
     public override async ValueTask DisposeAsync()
     {
+        if (_networkStatsTimer != null)
+        {
+            await _networkStatsTimer.DisposeAsync();
+            _networkStatsTimer = null;
+        }
         if (_udpBackend != null && _udpBackend != _pendingUdpBackend)
         {
             await _udpBackend.DisposeAsync();
