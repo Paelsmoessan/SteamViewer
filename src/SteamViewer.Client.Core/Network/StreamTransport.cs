@@ -75,6 +75,11 @@ public abstract class StreamTransport : IAsyncDisposable
     /// <summary>Whether the transport is currently using a direct UDP backend (vs WebSocket relay).</summary>
     public bool IsDirectUdp => _backend is UdpTransportBackend;
 
+    /// <summary>Connection quality monitor - active only when on UDP transport.</summary>
+    public ConnectionQualityMonitor? QualityMonitor => _qualityMonitor;
+    protected ConnectionQualityMonitor? _qualityMonitor;
+    private Timer? _qualityUpdateTimer;
+
     protected StreamTransport(ILogger logger)
     {
         _logger = logger;
@@ -366,8 +371,46 @@ public abstract class StreamTransport : IAsyncDisposable
             var pending = _pendingUdpBackend;
             _pendingUdpBackend = null;
             await SwitchBackendAsync(pending);
-            _logger.LogInformation("Both sides confirmed UDP — backend switched to direct");
+            _logger.LogInformation("Both sides confirmed UDP - backend switched to direct");
+
+            // Start quality monitoring on the new UDP backend
+            if (pending is UdpTransportBackend udp)
+                StartQualityMonitor(udp, udp.ProbeRtt);
         }
+    }
+
+    /// <summary>
+    /// Start the connection quality monitor. Called after switching to UDP backend.
+    /// Feeds loss rate from UdpTransportBackend every 10 seconds.
+    /// </summary>
+    protected void StartQualityMonitor(UdpTransportBackend udpBackend, TimeSpan? probeRtt)
+    {
+        _qualityMonitor = new ConnectionQualityMonitor(_logger);
+        if (probeRtt.HasValue)
+            _qualityMonitor.RecordProbeRtt(probeRtt.Value);
+
+        _qualityUpdateTimer = new Timer(_ =>
+        {
+            if (_disposed || !_connected) return;
+            try
+            {
+                var (lossRate, messageCount) = udpBackend.GetAndResetLossStats();
+                _qualityMonitor.Update(lossRate, messageCount);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Quality monitor update failed");
+            }
+        }, null, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(10));
+
+        _logger.LogInformation("[TRANSPORT] Connection quality monitor started (10s interval)");
+    }
+
+    private void StopQualityMonitor()
+    {
+        _qualityUpdateTimer?.Dispose();
+        _qualityUpdateTimer = null;
+        _qualityMonitor = null;
     }
 
     private void HandleBackendDisconnected()
@@ -442,6 +485,8 @@ public abstract class StreamTransport : IAsyncDisposable
         if (_disposed) return;
         _disposed = true;
         _connected = false;
+
+        StopQualityMonitor();
 
         // Dispose pending UDP backend if switch never completed
         if (_pendingUdpBackend != null)

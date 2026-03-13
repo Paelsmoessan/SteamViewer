@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Security.Cryptography;
@@ -72,15 +73,26 @@ public sealed class UdpTransportBackend : ITransportBackend
     public bool IsActive => _active && !_disposed;
 
     /// <summary>
+    /// Read and reset message loss stats. Returns loss rate (0.0-1.0) and total message count.
+    /// Thread-safe — uses interlocked exchange.
+    /// </summary>
+    public (double lossRate, int messageCount) GetAndResetLossStats()
+    {
+        var completed = Interlocked.Exchange(ref _messagesCompleted, 0);
+        var expired = Interlocked.Exchange(ref _messagesExpired, 0);
+        var total = completed + expired;
+        var lossRate = total > 0 ? (double)expired / total : 0.0;
+        return (lossRate, total);
+    }
+
+    /// <summary>
     /// Read and reset message loss stats. Returns loss rate (0.0-1.0).
     /// Thread-safe — uses interlocked exchange.
     /// </summary>
     public double GetAndResetLossRate()
     {
-        var completed = Interlocked.Exchange(ref _messagesCompleted, 0);
-        var expired = Interlocked.Exchange(ref _messagesExpired, 0);
-        var total = completed + expired;
-        return total > 0 ? (double)expired / total : 0.0;
+        var (lossRate, _) = GetAndResetLossStats();
+        return lossRate;
     }
 
     /// <summary>Local endpoint that was bound.</summary>
@@ -94,6 +106,9 @@ public sealed class UdpTransportBackend : ITransportBackend
 
     /// <summary>Last endpoint that sent us a probe packet (0xFF). Used for asymmetric NAT recovery.</summary>
     public IPEndPoint? LastProbeReceivedFrom { get; private set; }
+
+    /// <summary>RTT measured during the last successful probe. Null if no probe succeeded yet.</summary>
+    public TimeSpan? ProbeRtt { get; private set; }
 
     public UdpTransportBackend(ILogger logger)
     {
@@ -420,6 +435,7 @@ public sealed class UdpTransportBackend : ITransportBackend
         using var probeCts = new CancellationTokenSource(timeout);
         var attempt = 0;
         var rng = new Random();
+        var probeStopwatch = Stopwatch.StartNew();
         try
         {
             // Burst phase: send 3 probes at ~0ms, ~15ms, ~30ms with jitter
@@ -427,6 +443,7 @@ public sealed class UdpTransportBackend : ITransportBackend
             for (int burst = 0; burst < 3; burst++)
             {
                 attempt++;
+                if (burst == 0) probeStopwatch.Restart(); // Start RTT measurement from first send
                 await _udpClient.SendAsync(new byte[] { 0xFF }, 1, endpoint);
                 _logger.LogDebug("[UDP-DIAG] Probe #{Attempt} (burst) sent 0xFF to {Target}", attempt, endpoint);
 
@@ -438,7 +455,8 @@ public sealed class UdpTransportBackend : ITransportBackend
                     var result = await _udpClient.ReceiveAsync(burstCts.Token);
                     if (result.Buffer.Length <= 2)
                     {
-                        _logger.LogInformation("UDP probe to {Endpoint} succeeded (burst #{Attempt})", endpoint, attempt);
+                        ProbeRtt = probeStopwatch.Elapsed;
+                        _logger.LogInformation("UDP probe to {Endpoint} succeeded (burst #{Attempt}, RTT={Rtt}ms)", endpoint, attempt, ProbeRtt.Value.TotalMilliseconds);
                         StartEchoLoop(); // Restart echo loop for other candidates
                         return true;
                     }
@@ -459,7 +477,8 @@ public sealed class UdpTransportBackend : ITransportBackend
 
                     if (result.Buffer.Length <= 2)
                     {
-                        _logger.LogInformation("UDP probe to {Endpoint} succeeded (attempt #{Attempt})", endpoint, attempt);
+                        ProbeRtt = probeStopwatch.Elapsed;
+                        _logger.LogInformation("UDP probe to {Endpoint} succeeded (attempt #{Attempt}, RTT={Rtt}ms)", endpoint, attempt, ProbeRtt.Value.TotalMilliseconds);
                         StartEchoLoop();
                         return true;
                     }
@@ -469,6 +488,7 @@ public sealed class UdpTransportBackend : ITransportBackend
                 {
                     attempt++;
                     _logger.LogDebug("[UDP-DIAG] Probe #{Attempt} — no response after 150ms, resending to {Target}", attempt, endpoint);
+                    probeStopwatch.Restart(); // Reset RTT measurement for each resend
                     try { await _udpClient.SendAsync(new byte[] { 0xFF }, 1, endpoint); }
                     catch (Exception sendEx) { _logger.LogDebug("[UDP-DIAG] Resend failed: {Error}", sendEx.Message); }
                 }
