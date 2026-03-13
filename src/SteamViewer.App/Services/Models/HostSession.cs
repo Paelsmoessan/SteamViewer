@@ -678,9 +678,6 @@ public sealed class HostSession : IAsyncDisposable
                         HandleRequestLosslessFrame(root);
                         return;
 
-                    case "networkStats":
-                        HandleNetworkStats(root);
-                        return;
 
                     case "ack":
                         var ackType = root.TryGetProperty("ackType", out var ackProp) ? ackProp.GetString() : null;
@@ -885,31 +882,6 @@ public sealed class HostSession : IAsyncDisposable
             }
         }
         catch { }
-    }
-
-    #endregion
-
-    #region Network Stats Feedback
-
-    private void HandleNetworkStats(JsonElement root)
-    {
-        if (!root.TryGetProperty("lossRate", out var lossProp)) return;
-        var lossRate = lossProp.GetDouble();
-
-        // Adaptive SD capture quality based on viewer-reported packet loss
-        int targetFps;
-        long jpegQuality;
-        if (lossRate > 0.10)      { targetFps = 5;  jpegQuality = 60; }
-        else if (lossRate > 0.05) { targetFps = 8;  jpegQuality = 70; }
-        else if (lossRate > 0.01) { targetFps = 10; jpegQuality = 80; }
-        else                      { targetFps = 10; jpegQuality = 85; }
-
-        _logger.LogDebug("Network stats: loss={Loss:P1} → SD target {Fps}fps quality={Quality}",
-            lossRate, targetFps, jpegQuality);
-
-        // Forward to SYSTEM helper (SecureDesktopCapture runs in a separate process)
-        if (_elevationService != null)
-            _ = _elevationService.SetCaptureQualityAsync(targetFps, jpegQuality);
     }
 
     #endregion

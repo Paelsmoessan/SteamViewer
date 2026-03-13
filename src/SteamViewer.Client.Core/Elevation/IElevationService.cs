@@ -100,13 +100,6 @@ public interface IElevationService : IAsyncDisposable
     #region Secure Desktop (Phase 2)
 
     /// <summary>
-    /// Set Secure Desktop capture quality (FPS and JPEG quality).
-    /// Sent to the SYSTEM helper process which owns SecureDesktopCapture.
-    /// Fire-and-forget — does not await response.
-    /// </summary>
-    Task SetCaptureQualityAsync(int targetFps, long jpegQuality);
-
-    /// <summary>
     /// Raised when a JPEG frame is captured from the Secure Desktop (Winlogon).
     /// Parameters: (jpegData, width, height).
     /// </summary>

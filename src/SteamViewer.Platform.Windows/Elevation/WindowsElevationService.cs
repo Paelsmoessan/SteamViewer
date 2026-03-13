@@ -272,12 +272,6 @@ public sealed class WindowsElevationService : IElevationService
         return await _systemHelper.RunAsSystemAsync(path, args);
     }
 
-    public async Task SetCaptureQualityAsync(int targetFps, long jpegQuality)
-    {
-        if (_systemHelper?.IsConnected != true) return;
-        await _systemHelper.SetCaptureQualityAsync(targetFps, jpegQuality);
-    }
-
     #region Secure Desktop event forwarding
 
     private int _sdFrameForwardCount;

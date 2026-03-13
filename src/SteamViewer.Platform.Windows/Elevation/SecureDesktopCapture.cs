@@ -1,6 +1,5 @@
 using System.Drawing;
 using System.Drawing.Imaging;
-using System.IO.Hashing;
 using System.Runtime.InteropServices;
 using SteamViewer.Platform.Windows.Input;
 
@@ -25,30 +24,6 @@ public sealed class SecureDesktopCapture : IDisposable
 
     // The Winlogon desktop handle held by the capture thread (valid while active)
     private IntPtr _winlogonDesktop;
-
-    // Delta detection — skip unchanged SD frames
-    private uint _lastFrameHash;
-    private byte[]? _hashBuffer;
-    private int _skippedFrames;
-
-    // Adaptive quality — set by network stats feedback from viewer
-    private volatile int _targetFps = 10;
-    private volatile int _jpegQuality = 85;
-    private long _activeJpegQuality = 85; // Tracks when encoder params need rebuild
-
-    /// <summary>Target FPS for SD capture (adaptive, set by network stats feedback).</summary>
-    public int TargetFps
-    {
-        get => _targetFps;
-        set => _targetFps = Math.Clamp(value, 1, 30);
-    }
-
-    /// <summary>JPEG quality for SD capture (adaptive, set by network stats feedback).</summary>
-    public long JpegQuality
-    {
-        get => _jpegQuality;
-        set => _jpegQuality = (int)Math.Clamp(value, 10, 100);
-    }
 
     private static readonly string? DebugPath;
     private static readonly string? DebugPathLocal;
@@ -261,11 +236,10 @@ public sealed class SecureDesktopCapture : IDisposable
         IntPtr hOldBitmap = IntPtr.Zero;
         int cachedWidth = 0, cachedHeight = 0;
 
-        // JPEG encoder params — quality is adaptive (set by network stats feedback)
+        // JPEG encoder params (quality 85% — UAC/lock screens are mostly flat color, higher quality preserves text edges)
         var jpegEncoder = GetEncoder(ImageFormat.Jpeg);
         var encoderParams = new EncoderParameters(1);
-        _activeJpegQuality = _jpegQuality;
-        encoderParams.Param[0] = new EncoderParameter(Encoder.Quality, _activeJpegQuality);
+        encoderParams.Param[0] = new EncoderParameter(Encoder.Quality, 85L);
 
         try
         {
@@ -296,8 +270,6 @@ public sealed class SecureDesktopCapture : IDisposable
                     {
                         // Secure Desktop just activated
                         DebugLog("Secure Desktop ACTIVE (Winlogon detected)");
-                        _lastFrameHash = 0; // Reset delta detection — first frame always sends
-                        _skippedFrames = 0;
 
                         if (!SetThreadDesktop(hDesk))
                         {
@@ -362,47 +334,6 @@ public sealed class SecureDesktopCapture : IDisposable
                         // BitBlt capture
                         BitBlt(hMemDC, 0, 0, _desktopWidth, _desktopHeight, hDesktopDC, 0, 0, SRCCOPY);
 
-                        // Adaptive sleep based on TargetFps (set by network stats feedback)
-                        var sleepMs = 1000 / _targetFps;
-
-                        // Delta detection — skip unchanged frames (SD is mostly static)
-                        // GetDIBits requires bitmap NOT selected into DC (MS docs contract)
-                        SelectObject(hMemDC, hOldBitmap); // deselect
-                        var frameHash = HashFrameRows(hDesktopDC, hBitmap, _desktopWidth, _desktopHeight);
-                        SelectObject(hMemDC, hBitmap);    // reselect for next BitBlt
-                        if (frameHash == _lastFrameHash)
-                        {
-                            _skippedFrames++;
-                            // Force send every ~3s even if unchanged (viewer may have missed frames)
-                            if (_skippedFrames < 30)
-                            {
-                                if (_skippedFrames == 1 || _skippedFrames % 100 == 0)
-                                    DebugLog($"Delta skip #{_skippedFrames} (frame unchanged)");
-                                Thread.Sleep(sleepMs);
-                                continue;
-                            }
-                            DebugLog($"Force send after {_skippedFrames} skipped frames");
-                            _skippedFrames = 0;
-                            // fall through to encode + send
-                        }
-                        else
-                        {
-                            _lastFrameHash = frameHash;
-                            if (_skippedFrames > 0)
-                            {
-                                DebugLog($"Frame changed after {_skippedFrames} skipped frames");
-                                _skippedFrames = 0;
-                            }
-                        }
-
-                        // Rebuild encoder params if quality changed (adaptive network feedback)
-                        if (_jpegQuality != _activeJpegQuality)
-                        {
-                            _activeJpegQuality = _jpegQuality;
-                            encoderParams.Param[0] = new EncoderParameter(Encoder.Quality, _activeJpegQuality);
-                            DebugLog($"JPEG quality changed to {_activeJpegQuality}");
-                        }
-
                         // Encode to JPEG
                         try
                         {
@@ -412,7 +343,7 @@ public sealed class SecureDesktopCapture : IDisposable
                             var jpegData = ms.ToArray();
                             _frameCount++;
                             if (_frameCount <= 3 || _frameCount % 100 == 0)
-                                DebugLog($"Frame #{_frameCount}: {jpegData.Length}b, {_desktopWidth}x{_desktopHeight}, q={_activeJpegQuality}, fps={_targetFps}, subscribers={OnFrameCaptured?.GetInvocationList().Length ?? 0}");
+                                DebugLog($"Frame #{_frameCount}: {jpegData.Length}b, {_desktopWidth}x{_desktopHeight}, subscribers={OnFrameCaptured?.GetInvocationList().Length ?? 0}");
                             OnFrameCaptured?.Invoke(jpegData, _desktopWidth, _desktopHeight);
                         }
                         catch (Exception ex)
@@ -420,7 +351,8 @@ public sealed class SecureDesktopCapture : IDisposable
                             DebugLog($"JPEG encode error: {ex.Message}");
                         }
 
-                        Thread.Sleep(sleepMs);
+                        // ~30 FPS (smoother UAC/lock screen interaction)
+                        Thread.Sleep(33);
                         continue; // Skip the 150ms poll sleep
                     }
                     else if (!string.Equals(desktopName, "Winlogon", StringComparison.OrdinalIgnoreCase) && wasActive)
@@ -618,73 +550,5 @@ public sealed class SecureDesktopCapture : IDisposable
     [DllImport("user32.dll")]
     private static extern int GetSystemMetrics(int nIndex);
 
-    [DllImport("gdi32.dll")]
-    private static extern int GetDIBits(IntPtr hdc, IntPtr hbmp, uint uStartScan, uint cScanLines,
-        IntPtr lpvBits, ref BITMAPINFO lpbi, uint uUsage);
-
-    private const uint DIB_RGB_COLORS = 0;
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct BITMAPINFOHEADER
-    {
-        public uint biSize;
-        public int biWidth;
-        public int biHeight;
-        public ushort biPlanes;
-        public ushort biBitCount;
-        public uint biCompression;
-        public uint biSizeImage;
-        public int biXPelsPerMeter;
-        public int biYPelsPerMeter;
-        public uint biClrUsed;
-        public uint biClrImportant;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct BITMAPINFO
-    {
-        public BITMAPINFOHEADER bmiHeader;
-    }
-
     #endregion
-
-    /// <summary>
-    /// Hash 3 rows (first, middle, last) of the captured bitmap for delta detection.
-    /// Uses GetDIBits to read raw pixel data without creating a managed Bitmap.
-    /// Cost: ~23 KB read for 1920px wide screen — trivial.
-    /// </summary>
-    private unsafe uint HashFrameRows(IntPtr hdc, IntPtr hBitmap, int width, int height)
-    {
-        if (width <= 0 || height <= 0) return 0;
-
-        var rowSize = width * 4; // 32-bit BGRA
-        var bufferSize = rowSize * 3;
-        if (_hashBuffer == null || _hashBuffer.Length < bufferSize)
-            _hashBuffer = new byte[bufferSize];
-
-        var bmi = new BITMAPINFO
-        {
-            bmiHeader = new BITMAPINFOHEADER
-            {
-                biSize = (uint)sizeof(BITMAPINFOHEADER),
-                biWidth = width,
-                biHeight = height, // bottom-up DIB (positive = bottom-up for GetDIBits)
-                biPlanes = 1,
-                biBitCount = 32,
-                biCompression = 0 // BI_RGB
-            }
-        };
-
-        fixed (byte* ptr = _hashBuffer)
-        {
-            // Read first row (scan line 0 = bottom of image in bottom-up DIB)
-            GetDIBits(hdc, hBitmap, 0, 1, (IntPtr)ptr, ref bmi, DIB_RGB_COLORS);
-            // Read middle row
-            GetDIBits(hdc, hBitmap, (uint)(height / 2), 1, (IntPtr)(ptr + rowSize), ref bmi, DIB_RGB_COLORS);
-            // Read last row
-            GetDIBits(hdc, hBitmap, (uint)(height - 1), 1, (IntPtr)(ptr + rowSize * 2), ref bmi, DIB_RGB_COLORS);
-        }
-
-        return Crc32.HashToUInt32(_hashBuffer.AsSpan(0, bufferSize));
-    }
 }
