@@ -22,6 +22,10 @@ public sealed class SecureDesktopCapture : IDisposable
     private int _frameCount;
     private readonly ManualResetEventSlim _wakeSignal = new(false);
 
+    // Quality settings (adjusted by ConnectionQualityMonitor via SetQuality)
+    private volatile int _targetFps = 30;
+    private volatile int _jpegQuality = 85;
+
     // The Winlogon desktop handle held by the capture thread (valid while active)
     private IntPtr _winlogonDesktop;
 
@@ -106,6 +110,17 @@ public sealed class SecureDesktopCapture : IDisposable
         _captureThread?.Join(5000);
         _captureThread = null;
         DebugLog("Capture thread stopped");
+    }
+
+    /// <summary>
+    /// Set capture quality profile. Clamps to floor: 10fps, JPEG 75. Ceiling: 30fps, JPEG 85.
+    /// Thread-safe - applied on next capture iteration.
+    /// </summary>
+    public void SetQuality(int targetFps, int jpegQuality)
+    {
+        _targetFps = Math.Clamp(targetFps, 10, 30);
+        _jpegQuality = Math.Clamp(jpegQuality, 75, 85);
+        DebugLog($"Quality set: {_targetFps}fps, JPEG {_jpegQuality}");
     }
 
     /// <summary>
@@ -236,10 +251,11 @@ public sealed class SecureDesktopCapture : IDisposable
         IntPtr hOldBitmap = IntPtr.Zero;
         int cachedWidth = 0, cachedHeight = 0;
 
-        // JPEG encoder params (quality 85% — UAC/lock screens are mostly flat color, higher quality preserves text edges)
+        // JPEG encoder params - quality set from _jpegQuality (default 85, min 75)
         var jpegEncoder = GetEncoder(ImageFormat.Jpeg);
         var encoderParams = new EncoderParameters(1);
-        encoderParams.Param[0] = new EncoderParameter(Encoder.Quality, 85L);
+        var activeJpegQuality = _jpegQuality;
+        encoderParams.Param[0] = new EncoderParameter(Encoder.Quality, (long)activeJpegQuality);
 
         try
         {
@@ -334,6 +350,15 @@ public sealed class SecureDesktopCapture : IDisposable
                         // BitBlt capture
                         BitBlt(hMemDC, 0, 0, _desktopWidth, _desktopHeight, hDesktopDC, 0, 0, SRCCOPY);
 
+                        // Update JPEG quality if changed
+                        var currentJpegQuality = _jpegQuality;
+                        if (currentJpegQuality != activeJpegQuality)
+                        {
+                            activeJpegQuality = currentJpegQuality;
+                            encoderParams.Param[0] = new EncoderParameter(Encoder.Quality, (long)activeJpegQuality);
+                            DebugLog($"JPEG quality updated to {activeJpegQuality}");
+                        }
+
                         // Encode to JPEG
                         try
                         {
@@ -343,7 +368,7 @@ public sealed class SecureDesktopCapture : IDisposable
                             var jpegData = ms.ToArray();
                             _frameCount++;
                             if (_frameCount <= 3 || _frameCount % 100 == 0)
-                                DebugLog($"Frame #{_frameCount}: {jpegData.Length}b, {_desktopWidth}x{_desktopHeight}, subscribers={OnFrameCaptured?.GetInvocationList().Length ?? 0}");
+                                DebugLog($"Frame #{_frameCount}: {jpegData.Length}b, {_desktopWidth}x{_desktopHeight}, q={activeJpegQuality}, fps={_targetFps}, subscribers={OnFrameCaptured?.GetInvocationList().Length ?? 0}");
                             OnFrameCaptured?.Invoke(jpegData, _desktopWidth, _desktopHeight);
                         }
                         catch (Exception ex)
@@ -351,8 +376,9 @@ public sealed class SecureDesktopCapture : IDisposable
                             DebugLog($"JPEG encode error: {ex.Message}");
                         }
 
-                        // ~30 FPS (smoother UAC/lock screen interaction)
-                        Thread.Sleep(33);
+                        // FPS from _targetFps (default 30, min 10)
+                        var sleepMs = 1000 / _targetFps;
+                        Thread.Sleep(sleepMs);
                         continue; // Skip the 150ms poll sleep
                     }
                     else if (!string.Equals(desktopName, "Winlogon", StringComparison.OrdinalIgnoreCase) && wasActive)

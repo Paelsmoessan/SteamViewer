@@ -196,6 +196,7 @@ public sealed class HostSession : IAsyncDisposable
         _transport.OnFileData += HandleFileDataBinary;
         _transport.OnFileSignalingMessage += HandleFileChannelMessage;
         _transport.OnConnectionStateChanged += HandleTransportStateChanged;
+        _transport.OnConnectionQualityChanged += HandleConnectionQualityChanged;
 
         // Start relay: generate nonce, setup encryption, send RelayReady to viewer
         await _transport.StartRelayAsync(PeerId, _hostPasswordHash, _sendSignaling);
@@ -887,6 +888,34 @@ public sealed class HostSession : IAsyncDisposable
     #endregion
 
     #region Secure Desktop (Phase 2)
+
+    private void HandleConnectionQualityChanged(ConnectionQuality quality)
+    {
+        var (fps, jpegQ) = quality switch
+        {
+            ConnectionQuality.Fair => (15, 80),
+            ConnectionQuality.Poor => (10, 75),
+            _ => (30, 85) // Good or Unknown = full quality
+        };
+
+        _logger.LogInformation("[QualityAdapt] Connection quality: {Quality} - setting SD capture: {Fps}fps, JPEG {JpegQ}",
+            quality, fps, jpegQ);
+
+        if (_elevationService?.IsSystemConnected == true)
+        {
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await _elevationService.SetCaptureQualityAsync(fps, jpegQ);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to set SD capture quality");
+                }
+            });
+        }
+    }
 
     private int _sdHostFrameCount;
 
@@ -1830,6 +1859,7 @@ public sealed class HostSession : IAsyncDisposable
             _transport.OnFileData -= HandleFileDataBinary;
             _transport.OnFileSignalingMessage -= HandleFileChannelMessage;
             _transport.OnConnectionStateChanged -= HandleTransportStateChanged;
+            _transport.OnConnectionQualityChanged -= HandleConnectionQualityChanged;
             await _transport.DisposeAsync();
             _transport = null;
         }

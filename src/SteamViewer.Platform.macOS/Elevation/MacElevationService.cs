@@ -27,6 +27,7 @@ public sealed class MacElevationService : IElevationService
         string[]? turnUrls = null, string? turnUsername = null, string? turnCredential = null) => Task.FromResult(false);
     public Task<bool> RunElevatedAsync(string path, string? args) => Task.FromResult(false);
     public Task<bool> RunAsSystemAsync(string path, string? args) => Task.FromResult(false);
+    public Task<bool> SetCaptureQualityAsync(int targetFps, int jpegQuality) => Task.FromResult(false);
 
     public ValueTask DisposeAsync() => ValueTask.CompletedTask;
 }

@@ -70,6 +70,9 @@ public abstract class StreamTransport : IAsyncDisposable
     /// <summary>Raised when the transport connects or disconnects.</summary>
     public event Action<string>? OnConnectionStateChanged;
 
+    /// <summary>Raised when connection quality changes (Good/Fair/Poor). Only fires on UDP transport.</summary>
+    public event Action<ConnectionQuality>? OnConnectionQualityChanged;
+
     public bool IsConnected => _connected && !_disposed;
 
     /// <summary>Whether the transport is currently using a direct UDP backend (vs WebSocket relay).</summary>
@@ -386,6 +389,7 @@ public abstract class StreamTransport : IAsyncDisposable
     protected void StartQualityMonitor(UdpTransportBackend udpBackend, TimeSpan? probeRtt)
     {
         _qualityMonitor = new ConnectionQualityMonitor(_logger);
+        _qualityMonitor.OnQualityChanged += q => OnConnectionQualityChanged?.Invoke(q);
         if (probeRtt.HasValue)
             _qualityMonitor.RecordProbeRtt(probeRtt.Value);
 

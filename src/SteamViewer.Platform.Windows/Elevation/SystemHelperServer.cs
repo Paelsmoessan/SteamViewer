@@ -627,10 +627,36 @@ public static class SystemHelperServer
             "sendSAS" => HandleSendSAS(),
             "runAsSystem" => HandleRunAsSystem(doc.RootElement),
             "injectInput" => HandleInjectInput(json, doc.RootElement),
+            "setCaptureQuality" => HandleSetCaptureQuality(doc.RootElement),
             "wakeCapture" => HandleWakeCapture(),
             "exit" => HandleExit(),
             _ => JsonSerializer.Serialize(new HelperResponse(false, $"Unknown command: {command}"))
         };
+    }
+
+    private static string HandleSetCaptureQuality(JsonElement root)
+    {
+        try
+        {
+            var targetFps = root.GetProperty("targetFps").GetInt32();
+            var jpegQuality = root.GetProperty("jpegQuality").GetInt32();
+
+            // Clamp to floors
+            targetFps = Math.Clamp(targetFps, 10, 30);
+            jpegQuality = Math.Clamp(jpegQuality, 75, 85);
+
+            if (_capture != null)
+            {
+                _capture.SetQuality(targetFps, jpegQuality);
+                DebugLog($"SetCaptureQuality: fps={targetFps}, quality={jpegQuality}");
+            }
+            return JsonSerializer.Serialize(new HelperResponse(true, null));
+        }
+        catch (Exception ex)
+        {
+            DebugLog($"SetCaptureQuality error: {ex.Message}");
+            return JsonSerializer.Serialize(new HelperResponse(false, ex.Message));
+        }
     }
 
     private static string HandleWakeCapture()

@@ -100,6 +100,12 @@ public interface IElevationService : IAsyncDisposable
     #region Secure Desktop (Phase 2)
 
     /// <summary>
+    /// Set SD capture quality profile. Clamps to floor: 10fps, JPEG 75.
+    /// Only affects Secure Desktop capture (UAC/lock screen), not main video pipeline.
+    /// </summary>
+    Task<bool> SetCaptureQualityAsync(int targetFps, int jpegQuality);
+
+    /// <summary>
     /// Raised when a JPEG frame is captured from the Secure Desktop (Winlogon).
     /// Parameters: (jpegData, width, height).
     /// </summary>

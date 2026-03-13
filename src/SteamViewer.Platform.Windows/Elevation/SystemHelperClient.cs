@@ -278,6 +278,21 @@ public sealed class SystemHelperClient : IAsyncDisposable
     }
 
     /// <summary>
+    /// Set SD capture quality (fps + JPEG quality). Sent to SYSTEM helper which applies to SecureDesktopCapture.
+    /// </summary>
+    public async Task<bool> SetCaptureQualityAsync(int targetFps, int jpegQuality)
+    {
+        var response = await SendCommandAsync(new { command = "setCaptureQuality", targetFps, jpegQuality });
+        if (response?.Success == true)
+        {
+            _logger.LogInformation("SetCaptureQuality: fps={Fps}, quality={Quality}", targetFps, jpegQuality);
+            return true;
+        }
+        _logger.LogWarning("SetCaptureQuality failed: {Error}", response?.Error ?? "no response");
+        return false;
+    }
+
+    /// <summary>
     /// Wake the Secure Desktop capture thread for immediate polling.
     /// Called after LockWorkStation() to reduce SD detection delay.
     /// </summary>
