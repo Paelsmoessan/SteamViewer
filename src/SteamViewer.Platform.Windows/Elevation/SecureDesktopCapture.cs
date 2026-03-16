@@ -23,8 +23,9 @@ public sealed class SecureDesktopCapture : IDisposable
     private readonly ManualResetEventSlim _wakeSignal = new(false);
 
     // Quality settings (adjusted by ConnectionQualityMonitor via SetQuality)
-    private volatile int _targetFps = 30;
-    private volatile int _jpegQuality = 85;
+    // SD is mostly static (UAC/lock screen) - fewer sharp frames beats many blurry ones
+    private volatile int _targetFps = 10;
+    private volatile int _jpegQuality = 95;
 
     // The Winlogon desktop handle held by the capture thread (valid while active)
     private IntPtr _winlogonDesktop;
@@ -118,8 +119,8 @@ public sealed class SecureDesktopCapture : IDisposable
     /// </summary>
     public void SetQuality(int targetFps, int jpegQuality)
     {
-        _targetFps = Math.Clamp(targetFps, 10, 30);
-        _jpegQuality = Math.Clamp(jpegQuality, 75, 85);
+        _targetFps = Math.Clamp(targetFps, 5, 10);
+        _jpegQuality = Math.Clamp(jpegQuality, 75, 95);
         DebugLog($"Quality set: {_targetFps}fps, JPEG {_jpegQuality}");
     }
 

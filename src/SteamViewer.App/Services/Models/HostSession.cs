@@ -893,9 +893,9 @@ public sealed class HostSession : IAsyncDisposable
     {
         var (fps, jpegQ) = quality switch
         {
-            ConnectionQuality.Fair => (15, 80),
-            ConnectionQuality.Poor => (10, 75),
-            _ => (30, 85) // Good or Unknown = full quality
+            ConnectionQuality.Fair => (7, 85),
+            ConnectionQuality.Poor => (5, 75),
+            _ => (10, 95) // Good or Unknown = sharp text, low FPS
         };
 
         _logger.LogInformation("[QualityAdapt] Connection quality: {Quality} - setting SD capture: {Fps}fps, JPEG {JpegQ}",

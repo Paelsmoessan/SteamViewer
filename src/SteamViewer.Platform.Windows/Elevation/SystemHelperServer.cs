@@ -642,8 +642,8 @@ public static class SystemHelperServer
             var jpegQuality = root.GetProperty("jpegQuality").GetInt32();
 
             // Clamp to floors
-            targetFps = Math.Clamp(targetFps, 10, 30);
-            jpegQuality = Math.Clamp(jpegQuality, 75, 85);
+            targetFps = Math.Clamp(targetFps, 5, 10);
+            jpegQuality = Math.Clamp(jpegQuality, 75, 95);
 
             if (_capture != null)
             {
