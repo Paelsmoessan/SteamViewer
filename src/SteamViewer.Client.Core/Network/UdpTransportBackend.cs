@@ -64,6 +64,9 @@ public sealed class UdpTransportBackend : ITransportBackend
     private const int FecMinFragments = 10;
     private const int FecMetaSize = 5; // cols(1) + rows(1) + totalMsgLen(3)
 
+    /// <summary>FEC matrix scale factor. Higher = more parity overhead. Default 1.3 (~25%). Set 0 to disable FEC.</summary>
+    public double FecScaleFactor { get; set; } = 1.3;
+
     // Network loss tracking (for adaptive quality feedback)
     private int _messagesCompleted;
     private int _messagesExpired;
@@ -540,9 +543,10 @@ public sealed class UdpTransportBackend : ITransportBackend
         }
 
         // Generate and send FEC parity (2D XOR matrix)
-        if (totalFragments >= FecMinFragments)
+        var fecScale = FecScaleFactor;
+        if (totalFragments >= FecMinFragments && fecScale > 0)
         {
-            var (rows, cols) = ChooseFecMatrix(totalFragments);
+            var (rows, cols) = ChooseFecMatrix(totalFragments, fecScale);
             _logger.LogTrace("FEC: {Rows}x{Cols} matrix for {Frags} fragments (+{Extra} parity)",
                 rows, cols, totalFragments, rows + cols);
 
@@ -639,11 +643,10 @@ public sealed class UdpTransportBackend : ITransportBackend
             parity[b] ^= data[srcOffset + b];
     }
 
-    private static (int rows, int cols) ChooseFecMatrix(int fragmentCount)
+    private static (int rows, int cols) ChooseFecMatrix(int fragmentCount, double scaleFactor)
     {
-        // 1.3x wider matrix → ~22-25% parity overhead (up from ~17%)
-        // SRT recommends 25% for mobile/5G networks
-        var cols = (int)Math.Ceiling(Math.Sqrt(fragmentCount) * 1.3);
+        // scaleFactor controls parity overhead: 1.0 = ~17%, 1.3 = ~25%, 1.6 = ~35%
+        var cols = (int)Math.Ceiling(Math.Sqrt(fragmentCount) * scaleFactor);
         cols = Math.Clamp(cols, 2, 30);
         var rows = (int)Math.Ceiling((double)fragmentCount / cols);
         return (rows, cols);

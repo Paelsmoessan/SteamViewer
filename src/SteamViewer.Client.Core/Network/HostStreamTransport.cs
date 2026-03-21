@@ -19,6 +19,9 @@ public sealed class HostStreamTransport : StreamTransport
 {
     private readonly SignalingClient _signalingClient;
     private UdpTransportBackend? _udpBackend;
+
+    /// <summary>Get the active UDP backend for runtime tuning (FEC, etc.). Null if not on UDP.</summary>
+    public UdpTransportBackend? GetUdpBackend() => _backend as UdpTransportBackend;
     private Func<SignalingMessage, Task>? _sendSignaling;
     private string? _peerId;
 
