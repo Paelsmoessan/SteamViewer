@@ -1,5 +1,3 @@
-using System.Drawing;
-using System.Drawing.Imaging;
 using System.Runtime.InteropServices;
 using SteamViewer.Platform.Windows.Input;
 
@@ -9,7 +7,8 @@ namespace SteamViewer.Platform.Windows.Elevation;
 /// Captures the Secure Desktop (Winlogon) screen via BitBlt when a UAC prompt is active.
 /// Runs inside the SYSTEM helper process on a dedicated clean thread (no windows, no COM).
 /// Detects desktop switches by polling OpenInputDesktop every 150ms.
-/// When Winlogon is active, captures at ~15 FPS and fires OnFrameCaptured with JPEG data.
+/// Event-driven: captures on input activity, zero bandwidth when idle.
+/// Fires OnFrameCaptured with raw BGRA pixel data.
 /// Also provides input injection on the Winlogon desktop via SetThreadDesktop + SendInput.
 /// </summary>
 public sealed class SecureDesktopCapture : IDisposable
@@ -22,10 +21,17 @@ public sealed class SecureDesktopCapture : IDisposable
     private int _frameCount;
     private readonly ManualResetEventSlim _wakeSignal = new(false);
 
+    // Event-driven capture: track last input time for activity-based capture
+    private long _lastInputTimeTicks;
+
     // The Winlogon desktop handle held by the capture thread (valid while active)
     private IntPtr _winlogonDesktop;
 
+    // Reusable BGRA buffer (avoid allocations per frame)
+    private byte[]? _bgraBuffer;
+
     private static readonly string? DebugPath;
+    private static readonly string? DebugPathLocal;
 
     static SecureDesktopCapture()
     {
@@ -38,6 +44,19 @@ public sealed class SecureDesktopCapture : IDisposable
             DebugPath = Path.Combine(dir, "secure-desktop-debug.txt");
         }
         catch { }
+
+        // Also log next to exe (readable via network share from Dev PC)
+        try
+        {
+            var exeDir = Path.GetDirectoryName(Environment.ProcessPath);
+            if (exeDir != null)
+            {
+                var localDir = Path.Combine(exeDir, "logs");
+                Directory.CreateDirectory(localDir);
+                DebugPathLocal = Path.Combine(localDir, "secure-desktop-debug.txt");
+            }
+        }
+        catch { }
     }
 
     private static void DebugLog(string message)
@@ -45,6 +64,7 @@ public sealed class SecureDesktopCapture : IDisposable
         var line = $"[{DateTime.Now:HH:mm:ss.fff}] [SecureDesktop] {message}";
         Console.WriteLine(line);
         try { if (DebugPath != null) File.AppendAllText(DebugPath, line + "\n"); } catch { }
+        try { if (DebugPathLocal != null) File.AppendAllText(DebugPathLocal, line + "\n"); } catch { }
     }
 
     /// <summary>Whether the Secure Desktop (Winlogon) is currently active.</summary>
@@ -62,8 +82,8 @@ public sealed class SecureDesktopCapture : IDisposable
     /// <summary>Raised when the Secure Desktop becomes inactive (returned to Default desktop).</summary>
     public event Action? OnSecureDesktopInactive;
 
-    /// <summary>Raised when a JPEG frame is captured. Parameters: (jpegData, width, height).</summary>
-    public event Action<byte[], int, int>? OnFrameCaptured;
+    /// <summary>Raised when a raw BGRA frame is captured. Parameters: (bgraData, width, height, stride).</summary>
+    public event Action<byte[], int, int, int>? OnFrameCaptured;
 
     /// <summary>
     /// Start the capture thread. Must be called from the SYSTEM helper after authentication.
@@ -88,6 +108,7 @@ public sealed class SecureDesktopCapture : IDisposable
     public void Stop()
     {
         _stopRequested = true;
+        _wakeSignal.Set(); // Wake the thread if sleeping
         _captureThread?.Join(5000);
         _captureThread = null;
         DebugLog("Capture thread stopped");
@@ -99,8 +120,18 @@ public sealed class SecureDesktopCapture : IDisposable
     /// </summary>
     public void WakePolling()
     {
-        DebugLog("WakePolling signaled — immediate desktop check");
+        DebugLog("WakePolling signaled - immediate desktop check");
         _wakeSignal.Set();
+    }
+
+    /// <summary>
+    /// Notify that input was injected - triggers event-driven capture.
+    /// Called from InjectInputOnWinlogon when input is sent to the Winlogon desktop.
+    /// </summary>
+    public void NotifyInputActivity()
+    {
+        Interlocked.Exchange(ref _lastInputTimeTicks, Environment.TickCount64);
+        _wakeSignal.Set(); // Wake capture loop immediately
     }
 
     /// <summary>
@@ -111,6 +142,9 @@ public sealed class SecureDesktopCapture : IDisposable
     public void InjectInputOnWinlogon(string inputJson, int screenWidth, int screenHeight)
     {
         if (!_isSecureDesktopActive) return;
+
+        // Notify event-driven capture that input happened
+        NotifyInputActivity();
 
         // Open a fresh handle for this thread
         var hDesk = OpenInputDesktop(0, false, DESKTOP_SWITCHDESKTOP);
@@ -191,7 +225,7 @@ public sealed class SecureDesktopCapture : IDisposable
     /// <summary>
     /// Main capture loop running on a dedicated clean thread.
     /// Polls OpenInputDesktop every 150ms. When "Winlogon" is detected, switches desktop
-    /// and captures at ~15 FPS via BitBlt → JPEG.
+    /// and captures event-driven (on input activity) via BitBlt -> raw BGRA.
     /// </summary>
     private void CaptureLoop()
     {
@@ -214,17 +248,12 @@ public sealed class SecureDesktopCapture : IDisposable
         string? lastLoggedDesktopName = null;
         var pollCount = 0;
 
-        // GDI resources — created once, reused across frames, recreated on resolution change
+        // GDI resources - created once, reused across frames, recreated on resolution change
         IntPtr hDesktopDC = IntPtr.Zero;
         IntPtr hMemDC = IntPtr.Zero;
         IntPtr hBitmap = IntPtr.Zero;
         IntPtr hOldBitmap = IntPtr.Zero;
         int cachedWidth = 0, cachedHeight = 0;
-
-        // JPEG encoder params (quality 85% — UAC/lock screens are mostly flat color, higher quality preserves text edges)
-        var jpegEncoder = GetEncoder(ImageFormat.Jpeg);
-        var encoderParams = new EncoderParameters(1);
-        encoderParams.Param[0] = new EncoderParameter(Encoder.Quality, 85L);
 
         try
         {
@@ -235,7 +264,7 @@ public sealed class SecureDesktopCapture : IDisposable
                     var hDesk = OpenInputDesktop(0, false, DESKTOP_READOBJECTS | DESKTOP_SWITCHDESKTOP);
                     if (hDesk == IntPtr.Zero)
                     {
-                        // Can't open desktop — might be transitioning, wait and retry
+                        // Can't open desktop - might be transitioning, wait and retry
                         _wakeSignal.Wait(150);
                         _wakeSignal.Reset();
                         continue;
@@ -276,13 +305,14 @@ public sealed class SecureDesktopCapture : IDisposable
 
                         wasActive = true;
                         _isSecureDesktopActive = true;
+                        Interlocked.Exchange(ref _lastInputTimeTicks, Environment.TickCount64); // Treat activation as input (burst initial frames)
 
                         try { OnSecureDesktopActive?.Invoke(_desktopWidth, _desktopHeight); }
                         catch (Exception ex) { DebugLog($"OnSecureDesktopActive handler error: {ex.Message}"); }
                     }
                     else if (string.Equals(desktopName, "Winlogon", StringComparison.OrdinalIgnoreCase) && wasActive)
                     {
-                        // Still on Winlogon — capture a frame
+                        // Still on Winlogon - event-driven capture
                         CloseDesktop(hDesk); // Close the newly opened handle, we already have _winlogonDesktop
 
                         // Check for resolution change
@@ -290,13 +320,29 @@ public sealed class SecureDesktopCapture : IDisposable
                         var currentH = GetSystemMetrics(SM_CYSCREEN);
                         if (currentW != _desktopWidth || currentH != _desktopHeight)
                         {
-                            DebugLog($"Resolution changed: {_desktopWidth}x{_desktopHeight} → {currentW}x{currentH}");
+                            DebugLog($"Resolution changed: {_desktopWidth}x{_desktopHeight} -> {currentW}x{currentH}");
                             _desktopWidth = currentW;
                             _desktopHeight = currentH;
                             // Force GDI resource recreation
                             CleanupGdiResources(ref hDesktopDC, ref hMemDC, ref hBitmap, ref hOldBitmap);
                             cachedWidth = 0;
                             cachedHeight = 0;
+                            _bgraBuffer = null; // Force buffer reallocation
+                        }
+
+                        // Event-driven capture decision
+                        var msSinceInput = Environment.TickCount64 - Interlocked.Read(ref _lastInputTimeTicks);
+                        var shouldCapture = _frameCount < 3 || msSinceInput < 500;
+
+                        if (!shouldCapture)
+                        {
+                            // Idle - no input activity, just poll desktop state
+                            // Log periodically so we know capture thread is alive
+                            if (pollCount % 33 == 0)
+                                DebugLog($"SD idle: waiting for input (frames sent={_frameCount}, msSinceInput={msSinceInput})");
+                            _wakeSignal.Wait(150);
+                            _wakeSignal.Reset();
+                            continue;
                         }
 
                         // Create/reuse GDI resources
@@ -317,37 +363,99 @@ public sealed class SecureDesktopCapture : IDisposable
                         }
 
                         // BitBlt capture
-                        BitBlt(hMemDC, 0, 0, _desktopWidth, _desktopHeight, hDesktopDC, 0, 0, SRCCOPY);
+                        var bitBltOk = BitBlt(hMemDC, 0, 0, _desktopWidth, _desktopHeight, hDesktopDC, 0, 0, SRCCOPY);
+                        if (!bitBltOk && _frameCount < 3)
+                            DebugLog($"BitBlt failed (error {Marshal.GetLastWin32Error()})");
 
-                        // Encode to JPEG
+                        // Read raw BGRA pixels via GetDIBits
+                        // CRITICAL: Deselect bitmap from DC before GetDIBits (Phase 4 lesson - API contract)
+                        // GetDIBits requires the bitmap NOT selected into any DC.
+                        var deselected = SelectObject(hMemDC, hOldBitmap);
+                        if (_frameCount < 3)
+                            DebugLog($"GetDIBits prep: deselected=0x{deselected:X}, hBitmap=0x{hBitmap:X}, hDesktopDC=0x{hDesktopDC:X}, hMemDC=0x{hMemDC:X}");
+
                         try
                         {
-                            using var bitmap = Image.FromHbitmap(hBitmap);
-                            using var ms = new MemoryStream();
-                            bitmap.Save(ms, jpegEncoder!, encoderParams);
-                            var jpegData = ms.ToArray();
-                            _frameCount++;
-                            if (_frameCount <= 3 || _frameCount % 100 == 0)
-                                DebugLog($"Frame #{_frameCount}: {jpegData.Length}b, {_desktopWidth}x{_desktopHeight}, subscribers={OnFrameCaptured?.GetInvocationList().Length ?? 0}");
-                            OnFrameCaptured?.Invoke(jpegData, _desktopWidth, _desktopHeight);
+                            var stride = _desktopWidth * 4;
+                            var bufferSize = stride * _desktopHeight;
+
+                            // Reuse buffer if same size
+                            if (_bgraBuffer == null || _bgraBuffer.Length != bufferSize)
+                            {
+                                _bgraBuffer = new byte[bufferSize];
+                                DebugLog($"Allocated BGRA buffer: {bufferSize}b ({_desktopWidth}x{_desktopHeight}x4)");
+                            }
+
+                            var bmi = new BITMAPINFO
+                            {
+                                bmiHeader = new BITMAPINFOHEADER
+                                {
+                                    biSize = (uint)Marshal.SizeOf<BITMAPINFOHEADER>(),
+                                    biWidth = _desktopWidth,
+                                    biHeight = -_desktopHeight, // Negative = top-down (matches DXGI BGRA layout)
+                                    biPlanes = 1,
+                                    biBitCount = 32,
+                                    biCompression = BI_RGB
+                                }
+                            };
+
+                            // Use hDesktopDC for color format reference (Phase 4 lesson)
+                            if (_frameCount < 3)
+                                DebugLog($"Calling GetDIBits: hdc=0x{hDesktopDC:X}, hbmp=0x{hBitmap:X}, scanlines={_desktopHeight}, bufSize={bufferSize}");
+
+                            var scanlines = GetDIBits(hDesktopDC, hBitmap, 0, (uint)_desktopHeight,
+                                _bgraBuffer, ref bmi, DIB_RGB_COLORS);
+
+                            if (_frameCount < 3)
+                                DebugLog($"GetDIBits returned {scanlines} scanlines (expected {_desktopHeight})");
+
+                            if (scanlines > 0)
+                            {
+                                _frameCount++;
+                                if (_frameCount <= 3 || _frameCount % 100 == 0)
+                                    DebugLog($"Frame #{_frameCount}: {bufferSize}b BGRA, {_desktopWidth}x{_desktopHeight}, msSinceInput={msSinceInput}, subscribers={OnFrameCaptured?.GetInvocationList().Length ?? 0}");
+
+                                // Verify first pixel isn't all zeros (sanity check for valid capture)
+                                if (_frameCount <= 3)
+                                {
+                                    var b = _bgraBuffer[0]; var g = _bgraBuffer[1]; var r = _bgraBuffer[2]; var a = _bgraBuffer[3];
+                                    DebugLog($"First pixel BGRA: ({b},{g},{r},{a}) - should be non-zero for valid capture");
+                                }
+
+                                OnFrameCaptured?.Invoke(_bgraBuffer, _desktopWidth, _desktopHeight, stride);
+
+                                if (_frameCount <= 3)
+                                    DebugLog($"Frame #{_frameCount} delivered to {OnFrameCaptured?.GetInvocationList().Length ?? 0} subscribers");
+                            }
+                            else
+                            {
+                                DebugLog($"GetDIBits returned 0 scanlines (error {Marshal.GetLastWin32Error()})");
+                            }
                         }
                         catch (Exception ex)
                         {
-                            DebugLog($"JPEG encode error: {ex.Message}");
+                            DebugLog($"BGRA read error: {ex.GetType().Name}: {ex.Message}");
                         }
 
-                        // ~30 FPS (smoother UAC/lock screen interaction)
-                        Thread.Sleep(33);
+                        // Re-select bitmap into DC for next BitBlt
+                        hOldBitmap = SelectObject(hMemDC, hBitmap);
+                        if (_frameCount <= 3)
+                            DebugLog($"Re-selected bitmap into DC: hOldBitmap=0x{hOldBitmap:X}");
+
+                        // FPS during active capture: ~15fps for responsive hover feedback
+                        var sleepMs = _frameCount <= 3 ? 33 : 66; // Burst first 3 frames faster (~30fps), then ~15fps
+                        Thread.Sleep(sleepMs);
                         continue; // Skip the 150ms poll sleep
                     }
                     else if (!string.Equals(desktopName, "Winlogon", StringComparison.OrdinalIgnoreCase) && wasActive)
                     {
-                        // Secure Desktop deactivated — switch back to original
+                        // Secure Desktop deactivated - switch back to original
                         DebugLog("Secure Desktop INACTIVE (returned to Default desktop)");
 
                         CleanupGdiResources(ref hDesktopDC, ref hMemDC, ref hBitmap, ref hOldBitmap);
                         cachedWidth = 0;
                         cachedHeight = 0;
+                        _bgraBuffer = null;
 
                         SetThreadDesktop(originalDesktop);
                         CloseDesktop(_winlogonDesktop);
@@ -363,7 +471,7 @@ public sealed class SecureDesktopCapture : IDisposable
                     }
                     else
                     {
-                        // Not Winlogon and wasn't active — just close and wait
+                        // Not Winlogon and wasn't active - just close and wait
                         CloseDesktop(hDesk);
                     }
 
@@ -394,7 +502,6 @@ public sealed class SecureDesktopCapture : IDisposable
                 _isSecureDesktopActive = false;
             }
 
-            encoderParams.Dispose();
             DebugLog("Capture loop exited");
         }
     }
@@ -440,16 +547,6 @@ public sealed class SecureDesktopCapture : IDisposable
         return null;
     }
 
-    private static ImageCodecInfo? GetEncoder(ImageFormat format)
-    {
-        foreach (var codec in ImageCodecInfo.GetImageEncoders())
-        {
-            if (codec.FormatID == format.Guid)
-                return codec;
-        }
-        return null;
-    }
-
     private static Common.Protocol.MouseButton ParseMouseButton(string? button) => button switch
     {
         "Left" => Common.Protocol.MouseButton.Left,
@@ -476,7 +573,7 @@ public sealed class SecureDesktopCapture : IDisposable
         _wakeSignal.Dispose();
     }
 
-    #region Win32 P/Invoke — Desktop API
+    #region Win32 P/Invoke - Desktop API + GetDIBits
 
     private const int UOI_NAME = 2;
     private const uint DESKTOP_READOBJECTS = 0x0001;
@@ -484,6 +581,8 @@ public sealed class SecureDesktopCapture : IDisposable
     private const int SM_CXSCREEN = 0;
     private const int SM_CYSCREEN = 1;
     private const uint SRCCOPY = 0x00CC0020;
+    private const uint BI_RGB = 0;
+    private const uint DIB_RGB_COLORS = 0;
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern IntPtr OpenInputDesktop(uint dwFlags, bool fInherit, uint dwDesiredAccess);
@@ -534,6 +633,33 @@ public sealed class SecureDesktopCapture : IDisposable
 
     [DllImport("user32.dll")]
     private static extern int GetSystemMetrics(int nIndex);
+
+    [DllImport("gdi32.dll")]
+    private static extern int GetDIBits(IntPtr hdc, IntPtr hbmp, uint uStartScan, uint cScanLines,
+        [Out] byte[] lpvBits, ref BITMAPINFO lpbi, uint uUsage);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct BITMAPINFOHEADER
+    {
+        public uint biSize;
+        public int biWidth;
+        public int biHeight;
+        public ushort biPlanes;
+        public ushort biBitCount;
+        public uint biCompression;
+        public uint biSizeImage;
+        public int biXPelsPerMeter;
+        public int biYPelsPerMeter;
+        public uint biClrUsed;
+        public uint biClrImportant;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct BITMAPINFO
+    {
+        public BITMAPINFOHEADER bmiHeader;
+        // bmiColors omitted - not needed for BI_RGB 32bpp
+    }
 
     #endregion
 }

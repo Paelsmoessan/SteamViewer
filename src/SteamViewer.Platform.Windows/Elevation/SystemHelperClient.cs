@@ -26,7 +26,7 @@ public sealed class SystemHelperClient : IAsyncDisposable
     private string? _nonce;
     private bool _disposed;
 
-    // Video pipe for receiving JPEG frames from Secure Desktop capture
+    // Video pipe for receiving BGRA frames from Secure Desktop capture
     private NamedPipeClientStream? _videoPipe;
     private BinaryReader? _videoReader;
     private Thread? _videoReaderThread;
@@ -55,10 +55,10 @@ public sealed class SystemHelperClient : IAsyncDisposable
     public bool IsSecureDesktopActive => _isSecureDesktopActive;
 
     /// <summary>
-    /// Raised when a JPEG frame is received from the Secure Desktop.
-    /// Parameters: (jpegData, width, height).
+    /// Raised when a raw BGRA frame is received from the Secure Desktop.
+    /// Parameters: (bgraData, width, height, stride).
     /// </summary>
-    public event Action<byte[], int, int>? OnSecureDesktopFrame;
+    public event Action<byte[], int, int, int>? OnSecureDesktopFrame;
 
     /// <summary>
     /// Raised when the Secure Desktop state changes.
@@ -159,8 +159,8 @@ public sealed class SystemHelperClient : IAsyncDisposable
     }
 
     /// <summary>
-    /// Connect to the video pipe ({pipeName}_video) for receiving Secure Desktop JPEG frames.
-    /// Non-critical — if it fails, secure desktop capture just won't work.
+    /// Connect to the video pipe ({pipeName}_video) for receiving Secure Desktop BGRA frames.
+    /// Non-critical - if it fails, secure desktop capture just won't work.
     /// </summary>
     private async Task ConnectVideoPipeAsync()
     {
@@ -196,8 +196,8 @@ public sealed class SystemHelperClient : IAsyncDisposable
     }
 
     /// <summary>
-    /// Background thread reading binary JPEG frames from the video pipe.
-    /// Protocol: [uint32 length][jpeg bytes] per frame.
+    /// Background thread reading binary BGRA frames from the video pipe.
+    /// Protocol: [uint32 width][uint32 height][uint32 stride][BGRA pixels] per frame.
     /// </summary>
     private void VideoReaderLoop()
     {
@@ -209,28 +209,38 @@ public sealed class SystemHelperClient : IAsyncDisposable
             {
                 try
                 {
-                    // Read frame: [uint32 length][jpeg bytes]
-                    var length = _videoReader.ReadUInt32();
-                    if (length == 0 || length > 10_000_000) // Sanity check: max 10MB per frame
+                    // Read frame header: [uint32 width][uint32 height][uint32 stride]
+                    var width = _videoReader.ReadUInt32();
+                    var height = _videoReader.ReadUInt32();
+                    var stride = _videoReader.ReadUInt32();
+
+                    // Sanity checks
+                    if (width == 0 || width > 7680 || height == 0 || height > 4320)
                     {
-                        _logger.LogWarning("Video frame invalid length: {Length}", length);
+                        _logger.LogWarning("Video frame invalid dimensions: {W}x{H}", width, height);
                         continue;
                     }
 
-                    var jpegData = _videoReader.ReadBytes((int)length);
-                    if (jpegData.Length != (int)length)
+                    var dataSize = (int)(stride * height);
+                    if (dataSize > 50_000_000) // Max ~50MB (8K raw BGRA)
                     {
-                        _logger.LogWarning("Video frame incomplete: expected {Expected}, got {Actual}", length, jpegData.Length);
+                        _logger.LogWarning("Video frame too large: {Size}b", dataSize);
+                        break;
+                    }
+
+                    var bgraData = _videoReader.ReadBytes(dataSize);
+                    if (bgraData.Length != dataSize)
+                    {
+                        _logger.LogWarning("Video frame incomplete: expected {Expected}, got {Actual}", dataSize, bgraData.Length);
                         break; // Pipe likely disconnected
                     }
 
-                    // Use the last known secure desktop dimensions
                     _videoFrameCount++;
                     if (_videoFrameCount <= 3 || _videoFrameCount % 100 == 0)
-                        _logger.LogInformation("SD video frame #{Count}: {Bytes}b, dims={W}x{H}, active={Active}",
-                            _videoFrameCount, jpegData.Length, _secureDesktopWidth, _secureDesktopHeight, _isSecureDesktopActive);
+                        _logger.LogInformation("SD video frame #{Count}: {Bytes}b BGRA, {W}x{H}, stride={Stride}, active={Active}",
+                            _videoFrameCount, bgraData.Length, width, height, stride, _isSecureDesktopActive);
 
-                    OnSecureDesktopFrame?.Invoke(jpegData, _secureDesktopWidth, _secureDesktopHeight);
+                    OnSecureDesktopFrame?.Invoke(bgraData, (int)width, (int)height, (int)stride);
                 }
                 catch (EndOfStreamException)
                 {
@@ -276,6 +286,7 @@ public sealed class SystemHelperClient : IAsyncDisposable
         var response = await SendCommandAsync(new { command = "sendSAS" });
         return response?.Success == true;
     }
+
 
     /// <summary>
     /// Wake the Secure Desktop capture thread for immediate polling.

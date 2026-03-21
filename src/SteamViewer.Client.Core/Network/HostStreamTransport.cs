@@ -23,8 +23,7 @@ public sealed class HostStreamTransport : StreamTransport
     private string? _peerId;
 
     // ICE candidate pair pattern — buffer both sides, probe when both ready
-    private string[]? _remoteCandidateIPs;
-    private int _remoteCandidatePort;
+    private TransportCandidate[]? _remoteCandidates;
     private bool _localCandidatesReady;
 
     public HostStreamTransport(SignalingClient signalingClient, ILogger logger) : base(logger)
@@ -68,8 +67,7 @@ public sealed class HostStreamTransport : StreamTransport
         Func<SignalingMessage, Task> sendSignaling,
         string? turnServerUri = null,
         string? turnUsername = null,
-        string? turnCredential = null,
-        Func<string[], int, Task>? onEndpointReady = null)
+        string? turnCredential = null)
     {
         // Store for sending TransportConfirmed later
         _sendSignaling = sendSignaling;
@@ -80,32 +78,42 @@ public sealed class HostStreamTransport : StreamTransport
             _udpBackend = new UdpTransportBackend(_logger);
             await _udpBackend.InitializeAsync(turnServerUri, turnUsername, turnCredential);
 
-            // Gather endpoints: local IPs + reflexive + TURN relay
-            var endpoints = new List<string>();
-            // Local IPs
+            // Gather candidates: local IPs (host) + reflexive (srflx) + TURN relay
+            var candidates = new List<TransportCandidate>();
+            var localPort = _udpBackend.LocalEndPoint?.Port ?? 0;
+
+            // Local IPs — each uses the local socket port
             try
             {
                 var host = Dns.GetHostEntry(Dns.GetHostName());
                 foreach (var ip in host.AddressList)
                 {
-                    if (ip.AddressFamily == AddressFamily.InterNetwork)
-                        endpoints.Add(ip.ToString());
+                    if (ip.AddressFamily == AddressFamily.InterNetwork && localPort > 0)
+                        candidates.Add(new TransportCandidate(ip.ToString(), localPort, "host"));
                 }
             }
             catch { }
 
-            // Reflexive endpoint from STUN
+            // Reflexive endpoint from STUN — uses the NAT-mapped port
             if (_udpBackend.ReflexiveEndPoint != null)
-                endpoints.Add(_udpBackend.ReflexiveEndPoint.Address.ToString());
+                candidates.Add(new TransportCandidate(
+                    _udpBackend.ReflexiveEndPoint.Address.ToString(),
+                    _udpBackend.ReflexiveEndPoint.Port,
+                    "srflx"));
 
-            var port = _udpBackend.LocalEndPoint?.Port ?? 0;
+            // TURN relay endpoint
+            if (_udpBackend.TurnRelayEndPoint != null)
+                candidates.Add(new TransportCandidate(
+                    _udpBackend.TurnRelayEndPoint.Address.ToString(),
+                    _udpBackend.TurnRelayEndPoint.Port,
+                    "relay"));
 
-            // Send TransportEndpoint to viewer with all candidate IPs and the local port
-            if (endpoints.Count > 0 && port > 0)
+            // Send TransportEndpoint to viewer with per-candidate (ip, port, type)
+            if (candidates.Count > 0)
             {
-                await sendSignaling(new SignalingMessage.TransportEndpoint(peerId, endpoints.ToArray(), port));
-                onEndpointReady?.Invoke(endpoints.ToArray(), port);
-                _logger.LogInformation("Host UDP endpoints sent: {Endpoints}:{Port}", string.Join(",", endpoints), port);
+                await sendSignaling(new SignalingMessage.TransportEndpoint(peerId, candidates.ToArray()));
+                _logger.LogInformation("Host UDP candidates sent: {Candidates}",
+                    string.Join(", ", candidates.Select(c => $"{c.Type}={c.IP}:{c.Port}")));
             }
 
             // Local candidates ready — probe if remote already arrived (ICE pattern)
@@ -125,17 +133,18 @@ public sealed class HostStreamTransport : StreamTransport
     }
 
     /// <summary>
-    /// Handle a TransportEndpoint from the viewer (their UDP candidate).
+    /// Handle a TransportEndpoint from the viewer (their UDP candidates).
     /// Buffers remote candidates — probing happens when both local and remote are ready (ICE pattern).
     /// </summary>
-    public async Task HandleViewerEndpointAsync(string[] viewerIPs, int viewerPort)
+    public async Task HandleViewerEndpointAsync(TransportCandidate[] viewerCandidates)
     {
-        _logger.LogDebug("[UDP-DIAG] HandleViewerEndpointAsync: received {Count} IPs on port {Port}: [{IPs}], localReady={LocalReady}",
-            viewerIPs.Length, viewerPort, string.Join(", ", viewerIPs), _localCandidatesReady);
+        _logger.LogDebug("[UDP-DIAG] HandleViewerEndpointAsync: received {Count} candidates: [{Candidates}], localReady={LocalReady}",
+            viewerCandidates.Length,
+            string.Join(", ", viewerCandidates.Select(c => $"{c.Type}={c.IP}:{c.Port}")),
+            _localCandidatesReady);
 
         // Buffer remote candidates
-        _remoteCandidateIPs = viewerIPs;
-        _remoteCandidatePort = viewerPort;
+        _remoteCandidates = viewerCandidates;
 
         // Probe if local socket is already initialized
         await TryProbeCandidatesAsync();
@@ -147,79 +156,122 @@ public sealed class HostStreamTransport : StreamTransport
     /// </summary>
     private async Task TryProbeCandidatesAsync()
     {
-        if (!_localCandidatesReady || _remoteCandidateIPs == null || _udpBackend == null) return;
+        if (!_localCandidatesReady || _remoteCandidates == null || _udpBackend == null) return;
 
-        var remoteIPs = _remoteCandidateIPs;
-        var remotePort = _remoteCandidatePort;
-        _remoteCandidateIPs = null; // Consume — don't re-probe
+        var candidates = _remoteCandidates;
+        _remoteCandidates = null; // Consume — don't re-probe
 
-        _logger.LogDebug("[UDP-DIAG] TryProbeCandidatesAsync: probing {Count} IPs on port {Port}: [{IPs}]",
-            remoteIPs.Length, remotePort, string.Join(", ", remoteIPs));
+        _logger.LogDebug("[UDP-DIAG] TryProbeCandidatesAsync: probing {Count} candidates: [{Candidates}]",
+            candidates.Length, string.Join(", ", candidates.Select(c => $"{c.Type}={c.IP}:{c.Port}")));
 
-        foreach (var ip in remoteIPs)
+        // Probe host and srflx candidates first (direct)
+        foreach (var candidate in candidates.Where(c => c.Type != "relay"))
         {
             try
             {
-                var endpoint = new IPEndPoint(IPAddress.Parse(ip), remotePort);
-                _logger.LogDebug("[UDP-DIAG] Starting probe to {Endpoint}", endpoint);
-                var probeOk = await _udpBackend.ProbeAsync(endpoint, TimeSpan.FromSeconds(2));
+                var endpoint = new IPEndPoint(IPAddress.Parse(candidate.IP), candidate.Port);
+                _logger.LogDebug("[UDP-DIAG] Starting probe to {Type} {Endpoint}", candidate.Type, endpoint);
+                var probeOk = await _udpBackend.ProbeAsync(endpoint, TimeSpan.FromMilliseconds(1500));
                 _logger.LogDebug("[UDP-DIAG] Probe to {Endpoint} result: {Result}", endpoint, probeOk);
                 if (probeOk)
                 {
-                    _udpBackend.ConnectToPeer(endpoint, useTurnRelay: false);
-
-                    // Store as pending — don't switch yet
-                    _pendingUdpBackend = _udpBackend;
-                    _localUdpReady = true;
-                    _logger.LogInformation("Host: UDP probe succeeded via {Endpoint} — waiting for peer confirmation", endpoint);
-
-                    // Send confirmation to viewer
-                    if (_sendSignaling != null && _peerId != null)
-                        await _sendSignaling(new SignalingMessage.TransportConfirmed(_peerId));
-
-                    // Check if peer already confirmed
-                    await TryCompleteSwitchAsync();
-
-                    // Start timeout — if peer doesn't confirm within 5s, stay on relay
-                    _ = Task.Run(async () =>
-                    {
-                        await Task.Delay(5000);
-                        if (_localUdpReady && !_remoteUdpReady && _pendingUdpBackend != null)
-                        {
-                            _logger.LogWarning("Host: peer did not confirm UDP within 5s — staying on relay");
-                            _localUdpReady = false;
-                            _pendingUdpBackend = null;
-                        }
-                    });
+                    AcceptUdpPath(endpoint, useTurnRelay: false);
                     return;
                 }
             }
             catch (Exception ex)
             {
-                _logger.LogDebug(ex, "Host: UDP probe to {IP}:{Port} failed", ip, remotePort);
+                _logger.LogDebug(ex, "Host: UDP probe to {Type} {IP}:{Port} failed", candidate.Type, candidate.IP, candidate.Port);
             }
         }
 
         // Direct failed — try TURN relay
-        if (_udpBackend.TurnRelayEndPoint != null)
+        var relayCandidate = candidates.FirstOrDefault(c => c.Type == "relay");
+        if (relayCandidate != null && _udpBackend.TurnRelayEndPoint != null)
         {
-            _logger.LogInformation("Host: direct UDP failed, trying TURN relay");
-            _logger.LogInformation("Host: TURN relay upgrade not yet implemented — staying on WebSocket relay");
+            _logger.LogInformation("Host: direct UDP failed, trying TURN relay to {IP}:{Port}", relayCandidate.IP, relayCandidate.Port);
+            try
+            {
+                var relayEndpoint = new IPEndPoint(IPAddress.Parse(relayCandidate.IP), relayCandidate.Port);
+                var turnOk = await _udpBackend.ProbeViaTurnRelayAsync(relayEndpoint, TimeSpan.FromSeconds(3));
+                if (turnOk)
+                {
+                    AcceptUdpPath(relayEndpoint, useTurnRelay: true);
+                    return;
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Host: TURN relay probe failed");
+            }
         }
-        else
+
+        _logger.LogInformation("Host: no UDP path available — staying on WebSocket relay");
+    }
+
+    /// <summary>
+    /// Accept a working UDP path: connect, send TransportConfirmed, start retry loop.
+    /// </summary>
+    private void AcceptUdpPath(IPEndPoint endpoint, bool useTurnRelay)
+    {
+        if (_udpBackend == null) return;
+
+        _udpBackend.ConnectToPeer(endpoint, useTurnRelay);
+        _pendingUdpBackend = _udpBackend;
+        _localUdpReady = true;
+        _logger.LogInformation("Host: UDP probe succeeded via {Endpoint} (turn={Turn}) — waiting for peer confirmation", endpoint, useTurnRelay);
+
+        // Send confirmation to viewer
+        if (_sendSignaling != null && _peerId != null)
+            _ = _sendSignaling(new SignalingMessage.TransportConfirmed(_peerId));
+
+        // Check if peer already confirmed
+        _ = TryCompleteSwitchAsync();
+
+        // Retry TransportConfirmed every 3s — peer may have missed it
+        _ = Task.Run(async () =>
         {
-            _logger.LogInformation("Host: no UDP path available — staying on WebSocket relay");
-        }
+            for (int i = 0; i < 5; i++)
+            {
+                await Task.Delay(3000);
+                if (_remoteUdpReady || _pendingUdpBackend == null) return;
+
+                if (_sendSignaling != null && _peerId != null)
+                {
+                    _logger.LogDebug("Host: re-sending TransportConfirmed (retry {Retry})", i + 1);
+                    try { await _sendSignaling(new SignalingMessage.TransportConfirmed(_peerId)); }
+                    catch { }
+                }
+            }
+
+            if (_localUdpReady && !_remoteUdpReady && _pendingUdpBackend != null)
+            {
+                _logger.LogWarning("Host: peer did not confirm UDP within 15s — staying on relay");
+                _localUdpReady = false;
+                _pendingUdpBackend = null;
+            }
+        });
     }
 
     /// <summary>
     /// Handle TransportConfirmed from the viewer — viewer's probe also succeeded.
     /// If our probe already succeeded, complete the switch.
+    /// If our probing failed but viewer proved the path works, accept it (asymmetric NAT recovery).
     /// </summary>
     public async Task HandleTransportConfirmedAsync()
     {
-        _remoteUdpReady = true;
         _logger.LogInformation("Host: received UDP confirmation from viewer");
+
+        // Asymmetric NAT recovery: viewer probed us successfully (echo worked),
+        // so the NAT pinhole is open. Use the endpoint that probed us.
+        if (!_localUdpReady && _udpBackend?.LastProbeReceivedFrom != null)
+        {
+            _logger.LogInformation("Host: asymmetric NAT recovery — viewer proved path via {Endpoint}, accepting",
+                _udpBackend.LastProbeReceivedFrom);
+            AcceptUdpPath(_udpBackend.LastProbeReceivedFrom, useTurnRelay: false);
+        }
+
+        _remoteUdpReady = true;
         await TryCompleteSwitchAsync();
     }
 

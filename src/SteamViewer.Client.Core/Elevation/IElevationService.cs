@@ -100,10 +100,10 @@ public interface IElevationService : IAsyncDisposable
     #region Secure Desktop (Phase 2)
 
     /// <summary>
-    /// Raised when a JPEG frame is captured from the Secure Desktop (Winlogon).
-    /// Parameters: (jpegData, width, height).
+    /// Raised when a raw BGRA frame is captured from the Secure Desktop (Winlogon).
+    /// Parameters: (bgraData, width, height, stride).
     /// </summary>
-    event Action<byte[], int, int>? OnSecureDesktopFrame;
+    event Action<byte[], int, int, int>? OnSecureDesktopFrame;
 
     /// <summary>
     /// Raised when the Secure Desktop state changes.

@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text.Json;
@@ -52,8 +53,13 @@ public sealed class HostSession : IAsyncDisposable
     private readonly string _hostPasswordHash;
     private HostStreamTransport? _transport;
     private FFmpegEncoder? _encoder;
+    private readonly object _encoderLock = new();
     private bool _disposed;
     private bool _elevationDetached;
+
+    // Smart SD pipeline: track frame index for QOI burst + H.264 switchover
+    private int _sdFrameIndex;
+    private volatile bool _isSecureDesktopActive;
 
     // Track capture dimensions from viewer's mouse events (0 = not yet received)
     private int _lastCaptureWidth;
@@ -74,6 +80,9 @@ public sealed class HostSession : IAsyncDisposable
     private int _losslessRequestW;
     private int _losslessRequestH;
     private bool _losslessSent;
+
+    // ACK+retry for critical control messages over UDP
+    private readonly ConcurrentDictionary<string, bool> _pendingAcks = new();
 
     /// <summary>Session ID for JS interop — always "host".</summary>
     public string SessionId => "host";
@@ -204,10 +213,10 @@ public sealed class HostSession : IAsyncDisposable
     }
 
     /// <summary>
-    /// Handle a TransportEndpoint from the viewer (their UDP candidate IPs/port).
+    /// Handle a TransportEndpoint from the viewer (their UDP candidates).
     /// Called from Home.razor when signaling routes TransportEndpoint to this session.
     /// </summary>
-    public async Task HandleViewerTransportEndpointAsync(string[] ips, int port)
+    public async Task HandleViewerTransportEndpointAsync(TransportCandidate[] candidates)
     {
         if (_transport == null)
         {
@@ -215,8 +224,8 @@ public sealed class HostSession : IAsyncDisposable
             return;
         }
 
-        _logger.LogInformation("Host: Received viewer UDP endpoints ({Count} IPs, port {Port})", ips.Length, port);
-        await _transport.HandleViewerEndpointAsync(ips, port);
+        _logger.LogInformation("Host: Received viewer UDP candidates ({Count} candidates)", candidates.Length);
+        await _transport.HandleViewerEndpointAsync(candidates);
     }
 
     /// <summary>
@@ -402,6 +411,9 @@ public sealed class HostSession : IAsyncDisposable
     {
         if (_transport == null || !_transport.IsConnected || !_isNativeCapture) return;
 
+        // Skip DXGI frames during Secure Desktop - SD frames use the encoder instead
+        if (_isSecureDesktopActive) return;
+
         // Only reset lossless state on genuinely NEW frames (not refired cached frames)
         if (!ReferenceEquals(bgraData, _lastSeenFrameRef))
         {
@@ -410,49 +422,63 @@ public sealed class HostSession : IAsyncDisposable
             _losslessSent = false;
         }
 
-        try
+        lock (_encoderLock)
         {
-            // Lazy-init encoder on first frame (need real dimensions)
-            if (_encoder == null)
+            try
             {
-                FFmpegInit.EnsureInitialized();
-                var encoder = new FFmpegEncoder(_loggerFactory.CreateLogger<FFmpegEncoder>());
-                encoder.Initialize(width, height, 30, 20_000_000, crf: 14); // 30fps, CRF 14 (near-lossless text), VBV cap 20Mbps
-                _encoder = encoder; // Assign only after successful init
-                _logger.LogInformation("FFmpeg encoder initialized: {W}x{H}", width, height);
+                // Lazy-init encoder on first frame (need real dimensions)
+                if (_encoder == null)
+                {
+                    FFmpegInit.EnsureInitialized();
+                    var encoder = new FFmpegEncoder(_loggerFactory.CreateLogger<FFmpegEncoder>());
+                    encoder.Initialize(width, height, 30, 20_000_000, crf: 14); // 30fps, CRF 14 (near-lossless text), VBV cap 20Mbps
+                    _encoder = encoder; // Assign only after successful init
+                    _logger.LogInformation("FFmpeg encoder initialized: {W}x{H}", width, height);
+                    SendCaptureInfoIfChanged(width, height);
+                }
+
+                // Notify viewer if capture dims changed (monitor switch, resolution change)
                 SendCaptureInfoIfChanged(width, height);
+
+                _encodeSw.Restart();
+                var result = _encoder.EncodeFrame(bgraData, stride, width, height);
+                _encodeSw.Stop();
+
+                // Notify viewer of actual encode resolution (for 1:1 canvas sizing)
+                SendEncodeInfoIfChanged();
+
+                if (result is var (naluData, naluLength))
+                {
+                    _transport.EnqueueVideoFrame(naluData, naluLength);
+
+                    _encodeFrameCount++;
+                    if (_encodeFrameCount % 300 == 0)
+                        _logger.LogInformation("Encode #{Count}: {Ms:F1}ms, {Size}KB",
+                            _encodeFrameCount, _encodeSw.Elapsed.TotalMilliseconds, naluLength / 1024);
+                }
+
+                // Heartbeat: prove the encode pipeline is alive (every 60s)
+                if (_heartbeatSw.ElapsedMilliseconds >= 60_000)
+                {
+                    _logger.LogInformation("Encode heartbeat: #{Count} frames, encoder {W}x{H}",
+                        _encodeFrameCount, _encoder?.Width ?? 0, _encoder?.Height ?? 0);
+                    _heartbeatSw.Restart();
+                }
             }
-
-            // Notify viewer if capture dims changed (monitor switch, resolution change)
-            SendCaptureInfoIfChanged(width, height);
-
-            _encodeSw.Restart();
-            var result = _encoder.EncodeFrame(bgraData, stride, width, height);
-            _encodeSw.Stop();
-
-            // Notify viewer of actual encode resolution (for 1:1 canvas sizing)
-            SendEncodeInfoIfChanged();
-
-            if (result is var (naluData, naluLength))
+            catch (Exception ex)
             {
-                _transport.EnqueueVideoFrame(naluData, naluLength);
-
-                _encodeFrameCount++;
-                if (_encodeFrameCount % 300 == 0)
-                    _logger.LogInformation("Encode #{Count}: {Ms:F1}ms, {Size}KB",
-                        _encodeFrameCount, _encodeSw.Elapsed.TotalMilliseconds, naluLength / 1024);
+                // Log EVERY error on first occurrence, then sample
+                if (_encoderErrorCount == 0 || _encoderErrorCount % 300 == 0)
+                    _logger.LogError(ex, "FFmpeg encode error #{Count}", _encoderErrorCount);
+                _encoderErrorCount++;
             }
-        }
-        catch (Exception ex)
-        {
-            if (_encoderErrorCount++ % 300 == 0)
-                _logger.LogWarning(ex, "FFmpeg encode error (sample)");
-        }
+        } // lock
     }
 
     private int _encoderErrorCount;
     private long _encodeFrameCount;
     private readonly System.Diagnostics.Stopwatch _encodeSw = new();
+    private readonly System.Diagnostics.Stopwatch _heartbeatSw = System.Diagnostics.Stopwatch.StartNew();
     private int _lastSentCaptureW;
     private int _lastSentCaptureH;
     private int _lastSentEncodeW;
@@ -662,6 +688,13 @@ public sealed class HostSession : IAsyncDisposable
                     case "requestLosslessFrame":
                         HandleRequestLosslessFrame(root);
                         return;
+
+
+                    case "ack":
+                        var ackType = root.TryGetProperty("ackType", out var ackProp) ? ackProp.GetString() : null;
+                        if (ackType != null)
+                            _pendingAcks[ackType] = true;
+                        return;
                 }
             }
 
@@ -868,29 +901,91 @@ public sealed class HostSession : IAsyncDisposable
 
     private int _sdHostFrameCount;
 
-    private void HandleSecureDesktopFrame(byte[] jpegData, int width, int height)
+    private void HandleSecureDesktopFrame(byte[] bgraData, int width, int height, int stride)
     {
         _sdHostFrameCount++;
         if (_sdHostFrameCount <= 3 || _sdHostFrameCount % 100 == 0)
-            _logger.LogInformation("SD frame #{Count}: {Bytes}b {W}x{H}, transport={Transport}, ready={Ready}",
-                _sdHostFrameCount, jpegData.Length, width, height, _transport != null, IsDataChannelReady);
+            _logger.LogInformation("SD frame #{Count}: {Bytes}b BGRA {W}x{H}, sdIdx={Idx}, transport={Transport}, ready={Ready}",
+                _sdHostFrameCount, bgraData.Length, width, height, _sdFrameIndex, _transport != null, IsDataChannelReady);
 
         if (_transport == null || !IsDataChannelReady) return;
 
-        try
+        // Smart SD pipeline: QOI burst + H.264 unified
+        var frameIdx = _sdFrameIndex++;
+
+        // First 2 frames: send QOI on channel 4 (fire-and-forget lossless bonus)
+        if (frameIdx < 2)
         {
-            var base64 = Convert.ToBase64String(jpegData);
-            _ = _transport.SendControlAsync(JsonSerializer.Serialize(new
+            var frameCopy = new byte[stride * height];
+            Buffer.BlockCopy(bgraData, 0, frameCopy, 0, frameCopy.Length);
+            var captureW = width;
+            var captureH = height;
+            var captureStride = stride;
+
+            _ = Task.Run(async () =>
             {
-                type = "secureDesktopFrame",
-                data = base64,
-                width,
-                height
-            }));
+                try
+                {
+                    var sw = Stopwatch.StartNew();
+                    var qoiData = QoiCodec.Encode(frameCopy, captureW, captureH, captureStride);
+                    sw.Stop();
+                    var sent = await _transport!.SendLosslessFrameAsync(qoiData, 0, qoiData.Length);
+                    _logger.LogInformation("SD QOI frame #{Idx}: {W}x{H}, {Size}KB, encode={Ms:F1}ms, sent={Sent}",
+                        frameIdx, captureW, captureH, qoiData.Length / 1024, sw.Elapsed.TotalMilliseconds, sent);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to send SD QOI frame");
+                }
+            });
         }
-        catch (Exception ex)
+
+        // ALL frames: send through H.264 encoder on channel 1 (guaranteed stream)
+        lock (_encoderLock)
         {
-            _logger.LogWarning(ex, "Failed to send secure desktop frame");
+            try
+            {
+                // Lazy-init or reinit encoder for SD resolution
+                if (_encoder == null)
+                {
+                    _logger.LogInformation("SD: encoder is null, initializing for {W}x{H}", width, height);
+                    FFmpegInit.EnsureInitialized();
+                    var encoder = new FFmpegEncoder(_loggerFactory.CreateLogger<FFmpegEncoder>());
+                    encoder.Initialize(width, height, 30, 20_000_000, crf: 14);
+                    _encoder = encoder;
+                    _logger.LogInformation("FFmpeg encoder initialized for SD: {W}x{H}", width, height);
+                }
+                else if (frameIdx == 0)
+                {
+                    // Log encoder state on first SD frame (will it reinit for resolution change?)
+                    _logger.LogInformation("SD: encoder exists ({EW}x{EH}), SD frame is {W}x{H} - {Action}",
+                        _encoder.Width, _encoder.Height, width, height,
+                        (_encoder.Width != width || _encoder.Height != height) ? "REINIT expected" : "same resolution");
+                }
+
+                SendCaptureInfoIfChanged(width, height);
+
+                _encodeSw.Restart();
+                var result = _encoder.EncodeFrame(bgraData, stride, width, height);
+                _encodeSw.Stop();
+
+                SendEncodeInfoIfChanged();
+
+                if (result is var (naluData, naluLength))
+                {
+                    _transport.EnqueueVideoFrame(naluData, naluLength);
+                    _encodeFrameCount++;
+                    if (frameIdx < 3 || _encodeFrameCount % 300 == 0)
+                        _logger.LogInformation("SD H.264 frame #{Idx}: {Ms:F1}ms, {Size}KB",
+                            frameIdx, _encodeSw.Elapsed.TotalMilliseconds, naluLength / 1024);
+                }
+            }
+            catch (Exception ex)
+            {
+                if (_encoderErrorCount == 0 || _encoderErrorCount % 300 == 0)
+                    _logger.LogError(ex, "SD encode error #{Count}", _encoderErrorCount);
+                _encoderErrorCount++;
+            }
         }
     }
 
@@ -899,18 +994,42 @@ public sealed class HostSession : IAsyncDisposable
         _logger.LogInformation("SD state handler: active={Active}, transport={Transport}, ready={Ready}",
             active, _transport != null, IsDataChannelReady);
 
+        // Track SD state for encoder thread safety (skip DXGI frames during SD)
+        _isSecureDesktopActive = active;
+        if (active)
+        {
+            _sdFrameIndex = 0; // Reset for QOI burst on next SD activation
+            _logger.LogInformation("SD pipeline: active, sdFrameIndex reset, encoder={HasEncoder}, encoderDims={W}x{H}",
+                _encoder != null, _encoder?.Width ?? 0, _encoder?.Height ?? 0);
+        }
+        else
+        {
+            _logger.LogInformation("SD pipeline: inactive, sdFrameIndex was {Idx}", _sdFrameIndex);
+        }
+
         if (_transport == null || !IsDataChannelReady) return;
 
         try
         {
-            var message = active
-                ? JsonSerializer.Serialize(new { type = "secureDesktopActive" })
-                : JsonSerializer.Serialize(new { type = "secureDesktopInactive" });
+            var messageType = active ? "secureDesktopActive" : "secureDesktopInactive";
+            var message = JsonSerializer.Serialize(new { type = messageType });
 
-            _ = _transport.SendControlAsync(message);
+            // Send with ACK+retry — critical state change that can't be lost over UDP
+            _ = SendWithAckAsync(message, messageType);
 
-            _logger.LogInformation("Sent {Type} to viewer",
-                active ? "secureDesktopActive" : "secureDesktopInactive");
+            _logger.LogInformation("Sent {Type} to viewer (with ACK+retry)", messageType);
+
+            // When leaving Secure Desktop, force re-send encodeInfo so viewer canvas re-syncs CSS.
+            // Without this, SendEncodeInfoIfChanged() sees same resolution → skips → canvas stays stale.
+            if (!active)
+            {
+                _lastSentEncodeW = 0;
+                _lastSentEncodeH = 0;
+            }
+
+            // Wake DXGI retry loop immediately - don't wait for 500ms poll
+            if (!active && _screenCapture is DxgiScreenCapture dxgiWake)
+                dxgiWake.NotifyDesktopAvailable();
 
             // When leaving Secure Desktop, DXGI capture may have died (2min E_ACCESSDENIED timeout).
             // Restart capture if it's no longer running but we're still sharing.
@@ -955,6 +1074,34 @@ public sealed class HostSession : IAsyncDisposable
         {
             _logger.LogWarning(ex, "Failed to send secure desktop state change");
         }
+    }
+
+    /// <summary>
+    /// Send a critical control message with ACK+retry. Resends until viewer ACKs or max retries reached.
+    /// Use for infrequent state-change messages that can't tolerate loss over UDP.
+    /// </summary>
+    private async Task SendWithAckAsync(string json, string ackType, int retryIntervalMs = 500, int maxRetries = 5)
+    {
+        _pendingAcks[ackType] = false;
+
+        for (int i = 0; i <= maxRetries; i++)
+        {
+            if (_transport == null || !IsDataChannelReady) break;
+
+            await _transport.SendControlAsync(json);
+            if (i > 0) _logger.LogDebug("Resending {Type} (retry {N})", ackType, i);
+
+            await Task.Delay(retryIntervalMs);
+            if (_pendingAcks.TryGetValue(ackType, out var acked) && acked)
+            {
+                _pendingAcks.TryRemove(ackType, out _);
+                _logger.LogDebug("ACK received for {Type}", ackType);
+                return;
+            }
+        }
+
+        _logger.LogWarning("No ACK for {Type} after {N} retries", ackType, maxRetries);
+        _pendingAcks.TryRemove(ackType, out _);
     }
 
     private void HandleSystemStateChanged(bool connected)
@@ -1612,6 +1759,9 @@ public sealed class HostSession : IAsyncDisposable
 
     private void HandleRequestLosslessFrame(JsonElement root)
     {
+        // Don't fulfill lossless requests during SD - SD frames go through H.264/QOI pipeline
+        if (_isSecureDesktopActive) return;
+
         var w = root.TryGetProperty("width", out var wp) ? wp.GetInt32() : 0;
         var h = root.TryGetProperty("height", out var hp) ? hp.GetInt32() : 0;
 

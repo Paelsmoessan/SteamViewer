@@ -23,7 +23,6 @@ public sealed class ViewerSession : IAsyncDisposable
     private readonly IConfiguration _configuration;
     private readonly Func<SignalingMessage, Task> _sendSignaling;
     private readonly SignalingClient _signalingClient;
-    private int _sdViewerFrameCount;
     private ViewerStreamTransport? _transport;
     private FFmpegDecoder? _decoder;
     private DotNetObjectReference<ViewerSession>? _dotNetRef;
@@ -131,11 +130,6 @@ public sealed class ViewerSession : IAsyncDisposable
     public event Action<bool>? OnSecureDesktopStateChanged;
 
     /// <summary>
-    /// Raised when a Secure Desktop frame is received.
-    /// </summary>
-    public event Action<string, int, int>? OnSecureDesktopFrame;
-
-    /// <summary>
     /// Raised when host sends capture dimensions (on first frame + capture change).
     /// Viewer should constrain canvas to this AR for 1:1 pixel mapping.
     /// </summary>
@@ -232,6 +226,7 @@ public sealed class ViewerSession : IAsyncDisposable
             _transport.OnLosslessFrame += HandleLosslessFrame;
             _transport.OnFileData += HandleFileDataBinary;
             _transport.OnFileSignalingMessage += HandleFileChannelMessage;
+            // Channel 5 (SD JPEG) removed - SD frames now arrive via H.264 on channel 1
             _transport.OnConnectionStateChanged += HandleTransportStateChanged;
 
             // Connect relay (derives encryption key, subscribes to binary messages)
@@ -283,10 +278,10 @@ public sealed class ViewerSession : IAsyncDisposable
     }
 
     /// <summary>
-    /// Handle TransportEndpoint from host — contains host's UDP candidate IPs/port.
-    /// Probes each IP and switches to direct UDP if successful.
+    /// Handle TransportEndpoint from host — contains host's UDP candidates.
+    /// Probes each candidate and switches to direct UDP if successful.
     /// </summary>
-    public async Task HandleTransportEndpointAsync(string[] ips, int port)
+    public async Task HandleTransportEndpointAsync(TransportCandidate[] candidates)
     {
         if (_transport == null)
         {
@@ -294,9 +289,9 @@ public sealed class ViewerSession : IAsyncDisposable
             return;
         }
 
-        _logger.LogInformation("Session {SessionId}: Received host UDP endpoints ({Count} IPs, port {Port})",
-            SessionId, ips.Length, port);
-        await _transport.HandleHostEndpointAsync(ips, port);
+        _logger.LogInformation("Session {SessionId}: Received host UDP candidates ({Count} candidates)",
+            SessionId, candidates.Length);
+        await _transport.HandleHostEndpointAsync(candidates);
     }
 
     /// <summary>
@@ -793,21 +788,18 @@ public sealed class ViewerSession : IAsyncDisposable
                     case "secureDesktopActive":
                         IsSecureDesktopActive = true;
                         OnSecureDesktopStateChanged?.Invoke(true);
+                        _ = _transport?.SendControlAsync(
+                            JsonSerializer.Serialize(new { type = "ack", ackType = "secureDesktopActive" }));
                         break;
 
                     case "secureDesktopInactive":
                         IsSecureDesktopActive = false;
                         OnSecureDesktopStateChanged?.Invoke(false);
+                        _ = _transport?.SendControlAsync(
+                            JsonSerializer.Serialize(new { type = "ack", ackType = "secureDesktopInactive" }));
                         break;
 
-                    case "secureDesktopFrame":
-                        _sdViewerFrameCount++;
-                        var frameData = root.TryGetProperty("data", out var frameProp) ? frameProp.GetString() : null;
-                        var frameW = root.TryGetProperty("width", out var fwProp) ? fwProp.GetInt32() : 0;
-                        var frameH = root.TryGetProperty("height", out var fhProp) ? fhProp.GetInt32() : 0;
-                        if (frameData != null && frameW > 0 && frameH > 0)
-                            OnSecureDesktopFrame?.Invoke(frameData, frameW, frameH);
-                        break;
+                    // secureDesktopFrame: removed - SD frames now arrive via H.264 on channel 1
                 }
             }
         }
@@ -835,6 +827,7 @@ public sealed class ViewerSession : IAsyncDisposable
 
                 // Check if we should request a lossless frame (input idle)
                 if (!_losslessActive && !_losslessRequestPending
+                    && !IsSecureDesktopActive
                     && (DateTime.UtcNow - _lastInputTime).TotalMilliseconds > 150)
                 {
                     RequestLosslessFrame();

@@ -89,12 +89,12 @@ public sealed class ViewerSessionManager : IAsyncDisposable
             return null;
         }
 
-        // Check if already connected to this peer
-        if (_peerToSession.ContainsKey(peerId))
+        // If a stale session exists for this peer, clean it up first
+        if (_peerToSession.TryGetValue(peerId, out var existingSessionId))
         {
-            _logger.LogWarning("Already connected to peer {PeerId}", peerId);
-            OnConnectionFailed?.Invoke(peerId, "Already connected to this peer");
-            return null;
+            _logger.LogWarning("Stale session {SessionId} for peer {PeerId} — cleaning up before reconnect",
+                existingSessionId, peerId);
+            await RemoveSessionAsync(existingSessionId);
         }
 
         EnsureSignalingSubscribed();
@@ -384,8 +384,19 @@ public sealed class ViewerSessionManager : IAsyncDisposable
     private void HandleError(SignalingMessage.Error error)
     {
         _logger.LogWarning("Signaling error: {Message}", error.Message);
-        // Try to find which session this error relates to
-        // For now, just log it
+
+        // Server error likely means connection request failed (e.g. "Target client X is not online").
+        // Clean up any sessions that haven't established transport yet — they're the ones that failed.
+        var staleSessionIds = _sessions
+            .Where(kvp => !kvp.Value.IsInitialized)
+            .Select(kvp => kvp.Key)
+            .ToList();
+
+        foreach (var sessionId in staleSessionIds)
+        {
+            _logger.LogInformation("Cleaning up stale session {SessionId} after signaling error", sessionId);
+            _ = RemoveSessionAsync(sessionId);
+        }
     }
 
     private void HandleSessionStateChanged(string sessionId, ViewerSessionState state)
@@ -417,9 +428,9 @@ public sealed class ViewerSessionManager : IAsyncDisposable
             return;
         }
 
-        _logger.LogInformation("Session {SessionId}: Received transport endpoint from {PeerId} ({IpCount} IPs, port {Port})",
-            session.SessionId, endpoint.TargetId, endpoint.IPs.Length, endpoint.Port);
-        _ = session.HandleTransportEndpointAsync(endpoint.IPs, endpoint.Port);
+        _logger.LogInformation("Session {SessionId}: Received transport endpoint from {PeerId} ({CandidateCount} candidates)",
+            session.SessionId, endpoint.TargetId, endpoint.Candidates.Length);
+        _ = session.HandleTransportEndpointAsync(endpoint.Candidates);
     }
 
     private void HandleTransportConfirmed(SignalingMessage.TransportConfirmed confirmed)

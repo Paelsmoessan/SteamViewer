@@ -12,7 +12,7 @@ public sealed class MacElevationService : IElevationService
     public bool IsSystemConnected => false;
     public bool IsSecureDesktopActive => false;
 
-    public event Action<byte[], int, int>? OnSecureDesktopFrame;
+    public event Action<byte[], int, int, int>? OnSecureDesktopFrame;
     public event Action<bool>? OnSecureDesktopStateChanged;
     public event Action<bool>? OnAdminStateChanged;
     public event Action<bool>? OnSystemStateChanged;

@@ -53,10 +53,11 @@ public partial class App : Application
             Y = y
         };
 
-        // Save window state and kill process on close
+        // Save window state, kill child processes, and exit on close
         _mainWindow.Destroying += (s, e) =>
         {
             SaveWindowState();
+            WinUI.Program.KillChildProcesses();
             Environment.Exit(0);
         };
 
@@ -76,7 +77,21 @@ public partial class App : Application
         {
             if (!File.Exists(WindowStateFile)) return null;
             var json = File.ReadAllText(WindowStateFile);
-            return JsonSerializer.Deserialize<WindowState>(json);
+            var state = JsonSerializer.Deserialize<WindowState>(json);
+            if (state == null) return null;
+
+            // Discard if dimensions are bogus (minimized, corrupted)
+            if (state.Width < 200 || state.Height < 200 || state.X < -10000 || state.Y < -10000)
+                return null;
+
+            // Discard if window would be entirely off-screen
+            var display = DeviceDisplay.MainDisplayInfo;
+            var screenW = display.Width / display.Density;
+            var screenH = display.Height / display.Density;
+            if (state.X > screenW - 50 || state.Y > screenH - 50)
+                return null;
+
+            return state;
         }
         catch { return null; }
     }
@@ -86,13 +101,16 @@ public partial class App : Application
         try
         {
             if (_mainWindow == null) return;
-            var state = new WindowState
-            {
-                X = _mainWindow.X,
-                Y = _mainWindow.Y,
-                Width = _mainWindow.Width,
-                Height = _mainWindow.Height
-            };
+            var x = _mainWindow.X;
+            var y = _mainWindow.Y;
+            var w = _mainWindow.Width;
+            var h = _mainWindow.Height;
+
+            // Don't save minimized/off-screen garbage (Windows reports -32000,-32000 when minimized)
+            if (x < -10000 || y < -10000 || w < 200 || h < 200)
+                return;
+
+            var state = new WindowState { X = x, Y = y, Width = w, Height = h };
             Directory.CreateDirectory(Path.GetDirectoryName(WindowStateFile)!);
             File.WriteAllText(WindowStateFile, JsonSerializer.Serialize(state));
         }

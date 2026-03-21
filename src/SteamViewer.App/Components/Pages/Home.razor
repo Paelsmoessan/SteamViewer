@@ -985,12 +985,12 @@
                     break;
 
                 case SignalingMessage.TransportEndpoint endpoint:
-                    // Viewer's UDP candidate — forward to host session
+                    // Viewer's UDP candidates — forward to host session
                     if (_hostSession != null)
                     {
-                        Logger.LogInformation("Routing viewer TransportEndpoint to HostSession ({IpCount} IPs, port {Port})",
-                            endpoint.IPs.Length, endpoint.Port);
-                        _ = _hostSession.HandleViewerTransportEndpointAsync(endpoint.IPs, endpoint.Port);
+                        Logger.LogInformation("Routing viewer TransportEndpoint to HostSession ({CandidateCount} candidates)",
+                            endpoint.Candidates.Length);
+                        _ = _hostSession.HandleViewerTransportEndpointAsync(endpoint.Candidates);
                     }
                     break;
 

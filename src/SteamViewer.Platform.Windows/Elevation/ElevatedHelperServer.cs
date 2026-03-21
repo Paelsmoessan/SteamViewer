@@ -26,12 +26,14 @@ public static class ElevatedHelperServer
     private static extern void SendSAS(bool asUser);
 
     private static string? _debugPath;
+    private static string? _debugPathLocal;
 
     private static void DebugLog(string message)
     {
         var line = $"[{DateTime.Now:HH:mm:ss.fff}] {message}";
         Console.WriteLine($"[ElevatedHelper] {message}");
         try { if (_debugPath != null) File.AppendAllText(_debugPath, line + "\n"); } catch { }
+        try { if (_debugPathLocal != null) File.AppendAllText(_debugPathLocal, line + "\n"); } catch { }
     }
 
     /// <summary>
@@ -43,6 +45,14 @@ public static class ElevatedHelperServer
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "SteamViewer", "helper-debug.txt");
         try { Directory.CreateDirectory(Path.GetDirectoryName(_debugPath)!); } catch { }
+
+        // Also log next to exe (readable via network share from Dev PC)
+        var exeDir = Path.GetDirectoryName(Environment.ProcessPath);
+        if (exeDir != null)
+        {
+            _debugPathLocal = Path.Combine(exeDir, "logs", "helper-debug.txt");
+            try { Directory.CreateDirectory(Path.GetDirectoryName(_debugPathLocal)!); } catch { }
+        }
 
         DebugLog($"Starting pipe server: {pipeName} (PID {Environment.ProcessId})");
 

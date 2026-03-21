@@ -18,6 +18,7 @@ namespace SteamViewer.Client.Core.Network;
 /// Channel 2 = Binary file data
 /// Channel 3 = JSON file signaling
 /// Channel 4 = Lossless QOI frame (host → viewer, one-shot on screen settle)
+/// Channel 5 = Binary Secure Desktop JPEG frame (host → viewer)
 ///
 /// Each frame is AES-256-GCM encrypted before sending through the backend.
 /// </summary>
@@ -65,10 +66,18 @@ public abstract class StreamTransport : IAsyncDisposable
     /// <summary>Raised when the transport connects or disconnects.</summary>
     public event Action<string>? OnConnectionStateChanged;
 
+    /// <summary>Raised when connection quality changes (Good/Fair/Poor). Only fires on UDP transport.</summary>
+    public event Action<ConnectionQuality>? OnConnectionQualityChanged;
+
     public bool IsConnected => _connected && !_disposed;
 
     /// <summary>Whether the transport is currently using a direct UDP backend (vs WebSocket relay).</summary>
     public bool IsDirectUdp => _backend is UdpTransportBackend;
+
+    /// <summary>Connection quality monitor - active only when on UDP transport.</summary>
+    public ConnectionQualityMonitor? QualityMonitor => _qualityMonitor;
+    protected ConnectionQualityMonitor? _qualityMonitor;
+    private Timer? _qualityUpdateTimer;
 
     protected StreamTransport(ILogger logger)
     {
@@ -293,7 +302,7 @@ public abstract class StreamTransport : IAsyncDisposable
     /// Switch to a different transport backend (e.g., upgrade from WebSocket relay to direct UDP).
     /// The old backend is disposed after switching.
     /// </summary>
-    protected async Task SwitchBackendAsync(ITransportBackend newBackend)
+    protected Task SwitchBackendAsync(ITransportBackend newBackend)
     {
         var oldBackend = _backend;
         _logger.LogInformation("[TRANSPORT] Switching backend: {Old} → {New}",
@@ -310,12 +319,23 @@ public abstract class StreamTransport : IAsyncDisposable
         newBackend.OnDataReceived += HandleDataReceived;
         newBackend.OnDisconnected += HandleBackendDisconnected;
 
+        // Don't dispose old backend immediately — keep it alive as safety net.
+        // If the peer hasn't switched yet, they may still be sending on the old transport.
         if (oldBackend != null)
         {
-            await oldBackend.DisposeAsync();
+            _ = DisposeAfterGracePeriodAsync(oldBackend);
         }
 
         _logger.LogInformation("[TRANSPORT] Backend switch complete → {Backend}", newBackend.GetType().Name);
+        return Task.CompletedTask;
+    }
+
+    private async Task DisposeAfterGracePeriodAsync(ITransportBackend oldBackend)
+    {
+        await Task.Delay(10_000);
+        try { await oldBackend.DisposeAsync(); }
+        catch { }
+        _logger.LogDebug("[TRANSPORT] Old backend disposed after 10s grace period");
     }
 
     /// <summary>
@@ -329,8 +349,47 @@ public abstract class StreamTransport : IAsyncDisposable
             var pending = _pendingUdpBackend;
             _pendingUdpBackend = null;
             await SwitchBackendAsync(pending);
-            _logger.LogInformation("Both sides confirmed UDP — backend switched to direct");
+            _logger.LogInformation("Both sides confirmed UDP - backend switched to direct");
+
+            // Start quality monitoring on the new UDP backend
+            if (pending is UdpTransportBackend udp)
+                StartQualityMonitor(udp, udp.ProbeRtt);
         }
+    }
+
+    /// <summary>
+    /// Start the connection quality monitor. Called after switching to UDP backend.
+    /// Feeds loss rate from UdpTransportBackend every 10 seconds.
+    /// </summary>
+    protected void StartQualityMonitor(UdpTransportBackend udpBackend, TimeSpan? probeRtt)
+    {
+        _qualityMonitor = new ConnectionQualityMonitor(_logger);
+        _qualityMonitor.OnQualityChanged += q => OnConnectionQualityChanged?.Invoke(q);
+        if (probeRtt.HasValue)
+            _qualityMonitor.RecordProbeRtt(probeRtt.Value);
+
+        _qualityUpdateTimer = new Timer(_ =>
+        {
+            if (_disposed || !_connected) return;
+            try
+            {
+                var (lossRate, messageCount) = udpBackend.GetAndResetLossStats();
+                _qualityMonitor.Update(lossRate, messageCount);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Quality monitor update failed");
+            }
+        }, null, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(10));
+
+        _logger.LogInformation("[TRANSPORT] Connection quality monitor started (10s interval)");
+    }
+
+    private void StopQualityMonitor()
+    {
+        _qualityUpdateTimer?.Dispose();
+        _qualityUpdateTimer = null;
+        _qualityMonitor = null;
     }
 
     private void HandleBackendDisconnected()
@@ -405,6 +464,8 @@ public abstract class StreamTransport : IAsyncDisposable
         if (_disposed) return;
         _disposed = true;
         _connected = false;
+
+        StopQualityMonitor();
 
         // Dispose pending UDP backend if switch never completed
         if (_pendingUdpBackend != null)

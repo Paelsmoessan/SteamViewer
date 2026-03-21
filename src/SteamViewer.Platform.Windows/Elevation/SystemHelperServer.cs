@@ -58,6 +58,16 @@ public static class SystemHelperServer
     private const uint SE_PRIVILEGE_ENABLED = 0x00000002;
     private const string SE_TCB_NAME = "SeTcbPrivilege";
 
+    // Runtime UIAccess — set TokenUIAccess flag on process token to qualify for SendSAS(true).
+    // Requires SeTcbPrivilege (SYSTEM has it). Bypasses signing + protected location checks.
+    // Source: .claude/research/sendsas-ctrl-alt-del/research.md (Tyranid's Lair, James Forshaw)
+    private const int TokenUIAccess = 26;
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetTokenInformation(IntPtr tokenHandle,
+        int tokenInformationClass, ref uint tokenInformation, uint tokenInformationLength);
+
     [DllImport("kernel32.dll")]
     private static extern IntPtr GetCurrentProcess();
 
@@ -136,6 +146,7 @@ public static class SystemHelperServer
     private static Thread? _inputThread;
 
     private static string? _debugPath;
+    private static string? _debugPathLocal;
     private static SecureDesktopCapture? _capture;
 
     // Video pipe for binary JPEG frames (server → client)
@@ -155,6 +166,7 @@ public static class SystemHelperServer
         var line = $"[{DateTime.Now:HH:mm:ss.fff}] {message}";
         Console.WriteLine($"[SystemHelper] {message}");
         try { if (_debugPath != null) File.AppendAllText(_debugPath, line + "\n"); } catch { }
+        try { if (_debugPathLocal != null) File.AppendAllText(_debugPathLocal, line + "\n"); } catch { }
     }
 
     /// <summary>
@@ -168,6 +180,14 @@ public static class SystemHelperServer
             Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
             "SteamViewer", "system-helper-debug.txt");
         try { Directory.CreateDirectory(Path.GetDirectoryName(_debugPath)!); } catch { }
+
+        // Also log next to exe (readable via network share from Dev PC)
+        var exeDir = Path.GetDirectoryName(Environment.ProcessPath);
+        if (exeDir != null)
+        {
+            _debugPathLocal = Path.Combine(exeDir, "logs", "system-helper-debug.txt");
+            try { Directory.CreateDirectory(Path.GetDirectoryName(_debugPathLocal)!); } catch { }
+        }
 
         DebugLog($"Starting SYSTEM pipe server: {pipeName} (PID {Environment.ProcessId})");
         DebugLog($"Running as: {Environment.UserName} (SYSTEM expected)");
@@ -264,7 +284,7 @@ public static class SystemHelperServer
 
             DebugLog("Authentication succeeded. Starting video pipe and Secure Desktop capture...");
 
-            // Create video pipe for binary JPEG frames (server → client, outbound only)
+            // Create video pipe for binary BGRA frames (server -> client, outbound only)
             var videoPipeName = $"{pipeName}_video";
             var videoPipeSecurity = new PipeSecurity();
             videoPipeSecurity.AddAccessRule(new PipeAccessRule(
@@ -484,7 +504,7 @@ public static class SystemHelperServer
 
     private static int _frameCount;
 
-    private static void OnCaptureFrameCaptured(byte[] jpegData, int width, int height)
+    private static void OnCaptureFrameCaptured(byte[] bgraData, int width, int height, int stride)
     {
         if (!_videoConnected || _videoWriter == null) return;
 
@@ -493,13 +513,19 @@ public static class SystemHelperServer
             try
             {
                 _frameCount++;
+                var dataSize = stride * height;
                 if (_frameCount <= 3 || _frameCount % 100 == 0)
-                    DebugLog($"Video frame #{_frameCount}: {jpegData.Length} bytes ({width}x{height})");
+                    DebugLog($"Video frame #{_frameCount}: {dataSize}b BGRA ({width}x{height}, stride={stride}), writing to pipe...");
 
-                // Binary frame protocol: [uint32 length][jpeg bytes]
-                _videoWriter.Write((uint)jpegData.Length);
-                _videoWriter.Write(jpegData);
+                // Binary frame protocol: [uint32 width][uint32 height][uint32 stride][BGRA pixels]
+                _videoWriter.Write((uint)width);
+                _videoWriter.Write((uint)height);
+                _videoWriter.Write((uint)stride);
+                _videoWriter.Write(bgraData, 0, dataSize);
                 _videoWriter.Flush();
+
+                if (_frameCount <= 3)
+                    DebugLog($"Video frame #{_frameCount}: pipe write complete ({12 + dataSize}b total)");
             }
             catch (IOException)
             {
@@ -626,21 +652,30 @@ public static class SystemHelperServer
             // Re-check registry before each call — GPO can overwrite between calls
             EnsureSoftwareSASEnabled();
 
-            // Try process token first (cheap)
-            if (EnableTcbPrivilege())
+            if (!EnableTcbPrivilege())
             {
-                DebugLog("Calling SendSAS(false) with process token...");
-                SendSAS(false);
-                DebugLog("SendSAS(false) returned with process token");
+                DebugLog("SAS: SeTcbPrivilege not available — trying winlogon impersonation");
+                if (!CallSendSASWithImpersonation())
+                    return JsonSerializer.Serialize(new HelperResponse(false, "SeTcbPrivilege unavailable and impersonation failed"));
+                return JsonSerializer.Serialize(new HelperResponse(true, null));
+            }
+
+            // Option E: Set UIAccess flag on our process token at runtime.
+            // Requires SeTcbPrivilege (SYSTEM has it). Bypasses signing + protected location checks.
+            // Then SendSAS(true) — we're now a UIAccess app.
+            // Source: .claude/research/sendsas-ctrl-alt-del/research.md
+            if (SetUIAccessOnProcessToken())
+            {
+                DebugLog("Calling SendSAS(true) as UIAccess app...");
+                SendSAS(true);
+                DebugLog("SendSAS(true) returned — SAS should have fired");
             }
             else
             {
-                // Fallback: impersonate winlogon's token which has SeTcbPrivilege
-                DebugLog("Process token lacks SeTcbPrivilege — trying winlogon impersonation");
-                if (!CallSendSASWithImpersonation())
-                {
-                    return JsonSerializer.Serialize(new HelperResponse(false, "Both SAS methods failed"));
-                }
+                // Fallback: try SendSAS(false) anyway — won't work unless we're a service, but log the attempt
+                DebugLog("SetUIAccess failed — falling back to SendSAS(false) (unlikely to work)");
+                SendSAS(false);
+                DebugLog("SendSAS(false) returned (fallback)");
             }
 
             return JsonSerializer.Serialize(new HelperResponse(true, null));
@@ -649,6 +684,38 @@ public static class SystemHelperServer
         {
             DebugLog($"SendSAS failed: {ex.Message}");
             return JsonSerializer.Serialize(new HelperResponse(false, ex.Message));
+        }
+    }
+
+    /// <summary>
+    /// Set the UIAccess flag on the current process token at runtime.
+    /// This makes Windows treat our process as a UIAccess app, qualifying for SendSAS(true).
+    /// Requires SeTcbPrivilege — only SYSTEM processes have it.
+    /// Bypasses the signing + protected location checks enforced by AppInfo during CreateProcess.
+    /// Source: Tyranid's Lair (James Forshaw, Google Project Zero)
+    /// </summary>
+    private static bool SetUIAccessOnProcessToken()
+    {
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, out var token))
+        {
+            DebugLog($"SetUIAccess: OpenProcessToken failed ({Marshal.GetLastWin32Error()})");
+            return false;
+        }
+
+        try
+        {
+            uint uiAccess = 1;
+            if (!SetTokenInformation(token, TokenUIAccess, ref uiAccess, 4))
+            {
+                DebugLog($"SetUIAccess: SetTokenInformation(TokenUIAccess=1) failed ({Marshal.GetLastWin32Error()})");
+                return false;
+            }
+            DebugLog("SetUIAccess: TokenUIAccess flag set — process is now UIAccess");
+            return true;
+        }
+        finally
+        {
+            CloseHandle(token);
         }
     }
 
@@ -876,6 +943,9 @@ public static class SystemHelperServer
             // Always enqueue — the input thread handles both Default and Secure Desktop
             // by switching desktops dynamically (clean thread, no prior user32 calls)
             _inputQueue?.TryAdd((rawJson, sw, sh));
+
+            // Notify capture thread of input activity (event-driven capture)
+            _capture?.NotifyInputActivity();
         }
         catch (Exception ex)
         {

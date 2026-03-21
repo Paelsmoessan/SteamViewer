@@ -17,6 +17,8 @@ public sealed class SignalingClient : IAsyncDisposable
     private ClientWebSocket? _webSocket;
     private CancellationTokenSource? _cts;
     private Task? _receiveTask;
+    private PeriodicTimer? _pingTimer;
+    private Task? _pingTask;
     private Channel<SignalingMessage> _incomingMessages;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
 
@@ -87,6 +89,10 @@ public sealed class SignalingClient : IAsyncDisposable
 
             // Start receive loop
             _receiveTask = ReceiveLoopAsync(_cts.Token);
+
+            // Start keepalive ping timer (prevents Railway proxy from killing idle WS connections)
+            _pingTimer = new PeriodicTimer(TimeSpan.FromSeconds(25));
+            _pingTask = PingLoopAsync(_pingTimer, _cts.Token);
         }
         catch (Exception ex)
         {
@@ -305,11 +311,13 @@ public sealed class SignalingClient : IAsyncDisposable
         {
             _logger.LogWarning(ex, "WebSocket error in receive loop");
             OnError?.Invoke(ex);
+            OnDisconnected?.Invoke($"WebSocket error: {ex.Message}");
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Unexpected error in receive loop");
             OnError?.Invoke(ex);
+            OnDisconnected?.Invoke($"Receive loop error: {ex.Message}");
         }
         finally
         {
@@ -326,13 +334,43 @@ public sealed class SignalingClient : IAsyncDisposable
         await DisposeInternalAsync();
     }
 
+    private async Task PingLoopAsync(PeriodicTimer timer, CancellationToken ct)
+    {
+        try
+        {
+            while (await timer.WaitForNextTickAsync(ct))
+            {
+                try
+                {
+                    await PingAsync(ct);
+                    _logger.LogTrace("Keepalive ping sent");
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Keepalive ping failed");
+                    break;
+                }
+            }
+        }
+        catch (OperationCanceledException) { }
+    }
+
     private async Task DisposeInternalAsync()
     {
+        // Stop ping timer
+        _pingTimer?.Dispose();
+        _pingTimer = null;
+
         // First, cancel the receive loop so it exits cleanly
         // This prevents WebSocketException from being raised as an error
         _cts?.Cancel();
 
-        // Wait for receive loop to exit
+        // Wait for ping loop and receive loop to exit
+        if (_pingTask != null)
+        {
+            try { await _pingTask.WaitAsync(TimeSpan.FromSeconds(1)); }
+            catch { }
+        }
         if (_receiveTask != null)
         {
             try

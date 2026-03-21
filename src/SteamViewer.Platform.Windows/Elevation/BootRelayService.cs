@@ -21,6 +21,7 @@ namespace SteamViewer.Platform.Windows.Elevation;
 public static class BootRelayService
 {
     private static string? _debugPath;
+    private static string? _debugPathLocal;
     private static SecureDesktopCapture? _capture;
     private static RTCPeerConnection? _peerConnection;
     private static RTCDataChannel? _dataChannel;
@@ -80,6 +81,7 @@ public static class BootRelayService
         var line = $"[{DateTime.Now:HH:mm:ss.fff}] [BootRelay] {message}";
         Console.WriteLine(line);
         try { if (_debugPath != null) File.AppendAllText(_debugPath, line + "\n"); } catch { }
+        try { if (_debugPathLocal != null) File.AppendAllText(_debugPathLocal, line + "\n"); } catch { }
     }
 
     /// <summary>
@@ -92,6 +94,14 @@ public static class BootRelayService
             Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
             "SteamViewer", "boot-relay-debug.txt");
         try { Directory.CreateDirectory(Path.GetDirectoryName(_debugPath)!); } catch { }
+
+        // Also log next to exe (readable via network share from Dev PC)
+        var exeDir = Path.GetDirectoryName(Environment.ProcessPath);
+        if (exeDir != null)
+        {
+            _debugPathLocal = Path.Combine(exeDir, "logs", "boot-relay-debug.txt");
+            try { Directory.CreateDirectory(Path.GetDirectoryName(_debugPathLocal)!); } catch { }
+        }
 
         DebugLog($"Starting boot relay (PID {Environment.ProcessId}, User: {Environment.UserName})");
 
@@ -448,21 +458,41 @@ public static class BootRelayService
 
     private static int _frameCount;
 
-    private static void OnFrameCaptured(byte[] jpegData, int width, int height)
+    private static void OnFrameCaptured(byte[] bgraData, int width, int height, int stride)
     {
         _frameCount++;
         if (_frameCount <= 3 || _frameCount % 100 == 0)
-            DebugLog($"Frame #{_frameCount}: {jpegData.Length}b, {width}x{height}");
+            DebugLog($"Frame #{_frameCount}: {bgraData.Length}b BGRA, {width}x{height}");
 
-        var base64 = Convert.ToBase64String(jpegData);
-        var msg = JsonSerializer.Serialize(new
+        // Convert BGRA to JPEG for data channel (boot relay uses WebRTC DC, not StreamTransport)
+        var pin = System.Runtime.InteropServices.GCHandle.Alloc(bgraData, System.Runtime.InteropServices.GCHandleType.Pinned);
+        try
         {
-            type = "secureDesktopFrame",
-            data = base64,
-            width,
-            height
-        });
-        SendDataChannelMessage(msg);
+            using var bitmap = new System.Drawing.Bitmap(width, height, stride,
+                System.Drawing.Imaging.PixelFormat.Format32bppArgb,
+                pin.AddrOfPinnedObject());
+            using var ms = new MemoryStream();
+            bitmap.Save(ms, System.Drawing.Imaging.ImageFormat.Jpeg);
+            var jpegData = ms.ToArray();
+
+            var base64 = Convert.ToBase64String(jpegData);
+            var msg = JsonSerializer.Serialize(new
+            {
+                type = "secureDesktopFrame",
+                data = base64,
+                width,
+                height
+            });
+            SendDataChannelMessage(msg);
+        }
+        catch (Exception ex)
+        {
+            DebugLog($"Frame encode error: {ex.Message}");
+        }
+        finally
+        {
+            pin.Free();
+        }
     }
 
     private static void SendDataChannelMessage(string message)

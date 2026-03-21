@@ -22,7 +22,7 @@ public sealed class WindowsElevationService : IElevationService
     public bool IsSystemConnected => _systemHelper?.IsConnected ?? false;
     public bool IsSecureDesktopActive => _systemHelper?.IsSecureDesktopActive ?? false;
 
-    public event Action<byte[], int, int>? OnSecureDesktopFrame;
+    public event Action<byte[], int, int, int>? OnSecureDesktopFrame;
     public event Action<bool>? OnSecureDesktopStateChanged;
     public event Action<bool>? OnAdminStateChanged;
     public event Action<bool>? OnSystemStateChanged;
@@ -276,14 +276,14 @@ public sealed class WindowsElevationService : IElevationService
 
     private int _sdFrameForwardCount;
 
-    private void HandleSecureDesktopFrame(byte[] jpegData, int width, int height)
+    private void HandleSecureDesktopFrame(byte[] bgraData, int width, int height, int stride)
     {
         _sdFrameForwardCount++;
         if (_sdFrameForwardCount <= 3 || _sdFrameForwardCount % 100 == 0)
-            _logger.LogInformation("Forwarding SD frame #{Count}: {Bytes}b {W}x{H}, subscribers={Sub}",
-                _sdFrameForwardCount, jpegData.Length, width, height,
+            _logger.LogInformation("Forwarding SD frame #{Count}: {Bytes}b BGRA {W}x{H}, subscribers={Sub}",
+                _sdFrameForwardCount, bgraData.Length, width, height,
                 OnSecureDesktopFrame?.GetInvocationList().Length ?? 0);
-        OnSecureDesktopFrame?.Invoke(jpegData, width, height);
+        OnSecureDesktopFrame?.Invoke(bgraData, width, height, stride);
     }
 
     private void HandleSecureDesktopStateChanged(bool active)

@@ -41,6 +41,9 @@ public sealed class DxgiScreenCapture : IScreenCapture
     private volatile bool _stopRequested;
     private uint _currentOutputIndex;
 
+    // Signal to wake DXGI from SD polling sleep (fired when SD exits)
+    private readonly ManualResetEventSlim _desktopAvailableSignal = new(false);
+
     // Reusable frame buffer — avoids ~8MB allocation per frame (240MB/s GC pressure at 30fps)
     private byte[]? _frameBuffer;
 
@@ -52,6 +55,15 @@ public sealed class DxgiScreenCapture : IScreenCapture
     public (int Width, int Height) Resolution => (_width, _height);
 
     public bool IsCapturing => _isCapturing;
+
+    /// <summary>
+    /// Signal that the Secure Desktop has exited - wake the DXGI retry loop immediately.
+    /// Called from HostSession when OnSecureDesktopStateChanged(false) fires.
+    /// </summary>
+    public void NotifyDesktopAvailable()
+    {
+        _desktopAvailableSignal.Set();
+    }
 
     /// <summary>Whether to composite the host cursor onto captured frames. Default true.</summary>
     public bool ShowCursor { get; set; } = true;
@@ -168,8 +180,7 @@ public sealed class DxgiScreenCapture : IScreenCapture
         var jpegStream = new MemoryStream(512 * 1024); // Pre-allocate 512KB, reuse across frames
         var frameCount = 0;
         var consecutiveErrors = 0;
-        var reinitStartTicks = 0L; // Timestamp when reinitialize retries began
-        const long maxReinitDurationTicks = 120; // 2 minutes (compared against elapsed seconds)
+        var reinitStartTicks = 0L; // Timestamp when reinit attempts began (reset when SD exits)
         const int targetIntervalMs = 33; // ~30 FPS target
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var idleSw = System.Diagnostics.Stopwatch.StartNew(); // Tracks time since last frame fired
@@ -274,41 +285,66 @@ public sealed class DxgiScreenCapture : IScreenCapture
                     ex.Message.Contains("access lost", StringComparison.OrdinalIgnoreCase) ||
                     ex.Message.Contains("Not capturing", StringComparison.OrdinalIgnoreCase))
                 {
-                    _logger.LogWarning("[DXGI-TRAP] Caught InvalidOperationException in reinit handler: {Message}", ex.Message);
                     // DXGI_ERROR_ACCESS_LOST or resources released after failed reinitialize
                     // Triggers: desktop switch (UAC Secure Desktop), hot-plug, lock screen, display mode change
                     consecutiveErrors++;
 
-                    // Start the reinit clock on first error
                     if (consecutiveErrors == 1)
+                        _logger.LogWarning("DXGI access lost: {Message}", ex.Message);
+
+                    // Phase 1: While Secure Desktop is active, don't waste time on DuplicateOutput.
+                    // Just poll until Default desktop is available (Microsoft/Sunshine pattern).
+                    if (!IsDefaultDesktopAvailable())
+                    {
+                        if (consecutiveErrors == 1 || consecutiveErrors % 20 == 0)
+                            _logger.LogInformation("DXGI waiting for Secure Desktop to exit (attempt {Count})", consecutiveErrors);
+                        // Wait up to 500ms, but wake immediately if NotifyDesktopAvailable() is called
+                        _desktopAvailableSignal.Wait(500);
+                        _desktopAvailableSignal.Reset();
+                        continue; // Don't attempt reinit, don't count against timeout
+                    }
+
+                    // Phase 2: Default desktop is back — reset clock and attempt reinit.
+                    // Start/reset the reinit clock on first attempt after desktop available
+                    if (reinitStartTicks == 0L)
+                    {
                         reinitStartTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+                        _logger.LogInformation("Default desktop available — starting DXGI reinit");
+                    }
 
                     var reinitElapsedSec = (System.Diagnostics.Stopwatch.GetTimestamp() - reinitStartTicks)
                         / (double)System.Diagnostics.Stopwatch.Frequency;
 
-                    _logger.LogWarning("DXGI needs reinitialize: {Message} (attempt {Count}, {Elapsed:F0}s elapsed)",
-                        ex.Message, consecutiveErrors, reinitElapsedSec);
+                    // Progressive backoff: 250ms x20 (5s), then 2s x60 (2min), then 5s indefinitely
+                    // Never give up (Microsoft Desktop Duplication sample pattern)
+                    int sleepMs;
+                    if (consecutiveErrors <= 20) sleepMs = 250;
+                    else if (consecutiveErrors <= 80) sleepMs = 2000;
+                    else sleepMs = 5000;
 
-                    if (reinitElapsedSec > maxReinitDurationTicks)
-                    {
-                        _logger.LogError("DXGI reinitialize failed for over 2 minutes, stopping capture");
-                        break;
-                    }
-
-                    // Wait then reinitialize — first attempt immediate, then 250ms between retries
                     if (consecutiveErrors > 1)
-                        Thread.Sleep(250);
+                        Thread.Sleep(sleepMs);
 
                     try
                     {
-                        Reinitialize();
+                        // Try light reinit first (just DuplicateOutput, keep D3D device)
+                        // Falls back to full reinit if light reinit fails
+                        bool success = TryReinitDuplication();
+                        if (!success)
+                        {
+                            _logger.LogDebug("Light DXGI reinit failed, trying full reinitialize");
+                            Reinitialize();
+                        }
                         // Success — reset for next desktop switch event
                         consecutiveErrors = 0;
-                        _logger.LogInformation("DXGI reinitialize succeeded after {Elapsed:F1}s", reinitElapsedSec);
+                        reinitStartTicks = 0L;
+                        _logger.LogInformation("DXGI reinitialize succeeded after {Elapsed:F1}s ({Method})",
+                            reinitElapsedSec, success ? "light" : "full");
                     }
                     catch (Exception reinitEx)
                     {
-                        _logger.LogWarning(reinitEx, "DXGI reinitialize failed, will retry");
+                        if (consecutiveErrors <= 5 || consecutiveErrors % 20 == 0)
+                            _logger.LogWarning(reinitEx, "DXGI reinitialize failed (attempt {Count}, {Elapsed:F1}s)", consecutiveErrors, reinitElapsedSec);
                     }
                 }
                 catch (Exception ex)
@@ -397,6 +433,110 @@ public sealed class DxgiScreenCapture : IScreenCapture
         _logger.LogInformation("DXGI reinitialized on output {Output} ({W}x{H})",
             _currentOutputIndex, _width, _height);
     }
+
+    /// <summary>
+    /// Light reinit: only retry DuplicateOutput on existing D3D device.
+    /// Much faster than full Reinitialize() which recreates the D3D device.
+    /// Syncs thread desktop before attempting DuplicateOutput (Microsoft/Sunshine pattern).
+    /// Returns true on success.
+    /// </summary>
+    private bool TryReinitDuplication()
+    {
+        if (_device == null)
+            return false;
+
+        try
+        {
+            // Sync thread to current input desktop before DuplicateOutput
+            // (Microsoft Desktop Duplication sample + Sunshine pattern)
+            if (!SyncThreadDesktop())
+                return false;
+
+            _duplication?.Dispose();
+            _duplication = null;
+
+            var (adapterIndex, outputIndex) = ParseMonitorId(_currentOutputIndex);
+            using var factory = DXGIFactory.CreateDXGIFactory1<IDXGIFactory1>();
+            var adapterResult = factory.EnumAdapters1((int)adapterIndex, out var adapter);
+            if (adapterResult.Failure || adapter == null)
+                return false;
+
+            using (adapter)
+            {
+                var outputResult = adapter.EnumOutputs((int)outputIndex, out var output);
+                if (outputResult.Failure || output == null)
+                    return false;
+
+                using (output)
+                using (var output1 = output.QueryInterface<IDXGIOutput1>())
+                {
+                    _duplication = output1.DuplicateOutput(_device);
+                    return _duplication != null;
+                }
+            }
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Sync the capture thread to the current input desktop.
+    /// Must be called before DuplicateOutput — without this, the thread may be
+    /// stuck on a stale/Secure Desktop and DuplicateOutput will fail with E_ACCESSDENIED.
+    /// Pattern from Microsoft Desktop Duplication sample and Sunshine.
+    /// </summary>
+    private bool SyncThreadDesktop()
+    {
+        var hDesk = OpenInputDesktop(0, false, DESKTOP_GENERIC_ALL);
+        if (hDesk == IntPtr.Zero)
+            return false;
+
+        var result = SetThreadDesktop(hDesk);
+        CloseDesktop(hDesk);
+        return result;
+    }
+
+    /// <summary>
+    /// Check if the current input desktop is the normal Default desktop (not Winlogon/Secure Desktop).
+    /// Returns false while Secure Desktop is active — caller should skip DuplicateOutput attempts.
+    /// </summary>
+    private bool IsDefaultDesktopAvailable()
+    {
+        var hDesk = OpenInputDesktop(0, false, DESKTOP_READOBJECTS);
+        if (hDesk == IntPtr.Zero)
+            return false;
+
+        var name = GetDesktopName(hDesk);
+        CloseDesktop(hDesk);
+        return !string.Equals(name, "Winlogon", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string GetDesktopName(IntPtr hDesktop)
+    {
+        var buffer = new byte[256];
+        if (GetUserObjectInformationW(hDesktop, UOI_NAME, buffer, buffer.Length, out _))
+            return System.Text.Encoding.Unicode.GetString(buffer).TrimEnd('\0');
+        return string.Empty;
+    }
+
+    private const uint DESKTOP_READOBJECTS = 0x0001;
+    private const uint DESKTOP_SWITCHDESKTOP = 0x0100;
+    private const uint DESKTOP_GENERIC_ALL = 0x000F01FF;
+    private const int UOI_NAME = 2;
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr OpenInputDesktop(uint dwFlags, bool fInherit, uint dwDesiredAccess);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool SetThreadDesktop(IntPtr hDesktop);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool CloseDesktop(IntPtr hDesktop);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool GetUserObjectInformationW(IntPtr hObj, int nIndex, byte[] pvInfo, int nLength, out int lpnLengthNeeded);
 
     /// <summary>
     /// Release all DXGI/D3D11 resources without disposing the outer object.
@@ -549,6 +689,10 @@ public sealed class DxgiScreenCapture : IScreenCapture
 
         // Get IDXGIOutput1 for desktop duplication
         using var output1 = output.QueryInterface<IDXGIOutput1>();
+
+        // Sync thread to current input desktop before DuplicateOutput
+        // (matches Microsoft sample + Sunshine pattern — prevents E_ACCESSDENIED after SD)
+        SyncThreadDesktop();
 
         // Create desktop duplication
         try
@@ -896,6 +1040,7 @@ public sealed class DxgiScreenCapture : IScreenCapture
         _disposed = true;
 
         StopCaptureLoop();
+        _desktopAvailableSignal.Dispose();
         ReleaseResources();
 
         _logger.LogDebug("DXGI screen capture disposed");
