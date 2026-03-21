@@ -41,6 +41,9 @@ public sealed class DxgiScreenCapture : IScreenCapture
     private volatile bool _stopRequested;
     private uint _currentOutputIndex;
 
+    // Signal to wake DXGI from SD polling sleep (fired when SD exits)
+    private readonly ManualResetEventSlim _desktopAvailableSignal = new(false);
+
     // Reusable frame buffer — avoids ~8MB allocation per frame (240MB/s GC pressure at 30fps)
     private byte[]? _frameBuffer;
 
@@ -52,6 +55,15 @@ public sealed class DxgiScreenCapture : IScreenCapture
     public (int Width, int Height) Resolution => (_width, _height);
 
     public bool IsCapturing => _isCapturing;
+
+    /// <summary>
+    /// Signal that the Secure Desktop has exited - wake the DXGI retry loop immediately.
+    /// Called from HostSession when OnSecureDesktopStateChanged(false) fires.
+    /// </summary>
+    public void NotifyDesktopAvailable()
+    {
+        _desktopAvailableSignal.Set();
+    }
 
     /// <summary>Whether to composite the host cursor onto captured frames. Default true.</summary>
     public bool ShowCursor { get; set; } = true;
@@ -286,7 +298,9 @@ public sealed class DxgiScreenCapture : IScreenCapture
                     {
                         if (consecutiveErrors == 1 || consecutiveErrors % 20 == 0)
                             _logger.LogInformation("DXGI waiting for Secure Desktop to exit (attempt {Count})", consecutiveErrors);
-                        Thread.Sleep(500);
+                        // Wait up to 500ms, but wake immediately if NotifyDesktopAvailable() is called
+                        _desktopAvailableSignal.Wait(500);
+                        _desktopAvailableSignal.Reset();
                         continue; // Don't attempt reinit, don't count against timeout
                     }
 
@@ -1026,6 +1040,7 @@ public sealed class DxgiScreenCapture : IScreenCapture
         _disposed = true;
 
         StopCaptureLoop();
+        _desktopAvailableSignal.Dispose();
         ReleaseResources();
 
         _logger.LogDebug("DXGI screen capture disposed");

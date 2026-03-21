@@ -1028,76 +1028,9 @@ window.SteamViewerSecureDesktop = {
 
     hide(canvasId) {
         this.isActive = false;
-        if (canvasId) {
-            const canvas = document.getElementById(canvasId);
-            if (canvas) {
-                const ctx = canvas.getContext('2d');
-                ctx.clearRect(0, 0, canvas.width, canvas.height);
-            }
-        }
         this.canvas = null;
         this.ctx = null;
         console.log('[SD] Overlay hidden');
-    },
-
-    renderFrame(base64Jpeg, width, height) {
-        if (!this.isActive || !this.ctx) return;
-        this._width = width;
-        this._height = height;
-
-        const img = new Image();
-        img.onload = () => {
-            // Apply same high-quality scaling as normal video path
-            const rect = this.canvas.getBoundingClientRect();
-            const dpr = window.devicePixelRatio || 1;
-            const displayW = Math.round(rect.width * dpr);
-            const displayH = Math.round(rect.height * dpr);
-            const scale = Math.min(displayW / width, displayH / height);
-
-            if (scale < 0.95) {
-                // Downscale: canvas = display pixels, Mitchell-Netravali cubic
-                if (this.canvas.width !== displayW || this.canvas.height !== displayH) {
-                    this.canvas.width = displayW;
-                    this.canvas.height = displayH;
-                    this.ctx.imageSmoothingEnabled = true;
-                    this.ctx.imageSmoothingQuality = 'high';
-                }
-                const fitW = Math.round(width * scale);
-                const fitH = Math.round(height * scale);
-                const dx = Math.round((displayW - fitW) / 2);
-                const dy = Math.round((displayH - fitH) / 2);
-                if (dx > 0 || dy > 0) this.ctx.clearRect(0, 0, displayW, displayH);
-                this.ctx.drawImage(img, dx, dy, fitW, fitH);
-            } else {
-                // 1:1 or upscale
-                if (this.canvas.width !== width) this.canvas.width = width;
-                if (this.canvas.height !== height) this.canvas.height = height;
-                this.ctx.drawImage(img, 0, 0, width, height);
-            }
-            this._drawCursor();
-        };
-        img.src = 'data:image/jpeg;base64,' + base64Jpeg;
-    },
-
-    _drawCursor() {
-        if (!this.ctx) return;
-        const x = this._cursorX, y = this._cursorY;
-        this.ctx.save();
-        this.ctx.fillStyle = '#fff';
-        this.ctx.beginPath();
-        this.ctx.moveTo(x, y);
-        this.ctx.lineTo(x, y + 18);
-        this.ctx.lineTo(x + 5, y + 14);
-        this.ctx.lineTo(x + 10, y + 20);
-        this.ctx.lineTo(x + 13, y + 18);
-        this.ctx.lineTo(x + 8, y + 12);
-        this.ctx.lineTo(x + 14, y + 12);
-        this.ctx.closePath();
-        this.ctx.fill();
-        this.ctx.strokeStyle = '#000';
-        this.ctx.lineWidth = 1;
-        this.ctx.stroke();
-        this.ctx.restore();
     }
 };
 

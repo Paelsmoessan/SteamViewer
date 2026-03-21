@@ -284,7 +284,7 @@ public static class SystemHelperServer
 
             DebugLog("Authentication succeeded. Starting video pipe and Secure Desktop capture...");
 
-            // Create video pipe for binary JPEG frames (server → client, outbound only)
+            // Create video pipe for binary BGRA frames (server -> client, outbound only)
             var videoPipeName = $"{pipeName}_video";
             var videoPipeSecurity = new PipeSecurity();
             videoPipeSecurity.AddAccessRule(new PipeAccessRule(
@@ -504,7 +504,7 @@ public static class SystemHelperServer
 
     private static int _frameCount;
 
-    private static void OnCaptureFrameCaptured(byte[] jpegData, int width, int height)
+    private static void OnCaptureFrameCaptured(byte[] bgraData, int width, int height, int stride)
     {
         if (!_videoConnected || _videoWriter == null) return;
 
@@ -513,13 +513,19 @@ public static class SystemHelperServer
             try
             {
                 _frameCount++;
+                var dataSize = stride * height;
                 if (_frameCount <= 3 || _frameCount % 100 == 0)
-                    DebugLog($"Video frame #{_frameCount}: {jpegData.Length} bytes ({width}x{height})");
+                    DebugLog($"Video frame #{_frameCount}: {dataSize}b BGRA ({width}x{height}, stride={stride}), writing to pipe...");
 
-                // Binary frame protocol: [uint32 length][jpeg bytes]
-                _videoWriter.Write((uint)jpegData.Length);
-                _videoWriter.Write(jpegData);
+                // Binary frame protocol: [uint32 width][uint32 height][uint32 stride][BGRA pixels]
+                _videoWriter.Write((uint)width);
+                _videoWriter.Write((uint)height);
+                _videoWriter.Write((uint)stride);
+                _videoWriter.Write(bgraData, 0, dataSize);
                 _videoWriter.Flush();
+
+                if (_frameCount <= 3)
+                    DebugLog($"Video frame #{_frameCount}: pipe write complete ({12 + dataSize}b total)");
             }
             catch (IOException)
             {
@@ -627,36 +633,10 @@ public static class SystemHelperServer
             "sendSAS" => HandleSendSAS(),
             "runAsSystem" => HandleRunAsSystem(doc.RootElement),
             "injectInput" => HandleInjectInput(json, doc.RootElement),
-            "setCaptureQuality" => HandleSetCaptureQuality(doc.RootElement),
             "wakeCapture" => HandleWakeCapture(),
             "exit" => HandleExit(),
             _ => JsonSerializer.Serialize(new HelperResponse(false, $"Unknown command: {command}"))
         };
-    }
-
-    private static string HandleSetCaptureQuality(JsonElement root)
-    {
-        try
-        {
-            var targetFps = root.GetProperty("targetFps").GetInt32();
-            var jpegQuality = root.GetProperty("jpegQuality").GetInt32();
-
-            // Clamp to floors
-            targetFps = Math.Clamp(targetFps, 5, 10);
-            jpegQuality = Math.Clamp(jpegQuality, 75, 95);
-
-            if (_capture != null)
-            {
-                _capture.SetQuality(targetFps, jpegQuality);
-                DebugLog($"SetCaptureQuality: fps={targetFps}, quality={jpegQuality}");
-            }
-            return JsonSerializer.Serialize(new HelperResponse(true, null));
-        }
-        catch (Exception ex)
-        {
-            DebugLog($"SetCaptureQuality error: {ex.Message}");
-            return JsonSerializer.Serialize(new HelperResponse(false, ex.Message));
-        }
     }
 
     private static string HandleWakeCapture()
@@ -963,6 +943,9 @@ public static class SystemHelperServer
             // Always enqueue — the input thread handles both Default and Secure Desktop
             // by switching desktops dynamically (clean thread, no prior user32 calls)
             _inputQueue?.TryAdd((rawJson, sw, sh));
+
+            // Notify capture thread of input activity (event-driven capture)
+            _capture?.NotifyInputActivity();
         }
         catch (Exception ex)
         {

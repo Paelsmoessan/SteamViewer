@@ -458,21 +458,41 @@ public static class BootRelayService
 
     private static int _frameCount;
 
-    private static void OnFrameCaptured(byte[] jpegData, int width, int height)
+    private static void OnFrameCaptured(byte[] bgraData, int width, int height, int stride)
     {
         _frameCount++;
         if (_frameCount <= 3 || _frameCount % 100 == 0)
-            DebugLog($"Frame #{_frameCount}: {jpegData.Length}b, {width}x{height}");
+            DebugLog($"Frame #{_frameCount}: {bgraData.Length}b BGRA, {width}x{height}");
 
-        var base64 = Convert.ToBase64String(jpegData);
-        var msg = JsonSerializer.Serialize(new
+        // Convert BGRA to JPEG for data channel (boot relay uses WebRTC DC, not StreamTransport)
+        var pin = System.Runtime.InteropServices.GCHandle.Alloc(bgraData, System.Runtime.InteropServices.GCHandleType.Pinned);
+        try
         {
-            type = "secureDesktopFrame",
-            data = base64,
-            width,
-            height
-        });
-        SendDataChannelMessage(msg);
+            using var bitmap = new System.Drawing.Bitmap(width, height, stride,
+                System.Drawing.Imaging.PixelFormat.Format32bppArgb,
+                pin.AddrOfPinnedObject());
+            using var ms = new MemoryStream();
+            bitmap.Save(ms, System.Drawing.Imaging.ImageFormat.Jpeg);
+            var jpegData = ms.ToArray();
+
+            var base64 = Convert.ToBase64String(jpegData);
+            var msg = JsonSerializer.Serialize(new
+            {
+                type = "secureDesktopFrame",
+                data = base64,
+                width,
+                height
+            });
+            SendDataChannelMessage(msg);
+        }
+        catch (Exception ex)
+        {
+            DebugLog($"Frame encode error: {ex.Message}");
+        }
+        finally
+        {
+            pin.Free();
+        }
     }
 
     private static void SendDataChannelMessage(string message)

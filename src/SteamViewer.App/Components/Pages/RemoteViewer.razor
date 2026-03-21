@@ -185,11 +185,10 @@
             <button class="tab-add" title="New connection" @onclick="OpenConnectionDialog"><Icon Name="AppIcon.Plus" Size="14" /></button>
         </div>
         <div class="canvas-container" id="canvasContainer">
-            <canvas id="viewerCanvas" class="@(_secureDesktopActive ? "canvas-dimmed" : "")"></canvas>
-            <canvas id="secureDesktopOverlay" class="secure-desktop-overlay" style="display: @(_secureDesktopActive ? "block" : "none")"></canvas>
+            <canvas id="viewerCanvas"></canvas>
             @if (_secureDesktopActive)
             {
-                <div class="secure-desktop-banner">@(_secureDesktopFrameReceived ? "Secure Desktop (UAC)" : "Secure Desktop — Waiting...")</div>
+                <div class="secure-desktop-banner">Secure Desktop (UAC)</div>
             }
             @if (_tabs.Count == 0)
             {
@@ -276,8 +275,6 @@
     private bool? _hostSystemLevel;
     private bool _hasReceivedFrame;
     private bool _secureDesktopActive;
-    private bool _secureDesktopFrameReceived;
-    private CancellationTokenSource? _sdGraceCts;
     private List<MonitorInfo>? _hostMonitors;
     private int _activeMonitorId;
 
@@ -441,7 +438,6 @@
             _activeSession.OnControlMessage -= HandleControlMessage;
             _activeSession.OnClipboardReceived -= HandleClipboardReceived;
             _activeSession.OnSecureDesktopStateChanged -= HandleSecureDesktopStateChanged;
-            _activeSession.OnSecureDesktopFrame -= HandleSecureDesktopFrame;
             _activeSession.OnMonitorLayoutReceived -= HandleMonitorLayoutReceived;
             _activeSession.OnCaptureInfoReceived -= HandleCaptureInfoReceived;
             if (_statsVisible) _ = _activeSession.DisableStatsRelayAsync();
@@ -452,7 +448,6 @@
         _hasReceivedFrame = false;
         _showReconnectOverlay = false;
         _secureDesktopActive = false;
-        _secureDesktopFrameReceived = false;
         _reconnectTimer?.Dispose();
         _reconnectTimer = null;
 
@@ -477,7 +472,6 @@
                 _activeSession.OnControlMessage += HandleControlMessage;
                 _activeSession.OnClipboardReceived += HandleClipboardReceived;
                 _activeSession.OnSecureDesktopStateChanged += HandleSecureDesktopStateChanged;
-                _activeSession.OnSecureDesktopFrame += HandleSecureDesktopFrame;
                 _activeSession.OnMonitorLayoutReceived += HandleMonitorLayoutReceived;
                 _activeSession.OnCaptureInfoReceived += HandleCaptureInfoReceived;
 
@@ -1131,7 +1125,6 @@
 
     #region Secure Desktop
 
-    private int _sdRazorFrameCount;
 
     private void HandleCaptureInfoReceived(int width, int height)
     {
@@ -1150,113 +1143,18 @@
         FileLogger.Log("INFO", "RemoteViewer", $"HandleSecureDesktopStateChanged: active={active}");
         InvokeAsync(async () =>
         {
-            if (active)
-            {
-                // Cancel any pending grace timer — SD is active again
-                _sdGraceCts?.Cancel();
-                _sdGraceCts = null;
-
-                _secureDesktopActive = true;
-                _secureDesktopFrameReceived = false;
-                FileLogger.Log("INFO", "RemoteViewer", "Calling JS SteamViewerSecureDesktop.show");
-                await JSRuntime.InvokeVoidAsync("SteamViewerSecureDesktop.show", "secureDesktopOverlay");
-            }
-            else
-            {
-                // Don't hide immediately — SD frames may still be in flight via UDP
-                // Start a grace period; hide only if no new frames arrive
-                FileLogger.Log("INFO", "RemoteViewer", "SD inactive signaled — starting 1.5s grace period before hiding overlay");
-                _sdGraceCts?.Cancel();
-                var cts = new CancellationTokenSource();
-                _sdGraceCts = cts;
-
-                _ = Task.Run(async () =>
-                {
-                    try
-                    {
-                        await Task.Delay(1500, cts.Token);
-                        // Grace period expired with no new frames — hide overlay
-                        await InvokeAsync(async () =>
-                        {
-                            _secureDesktopActive = false;
-                            _secureDesktopFrameReceived = false;
-                            FileLogger.Log("INFO", "RemoteViewer", "SD grace period expired — hiding overlay");
-                            await JSRuntime.InvokeVoidAsync("SteamViewerSecureDesktop.hide", "secureDesktopOverlay");
-                            StateHasChanged();
-                            _ = RefocusCanvasAsync();
-                        });
-                        // Re-negotiate resolution after SD — desktop switch may have changed capture state
-                        await Task.Delay(200, CancellationToken.None);
-                        await InvokeAsync(async () => await SendDisplayResolutionAsync());
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        // Grace timer cancelled — new SD frame arrived, overlay stays visible
-                    }
-                });
-                return; // Don't call StateHasChanged/RefocusCanvas yet — grace timer handles it
-            }
+            _secureDesktopActive = active;
             StateHasChanged();
+
+            if (!active)
+            {
+                // Re-negotiate resolution after SD - desktop switch may have changed capture state
+                await Task.Delay(200);
+                await SendDisplayResolutionAsync();
+            }
+
             _ = RefocusCanvasAsync();
         });
-    }
-
-    private void HandleSecureDesktopFrame(string base64Jpeg, int width, int height)
-    {
-        _sdRazorFrameCount++;
-        if (_sdRazorFrameCount <= 3 || _sdRazorFrameCount % 100 == 0)
-            FileLogger.Log("INFO", "RemoteViewer", $"SD frame #{_sdRazorFrameCount}: {base64Jpeg.Length} chars, {width}x{height}, active={_secureDesktopActive}");
-
-        // SD frame arrival is proof that SD is (or was just) active — never drop frames.
-        // The race condition: secureDesktopInactive arrives via WS before buffered SD frames via UDP.
-        // Reset grace timer if one is running (SD still producing frames)
-        if (_sdGraceCts != null)
-        {
-            FileLogger.Log("DEBUG", "RemoteViewer", "SD frame during grace period — resetting timer");
-            _sdGraceCts.Cancel();
-            var cts = new CancellationTokenSource();
-            _sdGraceCts = cts;
-
-            _ = Task.Run(async () =>
-            {
-                try
-                {
-                    await Task.Delay(1500, cts.Token);
-                    await InvokeAsync(async () =>
-                    {
-                        _secureDesktopActive = false;
-                        _secureDesktopFrameReceived = false;
-                        FileLogger.Log("INFO", "RemoteViewer", "SD grace period expired (reset) — hiding overlay");
-                        await JSRuntime.InvokeVoidAsync("SteamViewerSecureDesktop.hide", "secureDesktopOverlay");
-                        StateHasChanged();
-                        _ = RefocusCanvasAsync();
-                    });
-                    await Task.Delay(200, CancellationToken.None);
-                    await InvokeAsync(async () => await SendDisplayResolutionAsync());
-                }
-                catch (OperationCanceledException) { }
-            });
-        }
-
-        // Auto-show overlay if not already visible (frame IS proof of SD)
-        if (!_secureDesktopActive)
-        {
-            FileLogger.Log("INFO", "RemoteViewer", "SD frame arrived while overlay hidden — auto-showing");
-            _secureDesktopActive = true;
-            InvokeAsync(async () =>
-            {
-                await JSRuntime.InvokeVoidAsync("SteamViewerSecureDesktop.show", "secureDesktopOverlay");
-                StateHasChanged();
-            });
-        }
-
-        if (!_secureDesktopFrameReceived)
-        {
-            _secureDesktopFrameReceived = true;
-            InvokeAsync(StateHasChanged); // Update banner text from "Waiting..." to "Secure Desktop (UAC)"
-        }
-
-        _ = JSRuntime.InvokeVoidAsync("SteamViewerSecureDesktop.renderFrame", base64Jpeg, width, height);
     }
 
     #endregion
@@ -1494,8 +1392,7 @@
                 _activeSession.OnControlMessage -= HandleControlMessage;
                 _activeSession.OnClipboardReceived -= HandleClipboardReceived;
                 _activeSession.OnSecureDesktopStateChanged -= HandleSecureDesktopStateChanged;
-                _activeSession.OnSecureDesktopFrame -= HandleSecureDesktopFrame;
-                _activeSession.OnMonitorLayoutReceived -= HandleMonitorLayoutReceived;
+                    _activeSession.OnMonitorLayoutReceived -= HandleMonitorLayoutReceived;
                 _activeSession.OnCaptureInfoReceived -= HandleCaptureInfoReceived;
 
                 // Update references (session ID stays the same for tab tracking)
@@ -1509,7 +1406,6 @@
                 _activeSession.OnControlMessage += HandleControlMessage;
                 _activeSession.OnClipboardReceived += HandleClipboardReceived;
                 _activeSession.OnSecureDesktopStateChanged += HandleSecureDesktopStateChanged;
-                _activeSession.OnSecureDesktopFrame += HandleSecureDesktopFrame;
                 _activeSession.OnMonitorLayoutReceived += HandleMonitorLayoutReceived;
                 _activeSession.OnCaptureInfoReceived += HandleCaptureInfoReceived;
 
@@ -1595,7 +1491,6 @@
             _activeSession.OnControlMessage -= HandleControlMessage;
             _activeSession.OnClipboardReceived -= HandleClipboardReceived;
             _activeSession.OnSecureDesktopStateChanged -= HandleSecureDesktopStateChanged;
-            _activeSession.OnSecureDesktopFrame -= HandleSecureDesktopFrame;
             _activeSession.OnMonitorLayoutReceived -= HandleMonitorLayoutReceived;
             _activeSession.OnCaptureInfoReceived -= HandleCaptureInfoReceived;
         }

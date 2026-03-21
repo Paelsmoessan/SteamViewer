@@ -23,7 +23,6 @@ public sealed class ViewerSession : IAsyncDisposable
     private readonly IConfiguration _configuration;
     private readonly Func<SignalingMessage, Task> _sendSignaling;
     private readonly SignalingClient _signalingClient;
-    private int _sdViewerFrameCount;
     private ViewerStreamTransport? _transport;
     private FFmpegDecoder? _decoder;
     private DotNetObjectReference<ViewerSession>? _dotNetRef;
@@ -131,11 +130,6 @@ public sealed class ViewerSession : IAsyncDisposable
     public event Action<bool>? OnSecureDesktopStateChanged;
 
     /// <summary>
-    /// Raised when a Secure Desktop frame is received.
-    /// </summary>
-    public event Action<string, int, int>? OnSecureDesktopFrame;
-
-    /// <summary>
     /// Raised when host sends capture dimensions (on first frame + capture change).
     /// Viewer should constrain canvas to this AR for 1:1 pixel mapping.
     /// </summary>
@@ -232,7 +226,7 @@ public sealed class ViewerSession : IAsyncDisposable
             _transport.OnLosslessFrame += HandleLosslessFrame;
             _transport.OnFileData += HandleFileDataBinary;
             _transport.OnFileSignalingMessage += HandleFileChannelMessage;
-            _transport.OnSecureDesktopFrame += HandleSecureDesktopFrameBinary;
+            // Channel 5 (SD JPEG) removed - SD frames now arrive via H.264 on channel 1
             _transport.OnConnectionStateChanged += HandleTransportStateChanged;
 
             // Connect relay (derives encryption key, subscribes to binary messages)
@@ -567,7 +561,6 @@ public sealed class ViewerSession : IAsyncDisposable
             _transport.OnLosslessFrame -= HandleLosslessFrame;
             _transport.OnFileData -= HandleFileDataBinary;
             _transport.OnFileSignalingMessage -= HandleFileChannelMessage;
-            _transport.OnSecureDesktopFrame -= HandleSecureDesktopFrameBinary;
             _transport.OnConnectionStateChanged -= HandleTransportStateChanged;
             await _transport.DisposeAsync();
             _transport = null;
@@ -806,30 +799,13 @@ public sealed class ViewerSession : IAsyncDisposable
                             JsonSerializer.Serialize(new { type = "ack", ackType = "secureDesktopInactive" }));
                         break;
 
-                    case "secureDesktopFrame":
-                        // Legacy JSON path (kept for backward compat, binary channel 5 is preferred)
-                        _sdViewerFrameCount++;
-                        var frameData = root.TryGetProperty("data", out var frameProp) ? frameProp.GetString() : null;
-                        var frameW = root.TryGetProperty("width", out var fwProp) ? fwProp.GetInt32() : 0;
-                        var frameH = root.TryGetProperty("height", out var fhProp) ? fhProp.GetInt32() : 0;
-                        if (frameData != null && frameW > 0 && frameH > 0)
-                            OnSecureDesktopFrame?.Invoke(frameData, frameW, frameH);
-                        break;
+                    // secureDesktopFrame: removed - SD frames now arrive via H.264 on channel 1
                 }
             }
         }
         catch (JsonException) { }
 
         await Task.CompletedTask;
-    }
-
-    /// <summary>Handle binary Secure Desktop JPEG frame from Channel 5.</summary>
-    private void HandleSecureDesktopFrameBinary(byte[] jpegData, int width, int height)
-    {
-        _sdViewerFrameCount++;
-        // Convert to base64 for JS Image element (network saved the base64 overhead, convert only on viewer)
-        var base64 = Convert.ToBase64String(jpegData);
-        OnSecureDesktopFrame?.Invoke(base64, width, height);
     }
 
     private void HandleVideoData(byte[] data, int length)
@@ -851,6 +827,7 @@ public sealed class ViewerSession : IAsyncDisposable
 
                 // Check if we should request a lossless frame (input idle)
                 if (!_losslessActive && !_losslessRequestPending
+                    && !IsSecureDesktopActive
                     && (DateTime.UtcNow - _lastInputTime).TotalMilliseconds > 150)
                 {
                     RequestLosslessFrame();
@@ -1153,7 +1130,6 @@ public sealed class ViewerSession : IAsyncDisposable
             _transport.OnLosslessFrame -= HandleLosslessFrame;
             _transport.OnFileData -= HandleFileDataBinary;
             _transport.OnFileSignalingMessage -= HandleFileChannelMessage;
-            _transport.OnSecureDesktopFrame -= HandleSecureDesktopFrameBinary;
             _transport.OnConnectionStateChanged -= HandleTransportStateChanged;
             await _transport.DisposeAsync();
             _transport = null;

@@ -12,7 +12,7 @@ public sealed class MacElevationService : IElevationService
     public bool IsSystemConnected => false;
     public bool IsSecureDesktopActive => false;
 
-    public event Action<byte[], int, int>? OnSecureDesktopFrame;
+    public event Action<byte[], int, int, int>? OnSecureDesktopFrame;
     public event Action<bool>? OnSecureDesktopStateChanged;
     public event Action<bool>? OnAdminStateChanged;
     public event Action<bool>? OnSystemStateChanged;
@@ -27,7 +27,6 @@ public sealed class MacElevationService : IElevationService
         string[]? turnUrls = null, string? turnUsername = null, string? turnCredential = null) => Task.FromResult(false);
     public Task<bool> RunElevatedAsync(string path, string? args) => Task.FromResult(false);
     public Task<bool> RunAsSystemAsync(string path, string? args) => Task.FromResult(false);
-    public Task<bool> SetCaptureQualityAsync(int targetFps, int jpegQuality) => Task.FromResult(false);
 
     public ValueTask DisposeAsync() => ValueTask.CompletedTask;
 }
