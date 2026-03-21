@@ -204,7 +204,8 @@ public sealed class HostSession : IAsyncDisposable
         _transport.OnFileData += HandleFileDataBinary;
         _transport.OnFileSignalingMessage += HandleFileChannelMessage;
         _transport.OnConnectionStateChanged += HandleTransportStateChanged;
-        _transport.OnConnectionQualityChanged += HandleConnectionQualityChanged;
+        // Quality adaptation driven by viewer's qualityReport messages, not host's own monitor
+        // (host receives mostly single-fragment input - not representative of video path quality)
 
         // Start relay: generate nonce, setup encryption, send RelayReady to viewer
         await _transport.StartRelayAsync(PeerId, _hostPasswordHash, _sendSignaling);
@@ -698,6 +699,9 @@ public sealed class HostSession : IAsyncDisposable
                         HandleRequestLosslessFrame(root);
                         return;
 
+                    case "qualityReport":
+                        HandleQualityReport(root);
+                        return;
 
                     case "ack":
                         var ackType = root.TryGetProperty("ackType", out var ackProp) ? ackProp.GetString() : null;
@@ -910,8 +914,25 @@ public sealed class HostSession : IAsyncDisposable
 
     private ConnectionQuality _lastQuality = ConnectionQuality.Unknown;
 
+    private void HandleQualityReport(JsonElement root)
+    {
+        var qualityStr = root.TryGetProperty("quality", out var qProp) ? qProp.GetString() : null;
+        if (qualityStr == null) return;
+
+        if (!Enum.TryParse<ConnectionQuality>(qualityStr, out var quality)) return;
+
+        var lossRate = root.TryGetProperty("lossRate", out var lProp) ? lProp.GetDouble() : -1;
+        var rttMs = root.TryGetProperty("rttMs", out var rProp) ? rProp.GetDouble() : -1;
+
+        _logger.LogInformation("[QualityReport] Viewer reports: {Quality}, loss={Loss:P1}, RTT={Rtt:F0}ms",
+            quality, lossRate, rttMs);
+
+        HandleConnectionQualityChanged(quality);
+    }
+
     private void HandleConnectionQualityChanged(ConnectionQuality quality)
     {
+        if (quality == _lastQuality) return; // No change
         _lastQuality = quality;
 
         // Adapt encoder bitrate cap based on network capacity
@@ -930,7 +951,7 @@ public sealed class HostSession : IAsyncDisposable
         // Adapt FEC overhead based on loss conditions
         if (_transport?.IsDirectUdp == true)
         {
-            var udp = (_transport as HostStreamTransport)?.GetUdpBackend();
+            var udp = _transport.GetUdpBackend();
             if (udp != null)
             {
                 udp.FecScaleFactor = quality switch
@@ -1988,7 +2009,6 @@ public sealed class HostSession : IAsyncDisposable
             _transport.OnFileData -= HandleFileDataBinary;
             _transport.OnFileSignalingMessage -= HandleFileChannelMessage;
             _transport.OnConnectionStateChanged -= HandleTransportStateChanged;
-            _transport.OnConnectionQualityChanged -= HandleConnectionQualityChanged;
             await _transport.DisposeAsync();
             _transport = null;
         }

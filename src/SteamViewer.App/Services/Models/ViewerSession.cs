@@ -39,6 +39,9 @@ public sealed class ViewerSession : IAsyncDisposable
     private ClipboardFileServer? _clipboardFileServer;
     private ClipboardFileWriter? _clipboardFileWriter;
 
+    // Quality report — viewer measures loss and reports to host for adaptation
+    private Timer? _qualityReportTimer;
+
     // Lossless settle — request QOI snapshot when input is idle and screen is static
     private DateTime _lastInputTime = DateTime.UtcNow;
     private bool _losslessActive;
@@ -228,6 +231,7 @@ public sealed class ViewerSession : IAsyncDisposable
             _transport.OnFileSignalingMessage += HandleFileChannelMessage;
             // Channel 5 (SD JPEG) removed - SD frames now arrive via H.264 on channel 1
             _transport.OnConnectionStateChanged += HandleTransportStateChanged;
+            _transport.OnConnectionQualityChanged += HandleConnectionQualityChanged;
 
             // Connect relay (derives encryption key, subscribes to binary messages)
             _transport.ConnectRelay(encryptionNonce, passwordHash);
@@ -527,6 +531,56 @@ public sealed class ViewerSession : IAsyncDisposable
         OnStatsUpdated?.Invoke(json);
     }
 
+    #region Quality Reporting
+
+    private void HandleConnectionQualityChanged(ConnectionQuality quality)
+    {
+        // Start periodic quality report timer on first classification
+        if (_qualityReportTimer == null)
+        {
+            _qualityReportTimer = new Timer(SendQualityReport, null, TimeSpan.Zero, TimeSpan.FromSeconds(30));
+            _logger.LogInformation("Session {SessionId}: Quality report timer started", SessionId);
+        }
+    }
+
+    private void SendQualityReport(object? state)
+    {
+        if (_transport == null || !_transport.IsConnected) return;
+
+        var monitor = _transport.QualityMonitor;
+        if (monitor == null) return;
+
+        var quality = monitor.CurrentQuality;
+        var lossRate = monitor.SmoothedLossRate;
+        var rtt = monitor.SmoothedRttMs;
+
+        try
+        {
+            var json = JsonSerializer.Serialize(new
+            {
+                type = "qualityReport",
+                quality = quality.ToString(),
+                lossRate = Math.Round(lossRate, 4),
+                rttMs = Math.Round(rtt, 1)
+            });
+            _ = _transport.SendControlAsync(json);
+            _logger.LogDebug("Session {SessionId}: Sent quality report: {Quality}, loss={Loss:P1}, RTT={Rtt:F0}ms",
+                SessionId, quality, lossRate, rtt);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to send quality report");
+        }
+    }
+
+    private void StopQualityReporting()
+    {
+        _qualityReportTimer?.Dispose();
+        _qualityReportTimer = null;
+    }
+
+    #endregion
+
     /// <summary>
     /// Disconnect this session. Cleans up all state so reconnect works without app restart.
     /// </summary>
@@ -536,6 +590,9 @@ public sealed class ViewerSession : IAsyncDisposable
 
         // Stop clipboard file transfer
         StopClipboardFileTransfer();
+
+        // Stop quality reporting
+        StopQualityReporting();
 
         // Stop stats relay
         _ = DisableStatsRelayAsync();
@@ -562,6 +619,7 @@ public sealed class ViewerSession : IAsyncDisposable
             _transport.OnFileData -= HandleFileDataBinary;
             _transport.OnFileSignalingMessage -= HandleFileChannelMessage;
             _transport.OnConnectionStateChanged -= HandleTransportStateChanged;
+            _transport.OnConnectionQualityChanged -= HandleConnectionQualityChanged;
             await _transport.DisposeAsync();
             _transport = null;
         }
@@ -1131,6 +1189,7 @@ public sealed class ViewerSession : IAsyncDisposable
             _transport.OnFileData -= HandleFileDataBinary;
             _transport.OnFileSignalingMessage -= HandleFileChannelMessage;
             _transport.OnConnectionStateChanged -= HandleTransportStateChanged;
+            _transport.OnConnectionQualityChanged -= HandleConnectionQualityChanged;
             await _transport.DisposeAsync();
             _transport = null;
         }

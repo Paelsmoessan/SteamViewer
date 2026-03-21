@@ -707,6 +707,7 @@ public sealed class UdpTransportBackend : ITransportBackend
                 // Single fragment — deliver immediately (no FEC possible)
                 if (fragIndex == 0 && totalFrags == 1)
                 {
+                    Interlocked.Increment(ref _messagesCompleted);
                     var payload = new byte[length - FragmentHeaderSize];
                     Buffer.BlockCopy(data, FragmentHeaderSize, payload, 0, payload.Length);
                     OnDataReceived?.Invoke(payload, payload.Length);
@@ -904,7 +905,12 @@ public sealed class UdpTransportBackend : ITransportBackend
         var now = Environment.TickCount64;
         foreach (var kvp in _reassemblyBuffers)
         {
-            if (now - kvp.Value.CreatedAt > 500) // 500ms timeout (large keyframes need more time)
+            // 2s timeout for fragment reassembly. Was 500ms, but large frames
+            // (700KB QOI = ~637 fragments, 1.5MB SD QOI = ~1445 fragments) need more
+            // time when burst-sent back-to-back. Doesn't affect latency — frames
+            // deliver immediately on completion; this only controls when we give up
+            // on incomplete messages. Needs real-world lossy testing to validate.
+            if (now - kvp.Value.CreatedAt > 2000)
             {
                 if (_reassemblyBuffers.TryRemove(kvp.Key, out _))
                     Interlocked.Increment(ref _messagesExpired);
