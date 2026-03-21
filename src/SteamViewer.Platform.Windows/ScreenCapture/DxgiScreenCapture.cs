@@ -219,28 +219,9 @@ public sealed class DxgiScreenCapture : IScreenCapture
                         // Notify listeners that screen is unchanged (for lossless settle detection)
                         OnFrameUnchanged?.Invoke();
 
-                        // Desktop unchanged — re-fire last frame at ~30fps to keep WebRTC JB calibrated
-                        if (idleSw.ElapsedMilliseconds >= targetIntervalMs)
-                        {
-                            if (OnRawFrameCaptured != null && lastRawData != null)
-                            {
-                                OnRawFrameCaptured.Invoke(lastRawData, lastWidth, lastHeight, lastRawStride);
-                                idleSw.Restart();
-                            }
-                            else if (OnFrameCaptured != null && lastJpegData != null)
-                            {
-                                OnFrameCaptured.Invoke(lastJpegData, lastWidth, lastHeight);
-                                idleSw.Restart();
-                            }
-                            else
-                            {
-                                Thread.Sleep(5);
-                            }
-                        }
-                        else
-                        {
-                            Thread.Sleep(5);
-                        }
+                        // Screen static - no need to re-encode identical frames.
+                        // Lossless settle (QOI) handles pixel-perfect quality on idle.
+                        Thread.Sleep(5);
                         continue;
                     }
 

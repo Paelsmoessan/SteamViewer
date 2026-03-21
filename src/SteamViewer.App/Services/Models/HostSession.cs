@@ -57,6 +57,9 @@ public sealed class HostSession : IAsyncDisposable
     private bool _disposed;
     private bool _elevationDetached;
 
+    // Frame rate adaptation for constrained connections
+    private long _dxgiFrameCounter;
+
     // Smart SD pipeline: track frame index for QOI burst + H.264 switchover
     private int _sdFrameIndex;
     private volatile bool _isSecureDesktopActive;
@@ -201,6 +204,8 @@ public sealed class HostSession : IAsyncDisposable
         _transport.OnFileData += HandleFileDataBinary;
         _transport.OnFileSignalingMessage += HandleFileChannelMessage;
         _transport.OnConnectionStateChanged += HandleTransportStateChanged;
+        // Quality adaptation driven by viewer's qualityReport messages, not host's own monitor
+        // (host receives mostly single-fragment input - not representative of video path quality)
 
         // Start relay: generate nonce, setup encryption, send RelayReady to viewer
         await _transport.StartRelayAsync(PeerId, _hostPasswordHash, _sendSignaling);
@@ -413,6 +418,11 @@ public sealed class HostSession : IAsyncDisposable
 
         // Skip DXGI frames during Secure Desktop - SD frames use the encoder instead
         if (_isSecureDesktopActive) return;
+
+        // Frame rate adaptation: skip frames on constrained connections
+        _dxgiFrameCounter++;
+        if (_lastQuality == ConnectionQuality.Poor && _dxgiFrameCounter % 2 != 0)
+            return; // 15fps on poor connections
 
         // Only reset lossless state on genuinely NEW frames (not refired cached frames)
         if (!ReferenceEquals(bgraData, _lastSeenFrameRef))
@@ -689,6 +699,9 @@ public sealed class HostSession : IAsyncDisposable
                         HandleRequestLosslessFrame(root);
                         return;
 
+                    case "qualityReport":
+                        HandleQualityReport(root);
+                        return;
 
                     case "ack":
                         var ackType = root.TryGetProperty("ackType", out var ackProp) ? ackProp.GetString() : null;
@@ -893,6 +906,72 @@ public sealed class HostSession : IAsyncDisposable
             }
         }
         catch { }
+    }
+
+    #endregion
+
+    #region Connection Quality Adaptation
+
+    private ConnectionQuality _lastQuality = ConnectionQuality.Unknown;
+
+    private void HandleQualityReport(JsonElement root)
+    {
+        var qualityStr = root.TryGetProperty("quality", out var qProp) ? qProp.GetString() : null;
+        if (qualityStr == null) return;
+
+        if (!Enum.TryParse<ConnectionQuality>(qualityStr, out var quality)) return;
+
+        var lossRate = root.TryGetProperty("lossRate", out var lProp) ? lProp.GetDouble() : -1;
+        var rttMs = root.TryGetProperty("rttMs", out var rProp) ? rProp.GetDouble() : -1;
+
+        _logger.LogInformation("[QualityReport] Viewer reports: {Quality}, loss={Loss:P1}, RTT={Rtt:F0}ms",
+            quality, lossRate, rttMs);
+
+        HandleConnectionQualityChanged(quality);
+    }
+
+    private void HandleConnectionQualityChanged(ConnectionQuality quality)
+    {
+        if (quality == _lastQuality) return; // No change
+        _lastQuality = quality;
+
+        // Adapt encoder bitrate cap based on network capacity
+        var maxBitrate = quality switch
+        {
+            ConnectionQuality.Poor => 5_000_000L,   // 5 Mbps - constrained
+            ConnectionQuality.Fair => 12_000_000L,  // 12 Mbps - moderate
+            _ => 20_000_000L                        // 20 Mbps - full quality
+        };
+
+        lock (_encoderLock)
+        {
+            _encoder?.SetMaxBitrate(maxBitrate);
+        }
+
+        // Adapt FEC overhead based on loss conditions
+        if (_transport?.IsDirectUdp == true)
+        {
+            var udp = _transport.GetUdpBackend();
+            if (udp != null)
+            {
+                udp.FecScaleFactor = quality switch
+                {
+                    ConnectionQuality.Good => 0,     // No FEC on LAN - zero overhead
+                    ConnectionQuality.Fair => 1.3,   // 25% parity
+                    ConnectionQuality.Poor => 1.6,   // 35% parity
+                    _ => 1.3                         // Unknown - moderate
+                };
+            }
+        }
+
+        _logger.LogInformation("[QualityAdapt] {Quality}: bitrate cap={Mbps}Mbps, FEC={Fec}",
+            quality, maxBitrate / 1_000_000, quality switch
+            {
+                ConnectionQuality.Good => "off",
+                ConnectionQuality.Fair => "25%",
+                ConnectionQuality.Poor => "35%",
+                _ => "25%"
+            });
     }
 
     #endregion
