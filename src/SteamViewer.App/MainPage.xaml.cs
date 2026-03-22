@@ -41,10 +41,6 @@ public partial class MainPage : ContentPage
     {
         try
         {
-            // Disable Ctrl+scroll zoom on home screen
-            coreWebView2.Settings.IsZoomControlEnabled = false;
-            coreWebView2.Settings.IsPinchZoomEnabled = false;
-
             var bridge = MauiProgram.ServiceProvider?.GetService<Services.NativeFrameBridge>();
             bridge?.Initialize(coreWebView2);
 
