@@ -13,6 +13,7 @@ public enum ConnectionState
     Registered,
     Connecting,
     Connected,
+    Reconnecting,
     Disconnected,
     Error
 }
