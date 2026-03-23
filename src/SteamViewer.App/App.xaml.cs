@@ -26,8 +26,8 @@ public partial class App : Application
     {
         var state = LoadWindowState();
 
-        double width = state?.Width ?? 640;
-        double height = state?.Height ?? 720;
+        double width = state?.Width ?? 750;
+        double height = state?.Height ?? 460;
         double x, y;
 
         if (state != null)

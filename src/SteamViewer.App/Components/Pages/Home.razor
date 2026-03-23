@@ -28,144 +28,137 @@
 @inject ViewerSessionManager ViewerSessionManager
 @inject ViewerTabManager TabManager
 
-<div class="version-tag">v@(Version)</div>
-<div class="container">
-    @if (currentMode == AppMode.Select)
-    {
-        <div class="mode-select">
-            <img src="images/logo.png" alt="SteamViewer" class="app-logo" />
-            <p class="subtitle">Secure Remote Desktop</p>
-
-            <div class="mode-buttons">
-                <button class="mode-btn host-btn" @onclick="SelectStartMode">
-                    <span class="icon"><Icon Name="AppIcon.MonitorPlay" Size="36" /></span>
-                    <span class="label">Start Session</span>
-                    <span class="desc">Share your screen with others</span>
-                </button>
-
-                <button class="mode-btn viewer-btn" @onclick="SelectJoinMode">
-                    <span class="icon"><Icon Name="AppIcon.ArrowRight" Size="36" /></span>
-                    <span class="label">Join Session</span>
-                    <span class="desc">Connect to an existing session</span>
-                </button>
+@if (connectionState == ConnectionState.Connected)
+{
+    @* === Connected as host - full-screen connected view === *@
+    <div class="version-tag">v@(Version)</div>
+    <div class="container connected-container">
+        @RenderConnectedView()
+    </div>
+}
+else if (connectionState == ConnectionState.Idle || connectionState == ConnectionState.Registering)
+{
+    @* === Splash screen while connecting === *@
+    <div class="splash-screen">
+        <img src="images/logo.png" alt="SteamViewer" class="splash-logo" />
+        <p class="splash-title">SteamViewer</p>
+        <p class="splash-subtitle">Secure Remote Desktop</p>
+        <div class="splash-progress">
+            <div class="splash-progress-bar"></div>
+        </div>
+        <p class="splash-status">Connecting to server...</p>
+        <span class="splash-version">v@(Version)</span>
+    </div>
+}
+else
+{
+    @* === Home screen - two-panel layout === *@
+    <div class="home-shell">
+        @* --- Top bar with logo --- *@
+        <div class="top-bar">
+            <div class="top-bar-brand">
+                <img src="images/logo_banner.png" alt="" class="top-logo" />
             </div>
-
-            <a href="/collaboration" class="collaboration-link">
-                <span class="collab-icon"><Icon Name="AppIcon.Users" Size="18" /></span>
-                <span>Collaboration Mode</span>
-                <span class="collab-desc">Multi-user screen sharing</span>
-            </a>
+            <span class="top-version">v@(Version)</span>
         </div>
-    }
-    else if (currentMode == AppMode.StartConnection)
-    {
-        <div class="session-view">
-            <h2>Start Session</h2>
 
-            @if (connectionState == ConnectionState.Idle || connectionState == ConnectionState.Registering || connectionState == ConnectionState.Error)
-            {
-                <p>Setting up session...</p>
-                <div class="spinner"></div>
-                <button class="secondary-btn" @onclick="GoBack">Cancel</button>
-            }
-            else if (connectionState == ConnectionState.Registered)
-            {
-                <div class="credentials">
-                    <div class="credential-item">
-                        <label>Session ID</label>
-                        <div class="value-row">
-                            <div class="value">@clientId</div>
-                            <button class="copy-btn" @onclick="CopySessionId" title="@(_copiedId ? "Copied!" : "Copy to clipboard")">
-                                <Icon Name="@(_copiedId ? AppIcon.Check : AppIcon.Copy)" Size="14" />
-                            </button>
-                        </div>
-                    </div>
-                    <div class="credential-item">
-                        <label>Password</label>
-                        <div class="value-row">
-                            <div class="value">@password</div>
-                            <button class="copy-btn" @onclick="CopyPassword" title="@(_copiedPassword ? "Copied!" : "Copy to clipboard")">
-                                <Icon Name="@(_copiedPassword ? AppIcon.Check : AppIcon.Copy)" Size="14" />
-                            </button>
-                        </div>
-                    </div>
-                </div>
-                <p class="status">Share these credentials with your partner</p>
-                <button class="secondary-btn" @onclick="StopSession">Cancel</button>
-            }
-            else if (connectionState == ConnectionState.Connecting)
-            {
-                <p>Incoming connection request</p>
-                <div class="connection-prompt">
-                    <button class="primary-btn" @onclick="AcceptConnection">Accept</button>
-                    <button class="secondary-btn" @onclick="RejectConnection">Reject</button>
-                </div>
-            }
-            else if (connectionState == ConnectionState.Connected)
-            {
-                @* Render connected view *@
-                @RenderConnectedView()
-            }
-
-            @if (!string.IsNullOrEmpty(errorMessage))
-            {
-                <div class="error">@errorMessage</div>
-            }
-        </div>
-    }
-    else if (currentMode == AppMode.JoinConnection)
-    {
-        <div class="session-view">
-            <h2>Join Session</h2>
-
-            @if (connectionState == ConnectionState.Idle || connectionState == ConnectionState.Registered || connectionState == ConnectionState.Error)
-            {
-                <div class="connect-form">
-                    <div class="input-group">
-                        <label>Session ID</label>
-                        <input type="text" @bind="targetId" placeholder="@_idPlaceholder" maxlength="@_idMaxLength" />
-                    </div>
-                    <div class="input-group">
-                        <label>Password</label>
-                        <input type="password" @bind="targetPassword" placeholder="Enter password" />
-                    </div>
-                    <div class="form-buttons">
-                        <button class="secondary-btn" @onclick="GoBack">Back</button>
-                        <button class="primary-btn" @onclick="JoinSession" disabled="@(string.IsNullOrWhiteSpace(targetId) || string.IsNullOrWhiteSpace(targetPassword))">
-                            Join
+        @* --- Main content: two panels --- *@
+        <div class="main-panels">
+            @* --- Left panel: identity --- *@
+            <div class="id-panel">
+                <div class="id-field">
+                    <label>Session ID</label>
+                    <div class="id-value-row">
+                        <span class="id-value">@clientId</span>
+                        <button class="id-copy-btn" @onclick="CopySessionId" title="@(_copiedId ? "Copied!" : "Copy")">
+                            <Icon Name="@(_copiedId ? AppIcon.Check : AppIcon.Copy)" Size="12" />
                         </button>
                     </div>
                 </div>
-            }
-            else if (connectionState == ConnectionState.Connecting)
-            {
-                <p>Connecting...</p>
-                <div class="spinner"></div>
-                <button class="secondary-btn" @onclick="GoBack">Cancel</button>
-            }
-            else if (connectionState == ConnectionState.Connected)
-            {
-                @* Render connected view *@
-                @RenderConnectedView()
-            }
+                <div class="id-field">
+                    <label>Password</label>
+                    <div class="id-value-row">
+                        <span class="id-value">@password</span>
+                        <button class="id-copy-btn" @onclick="CopyPassword" title="@(_copiedPassword ? "Copied!" : "Copy")">
+                            <Icon Name="@(_copiedPassword ? AppIcon.Check : AppIcon.Copy)" Size="12" />
+                        </button>
+                    </div>
+                </div>
+            </div>
 
-            @if (!string.IsNullOrEmpty(errorMessage))
-            {
-                <div class="error">@errorMessage</div>
-            }
+            @* --- Right panel: connect --- *@
+            <div class="connect-panel">
+                <h3 class="connect-title">Connect To</h3>
+                <div class="connect-form">
+                    <div class="field">
+                        <label>Partner ID</label>
+                        <input type="text" @bind="targetId" placeholder="@_idPlaceholder" maxlength="@_idMaxLength" />
+                    </div>
+                    <div class="field">
+                        <label>Password</label>
+                        <input type="password" @bind="targetPassword" placeholder="Enter password" />
+                    </div>
+                    <button class="connect-btn" @onclick="JoinSession"
+                            disabled="@(string.IsNullOrWhiteSpace(targetId) || string.IsNullOrWhiteSpace(targetPassword))">
+                        Connect
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        @* --- Status bar --- *@
+        <div class="status-bar">
+            <div class="status-left">
+                <span class="status-dot ready"></span>
+                <span>Ready</span>
+            </div>
+            <div class="status-right">
+                <a href="/collaboration" class="collab-link">
+                    <Icon Name="AppIcon.Users" Size="13" />
+                    Collaboration
+                </a>
+            </div>
+        </div>
+
+        @* --- Error banner --- *@
+        @if (!string.IsNullOrEmpty(errorMessage))
+        {
+            <div class="error-banner">@errorMessage</div>
+        }
+    </div>
+
+    @* === Incoming connection modal === *@
+    @if (connectionState == ConnectionState.Connecting && !string.IsNullOrEmpty(incomingPeerId))
+    {
+        <div class="modal-backdrop">
+            <div class="modal-card">
+                <h3>Incoming Connection</h3>
+                <p class="modal-peer-id">@incomingPeerId</p>
+                <p class="modal-subtitle">wants to connect to your desktop</p>
+                <div class="modal-actions">
+                    <button class="modal-btn accept" @onclick="AcceptConnection">
+                        <Icon Name="AppIcon.Check" Size="16" />
+                        Accept
+                    </button>
+                    <button class="modal-btn reject" @onclick="RejectConnection">
+                        <Icon Name="AppIcon.X" Size="16" />
+                        Reject
+                    </button>
+                </div>
+            </div>
         </div>
     }
+}
 
-    <FileTransferDialog
-        IsVisible="@_showFileTransferDialog"
-        Mode="@_fileDialogMode"
-        PendingTransfer="@_pendingFileTransfer"
-        Transfers="@(Enumerable.Empty<FileTransferState>())"
-        OnClose="@CloseFileTransferDialog"
-        OnAccept="@AcceptFileTransfer"
-        OnReject="@RejectFileTransfer"
-        OnCancel="@CancelFileTransfer" />
-</div>
+<FileTransferDialog
+    IsVisible="@_showFileTransferDialog"
+    Mode="@_fileDialogMode"
+    PendingTransfer="@_pendingFileTransfer"
+    Transfers="@(Enumerable.Empty<FileTransferState>())"
+    OnClose="@CloseFileTransferDialog"
+    OnAccept="@AcceptFileTransfer"
+    OnReject="@RejectFileTransfer"
+    OnCancel="@CancelFileTransfer" />
 
 
 @code {
@@ -177,7 +170,7 @@
 
     private enum AppMode { Select, StartConnection, JoinConnection }
 
-    private AppMode currentMode = AppMode.Select;
+    private AppMode currentMode = AppMode.StartConnection;
     private ConnectionState connectionState = ConnectionState.Idle;
 
     // Session state
@@ -314,16 +307,19 @@
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
-        // Auto-start hosting if valid reconnect data exists (from reboot or elevation restart)
         if (firstRender)
         {
             _pendingReconnect = ReconnectCredentials.Load();
             if (_pendingReconnect != null)
             {
+                // Reconnect with saved credentials (from reboot or elevation restart)
                 Logger.LogInformation("Found valid reconnect data for ID: {Id}", _pendingReconnect.ClientId);
-                currentMode = AppMode.StartConnection;
-                StateHasChanged();
                 _ = StartSessionWithRetryAsync();
+            }
+            else
+            {
+                // Auto-register on launch
+                _ = StartSession();
             }
         }
 
@@ -423,25 +419,15 @@
 
     #endregion
 
-    private async Task SelectStartMode()
-    {
-        currentMode = AppMode.StartConnection;
-        StateHasChanged();
-        await StartSession();
-    }
-
     private void SelectJoinMode()
     {
         currentMode = AppMode.JoinConnection;
         StateHasChanged();
     }
 
-    private async Task GoBack()
+    private void GoBack()
     {
-        await StopSession();
-        _canvasInitialized = false;
-        currentMode = AppMode.Select;
-        connectionState = ConnectionState.Idle;
+        currentMode = AppMode.StartConnection;
         errorMessage = "";
         StateHasChanged();
     }
@@ -694,9 +680,9 @@
                 errorMessage = "Failed to create session";
             }
 
-            // Return to select mode - viewer window handles everything
-            currentMode = AppMode.Select;
-            connectionState = ConnectionState.Idle;
+            // Return to host view - viewer window handles everything
+            currentMode = AppMode.StartConnection;
+            connectionState = ConnectionState.Registered;
         }
         catch (Exception ex)
         {
@@ -924,16 +910,7 @@
 
         connectedPeerId = "";
         _canvasInitialized = false;
-
-        if (currentMode == AppMode.StartConnection)
-        {
-            connectionState = ConnectionState.Registered;
-        }
-        else
-        {
-            connectionState = ConnectionState.Idle;
-        }
-
+        connectionState = ConnectionState.Registered;
         StateHasChanged();
     }
 
@@ -1073,25 +1050,462 @@
 }
 
 <style>
-    .version-tag {
+    /* ===== Splash screen ===== */
+    .splash-screen {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        min-height: 100vh;
+        background: radial-gradient(ellipse at 50% 38%, #000c22 0%, #000c22 25%, var(--ctp-base) 72%);
+        padding: 2rem;
+    }
+
+    .splash-logo {
+        width: 200px;
+        height: auto;
+        object-fit: contain;
+        margin-bottom: 1.5rem;
+    }
+
+    .splash-title {
+        font-size: 1.75rem;
+        font-weight: 700;
+        color: var(--ctp-text);
+        margin: 0 0 0.25rem 0;
+    }
+
+    .splash-subtitle {
+        font-size: 0.9rem;
+        color: var(--ctp-overlay0);
+        margin: 0 0 2rem 0;
+    }
+
+    .splash-progress {
+        width: 240px;
+        height: 3px;
+        background: var(--ctp-surface1);
+        border-radius: 2px;
+        overflow: hidden;
+        margin-bottom: 1rem;
+    }
+
+    .splash-progress-bar {
+        height: 100%;
+        width: 40%;
+        background: var(--ctp-blue);
+        border-radius: 2px;
+        animation: splash-slide 1.5s ease-in-out infinite;
+    }
+
+    @@keyframes splash-slide {
+        0% { transform: translateX(-100%); }
+        100% { transform: translateX(350%); }
+    }
+
+    .splash-status {
+        font-size: 0.8rem;
+        color: var(--ctp-overlay0);
+        margin: 0;
+    }
+
+    .splash-version {
         position: fixed;
-        top: 10px;
-        right: 10px;
-        font-size: 0.75rem;
-        color: #6c7086;
+        bottom: 12px;
+        right: 12px;
+        font-size: 0.7rem;
+        color: var(--ctp-surface2);
         font-family: monospace;
+    }
+
+    /* ===== Home shell layout ===== */
+    .home-shell {
+        display: flex;
+        flex-direction: column;
+        height: 100vh;
+        overflow: hidden;
+        background: var(--ctp-base);
+    }
+
+    /* ===== Top bar ===== */
+    .top-bar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        height: 44px;
+        min-height: 44px;
+        padding: 0 16px;
+        background: linear-gradient(to right, #000c22 0%, #000c22 220px, var(--ctp-mantle) 400px);
+        border-bottom: 1px solid var(--ctp-surface0);
+        -webkit-app-region: drag;
+    }
+
+    .top-bar-brand {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+    }
+
+    .top-logo {
+        height: 34px;
+        width: auto;
+        object-fit: contain;
+    }
+
+    .top-version {
+        font-size: 0.7rem;
+        color: var(--ctp-surface2);
+        font-family: monospace;
+        line-height: 1;
+    }
+
+    /* ===== Main panels ===== */
+    .main-panels {
+        display: flex;
+        flex: 1;
+        overflow: hidden;
+    }
+
+    /* ===== Left panel (identity) ===== */
+    .id-panel {
+        width: 220px;
+        min-width: 220px;
+        background: var(--ctp-mantle);
+        border-right: 1px solid var(--ctp-surface0);
+        padding: 20px 16px;
+        display: flex;
+        flex-direction: column;
+        gap: 16px;
+        overflow-y: auto;
+    }
+
+    .id-field {
+        border-left: 3px solid var(--ctp-blue);
+        padding-left: 12px;
+    }
+
+    .id-field label {
+        display: block;
+        font-size: 0.7rem;
+        color: var(--ctp-overlay0);
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        margin-bottom: 4px;
+    }
+
+    .id-value-row {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+    }
+
+    .id-value {
+        font-family: monospace;
+        font-size: 18px;
+        font-weight: 600;
+        color: var(--ctp-green);
+        letter-spacing: 1.5px;
+        line-height: 1.3;
+    }
+
+    .id-copy-btn {
+        width: 20px;
+        height: 20px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        background: transparent;
+        border: 1px solid var(--ctp-surface1);
+        border-radius: 3px;
+        color: var(--ctp-overlay0);
+        cursor: pointer;
+        font-size: 11px;
+        padding: 0;
+        flex-shrink: 0;
+        transition: all 0.15s;
+    }
+
+    .id-copy-btn:hover {
+        background: var(--ctp-surface1);
+        color: var(--ctp-text);
+        border-color: var(--ctp-blue);
+    }
+
+    .id-field.dim {
+        opacity: 0.5;
+    }
+
+    .reconnect-text {
+        font-size: 0.8rem;
+        color: var(--ctp-yellow);
+    }
+
+    .disconnected-text {
+        font-size: 0.8rem;
+        color: var(--ctp-red);
+    }
+
+    .retry-btn {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        margin-top: 0.5rem;
+        padding: 6px 12px;
+        background: transparent;
+        border: 1px solid var(--ctp-surface1);
+        border-radius: 4px;
+        color: var(--ctp-blue);
+        cursor: pointer;
+        font-size: 0.8rem;
+        transition: all 0.15s;
+    }
+
+    .retry-btn:hover {
+        background: var(--ctp-surface1);
+        border-color: var(--ctp-blue);
+    }
+
+    /* ===== Right panel (connect) ===== */
+    .connect-panel {
+        flex: 1;
+        background: var(--ctp-base);
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        padding: 32px 24px;
+        overflow-y: auto;
+    }
+
+    .connect-title {
+        font-size: 16px;
+        font-weight: 600;
+        color: var(--ctp-text);
+        margin: 0 0 1.25rem 0;
+    }
+
+    .connect-form {
+        display: flex;
+        flex-direction: column;
+        width: 100%;
+        max-width: 300px;
+    }
+
+    .field {
+        margin-bottom: 1rem;
+    }
+
+    .field label {
+        display: block;
+        font-size: 0.75rem;
+        color: var(--ctp-overlay0);
+        margin-bottom: 4px;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+    }
+
+    .field input {
+        width: 100%;
+        padding: 0.6rem 0.75rem;
+        border: 1px solid var(--ctp-surface1);
+        border-radius: 6px;
+        background: var(--ctp-surface0);
+        color: var(--ctp-text);
+        font-size: 1rem;
+        box-sizing: border-box;
+        transition: border-color 0.15s;
+    }
+
+    .field input:focus {
+        outline: none;
+        border-color: var(--ctp-blue);
+    }
+
+    .field input::placeholder {
+        color: var(--ctp-surface2);
+    }
+
+    .connect-btn {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        width: 100%;
+        height: 40px;
+        padding: 0 1rem;
+        background: var(--ctp-blue);
+        color: var(--ctp-crust);
+        border: none;
+        border-radius: 6px;
+        font-size: 1rem;
+        font-weight: 600;
+        cursor: pointer;
+        transition: background 0.15s;
+    }
+
+    .connect-btn:hover {
+        background: var(--ctp-lavender);
+    }
+
+    .connect-btn:disabled {
+        background: var(--ctp-surface1);
+        cursor: not-allowed;
+        color: var(--ctp-overlay0);
+    }
+
+    .btn-spinner {
+        width: 16px;
+        height: 16px;
+        border: 2px solid var(--ctp-surface1);
+        border-top-color: var(--ctp-crust);
+        border-radius: 50%;
+        animation: spin 0.8s linear infinite;
+    }
+
+    /* ===== Status bar ===== */
+    .status-bar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        height: 32px;
+        min-height: 32px;
+        padding: 0 12px;
+        background: var(--ctp-crust);
+        font-size: 0.75rem;
+    }
+
+    .status-left {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+    }
+
+    .status-right {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+    }
+
+    .status-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        flex-shrink: 0;
+    }
+
+    .status-dot.ready {
+        background: var(--ctp-green);
+        box-shadow: 0 0 6px var(--ctp-green);
+    }
+
+    .status-dot.reconnecting {
+        background: var(--ctp-yellow);
+        animation: pulse 1.5s ease-in-out infinite;
+    }
+
+    .status-dot.disconnected {
+        background: var(--ctp-red);
+    }
+
+    .collab-link {
+        color: var(--ctp-overlay0);
+        text-decoration: none;
+        font-size: 0.75rem;
+        transition: color 0.15s;
+    }
+
+    .collab-link:hover {
+        color: var(--ctp-green);
+    }
+
+    /* ===== Incoming connection modal ===== */
+    .modal-backdrop {
+        position: fixed;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.6);
+        backdrop-filter: blur(4px);
+        display: flex;
+        align-items: center;
+        justify-content: center;
         z-index: 1000;
     }
 
-    .app-logo {
-        max-width: 360px;
-        height: auto;
-        margin-bottom: 1.5rem;
-        filter: drop-shadow(0 4px 20px rgba(137, 180, 250, 0.3));
+    .modal-card {
+        background: var(--ctp-surface0);
+        border: 1px solid var(--ctp-surface1);
         border-radius: 12px;
+        padding: 2rem;
+        text-align: center;
+        width: 360px;
+        max-width: 90vw;
+        box-shadow: 0 16px 48px rgba(0, 0, 0, 0.4);
     }
 
+    .modal-card h3 {
+        margin: 0 0 1rem 0;
+        color: var(--ctp-text);
+        font-size: 1.1rem;
+    }
+
+    .modal-peer-id {
+        font-family: monospace;
+        font-size: 1.5rem;
+        font-weight: 700;
+        color: var(--ctp-blue);
+        letter-spacing: 1px;
+        margin: 0.5rem 0 0.25rem;
+    }
+
+    .modal-subtitle {
+        color: var(--ctp-overlay0);
+        font-size: 0.875rem;
+        margin: 0 0 1.5rem;
+    }
+
+    .modal-actions {
+        display: flex;
+        gap: 0.75rem;
+        justify-content: center;
+    }
+
+    .modal-btn {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 0.65rem 1.5rem;
+        border: none;
+        border-radius: 8px;
+        font-size: 0.95rem;
+        font-weight: 600;
+        cursor: pointer;
+        transition: all 0.15s;
+    }
+
+    .modal-btn.accept {
+        background: var(--ctp-green);
+        color: var(--ctp-base);
+    }
+
+    .modal-btn.accept:hover {
+        filter: brightness(1.1);
+    }
+
+    .modal-btn.reject {
+        background: var(--ctp-surface1);
+        color: var(--ctp-text);
+    }
+
+    .modal-btn.reject:hover {
+        background: var(--ctp-surface2);
+    }
+
+    /* ===== Connected view (host) ===== */
     .container {
+        display: flex;
+        flex-direction: column;
+        min-height: 100vh;
+    }
+
+    .connected-container {
         display: flex;
         flex-direction: column;
         align-items: center;
@@ -1100,311 +1514,16 @@
         padding: 2rem;
     }
 
-    .mode-select {
-        text-align: center;
-    }
-
-    h1 {
-        font-size: 3rem;
-        margin-bottom: 0.5rem;
-        color: #89b4fa;
-    }
-
-    h2 {
-        font-size: 1.5rem;
-        margin-bottom: 1.5rem;
-        color: #89b4fa;
-    }
-
-    .subtitle {
-        color: #6c7086;
-        margin-bottom: 3rem;
-    }
-
-    .mode-buttons {
-        display: flex;
-        gap: 2rem;
-    }
-
-    .mode-btn {
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        padding: 2rem 3rem;
-        border: 2px solid #45475a;
-        border-radius: 12px;
-        background: #313244;
-        cursor: pointer;
-        transition: all 0.2s;
-    }
-
-    .mode-btn:hover {
-        border-color: #89b4fa;
-        transform: translateY(-2px);
-    }
-
-    .mode-btn .icon {
-        font-size: 3rem;
-        margin-bottom: 1rem;
-    }
-
-    .mode-btn .label {
-        font-size: 1.25rem;
-        font-weight: 600;
-        color: #cdd6f4;
-    }
-
-    .mode-btn .desc {
-        font-size: 0.875rem;
-        color: #6c7086;
-        margin-top: 0.5rem;
-    }
-
-    .collaboration-link {
-        display: flex;
-        align-items: center;
-        gap: 12px;
-        margin-top: 2rem;
-        padding: 12px 24px;
-        background: #181825;
-        border: 1px solid #313244;
-        border-radius: 8px;
-        color: #9399b2;
-        text-decoration: none;
-        transition: all 0.2s;
-    }
-
-    .collaboration-link:hover {
-        border-color: #a6e3a1;
-        color: #a6e3a1;
-    }
-
-    .collab-icon {
+    .version-tag {
+        position: fixed;
+        top: 10px;
+        right: 10px;
+        font-size: 0.75rem;
+        color: var(--ctp-overlay0);
         font-family: monospace;
-        font-weight: bold;
-        color: #a6e3a1;
+        z-index: 1000;
     }
 
-    .collab-desc {
-        font-size: 12px;
-        color: #6c7086;
-    }
-
-    .back-btn {
-        align-self: flex-start;
-        background: none;
-        border: none;
-        color: #6c7086;
-        cursor: pointer;
-        font-size: 1rem;
-        margin-bottom: 1rem;
-    }
-
-    .back-btn:hover {
-        color: #89b4fa;
-    }
-
-    .credentials {
-        background: #313244;
-        border-radius: 8px;
-        padding: 1.5rem;
-        margin: 1.5rem 0;
-    }
-
-    .credential-item {
-        margin-bottom: 1rem;
-    }
-
-    .credential-item:last-child {
-        margin-bottom: 0;
-    }
-
-    .credential-item label {
-        display: block;
-        font-size: 0.875rem;
-        color: #6c7086;
-        margin-bottom: 0.25rem;
-    }
-
-    .credential-item .value {
-        font-size: 1.5rem;
-        font-family: monospace;
-        color: #a6e3a1;
-        letter-spacing: 2px;
-    }
-
-    .value-row {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-    }
-
-    .copy-btn {
-        background: transparent;
-        border: 1px solid #45475a;
-        border-radius: 4px;
-        color: #6c7086;
-        cursor: pointer;
-        padding: 4px 8px;
-        font-size: 14px;
-        transition: all 0.15s;
-    }
-
-    .copy-btn:hover {
-        background: #45475a;
-        color: #cdd6f4;
-        border-color: #89b4fa;
-    }
-
-    .connect-form {
-        width: 300px;
-    }
-
-    .form-buttons {
-        display: flex;
-        gap: 1rem;
-        margin-top: 1rem;
-    }
-
-    .form-buttons .secondary-btn {
-        flex: 1;
-    }
-
-    .form-buttons .primary-btn {
-        flex: 2;
-    }
-
-    .input-group {
-        margin-bottom: 1rem;
-    }
-
-    .input-group label {
-        display: block;
-        font-size: 0.875rem;
-        color: #6c7086;
-        margin-bottom: 0.25rem;
-    }
-
-    .input-group input {
-        width: 100%;
-        padding: 0.75rem;
-        border: 2px solid #45475a;
-        border-radius: 6px;
-        background: #313244;
-        color: #cdd6f4;
-        font-size: 1rem;
-    }
-
-    .input-group input:focus {
-        outline: none;
-        border-color: #89b4fa;
-    }
-
-    .primary-btn {
-        background: #89b4fa;
-        color: #1e1e2e;
-        border: none;
-        padding: 0.75rem 2rem;
-        border-radius: 6px;
-        font-size: 1rem;
-        font-weight: 600;
-        cursor: pointer;
-        transition: background 0.2s;
-    }
-
-    .primary-btn:hover {
-        background: #b4befe;
-    }
-
-    .primary-btn:disabled {
-        background: #45475a;
-        cursor: not-allowed;
-    }
-
-    .secondary-btn {
-        background: transparent;
-        color: #cdd6f4;
-        border: 2px solid #45475a;
-        padding: 0.75rem 2rem;
-        border-radius: 6px;
-        font-size: 1rem;
-        cursor: pointer;
-        transition: all 0.2s;
-    }
-
-    .secondary-btn:hover {
-        border-color: #89b4fa;
-        color: #89b4fa;
-    }
-
-    .status {
-        color: #6c7086;
-        margin: 1rem 0;
-    }
-
-    .status.connected {
-        color: #a6e3a1;
-    }
-
-    .error {
-        background: #45475a;
-        border-left: 4px solid #f38ba8;
-        padding: 1rem;
-        margin-top: 1rem;
-        border-radius: 4px;
-        color: #f38ba8;
-    }
-
-    .spinner {
-        width: 40px;
-        height: 40px;
-        border: 3px solid #45475a;
-        border-top-color: #89b4fa;
-        border-radius: 50%;
-        animation: spin 1s linear infinite;
-        margin: 1rem auto;
-    }
-
-    @@keyframes spin {
-        to { transform: rotate(360deg); }
-    }
-
-    .connection-prompt {
-        display: flex;
-        gap: 1rem;
-        margin-top: 1rem;
-    }
-
-    .remote-screen {
-        background: #11111b;
-        border-radius: 8px;
-        overflow: hidden;
-        margin: 1rem 0;
-    }
-
-    .remote-screen canvas {
-        display: block;
-        max-width: 100%;
-        height: auto;
-    }
-
-    .toolbar-btn {
-        background: rgba(49, 50, 68, 0.9);
-        color: #cdd6f4;
-        border: 1px solid #45475a;
-        padding: 8px 16px;
-        border-radius: 6px;
-        font-size: 0.875rem;
-        cursor: pointer;
-        backdrop-filter: blur(4px);
-    }
-
-    .toolbar-btn:hover {
-        background: rgba(69, 71, 90, 0.9);
-        border-color: #89b4fa;
-    }
-
-    /* Connected view styles */
     .connected-view {
         text-align: center;
         width: 100%;
@@ -1420,51 +1539,28 @@
         align-items: center;
         gap: 0.5rem;
         padding: 1rem 2rem;
-        border: 2px solid #45475a;
+        border: 2px solid var(--ctp-surface1);
         border-radius: 8px;
-        background: #313244;
-        color: #cdd6f4;
+        background: var(--ctp-surface0);
+        color: var(--ctp-text);
         font-size: 1.1rem;
         cursor: pointer;
         transition: all 0.2s;
     }
 
     .share-btn:hover {
-        border-color: #89b4fa;
-        background: #45475a;
+        border-color: var(--ctp-blue);
+        background: var(--ctp-surface1);
     }
 
     .share-btn.sharing {
-        border-color: #f38ba8;
+        border-color: var(--ctp-red);
         background: rgba(243, 139, 168, 0.15);
-        color: #f38ba8;
+        color: var(--ctp-red);
     }
 
     .share-btn.sharing:hover {
         background: rgba(243, 139, 168, 0.25);
-    }
-
-    .share-btn .icon {
-        font-size: 1.5rem;
-    }
-
-    .share-status {
-        color: #a6e3a1;
-        margin-top: 0.75rem;
-        font-size: 0.875rem;
-    }
-
-    .waiting-status {
-        color: #6c7086;
-        margin: 2rem 0;
-        font-style: italic;
-    }
-
-    .connecting-status {
-        color: #f9e2af;
-        margin-top: 0.5rem;
-        font-size: 0.875rem;
-        font-style: italic;
     }
 
     .share-btn:disabled {
@@ -1473,20 +1569,60 @@
     }
 
     .share-btn.cancel {
-        background: #45475a;
+        background: var(--ctp-surface1);
         margin-top: 0.5rem;
     }
 
     .share-btn.cancel:hover {
-        background: #585b70;
+        background: var(--ctp-surface2);
     }
 
+    .share-status {
+        color: var(--ctp-green);
+        margin-top: 0.75rem;
+        font-size: 0.875rem;
+    }
+
+    .waiting-status {
+        color: var(--ctp-overlay0);
+        margin: 2rem 0;
+        font-style: italic;
+    }
+
+    .connecting-status {
+        color: var(--ctp-yellow);
+        margin-top: 0.5rem;
+        font-size: 0.875rem;
+        font-style: italic;
+    }
+
+    /* ===== Remote screen ===== */
+    .remote-screen-container {
+        background: var(--ctp-base);
+        border-radius: 12px;
+        overflow: hidden;
+        border: 1px solid var(--ctp-surface1);
+        margin: 1rem 0;
+    }
+
+    .remote-screen {
+        background: var(--ctp-crust);
+        overflow: hidden;
+    }
+
+    .remote-screen canvas {
+        display: block;
+        max-width: 100%;
+        height: auto;
+    }
+
+    /* ===== Monitor picker ===== */
     .monitor-picker {
         text-align: center;
     }
 
     .picker-label {
-        color: #cdd6f4;
+        color: var(--ctp-text);
         margin-bottom: 0.75rem;
         font-size: 0.9rem;
     }
@@ -1503,22 +1639,22 @@
         align-items: center;
         gap: 0.75rem;
         padding: 0.75rem 1rem;
-        background: #313244;
-        border: 2px solid #45475a;
+        background: var(--ctp-surface0);
+        border: 2px solid var(--ctp-surface1);
         border-radius: 8px;
-        color: #cdd6f4;
+        color: var(--ctp-text);
         cursor: pointer;
         transition: all 0.15s;
     }
 
     .monitor-option:hover {
-        border-color: #89b4fa;
-        background: #45475a;
+        border-color: var(--ctp-blue);
+        background: var(--ctp-surface1);
     }
 
     .monitor-option.selected {
-        border-color: #89b4fa;
-        background: #45475a;
+        border-color: var(--ctp-blue);
+        background: var(--ctp-surface1);
     }
 
     .monitor-name {
@@ -1528,62 +1664,87 @@
     }
 
     .monitor-res {
-        color: #a6adc8;
+        color: var(--ctp-subtext0);
         font-size: 0.85rem;
     }
 
     .monitor-primary {
-        background: #89b4fa;
-        color: #1e1e2e;
+        background: var(--ctp-blue);
+        color: var(--ctp-base);
         padding: 0.15rem 0.5rem;
         border-radius: 4px;
         font-size: 0.75rem;
         font-weight: 600;
     }
 
+    /* ===== Session toolbar ===== */
     .session-toolbar {
         display: flex;
         justify-content: center;
         gap: 1rem;
         margin-top: 2rem;
         padding-top: 1.5rem;
-        border-top: 1px solid #45475a;
+        border-top: 1px solid var(--ctp-surface1);
     }
 
-    .session-toolbar .toolbar-btn {
+    .toolbar-btn {
+        background: var(--ctp-surface0);
+        color: var(--ctp-text);
+        border: 1px solid var(--ctp-surface1);
         padding: 0.75rem 1.5rem;
+        border-radius: 6px;
+        font-size: 0.875rem;
+        cursor: pointer;
+        transition: all 0.15s;
     }
 
-    .session-toolbar .toolbar-btn.disconnect {
-        border-color: #f38ba8;
-        color: #f38ba8;
+    .toolbar-btn:hover {
+        background: var(--ctp-surface1);
+        border-color: var(--ctp-blue);
     }
 
-    .session-toolbar .toolbar-btn.disconnect:hover {
+    .toolbar-btn.disconnect {
+        border-color: var(--ctp-red);
+        color: var(--ctp-red);
+    }
+
+    .toolbar-btn.disconnect:hover {
         background: rgba(243, 139, 168, 0.15);
     }
 
-    /* Remote screen container with header */
-    .remote-screen-container {
-        background: #1e1e2e;
-        border-radius: 12px;
-        overflow: hidden;
-        border: 1px solid #45475a;
-        margin: 1rem 0;
+    /* ===== Error banner ===== */
+    .error-banner {
+        position: fixed;
+        bottom: 16px;
+        left: 50%;
+        transform: translateX(-50%);
+        background: var(--ctp-surface0);
+        border: 1px solid var(--ctp-red);
+        border-left: 4px solid var(--ctp-red);
+        padding: 10px 20px;
+        border-radius: 6px;
+        color: var(--ctp-red);
+        font-size: 0.875rem;
+        z-index: 900;
+        max-width: 500px;
     }
 
-    .remote-screen-header {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        padding: 0.75rem 1rem;
-        background: #313244;
-        border-bottom: 1px solid #45475a;
+    /* ===== Spinner ===== */
+    .spinner {
+        width: 32px;
+        height: 32px;
+        border: 3px solid var(--ctp-surface1);
+        border-top-color: var(--ctp-blue);
+        border-radius: 50%;
+        animation: spin 1s linear infinite;
     }
 
-    .remote-label {
-        color: #a6e3a1;
-        font-weight: 500;
+    @@keyframes spin {
+        to { transform: rotate(360deg); }
     }
 
+    @@keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.3; }
+    }
 </style>
