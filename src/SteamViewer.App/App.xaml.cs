@@ -53,24 +53,6 @@ public partial class App : Application
             Y = y
         };
 
-#if WINDOWS
-        // Disable resize and maximize on home window — fixed size
-        _mainWindow.HandlerChanged += (s, e) =>
-        {
-            if (_mainWindow.Handler?.PlatformView is Microsoft.UI.Xaml.Window winuiWindow)
-            {
-                var hwnd = WinRT.Interop.WindowNative.GetWindowHandle(winuiWindow);
-                var windowId = Microsoft.UI.Win32Interop.GetWindowIdFromWindow(hwnd);
-                var appWindow = Microsoft.UI.Windowing.AppWindow.GetFromWindowId(windowId);
-                if (appWindow.Presenter is Microsoft.UI.Windowing.OverlappedPresenter presenter)
-                {
-                    presenter.IsResizable = false;
-                    presenter.IsMaximizable = false;
-                }
-            }
-        };
-#endif
-
         // Save window state, kill child processes, and exit on close
         _mainWindow.Destroying += (s, e) =>
         {

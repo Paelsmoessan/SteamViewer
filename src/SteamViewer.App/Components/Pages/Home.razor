@@ -52,7 +52,7 @@ else if (connectionState == ConnectionState.Idle || connectionState == Connectio
 }
 else
 {
-    @* === Home screen - RustDesk/TV-style layout === *@
+    @* === Home screen - two-panel layout === *@
     <div class="home-shell">
         @* --- Top bar with logo --- *@
         <div class="top-bar">
@@ -66,45 +66,24 @@ else
         <div class="main-panels">
             @* --- Left panel: identity --- *@
             <div class="id-panel">
-                @if (connectionState == ConnectionState.Registered || connectionState == ConnectionState.Connecting)
-                {
-                    <div class="id-field">
-                        <label>Session ID</label>
-                        <div class="id-value-row">
-                            <span class="id-value">@clientId</span>
-                            <button class="id-copy-btn" @onclick="CopySessionId" title="@(_copiedId ? "Copied!" : "Copy")">
-                                <Icon Name="@(_copiedId ? AppIcon.Check : AppIcon.Copy)" Size="12" />
-                            </button>
-                        </div>
+                <div class="id-field">
+                    <label>Session ID</label>
+                    <div class="id-value-row">
+                        <span class="id-value">@clientId</span>
+                        <button class="id-copy-btn" @onclick="CopySessionId" title="@(_copiedId ? "Copied!" : "Copy")">
+                            <Icon Name="@(_copiedId ? AppIcon.Check : AppIcon.Copy)" Size="12" />
+                        </button>
                     </div>
-                    <div class="id-field">
-                        <label>Password</label>
-                        <div class="id-value-row">
-                            <span class="id-value">@password</span>
-                            <button class="id-copy-btn" @onclick="CopyPassword" title="@(_copiedPassword ? "Copied!" : "Copy")">
-                                <Icon Name="@(_copiedPassword ? AppIcon.Check : AppIcon.Copy)" Size="12" />
-                            </button>
-                        </div>
+                </div>
+                <div class="id-field">
+                    <label>Password</label>
+                    <div class="id-value-row">
+                        <span class="id-value">@password</span>
+                        <button class="id-copy-btn" @onclick="CopyPassword" title="@(_copiedPassword ? "Copied!" : "Copy")">
+                            <Icon Name="@(_copiedPassword ? AppIcon.Check : AppIcon.Copy)" Size="12" />
+                        </button>
                     </div>
-                }
-                else if (connectionState == ConnectionState.Reconnecting)
-                {
-                    <div class="id-field dim">
-                        <label>Session ID</label>
-                        <div class="id-value-row">
-                            <span class="id-value">@clientId</span>
-                        </div>
-                    </div>
-                    <p class="reconnect-text">Reconnecting (@_reconnectAttempt/@MaxReconnectAttempts)...</p>
-                }
-                else if (connectionState == ConnectionState.Disconnected || connectionState == ConnectionState.Error)
-                {
-                    <p class="disconnected-text">Connection lost</p>
-                    <button class="retry-btn" @onclick="RetryConnection">
-                        <Icon Name="AppIcon.RotateCw" Size="12" />
-                        Retry
-                    </button>
-                }
+                </div>
             </div>
 
             @* --- Right panel: connect --- *@
@@ -120,16 +99,8 @@ else
                         <input type="password" @bind="targetPassword" placeholder="Enter password" />
                     </div>
                     <button class="connect-btn" @onclick="JoinSession"
-                            disabled="@(string.IsNullOrWhiteSpace(targetId) || string.IsNullOrWhiteSpace(targetPassword) || _isJoining)">
-                        @if (_isJoining)
-                        {
-                            <span class="btn-spinner"></span>
-                            <span>Connecting...</span>
-                        }
-                        else
-                        {
-                            <span>Connect</span>
-                        }
+                            disabled="@(string.IsNullOrWhiteSpace(targetId) || string.IsNullOrWhiteSpace(targetPassword))">
+                        Connect
                     </button>
                 </div>
             </div>
@@ -138,21 +109,8 @@ else
         @* --- Status bar --- *@
         <div class="status-bar">
             <div class="status-left">
-                @if (connectionState == ConnectionState.Registered || connectionState == ConnectionState.Connecting)
-                {
-                    <span class="status-dot ready"></span>
-                    <span>Ready</span>
-                }
-                else if (connectionState == ConnectionState.Reconnecting)
-                {
-                    <span class="status-dot reconnecting"></span>
-                    <span>Reconnecting...</span>
-                }
-                else
-                {
-                    <span class="status-dot disconnected"></span>
-                    <span>Offline</span>
-                }
+                <span class="status-dot ready"></span>
+                <span>Ready</span>
             </div>
             <div class="status-right">
                 <a href="/collaboration" class="collab-link">
@@ -210,8 +168,10 @@ else
 #if DEBUG
 #endif
 
+    private enum AppMode { Select, StartConnection, JoinConnection }
+
+    private AppMode currentMode = AppMode.StartConnection;
     private ConnectionState connectionState = ConnectionState.Idle;
-    private bool _disposed;
 
     // Session state
     private string clientId = "";
@@ -224,7 +184,6 @@ else
     private ReconnectCredentials.ReconnectResult? _pendingReconnect;
 
     // Join mode state
-    private bool _isJoining;
 #if DEBUG
     private string targetId = "";
     private string targetPassword = "TESTPASS";
@@ -254,15 +213,10 @@ else
     private FileTransferDialog.DialogMode _fileDialogMode;
     private FileTransferState? _pendingFileTransfer;
 
-    // Monitor picker state (DXGI native capture - no browser picker)
+    // Monitor picker state (DXGI native capture — no browser picker)
     private bool _showMonitorPicker;
     private List<MonitorInfo>? _availableMonitors;
     private uint _selectedMonitorId;
-
-    // Auto-reconnect state
-    private int _reconnectAttempt;
-    private const int MaxReconnectAttempts = 10;
-    private CancellationTokenSource? _reconnectCts;
 
     // UI helper properties that delegate to HostSession
     private bool _isSharingScreen => _hostSession?.IsSharingScreen ?? false;
@@ -287,7 +241,7 @@ else
                 }
                 else if (_showMonitorPicker && _availableMonitors != null)
                 {
-                    @* Monitor picker - shown when 2+ monitors detected *@
+                    @* Monitor picker — shown when 2+ monitors detected *@
                     <div class="monitor-picker">
                         <p class="picker-label">Select monitor to share:</p>
                         <div class="monitor-options">
@@ -355,16 +309,16 @@ else
     {
         if (firstRender)
         {
-            // Check for reconnect data first (from reboot or elevation restart)
             _pendingReconnect = ReconnectCredentials.Load();
             if (_pendingReconnect != null)
             {
+                // Reconnect with saved credentials (from reboot or elevation restart)
                 Logger.LogInformation("Found valid reconnect data for ID: {Id}", _pendingReconnect.ClientId);
                 _ = StartSessionWithRetryAsync();
             }
             else
             {
-                // Auto-register on launch - always connect to signaling server immediately
+                // Auto-register on launch
                 _ = StartSession();
             }
         }
@@ -465,6 +419,19 @@ else
 
     #endregion
 
+    private void SelectJoinMode()
+    {
+        currentMode = AppMode.JoinConnection;
+        StateHasChanged();
+    }
+
+    private void GoBack()
+    {
+        currentMode = AppMode.StartConnection;
+        errorMessage = "";
+        StateHasChanged();
+    }
+
     private async Task CopySessionId()
     {
         await CopyToClipboard(clientId);
@@ -527,7 +494,7 @@ else
 
         if (_availableMonitors != null && _availableMonitors.Count > 1)
         {
-            // Multiple monitors - show picker (no browser picker!)
+            // Multiple monitors — show picker (no browser picker!)
             _selectedMonitorId = _availableMonitors.FirstOrDefault(m => m.IsPrimary)?.Id
                 ?? _availableMonitors[0].Id;
             _showMonitorPicker = true;
@@ -535,7 +502,7 @@ else
             return;
         }
 
-        // Single monitor (or enumeration failed) - start directly
+        // Single monitor (or enumeration failed) — start directly
         var outputIndex = _availableMonitors?.FirstOrDefault()?.Id;
         var success = await _hostSession.StartScreenShareAsync(outputIndex);
         if (!success)
@@ -587,9 +554,9 @@ else
             {
                 clientId = _pendingReconnect.ClientId;
                 passwordHash = _pendingReconnect.PasswordHash;
-                password = "(reconnecting)"; // Plain password not available - hash is sufficient for registration
+                password = "(reconnecting)"; // Plain password not available — hash is sufficient for registration
                 _isReconnect = true;
-                _pendingReconnect = null; // Consume - one-time use
+                _pendingReconnect = null; // Consume — one-time use
                 Logger.LogInformation("Reconnecting with saved credentials - ID: {Id}", clientId);
             }
             else
@@ -691,18 +658,11 @@ else
         StateHasChanged();
     }
 
-    private async Task RetryConnection()
-    {
-        _reconnectCts?.Cancel();
-        errorMessage = "";
-        await StartSession();
-    }
-
     private async Task JoinSession()
     {
         try
         {
-            _isJoining = true;
+            connectionState = ConnectionState.Connecting;
             errorMessage = "";
             StateHasChanged();
 
@@ -720,16 +680,16 @@ else
                 errorMessage = "Failed to create session";
             }
 
-            // Stay registered as host - viewer window handles everything
-            // connectionState stays as Registered since we're still a host
+            // Return to host view - viewer window handles everything
+            currentMode = AppMode.StartConnection;
+            connectionState = ConnectionState.Registered;
         }
         catch (Exception ex)
         {
             Logger.LogError(ex, "Failed to join session");
+            connectionState = ConnectionState.Error;
             errorMessage = ex.Message;
         }
-
-        _isJoining = false;
         StateHasChanged();
     }
 
@@ -791,7 +751,7 @@ else
             {
                 Logger.LogWarning("Host session disconnected: {Reason}. Resetting to accept reconnections.", reason);
 
-                // Detach elevation service before disposing - keeps helper processes alive
+                // Detach elevation service before disposing — keeps helper processes alive
                 if (_hostSession != null)
                 {
                     _preservedElevationService = _hostSession.DetachElevationService();
@@ -803,7 +763,7 @@ else
                     _hostSession = null;
                 }
 
-                // Reset to registered state - host is still registered on signaling server
+                // Reset to registered state — host is still registered on signaling server
                 connectedPeerId = "";
                 _canvasInitialized = false;
                 _isReconnect = true; // Auto-accept viewer's reconnect
@@ -812,7 +772,7 @@ else
             });
             _hostSession.OnScreenShareLost += () => InvokeAsync(() =>
             {
-                Logger.LogWarning("Screen sharing lost - user needs to reshare or click canvas to trigger gesture-backed restart");
+                Logger.LogWarning("Screen sharing lost — user needs to reshare or click canvas to trigger gesture-backed restart");
                 StateHasChanged();
             });
             _hostSession.OnPeerSharingChanged += sharing => InvokeAsync(() =>
@@ -941,7 +901,7 @@ else
             _hostSession = null;
         }
 
-        // User-initiated disconnect - fully dispose any preserved elevation
+        // User-initiated disconnect — fully dispose any preserved elevation
         if (_preservedElevationService != null)
         {
             await _preservedElevationService.DisposeAsync();
@@ -950,18 +910,15 @@ else
 
         connectedPeerId = "";
         _canvasInitialized = false;
-
-        // Stay registered - we're always a host on the home screen
         connectionState = ConnectionState.Registered;
-
         StateHasChanged();
     }
 
     private void HandleMessage(SignalingMessage message)
     {
-        // Home.razor handles HOST-side signaling.
+        // Home.razor only handles HOST-side signaling.
         // Viewer-side signaling is handled by ViewerSessionManager (subscribed to same event).
-        // Always handle since we're always registered on the home screen.
+        if (currentMode != AppMode.StartConnection) return;
 
         InvokeAsync(async () =>
         {
@@ -1005,7 +962,7 @@ else
                     break;
 
                 case SignalingMessage.TransportEndpoint endpoint:
-                    // Viewer's UDP candidates - forward to host session
+                    // Viewer's UDP candidates — forward to host session
                     if (_hostSession != null)
                     {
                         Logger.LogInformation("Routing viewer TransportEndpoint to HostSession ({CandidateCount} candidates)",
@@ -1015,7 +972,7 @@ else
                     break;
 
                 case SignalingMessage.TransportConfirmed confirmed:
-                    // Viewer confirmed UDP probe succeeded - forward to host session
+                    // Viewer confirmed UDP probe succeeded — forward to host session
                     if (_hostSession != null)
                     {
                         Logger.LogInformation("Routing TransportConfirmed to HostSession");
@@ -1034,58 +991,12 @@ else
 
     private void HandleDisconnected(string? reason)
     {
-        InvokeAsync(async () =>
+        InvokeAsync(() =>
         {
-            if (_disposed) return;
-            Logger.LogWarning("Signaling disconnected: {Reason}. Auto-reconnecting...", reason);
-            connectionState = ConnectionState.Reconnecting;
-            errorMessage = "";
+            connectionState = ConnectionState.Disconnected;
+            errorMessage = reason ?? "Disconnected from server";
             StateHasChanged();
-            await AutoReconnectAsync();
         });
-    }
-
-    private async Task AutoReconnectAsync()
-    {
-        _reconnectCts?.Cancel();
-        _reconnectCts = new CancellationTokenSource();
-        var ct = _reconnectCts.Token;
-
-        for (_reconnectAttempt = 1; _reconnectAttempt <= MaxReconnectAttempts; _reconnectAttempt++)
-        {
-            if (ct.IsCancellationRequested) return;
-
-            var delay = Math.Min(2000 * (int)Math.Pow(2, _reconnectAttempt - 1), 30000);
-            Logger.LogInformation("Reconnect attempt {Attempt}/{Max} in {Delay}ms", _reconnectAttempt, MaxReconnectAttempts, delay);
-
-            try { await Task.Delay(delay, ct); } catch (OperationCanceledException) { return; }
-
-            try
-            {
-                await SignalingClient.ConnectAsync();
-                var success = await SignalingClient.RegisterAsync(clientId, passwordHash);
-                if (success)
-                {
-                    Logger.LogInformation("Reconnected successfully on attempt {Attempt}", _reconnectAttempt);
-                    connectionState = ConnectionState.Registered;
-                    _reconnectAttempt = 0;
-                    errorMessage = "";
-                    StateHasChanged();
-                    return;
-                }
-            }
-            catch (Exception ex)
-            {
-                Logger.LogDebug(ex, "Reconnect attempt {Attempt} failed", _reconnectAttempt);
-            }
-
-            StateHasChanged();
-        }
-
-        Logger.LogError("Reconnect failed after {Max} attempts", MaxReconnectAttempts);
-        connectionState = ConnectionState.Disconnected;
-        errorMessage = "Connection lost. Click to retry.";
-        StateHasChanged();
     }
 
     private void HandleError(Exception ex)
@@ -1099,10 +1010,6 @@ else
 
     public async ValueTask DisposeAsync()
     {
-        _disposed = true;
-        _reconnectCts?.Cancel();
-        _reconnectCts?.Dispose();
-
         SignalingClient.OnMessageReceived -= HandleMessage;
         SignalingClient.OnDisconnected -= HandleDisconnected;
         SignalingClient.OnError -= HandleError;
