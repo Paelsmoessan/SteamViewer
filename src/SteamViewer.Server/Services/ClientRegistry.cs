@@ -6,6 +6,19 @@ using SteamViewer.Common.Protocol;
 namespace SteamViewer.Server.Services;
 
 /// <summary>
+/// Result of a client registration attempt.
+/// </summary>
+public enum RegisterResult
+{
+    /// <summary>New client registered successfully.</summary>
+    Success,
+    /// <summary>Existing registration replaced (session takeover). Old client info returned.</summary>
+    Takeover,
+    /// <summary>Client ID exists but password hash doesn't match.</summary>
+    PasswordMismatch
+}
+
+/// <summary>
 /// Client connection information stored in the registry.
 /// </summary>
 public sealed class ClientInfo
@@ -46,10 +59,10 @@ public sealed class ClientRegistry
     private readonly object _peerLock = new();
 
     /// <summary>
-    /// Register a new client.
+    /// Register a client. If the client ID already exists with matching password,
+    /// performs session takeover (replaces old registration, returns old ClientInfo).
     /// </summary>
-    /// <returns>True if registration succeeded, false if client ID already exists.</returns>
-    public bool TryRegister(
+    public (RegisterResult Result, ClientInfo? OldClient) Register(
         string clientId,
         string passwordHash,
         ChannelWriter<SignalingMessage> messageWriter,
@@ -65,13 +78,38 @@ public sealed class ClientRegistry
             RegisteredAt = DateTimeOffset.UtcNow
         };
 
-        if (!_clients.TryAdd(clientId, info))
+        // Fast path: no existing registration
+        if (_clients.TryAdd(clientId, info))
         {
-            return false;
+            _connections[connectionId] = clientId;
+            return (RegisterResult.Success, null);
         }
 
-        _connections[connectionId] = clientId;
-        return true;
+        // Client ID exists - check password for takeover
+        lock (_peerLock)
+        {
+            if (!_clients.TryGetValue(clientId, out var existing))
+            {
+                // Removed between TryAdd and lock - retry
+                if (_clients.TryAdd(clientId, info))
+                {
+                    _connections[connectionId] = clientId;
+                    return (RegisterResult.Success, null);
+                }
+                return (RegisterResult.PasswordMismatch, null);
+            }
+
+            if (existing.PasswordHash != passwordHash)
+            {
+                return (RegisterResult.PasswordMismatch, null);
+            }
+
+            // Password matches - takeover: replace registration
+            _connections.TryRemove(existing.ConnectionId, out _);
+            _clients[clientId] = info;
+            _connections[connectionId] = clientId;
+            return (RegisterResult.Takeover, existing);
+        }
     }
 
     /// <summary>

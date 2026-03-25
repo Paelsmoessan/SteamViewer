@@ -114,6 +114,12 @@ public sealed class SignalingHandler
         return _registry.GetClient(clientId)?.WriteLock;
     }
 
+    /// <summary>
+    /// Receive timeout: if no data arrives within this window, assume connection is dead.
+    /// Client sends pings every 25s, so 90s = 3 missed pings + margin.
+    /// </summary>
+    private static readonly TimeSpan ReceiveTimeout = TimeSpan.FromSeconds(90);
+
     private async Task ReceiveLoopAsync(
         WebSocket webSocket,
         ChannelWriter<SignalingMessage> writer,
@@ -128,7 +134,11 @@ public sealed class SignalingHandler
         {
             try
             {
-                var result = await webSocket.ReceiveAsync(new ArraySegment<byte>(buffer), cancellationToken);
+                using var timeoutCts = new CancellationTokenSource(ReceiveTimeout);
+                using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(
+                    timeoutCts.Token, cancellationToken);
+
+                var result = await webSocket.ReceiveAsync(new ArraySegment<byte>(buffer), linkedCts.Token);
 
                 if (result.MessageType == WebSocketMessageType.Close)
                 {
@@ -190,8 +200,16 @@ public sealed class SignalingHandler
                 _logger.LogWarning(ex, "WebSocket error for connection {ConnectionId}", connectionId);
                 break;
             }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                // Receive timeout - no data for 90s, connection is dead
+                _logger.LogWarning("Connection {ConnectionId} timed out (no data for {Timeout}s)",
+                    connectionId, ReceiveTimeout.TotalSeconds);
+                break;
+            }
             catch (OperationCanceledException)
             {
+                // Server shutdown
                 break;
             }
         }
@@ -251,16 +269,48 @@ public sealed class SignalingHandler
         ChannelWriter<SignalingMessage> writer,
         Action<string> setClientId)
     {
-        if (_registry.TryRegister(register.ClientId, register.PasswordHash, writer, connectionId))
+        var (result, oldClient) = _registry.Register(register.ClientId, register.PasswordHash, writer, connectionId);
+
+        switch (result)
         {
-            setClientId(register.ClientId);
-            _logger.LogInformation("Client {ClientId} registered", register.ClientId);
-            return new SignalingMessage.RegisterSuccess(register.ClientId);
-        }
-        else
-        {
-            _logger.LogWarning("Client ID {ClientId} already registered", register.ClientId);
-            return new SignalingMessage.RegisterFailed("Client ID already registered");
+            case RegisterResult.Success:
+                setClientId(register.ClientId);
+                _logger.LogInformation("Client {ClientId} registered", register.ClientId);
+                return new SignalingMessage.RegisterSuccess(register.ClientId);
+
+            case RegisterResult.Takeover:
+                setClientId(register.ClientId);
+
+                // Clean up old client's peer relationship
+                if (oldClient?.PeerId != null)
+                {
+                    _registry.SetPeer(oldClient.PeerId, null);
+                    _registry.TrySendToClient(oldClient.PeerId,
+                        new SignalingMessage.Disconnected(register.ClientId, "Peer reconnected"));
+                }
+
+                // Clean up old client's session membership
+                var (session, _) = _sessionRegistry.LeaveSession(register.ClientId);
+                if (session != null)
+                {
+                    foreach (var participantId in session.Participants.Keys)
+                        _registry.TrySendToClient(participantId, new SignalingMessage.ParticipantLeft(register.ClientId));
+                }
+
+                // Kill old WebSocket (causes old receive loop to exit and hit cleanup,
+                // which is a no-op since we already replaced the registration)
+                try { oldClient?.MessageWriter.TryComplete(); } catch { }
+                try { oldClient?.WebSocket?.Abort(); } catch { }
+
+                _logger.LogInformation("Client {ClientId} session takeover (old connection {OldConn} replaced)",
+                    register.ClientId, oldClient?.ConnectionId);
+                return new SignalingMessage.RegisterSuccess(register.ClientId);
+
+            case RegisterResult.PasswordMismatch:
+            default:
+                _logger.LogWarning("Client ID {ClientId} registration rejected (password mismatch or already registered)",
+                    register.ClientId);
+                return new SignalingMessage.RegisterFailed("Client ID already registered");
         }
     }
 
@@ -547,15 +597,23 @@ public sealed class SignalingHandler
             return Task.CompletedTask;
         }
 
-        // Get peer ID before unregistering
+        // Check if this connection still owns the client registration.
+        // After session takeover, the old connection's cleanup runs but the registration
+        // now belongs to the new connection - we must not touch it.
         var client = _registry.GetClient(clientId);
+        if (client != null && client.ConnectionId != connectionId)
+        {
+            _logger.LogInformation("Client {ClientId} cleanup skipped for old connection {ConnectionId} (taken over)",
+                clientId, connectionId);
+            return Task.CompletedTask;
+        }
+
         var peerId = client?.PeerId;
 
         // Clean up session membership
         var (session, _) = _sessionRegistry.LeaveSession(clientId);
         if (session != null)
         {
-            // Notify remaining session participants
             foreach (var participantId in session.Participants.Keys)
             {
                 _registry.TrySendToClient(participantId, new SignalingMessage.ParticipantLeft(clientId));
