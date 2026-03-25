@@ -166,6 +166,7 @@ else
         .GetCustomAttribute<System.Reflection.AssemblyInformationalVersionAttribute>(typeof(Home).Assembly)?.InformationalVersion?.Split('+')[0] ?? "0.0.0";
 
 #if DEBUG
+    private bool _debugCredsSaved;
 #endif
 
     private enum AppMode { Select, StartConnection, JoinConnection }
@@ -272,6 +273,20 @@ else
                     }
                 }
             </div>
+
+            @* Debug: save reconnect credentials for boot relay testing *@
+#if DEBUG
+            <div class="debug-controls" style="margin-top: 8px;">
+                <button class="share-btn" style="font-size: 11px; padding: 4px 8px; opacity: 0.6;"
+                        @onclick="SaveDebugReconnectCreds" disabled="@(!_dataChannelReady)">
+                    Save Reconnect Creds (Debug)
+                </button>
+                @if (_debugCredsSaved)
+                {
+                    <span style="color: #4caf50; font-size: 11px; margin-left: 8px;">Saved!</span>
+                }
+            </div>
+#endif
 
             @* Remote screen display (when peer is sharing) *@
             @if (_peerIsSharingScreen)
@@ -536,6 +551,23 @@ else
         _showMonitorPicker = false;
         StateHasChanged();
     }
+
+#if DEBUG
+    private void SaveDebugReconnectCreds()
+    {
+        if (string.IsNullOrEmpty(clientId) || string.IsNullOrEmpty(passwordHash) || string.IsNullOrEmpty(connectedPeerId))
+        {
+            Logger.LogWarning("Cannot save reconnect creds: missing session data");
+            return;
+        }
+
+        var serverUrl = Configuration["SignalingServer"] ?? "";
+        ReconnectCredentials.Save(clientId, passwordHash, connectedPeerId, serverUrl);
+        _debugCredsSaved = true;
+        Logger.LogInformation("DEBUG: Saved reconnect credentials (clientId={Id}, serverUrl={Url})", clientId, serverUrl);
+        StateHasChanged();
+    }
+#endif
 
     #endregion
 

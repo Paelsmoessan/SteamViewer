@@ -1,10 +1,11 @@
 using System.Collections.Concurrent;
-using System.Net.WebSockets;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
-using SIPSorcery.Net;
+using Microsoft.Extensions.Logging;
+using SteamViewer.Client.Core.Network;
 using SteamViewer.Client.Core.Session;
+using SteamViewer.Client.Core.Video;
 using SteamViewer.Common.Protocol;
 using SteamViewer.Platform.Windows.Input;
 
@@ -12,10 +13,10 @@ namespace SteamViewer.Platform.Windows.Elevation;
 
 /// <summary>
 /// Boot-time relay service that runs as SYSTEM before user login.
-/// Reads ReconnectCredentials, connects to the signaling server,
-/// establishes a SIPSorcery WebRTC data channel with the viewer,
-/// captures the login screen (Winlogon desktop), and relays
-/// JPEG frames + keyboard/mouse input.
+/// Reads ReconnectCredentials, connects to the signaling server via SignalingClient,
+/// establishes a StreamTransport relay with the viewer, captures the login screen
+/// (Winlogon desktop) via SecureDesktopCapture, encodes H.264 frames, and relays
+/// keyboard/mouse input.
 /// Exits when the main app re-registers (duplicate clientId kicks us).
 /// </summary>
 public static class BootRelayService
@@ -23,15 +24,23 @@ public static class BootRelayService
     private static string? _debugPath;
     private static string? _debugPathLocal;
     private static SecureDesktopCapture? _capture;
-    private static RTCPeerConnection? _peerConnection;
-    private static RTCDataChannel? _dataChannel;
-    private static ClientWebSocket? _ws;
+    private static SignalingClient? _signalingClient;
+    private static HostStreamTransport? _transport;
+    private static FFmpegEncoder? _encoder;
     private static string? _viewerPeerId;
     private static volatile bool _stopping;
+    private static ILoggerFactory? _loggerFactory;
 
-    // Input thread — same pattern as SystemHelperServer
+    // Input thread - same pattern as SystemHelperServer
     private static BlockingCollection<(string json, int sw, int sh)>? _inputQueue;
     private static Thread? _inputThread;
+
+    // Frame tracking
+    private static int _frameCount;
+    private static int _lastSentCaptureW;
+    private static int _lastSentCaptureH;
+    private static int _lastSentEncodeW;
+    private static int _lastSentEncodeH;
 
     // WinSta0 attachment
     private const uint WINSTA_ALL_ACCESS = 0x37F;
@@ -67,12 +76,6 @@ public static class BootRelayService
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool CloseDesktop(IntPtr hDesktop);
 
-    [DllImport("user32.dll", SetLastError = true)]
-    private static extern IntPtr GetThreadDesktop(uint dwThreadId);
-
-    [DllImport("kernel32.dll")]
-    private static extern uint GetCurrentThreadId();
-
     [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     private static extern IntPtr OpenDesktop(string lpszDesktop, uint dwFlags, bool fInherit, uint dwDesiredAccess);
 
@@ -88,7 +91,7 @@ public static class BootRelayService
     /// Main entry point. Called from Program.cs when --boot-relay is passed.
     /// Blocks until the viewer disconnects, main app takes over, or timeout.
     /// </summary>
-    public static void Run()
+    public static void Run(string? taskName = null)
     {
         _debugPath = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
@@ -103,7 +106,10 @@ public static class BootRelayService
             try { Directory.CreateDirectory(Path.GetDirectoryName(_debugPathLocal)!); } catch { }
         }
 
-        DebugLog($"Starting boot relay (PID {Environment.ProcessId}, User: {Environment.UserName})");
+        DebugLog($"Starting boot relay (PID {Environment.ProcessId}, User: {Environment.UserName}, Task: {taskName ?? "none"})");
+
+        // TODO: Self-delete scheduled task here (Step 3 of reboot-reconnect plan)
+        // if (!string.IsNullOrEmpty(taskName)) BootTaskManager.DeleteTask(taskName);
 
         // Read reconnect credentials
         var creds = ReconnectCredentials.Load();
@@ -160,22 +166,40 @@ public static class BootRelayService
             _inputThread?.Join(2000);
             _capture?.Dispose();
             _capture = null;
-            _peerConnection?.Dispose();
-            _peerConnection = null;
+            _encoder?.Dispose();
+            _encoder = null;
+            _transport?.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            _transport = null;
+            _signalingClient?.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            _signalingClient = null;
+            _loggerFactory?.Dispose();
+            _loggerFactory = null;
             DebugLog("Boot relay exited.");
         }
     }
 
     private static async Task RunAsync(ReconnectCredentials.ReconnectResult creds)
     {
-        // Connect to signaling server
-        _ws = new ClientWebSocket();
+        // Create logger factory (console output + debug log level)
+        _loggerFactory = LoggerFactory.Create(builder =>
+        {
+            builder.SetMinimumLevel(LogLevel.Debug);
+            builder.AddConsole();
+        });
+
+        var logger = _loggerFactory.CreateLogger("BootRelay");
+
+        // Create SignalingClient and connect
+        _signalingClient = new SignalingClient(
+            creds.ServerUrl!,
+            _loggerFactory.CreateLogger<SignalingClient>());
+
         var cts = new CancellationTokenSource(TimeSpan.FromMinutes(60)); // Max lifetime
 
         try
         {
             DebugLog($"Connecting to signaling server: {creds.ServerUrl}");
-            await _ws.ConnectAsync(new Uri(creds.ServerUrl!), cts.Token);
+            await _signalingClient.ConnectAsync(cts.Token);
             DebugLog("Connected to signaling server");
         }
         catch (Exception ex)
@@ -184,346 +208,145 @@ public static class BootRelayService
             return;
         }
 
+        // Handle signaling disconnect
+        _signalingClient.OnDisconnected += reason =>
+        {
+            DebugLog($"Signaling disconnected: {reason} (likely main app re-registered)");
+            _stopping = true;
+        };
+
+        // Handle incoming connections
+        _signalingClient.OnMessageReceived += msg =>
+        {
+            switch (msg)
+            {
+                case SignalingMessage.IncomingConnection incoming:
+                    DebugLog($"Incoming connection from {incoming.FromId}");
+                    _viewerPeerId = incoming.FromId;
+                    _ = HandleIncomingConnectionAsync(incoming.FromId, creds, cts.Token);
+                    break;
+
+                case SignalingMessage.RelayReady:
+                case SignalingMessage.TransportEndpoint:
+                case SignalingMessage.TransportConfirmed:
+                    // These are handled by HostStreamTransport internally via sendSignaling callback
+                    break;
+
+                case SignalingMessage.Disconnected disconnected:
+                    DebugLog($"Peer disconnected: {disconnected.PeerId}");
+                    break;
+
+                case SignalingMessage.Error error:
+                    DebugLog($"Server error: {error.Message}");
+                    break;
+            }
+        };
+
         // Register with saved credentials
-        var registerMsg = SignalingSerializer.Serialize(
-            new SignalingMessage.Register(creds.ClientId, creds.PasswordHash));
-        await WsSendAsync(registerMsg, cts.Token);
-        DebugLog($"Sent register: clientId={creds.ClientId}");
+        DebugLog($"Registering: clientId={creds.ClientId}");
+        var registered = await _signalingClient.RegisterAsync(creds.ClientId, creds.PasswordHash, cts.Token);
+        if (!registered)
+        {
+            DebugLog("Registration failed. Exiting.");
+            return;
+        }
+        DebugLog("Registered successfully");
 
         // Start logon monitor on a background thread
         var logonMonitorCts = CancellationTokenSource.CreateLinkedTokenSource(cts.Token);
         _ = Task.Run(() => MonitorUserLogon(creds, logonMonitorCts.Token), logonMonitorCts.Token);
 
-        // Start keepalive pinger
-        _ = Task.Run(async () =>
+        // Wait until stopping
+        while (!cts.Token.IsCancellationRequested && !_stopping)
         {
-            while (!cts.Token.IsCancellationRequested && _ws?.State == WebSocketState.Open)
-            {
-                try
-                {
-                    await Task.Delay(30_000, cts.Token);
-                    var ping = SignalingSerializer.Serialize(new SignalingMessage.Ping());
-                    await WsSendAsync(ping, cts.Token);
-                }
-                catch { break; }
-            }
-        }, cts.Token);
-
-        // Message receive loop
-        var buffer = new byte[16384];
-        var msgBuilder = new StringBuilder();
-
-        while (_ws.State == WebSocketState.Open && !cts.Token.IsCancellationRequested && !_stopping)
-        {
-            try
-            {
-                var result = await _ws.ReceiveAsync(new ArraySegment<byte>(buffer), cts.Token);
-
-                if (result.MessageType == WebSocketMessageType.Close)
-                {
-                    DebugLog("Signaling server closed connection (likely main app re-registered)");
-                    break;
-                }
-
-                if (result.MessageType == WebSocketMessageType.Text)
-                {
-                    msgBuilder.Append(Encoding.UTF8.GetString(buffer, 0, result.Count));
-                    if (result.EndOfMessage)
-                    {
-                        var json = msgBuilder.ToString();
-                        msgBuilder.Clear();
-                        await HandleSignalingMessage(json, creds, cts.Token);
-                    }
-                }
-            }
-            catch (OperationCanceledException)
-            {
-                break;
-            }
-            catch (WebSocketException ex)
-            {
-                DebugLog($"WebSocket error: {ex.Message}");
-                break;
-            }
+            await Task.Delay(1000, cts.Token).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
         }
 
         logonMonitorCts.Cancel();
-        DebugLog("Signaling loop ended");
+        DebugLog("Main loop ended");
     }
 
-    private static async Task HandleSignalingMessage(string json, ReconnectCredentials.ReconnectResult creds, CancellationToken ct)
+    private static async Task HandleIncomingConnectionAsync(
+        string viewerPeerId, ReconnectCredentials.ReconnectResult creds, CancellationToken ct)
     {
-        var msg = SignalingSerializer.Deserialize(json);
-        if (msg == null)
+        try
         {
-            DebugLog($"Unknown message: {json[..Math.Min(json.Length, 200)]}");
-            return;
-        }
+            // Auto-approve
+            await _signalingClient!.RespondToConnectionAsync(viewerPeerId, true, ct);
+            DebugLog("Auto-approved connection");
 
-        switch (msg)
-        {
-            case SignalingMessage.RegisterSuccess success:
-                DebugLog($"Registered successfully as {success.ClientId}");
-                break;
+            // Create transport
+            _transport = new HostStreamTransport(
+                _signalingClient,
+                _loggerFactory!.CreateLogger<HostStreamTransport>());
 
-            case SignalingMessage.RegisterFailed failed:
-                DebugLog($"Registration failed: {failed.Reason}");
-                _stopping = true;
-                break;
-
-            case SignalingMessage.IncomingConnection incoming:
-                DebugLog($"Incoming connection from {incoming.FromId}");
-                _viewerPeerId = incoming.FromId;
-
-                // Auto-approve
-                var approveMsg = SignalingSerializer.Serialize(
-                    new SignalingMessage.ConnectionResponse(incoming.FromId, true));
-                await WsSendAsync(approveMsg, ct);
-                DebugLog("Auto-approved connection");
-
-                // Create WebRTC peer connection and send SDP offer
-                await CreatePeerConnectionAndOffer(creds, ct);
-                break;
-
-            case SignalingMessage.SdpAnswer answer:
-                DebugLog("Received SDP answer from viewer");
-                if (_peerConnection != null)
-                {
-                    var sdpAnswer = new RTCSessionDescriptionInit
-                    {
-                        type = RTCSdpType.answer,
-                        sdp = answer.Sdp
-                    };
-                    var setResult = _peerConnection.setRemoteDescription(sdpAnswer);
-                    DebugLog($"Set remote description: {setResult}");
-                }
-                break;
-
-            case SignalingMessage.IceCandidate ice:
-                if (_peerConnection != null)
-                {
-                    var candidate = new RTCIceCandidateInit
-                    {
-                        candidate = ice.Candidate,
-                        sdpMid = ice.SdpMid ?? "0",
-                        sdpMLineIndex = ice.SdpMLineIndex ?? 0
-                    };
-                    _peerConnection.addIceCandidate(candidate);
-                }
-                break;
-
-            case SignalingMessage.Disconnected disconnected:
-                DebugLog($"Peer disconnected: {disconnected.PeerId}");
-                break;
-
-            case SignalingMessage.Pong:
-                // Keepalive response
-                break;
-
-            case SignalingMessage.Error error:
-                DebugLog($"Server error: {error.Message}");
-                break;
-
-            default:
-                DebugLog($"Unhandled message type: {msg.GetType().Name}");
-                break;
-        }
-    }
-
-    private static async Task CreatePeerConnectionAndOffer(ReconnectCredentials.ReconnectResult creds, CancellationToken ct)
-    {
-        // Configure ICE servers
-        var iceServers = new List<RTCIceServer>();
-
-        // STUN servers
-        if (creds.StunUrls is { Length: > 0 })
-        {
-            iceServers.Add(new RTCIceServer { urls = string.Join(",", creds.StunUrls) });
-        }
-        else
-        {
-            // Default Google STUN servers
-            iceServers.Add(new RTCIceServer { urls = "stun:stun.l.google.com:19302" });
-        }
-
-        // TURN servers
-        if (creds.TurnUrls is { Length: > 0 } && !string.IsNullOrEmpty(creds.TurnUsername))
-        {
-            foreach (var turnUrl in creds.TurnUrls)
+            // Subscribe to input messages
+            _transport.OnControlMessage += HandleControlMessage;
+            _transport.OnConnectionStateChanged += state =>
             {
-                iceServers.Add(new RTCIceServer
-                {
-                    urls = turnUrl,
-                    username = creds.TurnUsername,
-                    credential = creds.TurnCredential
-                });
-            }
-        }
+                DebugLog($"Transport state: {state}");
+                if (state == "disconnected")
+                    _stopping = true;
+            };
 
-        var config = new RTCConfiguration
-        {
-            iceServers = iceServers
-        };
+            // Start relay (generates nonce, sets up encryption, sends RelayReady to viewer)
+            await _transport.StartRelayAsync(
+                viewerPeerId,
+                creds.PasswordHash,
+                msg => _signalingClient.SendAsync(msg, ct));
 
-        _peerConnection?.Dispose();
-        _peerConnection = new RTCPeerConnection(config);
+            DebugLog("StreamTransport relay started, waiting for viewer...");
 
-        _peerConnection.onconnectionstatechange += (state) =>
-        {
-            DebugLog($"Connection state: {state}");
-            if (state == RTCPeerConnectionState.disconnected || state == RTCPeerConnectionState.failed)
-            {
-                DebugLog("WebRTC disconnected/failed — stopping");
-                _stopping = true;
-            }
-        };
-
-        _peerConnection.onicecandidate += (candidate) =>
-        {
-            if (candidate != null && _viewerPeerId != null && _ws?.State == WebSocketState.Open)
-            {
-                var iceMsg = SignalingSerializer.Serialize(
-                    new SignalingMessage.IceCandidate(
-                        _viewerPeerId,
-                        candidate.candidate,
-                        candidate.sdpMid,
-                        candidate.sdpMLineIndex));
-                _ = WsSendAsync(iceMsg, CancellationToken.None);
-            }
-        };
-
-        // Create data channel
-        _dataChannel = await _peerConnection.createDataChannel("data");
-
-        _dataChannel.onopen += () =>
-        {
-            DebugLog("Data channel OPEN — starting screen capture");
+            // Wait for viewerReady - the transport.OnControlMessage will handle it
+            // Start capture immediately - frames will queue until viewer is ready
             StartCapture();
-        };
-
-        _dataChannel.onclose += () =>
-        {
-            DebugLog("Data channel closed");
-            StopCapture();
-        };
-
-        _dataChannel.onmessage += (dc, protocol, data) =>
-        {
-            HandleDataChannelMessage(data);
-        };
-
-        // Create and send SDP offer
-        var offer = _peerConnection.createOffer();
-        await _peerConnection.setLocalDescription(offer);
-
-        DebugLog("Created SDP offer, sending to viewer");
-
-        var sdpMsg = SignalingSerializer.Serialize(
-            new SignalingMessage.SdpOffer(_viewerPeerId!, offer.sdp));
-        await WsSendAsync(sdpMsg, ct);
-    }
-
-    private static void StartCapture()
-    {
-        if (_capture != null) return;
-
-        _capture = new SecureDesktopCapture();
-        _capture.OnFrameCaptured += OnFrameCaptured;
-        _capture.OnSecureDesktopActive += (w, h) =>
-        {
-            DebugLog($"Desktop active for capture: {w}x{h}");
-            SendDataChannelMessage(JsonSerializer.Serialize(new { type = "secureDesktopActive" }));
-        };
-        _capture.OnSecureDesktopInactive += () =>
-        {
-            DebugLog("Desktop inactive — user may have logged in");
-            SendDataChannelMessage(JsonSerializer.Serialize(new { type = "secureDesktopInactive" }));
-        };
-
-        // At boot, immediately send secureDesktopActive since we know Winlogon is the active desktop
-        SendDataChannelMessage(JsonSerializer.Serialize(new { type = "secureDesktopActive" }));
-
-        _capture.Start();
-        DebugLog("SecureDesktopCapture started");
-    }
-
-    private static void StopCapture()
-    {
-        if (_capture == null) return;
-        _capture.OnFrameCaptured -= OnFrameCaptured;
-        _capture.Dispose();
-        _capture = null;
-        DebugLog("SecureDesktopCapture stopped");
-    }
-
-    private static int _frameCount;
-
-    private static void OnFrameCaptured(byte[] bgraData, int width, int height, int stride)
-    {
-        _frameCount++;
-        if (_frameCount <= 3 || _frameCount % 100 == 0)
-            DebugLog($"Frame #{_frameCount}: {bgraData.Length}b BGRA, {width}x{height}");
-
-        // Convert BGRA to JPEG for data channel (boot relay uses WebRTC DC, not StreamTransport)
-        var pin = System.Runtime.InteropServices.GCHandle.Alloc(bgraData, System.Runtime.InteropServices.GCHandleType.Pinned);
-        try
-        {
-            using var bitmap = new System.Drawing.Bitmap(width, height, stride,
-                System.Drawing.Imaging.PixelFormat.Format32bppArgb,
-                pin.AddrOfPinnedObject());
-            using var ms = new MemoryStream();
-            bitmap.Save(ms, System.Drawing.Imaging.ImageFormat.Jpeg);
-            var jpegData = ms.ToArray();
-
-            var base64 = Convert.ToBase64String(jpegData);
-            var msg = JsonSerializer.Serialize(new
-            {
-                type = "secureDesktopFrame",
-                data = base64,
-                width,
-                height
-            });
-            SendDataChannelMessage(msg);
         }
         catch (Exception ex)
         {
-            DebugLog($"Frame encode error: {ex.Message}");
-        }
-        finally
-        {
-            pin.Free();
+            DebugLog($"HandleIncomingConnection error: {ex.Message}");
         }
     }
 
-    private static void SendDataChannelMessage(string message)
+    private static Task HandleControlMessage(string json)
     {
         try
         {
-            if (_dataChannel?.readyState == RTCDataChannelState.open)
-            {
-                _dataChannel.send(message);
-            }
-        }
-        catch (Exception ex)
-        {
-            DebugLog($"Data channel send error: {ex.Message}");
-        }
-    }
-
-    private static void HandleDataChannelMessage(byte[] data)
-    {
-        try
-        {
-            var json = Encoding.UTF8.GetString(data);
             using var doc = JsonDocument.Parse(json);
             var root = doc.RootElement;
             var type = root.TryGetProperty("type", out var typeProp) ? typeProp.GetString() : null;
 
-            if (type == null) return;
+            if (type == null) return Task.CompletedTask;
 
-            // Handle input events
             switch (type)
             {
+                case "viewerReady":
+                    DebugLog("Viewer relay connected - sending boot relay state");
+                    // Tell viewer we're in secure desktop mode (login screen)
+                    _ = _transport?.SendControlAsync(JsonSerializer.Serialize(new
+                    {
+                        type = "secureDesktopActive"
+                    }));
+                    // Send capture/encode info if we have frames already
+                    if (_lastSentCaptureW > 0)
+                    {
+                        _ = _transport?.SendControlAsync(JsonSerializer.Serialize(new
+                        {
+                            type = "captureInfo",
+                            width = _lastSentCaptureW,
+                            height = _lastSentCaptureH
+                        }));
+                    }
+                    if (_lastSentEncodeW > 0)
+                    {
+                        _ = _transport?.SendControlAsync(JsonSerializer.Serialize(new
+                        {
+                            type = "encodeInfo",
+                            width = _lastSentEncodeW,
+                            height = _lastSentEncodeH
+                        }));
+                    }
+                    break;
+
                 case "mouse_move":
                 case "mouse_down":
                 case "mouse_up":
@@ -541,9 +364,109 @@ public static class BootRelayService
         }
         catch (Exception ex)
         {
-            DebugLog($"Data channel message error: {ex.Message}");
+            DebugLog($"Control message error: {ex.Message}");
+        }
+
+        return Task.CompletedTask;
+    }
+
+    #region Screen Capture + H.264 Encoding
+
+    private static void StartCapture()
+    {
+        if (_capture != null) return;
+
+        _capture = new SecureDesktopCapture();
+        _capture.OnFrameCaptured += OnFrameCaptured;
+        _capture.OnSecureDesktopActive += (w, h) =>
+        {
+            DebugLog($"Desktop active for capture: {w}x{h}");
+        };
+        _capture.OnSecureDesktopInactive += () =>
+        {
+            DebugLog("Desktop inactive - user may have logged in");
+        };
+
+        _capture.Start();
+        DebugLog("SecureDesktopCapture started");
+    }
+
+    private static void StopCapture()
+    {
+        if (_capture == null) return;
+        _capture.OnFrameCaptured -= OnFrameCaptured;
+        _capture.Dispose();
+        _capture = null;
+        DebugLog("SecureDesktopCapture stopped");
+    }
+
+    private static void OnFrameCaptured(byte[] bgraData, int width, int height, int stride)
+    {
+        if (_transport == null || !_transport.IsConnected) return;
+
+        _frameCount++;
+        if (_frameCount <= 3 || _frameCount % 100 == 0)
+            DebugLog($"Frame #{_frameCount}: {bgraData.Length}b BGRA, {width}x{height}");
+
+        try
+        {
+            // Lazy-init encoder on first frame
+            if (_encoder == null)
+            {
+                FFmpegInit.EnsureInitialized();
+                _encoder = new FFmpegEncoder(_loggerFactory!.CreateLogger<FFmpegEncoder>());
+                _encoder.Initialize(width, height, 15, 10_000_000, crf: 18); // 15fps, CRF 18, 10Mbps cap (login screen is mostly static)
+                DebugLog($"FFmpeg encoder initialized: {width}x{height}");
+            }
+
+            // Send captureInfo if dimensions changed
+            if (width != _lastSentCaptureW || height != _lastSentCaptureH)
+            {
+                _lastSentCaptureW = width;
+                _lastSentCaptureH = height;
+                _ = _transport.SendControlAsync(JsonSerializer.Serialize(new
+                {
+                    type = "captureInfo",
+                    width,
+                    height
+                }));
+            }
+
+            // Encode BGRA to H.264
+            var result = _encoder.EncodeFrame(bgraData, stride, width, height);
+
+            // Send encodeInfo if dimensions changed
+            var ew = _encoder.Width;
+            var eh = _encoder.Height;
+            if (ew != _lastSentEncodeW || eh != _lastSentEncodeH)
+            {
+                _lastSentEncodeW = ew;
+                _lastSentEncodeH = eh;
+                _ = _transport.SendControlAsync(JsonSerializer.Serialize(new
+                {
+                    type = "encodeInfo",
+                    width = ew,
+                    height = eh
+                }));
+            }
+
+            if (result is var (naluData, naluLength))
+            {
+                _transport.EnqueueVideoFrame(naluData, naluLength);
+
+                if (_frameCount <= 3 || _frameCount % 100 == 0)
+                    DebugLog($"H.264 frame #{_frameCount}: {naluLength / 1024}KB");
+            }
+        }
+        catch (Exception ex)
+        {
+            DebugLog($"Frame encode error: {ex.Message}");
         }
     }
+
+    #endregion
+
+    #region Input Injection
 
     /// <summary>
     /// Dedicated input thread. Attaches to the active desktop and injects input.
@@ -635,6 +558,10 @@ public static class BootRelayService
         }
     }
 
+    #endregion
+
+    #region User Logon Monitoring
+
     /// <summary>
     /// Monitors for user logon. When detected, launches the main app as the user.
     /// </summary>
@@ -660,26 +587,31 @@ public static class BootRelayService
                     DebugLog($"User logged in (session {sessionId}). Waiting for desktop to settle...");
                     Thread.Sleep(5000); // Let desktop initialize
 
-                    // Launch main app as the logged-in user
+                    // Launch main app in user's session as SYSTEM (ServiceUI technique)
                     var appPath = Environment.ProcessPath;
                     if (!string.IsNullOrEmpty(appPath))
                     {
-                        DebugLog($"Launching main app as user: {appPath}");
-                        // Reuse SasMode's pattern — CreateProcessAsUser
-                        if (LaunchAppAsUser(userToken, appPath))
+                        DebugLog($"Launching main app via ProcessLauncher: {appPath}");
+                        if (ProcessLauncher.LaunchInUserSession(appPath, null, out var pid))
                         {
-                            DebugLog("Main app launched. Waiting for it to take over...");
+                            DebugLog($"Main app launched in user session: PID {pid}");
+                            DebugLog("Waiting for main app to take over signaling...");
                             // Wait for main app to re-register with signaling server
                             // which will kick our connection (duplicate clientId)
                             Thread.Sleep(30_000);
                         }
                         else
                         {
-                            DebugLog("Failed to launch main app as user");
+                            DebugLog($"ProcessLauncher.LaunchInUserSession failed (error {Marshal.GetLastWin32Error()})");
+                            // Fallback: try launching as user
+                            if (LaunchAppAsUser(userToken, appPath))
+                                DebugLog("Fallback: launched main app as user");
+                            else
+                                DebugLog("Failed to launch main app via any method");
                         }
                     }
 
-                    // Either main app took over or timeout — we should exit
+                    // Either main app took over or timeout - we should exit
                     _stopping = true;
                     return;
                 }
@@ -697,7 +629,9 @@ public static class BootRelayService
         DebugLog("Logon monitor stopped");
     }
 
-    #region LaunchAppAsUser (from SasMode pattern)
+    #endregion
+
+    #region LaunchAppAsUser (fallback - from user token)
 
     [DllImport("advapi32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
@@ -805,21 +739,6 @@ public static class BootRelayService
     #endregion
 
     #region Helpers
-
-    private static readonly object _wsLock = new();
-
-    private static async Task WsSendAsync(string message, CancellationToken ct)
-    {
-        if (_ws?.State != WebSocketState.Open) return;
-
-        var bytes = Encoding.UTF8.GetBytes(message);
-        // WebSocket SendAsync is not thread-safe — serialize sends
-        lock (_wsLock)
-        {
-            _ws.SendAsync(new ArraySegment<byte>(bytes),
-                WebSocketMessageType.Text, true, ct).GetAwaiter().GetResult();
-        }
-    }
 
     private static MouseButton ParseMouseButton(string? button) => button switch
     {
