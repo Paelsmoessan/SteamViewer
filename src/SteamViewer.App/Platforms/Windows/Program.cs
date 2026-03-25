@@ -51,7 +51,7 @@ public static class Program
 
             try
             {
-                SteamViewer.Platform.Windows.Elevation.BootRelayService.Run(taskName);
+                SteamViewer.App.Services.BootRelayOrchestrator.Run(taskName);
             }
             catch (Exception ex)
             {

@@ -39,7 +39,7 @@ public enum HostSessionState
 /// </summary>
 public sealed class HostSession : IAsyncDisposable
 {
-    private readonly IJSRuntime _jsRuntime;
+    private readonly IJSRuntime? _jsRuntime;
     private readonly ILogger _logger;
     private readonly ILoggerFactory _loggerFactory;
     private readonly IInputInjector _inputInjector;
@@ -129,7 +129,7 @@ public sealed class HostSession : IAsyncDisposable
 
     public HostSession(
         string peerId,
-        IJSRuntime jsRuntime,
+        IJSRuntime? jsRuntime,
         ILoggerFactory loggerFactory,
         IInputInjector inputInjector,
         IConfiguration configuration,
@@ -193,8 +193,9 @@ public sealed class HostSession : IAsyncDisposable
     {
         _logger.LogInformation("Initializing host session for peer {PeerId}", PeerId);
 
-        // Set logger to host mode
-        await _jsRuntime.InvokeVoidAsync("SteamViewerLogger.setMode", true);
+        // Set logger to host mode (no-op when running without WebView, e.g. boot relay)
+        if (_jsRuntime != null)
+            await _jsRuntime.InvokeVoidAsync("SteamViewerLogger.setMode", true);
 
         // Create relay transport (binary frames through signaling WebSocket)
         _transport = new HostStreamTransport(_signalingClient, _loggerFactory.CreateLogger<HostStreamTransport>());
