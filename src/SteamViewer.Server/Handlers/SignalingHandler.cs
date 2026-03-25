@@ -56,8 +56,8 @@ public sealed class SignalingHandler
             // Wait for either to complete
             await Task.WhenAny(sendTask, receiveTask);
 
-            // Cancel and cleanup
-            channel.Writer.Complete();
+            // Cancel and cleanup (TryComplete - may already be completed by session takeover)
+            channel.Writer.TryComplete();
         }
         finally
         {
