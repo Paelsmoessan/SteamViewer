@@ -38,6 +38,7 @@ public sealed class ClipboardFileWriter : IDisposable
     private volatile bool _stopping;
     private readonly ConcurrentQueue<ClipboardFileInfo[]> _pendingClipboardSets = new();
     private WndProcDelegate? _wndProc; // prevent GC of delegate
+    private GCHandle _wndProcHandle; // explicit GC root - prevents native callback crash
 
     // Transfer tracking (receiver side)
     private long _receiveStartTick;
@@ -351,6 +352,7 @@ public sealed class ClipboardFileWriter : IDisposable
         const string className = "SteamViewer_ClipboardFileWriter";
 
         _wndProc = WndProc; // prevent GC of delegate
+        _wndProcHandle = GCHandle.Alloc(_wndProc); // explicit root - GC cannot collect this
 
         var wc = new WNDCLASSEX
         {

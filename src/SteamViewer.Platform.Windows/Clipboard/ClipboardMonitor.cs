@@ -128,6 +128,7 @@ public sealed class ClipboardMonitor : IDisposable
         const string className = "SteamViewer_ClipboardMonitor";
 
         _wndProc = WndProc; // prevent GC of delegate
+        _wndProcHandle = GCHandle.Alloc(_wndProc); // explicit root - GC cannot collect this
 
         var wc = new WNDCLASSEX
         {
@@ -147,6 +148,7 @@ public sealed class ClipboardMonitor : IDisposable
     }
 
     private WndProcDelegate? _wndProc; // prevent GC
+    private GCHandle _wndProcHandle; // explicit GC root - prevents native callback crash
 
     private IntPtr WndProc(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam)
     {
@@ -295,6 +297,11 @@ public sealed class ClipboardMonitor : IDisposable
     public void Dispose()
     {
         Stop();
+        // Do NOT free _wndProcHandle here — the clipboard thread may still be
+        // processing a final DispatchMessage after Stop() returns (3s timeout).
+        // Freeing the handle allows GC to collect the WndProc delegate, which
+        // crashes the next time Windows calls it. One handle per session is not
+        // a meaningful leak. The handle is freed when the process exits.
     }
 
     #region Win32 Constants

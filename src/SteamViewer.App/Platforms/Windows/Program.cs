@@ -32,9 +32,11 @@ public static class Program
             return;
         }
 
-        // --boot-relay: SYSTEM-level boot relay — captures login screen, relays via SIPSorcery WebRTC
-        if (args.Contains("--boot-relay"))
+        // --boot-relay [taskName]: SYSTEM-level boot relay — captures login screen, relays via StreamTransport
+        var bootIdx = Array.IndexOf(args, "--boot-relay");
+        if (bootIdx >= 0)
         {
+            var taskName = (bootIdx + 1 < args.Length) ? args[bootIdx + 1] : null;
             var bootDebugPath = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
                 "SteamViewer", "boot-relay-debug.txt");
@@ -43,13 +45,13 @@ public static class Program
                 Directory.CreateDirectory(Path.GetDirectoryName(bootDebugPath)!);
                 File.AppendAllText(bootDebugPath,
                     $"[{DateTime.Now:HH:mm:ss}] Boot relay intercepted. PID: {Environment.ProcessId}\n" +
-                    $"[{DateTime.Now:HH:mm:ss}] User: {Environment.UserName}\n");
+                    $"[{DateTime.Now:HH:mm:ss}] User: {Environment.UserName}, Task: {taskName ?? "none"}\n");
             }
             catch { }
 
             try
             {
-                SteamViewer.Platform.Windows.Elevation.BootRelayService.Run();
+                SteamViewer.App.Services.BootRelayOrchestrator.Run(taskName);
             }
             catch (Exception ex)
             {
