@@ -687,10 +687,15 @@ public sealed class ViewerSession : IAsyncDisposable
     /// before encoding, so viewer receives frames at exact display size (zero scaling blur).
     /// Call on connect and on window resize (debounced).
     /// </summary>
+    private int _lastDesiredWidth;
+    private int _lastDesiredHeight;
+
     public async Task SendDesiredResolutionAsync(int width, int height)
     {
         if (_transport == null || !_transport.IsConnected) return;
         if (width <= 0 || height <= 0) return;
+        _lastDesiredWidth = width;
+        _lastDesiredHeight = height;
 
         try
         {
@@ -971,6 +976,18 @@ public sealed class ViewerSession : IAsyncDisposable
         {
             SetState(ViewerSessionState.Disconnected);
             OnDisconnected?.Invoke("Transport disconnected");
+        }
+        else if (state == "udp-upgraded")
+        {
+            // Re-send desired resolution on new UDP backend.
+            // The initial setResolution was sent on the WS relay which the host may
+            // have already unsubscribed from. Re-sending ensures the host gets it.
+            if (_lastDesiredWidth > 0 && _lastDesiredHeight > 0)
+            {
+                _logger.LogInformation("Session {SessionId}: Re-sending resolution {W}x{H} after UDP upgrade",
+                    SessionId, _lastDesiredWidth, _lastDesiredHeight);
+                _ = SendDesiredResolutionAsync(_lastDesiredWidth, _lastDesiredHeight);
+            }
         }
     }
 

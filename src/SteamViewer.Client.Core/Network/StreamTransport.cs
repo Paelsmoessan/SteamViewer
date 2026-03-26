@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text;
 using System.Threading.Channels;
 using Microsoft.Extensions.Logging;
@@ -35,6 +36,10 @@ public abstract class StreamTransport : IAsyncDisposable
     protected bool _connected;
     private int _controlSendFailures;
     private bool _firstDataLogged;
+
+    // Decryption failure tracking (RFC 9147 pattern: silent drop + counted failures)
+    private int _decryptionFailures;
+    private readonly Stopwatch _transportStartTime = new();
 
     // Synchronized UDP switch state
     protected ITransportBackend? _pendingUdpBackend;
@@ -190,10 +195,20 @@ public abstract class StreamTransport : IAsyncDisposable
 
         try
         {
-            // Decrypt
-            byte[] plaintext;
+            // Decrypt (returns null if session tag mismatches = stale data from old session)
+            byte[]? plaintext;
             if (_encryption != null)
+            {
                 plaintext = _encryption.Decrypt(data, 0, length);
+                if (plaintext == null)
+                {
+                    // Session tag mismatch: stale data from old session, fast-rejected without crypto cost
+                    var staleCount = Interlocked.Increment(ref _decryptionFailures);
+                    if (staleCount <= 3 || staleCount % 100 == 0)
+                        _logger.LogDebug("Stale session data dropped (tag mismatch, count={Count})", staleCount);
+                    return;
+                }
+            }
             else
             {
                 plaintext = new byte[length];
@@ -261,9 +276,25 @@ public abstract class StreamTransport : IAsyncDisposable
                     break;
             }
         }
-        catch (System.Security.Cryptography.CryptographicException ex)
+        catch (System.Security.Cryptography.CryptographicException)
         {
-            _logger.LogWarning("Decryption failed (bad key or corrupted data): {Error}", ex.Message);
+            // RFC 9147 (DTLS 1.3) pattern: silently drop invalid records, count failures.
+            // Stale data from old sessions is expected during reconnect and fails decryption
+            // because each session derives a unique key via HKDF with session nonce.
+            var count = Interlocked.Increment(ref _decryptionFailures);
+            var elapsed = _transportStartTime.Elapsed;
+
+            if (elapsed.TotalSeconds < 5)
+            {
+                // Grace window: reconnect transient, log sparingly
+                if (count == 1 || count % 50 == 0)
+                    _logger.LogDebug("Decryption failed during grace window (count={Count}, elapsed={Elapsed:F1}s)", count, elapsed.TotalSeconds);
+            }
+            else if (count <= 5 || count % 100 == 0)
+            {
+                // Steady state: log periodically
+                _logger.LogWarning("Decryption failed in steady state (count={Count})", count);
+            }
         }
         catch (Exception ex)
         {
@@ -293,6 +324,8 @@ public abstract class StreamTransport : IAsyncDisposable
             _videoSendTask = Task.Run(() => VideoSendLoopAsync(_cts.Token));
 
         _connected = true;
+        _transportStartTime.Restart();
+        _decryptionFailures = 0;
         OnConnectionStateChanged?.Invoke("connected");
         _logger.LogInformation("Transport started (backend={Backend}, videoSend={VideoSend})",
             backend.GetType().Name, enableVideoSend);
@@ -319,8 +352,9 @@ public abstract class StreamTransport : IAsyncDisposable
         newBackend.OnDataReceived += HandleDataReceived;
         newBackend.OnDisconnected += HandleBackendDisconnected;
 
-        // Don't dispose old backend immediately — keep it alive as safety net.
-        // If the peer hasn't switched yet, they may still be sending on the old transport.
+        // Don't dispose old backend immediately — keep it alive for SENDING.
+        // Peer may still be sending on old transport (hasn't switched yet).
+        // OnDataReceived is unsubscribed above — we don't want stale data from old sessions.
         if (oldBackend != null)
         {
             _ = DisposeAfterGracePeriodAsync(oldBackend);
@@ -335,7 +369,7 @@ public abstract class StreamTransport : IAsyncDisposable
         await Task.Delay(10_000);
         try { await oldBackend.DisposeAsync(); }
         catch { }
-        _logger.LogDebug("[TRANSPORT] Old backend disposed after 10s grace period");
+        _logger.LogDebug("[RELAY] {Backend} disposed (sent-only grace period ended)", oldBackend.GetType().Name);
     }
 
     /// <summary>
@@ -350,6 +384,7 @@ public abstract class StreamTransport : IAsyncDisposable
             _pendingUdpBackend = null;
             await SwitchBackendAsync(pending);
             _logger.LogInformation("Both sides confirmed UDP - backend switched to direct");
+            OnConnectionStateChanged?.Invoke("udp-upgraded");
 
             // Start quality monitoring on the new UDP backend
             if (pending is UdpTransportBackend udp)
