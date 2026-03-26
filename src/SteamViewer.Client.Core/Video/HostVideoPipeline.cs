@@ -1,0 +1,743 @@
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Text.Json;
+using Microsoft.Extensions.Logging;
+using SteamViewer.Client.Core.Network;
+
+namespace SteamViewer.Client.Core.Video;
+
+/// <summary>
+/// Encapsulates the host-side video pipeline: DXGI capture event handling,
+/// FFmpeg encoding, frame enqueueing, quality adaptation, Secure Desktop
+/// frame routing, lossless settle (QOI), cursor shape forwarding, and sleep
+/// prevention.
+///
+/// Extracted from HostSession to keep the session orchestrator slim and to
+/// allow reuse from the boot-relay path.
+/// </summary>
+public sealed class HostVideoPipeline : IDisposable
+{
+    private readonly ILogger _logger;
+    private readonly ILoggerFactory _loggerFactory;
+
+    // ------------------------------------------------------------------
+    //  Transport abstraction -- thin interface so pipeline doesn't depend
+    //  on HostStreamTransport directly.
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// Minimal transport surface the video pipeline needs.
+    /// Implemented by HostSession as a shim over HostStreamTransport.
+    /// </summary>
+    public interface IVideoTransport
+    {
+        bool IsConnected { get; }
+        bool IsDirectUdp { get; }
+        void EnqueueVideoFrame(byte[] data, int length);
+        ValueTask<bool> SendControlAsync(string json);
+        ValueTask<bool> SendLosslessFrameAsync(byte[] data, int offset, int length);
+        UdpTransportBackend? GetUdpBackend();
+    }
+
+    private IVideoTransport? _transport;
+
+    // ------------------------------------------------------------------
+    //  Encoder state
+    // ------------------------------------------------------------------
+    private FFmpegEncoder? _encoder;
+    private readonly object _encoderLock = new();
+    private int _encoderErrorCount;
+    private long _encodeFrameCount;
+    private readonly Stopwatch _encodeSw = new();
+    private readonly Stopwatch _heartbeatSw = Stopwatch.StartNew();
+
+    // Capture/encode info change tracking
+    private int _lastSentCaptureW;
+    private int _lastSentCaptureH;
+    private int _lastSentEncodeW;
+    private int _lastSentEncodeH;
+
+    // Frame rate adaptation for constrained connections
+    private long _dxgiFrameCounter;
+    private ConnectionQuality _lastQuality = ConnectionQuality.Unknown;
+
+    // Track frame identity to detect refires vs real changes
+    private byte[]? _lastSeenFrameRef;
+
+    // Smart SD pipeline: track frame index for QOI burst + H.264 switchover
+    private int _sdFrameIndex;
+    private volatile bool _isSecureDesktopActive;
+    private int _sdHostFrameCount;
+
+    // Lossless settle -- QOI snapshot when screen stops changing
+    private int _consecutiveNullFrames;
+    private bool _losslessRequested;
+    private int _losslessRequestW;
+    private int _losslessRequestH;
+    private bool _losslessSent;
+
+    // Cursor shape dedup
+    private string? _lastSentCursorShape;
+
+    // DXGI capture references (set via AttachCapture / detached via DetachCapture)
+    private IDxgiCapture? _activeDxgi;
+
+    private bool _disposed;
+
+    // ------------------------------------------------------------------
+    //  Events
+    // ------------------------------------------------------------------
+
+    /// <summary>Raised when screen share could not be auto-restarted after SD.</summary>
+    public event Action? OnScreenShareRestartFailed;
+
+    // ------------------------------------------------------------------
+    //  DXGI abstraction -- keeps Platform.Windows out of Client.Core
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// Minimal DXGI capture surface the pipeline needs.
+    /// Implemented by DxgiScreenCapture in Platform.Windows.
+    /// </summary>
+    public interface IDxgiCapture
+    {
+        bool IsCapturing { get; }
+        bool ShowCursor { get; set; }
+        byte[]? LastRawFrame { get; }
+        int LastRawWidth { get; }
+        int LastRawHeight { get; }
+        int LastRawStride { get; }
+        void StartCaptureLoop(uint outputIndex);
+        void StopCaptureLoop();
+        void NotifyDesktopAvailable();
+
+        event Action<byte[], int, int, int> OnRawFrameCaptured;
+        event Action<string> OnCursorShapeChanged;
+        event Action OnFrameUnchanged;
+    }
+
+    // ------------------------------------------------------------------
+    //  Construction / lifecycle
+    // ------------------------------------------------------------------
+
+    public HostVideoPipeline(ILoggerFactory loggerFactory)
+    {
+        _loggerFactory = loggerFactory;
+        _logger = loggerFactory.CreateLogger<HostVideoPipeline>();
+    }
+
+    /// <summary>Set or replace the transport. Call when transport connects.</summary>
+    public void SetTransport(IVideoTransport transport)
+    {
+        _transport = transport;
+    }
+
+    /// <summary>Whether a DXGI capture is actively sending frames.</summary>
+    public bool IsCapturing { get; private set; }
+
+    /// <summary>Whether Secure Desktop is currently active (DXGI frames are suppressed).</summary>
+    public bool IsSecureDesktopActive => _isSecureDesktopActive;
+
+    /// <summary>The active DXGI capture instance, if any.</summary>
+    public IDxgiCapture? ActiveCapture => _activeDxgi;
+
+    // ------------------------------------------------------------------
+    //  Start / Stop capture
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// Attach a DXGI capture source and start the capture loop.
+    /// Returns true on success.
+    /// </summary>
+    public bool StartCapture(IDxgiCapture dxgi, uint outputIndex)
+    {
+        if (_transport == null || !_transport.IsConnected) return false;
+
+        try
+        {
+            _logger.LogInformation("Starting DXGI capture on output {Output} via pipeline...", outputIndex);
+
+            dxgi.OnRawFrameCaptured += OnDxgiRawFrameCaptured;
+            dxgi.OnCursorShapeChanged += OnCursorShapeChanged;
+            dxgi.OnFrameUnchanged += OnDxgiFrameUnchanged;
+
+            dxgi.StartCaptureLoop(outputIndex);
+
+            // Prevent host from sleeping/screen-off while sharing
+            SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
+
+            _activeDxgi = dxgi;
+            IsCapturing = true;
+            _logger.LogInformation("DXGI capture started on output {Output} via pipeline", outputIndex);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "DXGI capture + FFmpeg encoding failed");
+            try { dxgi.OnRawFrameCaptured -= OnDxgiRawFrameCaptured; } catch { }
+            try { dxgi.OnCursorShapeChanged -= OnCursorShapeChanged; } catch { }
+            try { dxgi.OnFrameUnchanged -= OnDxgiFrameUnchanged; } catch { }
+            try { dxgi.StopCaptureLoop(); } catch { }
+            SetThreadExecutionState(ES_CONTINUOUS);
+            DisposeEncoder();
+            return false;
+        }
+    }
+
+    /// <summary>Stop the capture loop and dispose the encoder.</summary>
+    public void StopCapture()
+    {
+        if (_activeDxgi != null)
+        {
+            _activeDxgi.OnRawFrameCaptured -= OnDxgiRawFrameCaptured;
+            _activeDxgi.OnCursorShapeChanged -= OnCursorShapeChanged;
+            _activeDxgi.OnFrameUnchanged -= OnDxgiFrameUnchanged;
+            _activeDxgi.StopCaptureLoop();
+        }
+
+        DisposeEncoder();
+        SetThreadExecutionState(ES_CONTINUOUS);
+        IsCapturing = false;
+    }
+
+    /// <summary>Detach all DXGI event handlers without stopping the loop (used during SD restart).</summary>
+    public void DetachCapture()
+    {
+        if (_activeDxgi != null)
+        {
+            _activeDxgi.OnRawFrameCaptured -= OnDxgiRawFrameCaptured;
+            _activeDxgi.OnCursorShapeChanged -= OnCursorShapeChanged;
+            _activeDxgi.OnFrameUnchanged -= OnDxgiFrameUnchanged;
+        }
+        DisposeEncoder();
+        IsCapturing = false;
+    }
+
+    // ------------------------------------------------------------------
+    //  DXGI frame handler (called from capture thread)
+    // ------------------------------------------------------------------
+
+    private void OnDxgiRawFrameCaptured(byte[] bgraData, int width, int height, int stride)
+    {
+        if (_transport == null || !_transport.IsConnected || !IsCapturing) return;
+
+        // Skip DXGI frames during Secure Desktop - SD frames use the encoder instead
+        if (_isSecureDesktopActive) return;
+
+        // Frame rate adaptation: skip frames on constrained connections
+        _dxgiFrameCounter++;
+        if (_lastQuality == ConnectionQuality.Poor && _dxgiFrameCounter % 2 != 0)
+            return; // 15fps on poor connections
+
+        // Only reset lossless state on genuinely NEW frames (not refired cached frames)
+        if (!ReferenceEquals(bgraData, _lastSeenFrameRef))
+        {
+            _lastSeenFrameRef = bgraData;
+            _consecutiveNullFrames = 0;
+            _losslessSent = false;
+        }
+
+        EncodeAndSend(bgraData, width, height, stride, isSecureDesktop: false, frameIndex: -1);
+    }
+
+    // ------------------------------------------------------------------
+    //  Secure Desktop frame handler
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// Handle a Secure Desktop BGRA frame from the elevation service.
+    /// Sends QOI burst for first 2 frames, then H.264 for all.
+    /// </summary>
+    public void HandleSecureDesktopFrame(byte[] bgraData, int width, int height, int stride)
+    {
+        _sdHostFrameCount++;
+        if (_sdHostFrameCount <= 3 || _sdHostFrameCount % 100 == 0)
+            _logger.LogInformation("SD frame #{Count}: {Bytes}b BGRA {W}x{H}, sdIdx={Idx}, transport={Transport}, ready={Ready}",
+                _sdHostFrameCount, bgraData.Length, width, height, _sdFrameIndex, _transport != null, _transport?.IsConnected ?? false);
+
+        if (_transport == null || !_transport.IsConnected) return;
+
+        // Smart SD pipeline: QOI burst + H.264 unified
+        var frameIdx = _sdFrameIndex++;
+
+        // First 2 frames: send QOI on lossless channel (fire-and-forget lossless bonus)
+        if (frameIdx < 2)
+        {
+            var frameCopy = new byte[stride * height];
+            Buffer.BlockCopy(bgraData, 0, frameCopy, 0, frameCopy.Length);
+            var captureW = width;
+            var captureH = height;
+            var captureStride = stride;
+
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    var sw = Stopwatch.StartNew();
+                    var qoiData = QoiCodec.Encode(frameCopy, captureW, captureH, captureStride);
+                    sw.Stop();
+                    var sent = await _transport!.SendLosslessFrameAsync(qoiData, 0, qoiData.Length);
+                    _logger.LogInformation("SD QOI frame #{Idx}: {W}x{H}, {Size}KB, encode={Ms:F1}ms, sent={Sent}",
+                        frameIdx, captureW, captureH, qoiData.Length / 1024, sw.Elapsed.TotalMilliseconds, sent);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to send SD QOI frame");
+                }
+            });
+        }
+
+        // ALL frames: send through H.264 encoder (guaranteed stream)
+        EncodeAndSend(bgraData, width, height, stride, isSecureDesktop: true, frameIndex: frameIdx);
+    }
+
+    /// <summary>
+    /// Notify the pipeline that Secure Desktop state changed.
+    /// Handles encoder dimension reset, DXGI capture restart after SD, etc.
+    /// </summary>
+    /// <param name="active">True if entering SD, false if leaving.</param>
+    /// <param name="restartCaptureAsync">
+    /// Callback to restart screen sharing after SD if DXGI capture died.
+    /// Takes an optional output index, returns Task.
+    /// </param>
+    public void HandleSecureDesktopStateChanged(bool active, Func<uint?, Task>? restartCaptureAsync = null)
+    {
+        _logger.LogInformation("SD state handler: active={Active}, transport={Transport}, ready={Ready}",
+            active, _transport != null, _transport?.IsConnected ?? false);
+
+        _isSecureDesktopActive = active;
+        if (active)
+        {
+            _sdFrameIndex = 0;
+            _logger.LogInformation("SD pipeline: active, sdFrameIndex reset, encoder={HasEncoder}, encoderDims={W}x{H}",
+                _encoder != null, _encoder?.Width ?? 0, _encoder?.Height ?? 0);
+        }
+        else
+        {
+            _logger.LogInformation("SD pipeline: inactive, sdFrameIndex was {Idx}", _sdFrameIndex);
+        }
+
+        // When leaving Secure Desktop, force re-send encodeInfo so viewer canvas re-syncs CSS.
+        if (!active)
+        {
+            _lastSentEncodeW = 0;
+            _lastSentEncodeH = 0;
+        }
+
+        // Wake DXGI retry loop immediately
+        if (!active)
+            _activeDxgi?.NotifyDesktopAvailable();
+
+        // When leaving SD, DXGI capture may have died. Restart if needed.
+        if (!active && IsCapturing && _activeDxgi != null)
+        {
+            if (_activeDxgi.IsCapturing)
+            {
+                _logger.LogInformation("DXGI capture still running after SD - no restart needed");
+            }
+            else
+            {
+                _logger.LogInformation("DXGI capture died during SD - restarting capture");
+                // Clean up dead state
+                _activeDxgi.StopCaptureLoop();
+                DetachCapture();
+
+                if (restartCaptureAsync != null)
+                {
+                    _ = Task.Run(async () =>
+                    {
+                        await Task.Delay(500);
+                        try
+                        {
+                            await restartCaptureAsync(0);
+                            _logger.LogInformation("DXGI capture restarted after SD");
+                        }
+                        catch (Exception restartEx)
+                        {
+                            _logger.LogWarning(restartEx, "Failed to restart DXGI capture after SD");
+                            OnScreenShareRestartFailed?.Invoke();
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    /// <summary>Reset the encode-info tracking so the next frame re-sends dimensions to viewer.</summary>
+    public void ResetEncodeInfo()
+    {
+        _lastSentEncodeW = 0;
+        _lastSentEncodeH = 0;
+    }
+
+    // ------------------------------------------------------------------
+    //  Shared encode path
+    // ------------------------------------------------------------------
+
+    private void EncodeAndSend(byte[] bgraData, int width, int height, int stride, bool isSecureDesktop, int frameIndex)
+    {
+        lock (_encoderLock)
+        {
+            try
+            {
+                // Lazy-init encoder on first frame (need real dimensions)
+                if (_encoder == null)
+                {
+                    if (isSecureDesktop)
+                        _logger.LogInformation("SD: encoder is null, initializing for {W}x{H}", width, height);
+
+                    FFmpegInit.EnsureInitialized();
+                    var encoder = new FFmpegEncoder(_loggerFactory.CreateLogger<FFmpegEncoder>());
+                    encoder.Initialize(width, height, 30, 20_000_000, crf: 14);
+                    _encoder = encoder;
+                    _logger.LogInformation("FFmpeg encoder initialized: {W}x{H}", width, height);
+                    SendCaptureInfoIfChanged(width, height);
+                }
+                else if (isSecureDesktop && frameIndex == 0)
+                {
+                    _logger.LogInformation("SD: encoder exists ({EW}x{EH}), SD frame is {W}x{H} - {Action}",
+                        _encoder.Width, _encoder.Height, width, height,
+                        (_encoder.Width != width || _encoder.Height != height) ? "REINIT expected" : "same resolution");
+                }
+
+                // Notify viewer if capture dims changed
+                SendCaptureInfoIfChanged(width, height);
+
+                _encodeSw.Restart();
+                var result = _encoder.EncodeFrame(bgraData, stride, width, height);
+                _encodeSw.Stop();
+
+                // Notify viewer of actual encode resolution
+                SendEncodeInfoIfChanged();
+
+                if (result is var (naluData, naluLength))
+                {
+                    _transport!.EnqueueVideoFrame(naluData, naluLength);
+
+                    _encodeFrameCount++;
+                    if (isSecureDesktop)
+                    {
+                        if (frameIndex < 3 || _encodeFrameCount % 300 == 0)
+                            _logger.LogInformation("SD H.264 frame #{Idx}: {Ms:F1}ms, {Size}KB",
+                                frameIndex, _encodeSw.Elapsed.TotalMilliseconds, naluLength / 1024);
+                    }
+                    else
+                    {
+                        if (_encodeFrameCount % 300 == 0)
+                            _logger.LogInformation("Encode #{Count}: {Ms:F1}ms, {Size}KB",
+                                _encodeFrameCount, _encodeSw.Elapsed.TotalMilliseconds, naluLength / 1024);
+                    }
+                }
+
+                // Heartbeat: prove the encode pipeline is alive (every 60s)
+                if (_heartbeatSw.ElapsedMilliseconds >= 60_000)
+                {
+                    _logger.LogInformation("Encode heartbeat: #{Count} frames, encoder {W}x{H}",
+                        _encodeFrameCount, _encoder?.Width ?? 0, _encoder?.Height ?? 0);
+                    _heartbeatSw.Restart();
+                }
+            }
+            catch (Exception ex)
+            {
+                if (_encoderErrorCount == 0 || _encoderErrorCount % 300 == 0)
+                    _logger.LogError(ex, "{Prefix}encode error #{Count}",
+                        isSecureDesktop ? "SD " : "FFmpeg ", _encoderErrorCount);
+                _encoderErrorCount++;
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    //  Capture/encode info change notifications
+    // ------------------------------------------------------------------
+
+    private void SendEncodeInfoIfChanged()
+    {
+        var w = _encoder?.Width ?? 0;
+        var h = _encoder?.Height ?? 0;
+        if (w <= 0 || h <= 0) return;
+        if (w == _lastSentEncodeW && h == _lastSentEncodeH) return;
+        _lastSentEncodeW = w;
+        _lastSentEncodeH = h;
+        _logger.LogInformation("Sending encodeInfo to viewer: {W}x{H}", w, h);
+        _ = _transport?.SendControlAsync(JsonSerializer.Serialize(new
+        {
+            type = "encodeInfo",
+            width = w,
+            height = h
+        }));
+    }
+
+    private void SendCaptureInfoIfChanged(int width, int height)
+    {
+        if (width == _lastSentCaptureW && height == _lastSentCaptureH) return;
+        _lastSentCaptureW = width;
+        _lastSentCaptureH = height;
+        _logger.LogInformation("Sending captureInfo to viewer: {W}x{H}", width, height);
+        _ = _transport?.SendControlAsync(JsonSerializer.Serialize(new
+        {
+            type = "captureInfo",
+            width,
+            height
+        }));
+    }
+
+    // ------------------------------------------------------------------
+    //  Viewer requests
+    // ------------------------------------------------------------------
+
+    /// <summary>Handle viewer resolution request - encoder will downscale using Bicubic.</summary>
+    public void HandleSetResolution(JsonElement root)
+    {
+        var w = root.TryGetProperty("width", out var wp) ? wp.GetInt32() : 0;
+        var h = root.TryGetProperty("height", out var hp) ? hp.GetInt32() : 0;
+
+        if (w <= 0 || h <= 0)
+        {
+            _logger.LogWarning("Invalid resolution request: {W}x{H}", w, h);
+            return;
+        }
+
+        _logger.LogInformation("Viewer requested encode resolution: {W}x{H}", w, h);
+        _encoder?.SetRequestedResolution(w, h);
+    }
+
+    /// <summary>Handle viewer request for a lossless QOI settle frame.</summary>
+    public void HandleRequestLosslessFrame(JsonElement root)
+    {
+        if (_isSecureDesktopActive) return;
+
+        var w = root.TryGetProperty("width", out var wp) ? wp.GetInt32() : 0;
+        var h = root.TryGetProperty("height", out var hp) ? hp.GetInt32() : 0;
+
+        if (w <= 0 || h <= 0)
+        {
+            _logger.LogWarning("Invalid lossless frame request: {W}x{H}", w, h);
+            return;
+        }
+
+        _losslessRequestW = w;
+        _losslessRequestH = h;
+        _losslessRequested = true;
+        _losslessSent = false;
+        _logger.LogDebug("Viewer requested lossless frame: {W}x{H}", w, h);
+
+        if (_consecutiveNullFrames >= 3)
+            FulfillLosslessRequest();
+    }
+
+    // ------------------------------------------------------------------
+    //  Connection quality adaptation
+    // ------------------------------------------------------------------
+
+    /// <summary>Handle a quality report from the viewer.</summary>
+    public void HandleQualityReport(JsonElement root)
+    {
+        var qualityStr = root.TryGetProperty("quality", out var qProp) ? qProp.GetString() : null;
+        if (qualityStr == null) return;
+
+        if (!Enum.TryParse<ConnectionQuality>(qualityStr, out var quality)) return;
+
+        var lossRate = root.TryGetProperty("lossRate", out var lProp) ? lProp.GetDouble() : -1;
+        var rttMs = root.TryGetProperty("rttMs", out var rProp) ? rProp.GetDouble() : -1;
+
+        _logger.LogInformation("[QualityReport] Viewer reports: {Quality}, loss={Loss:P1}, RTT={Rtt:F0}ms",
+            quality, lossRate, rttMs);
+
+        ApplyQualityAdaptation(quality);
+    }
+
+    private void ApplyQualityAdaptation(ConnectionQuality quality)
+    {
+        if (quality == _lastQuality) return;
+        _lastQuality = quality;
+
+        var maxBitrate = quality switch
+        {
+            ConnectionQuality.Poor => 5_000_000L,
+            ConnectionQuality.Fair => 12_000_000L,
+            _ => 20_000_000L
+        };
+
+        lock (_encoderLock)
+        {
+            _encoder?.SetMaxBitrate(maxBitrate);
+        }
+
+        if (_transport?.IsDirectUdp == true)
+        {
+            var udp = _transport.GetUdpBackend();
+            if (udp != null)
+            {
+                udp.FecScaleFactor = quality switch
+                {
+                    ConnectionQuality.Good => 0,
+                    ConnectionQuality.Fair => 1.3,
+                    ConnectionQuality.Poor => 1.6,
+                    _ => 1.3
+                };
+            }
+        }
+
+        _logger.LogInformation("[QualityAdapt] {Quality}: bitrate cap={Mbps}Mbps, FEC={Fec}",
+            quality, maxBitrate / 1_000_000, quality switch
+            {
+                ConnectionQuality.Good => "off",
+                ConnectionQuality.Fair => "25%",
+                ConnectionQuality.Poor => "35%",
+                _ => "25%"
+            });
+    }
+
+    // ------------------------------------------------------------------
+    //  Cursor shape
+    // ------------------------------------------------------------------
+
+    private void OnCursorShapeChanged(string cssValue)
+    {
+        if (cssValue == _lastSentCursorShape) return;
+        _lastSentCursorShape = cssValue;
+
+        if (_transport?.IsConnected == true)
+        {
+            _ = _transport.SendControlAsync(JsonSerializer.Serialize(new
+            {
+                type = "cursorShape",
+                cursor = cssValue
+            }));
+        }
+    }
+
+    /// <summary>Toggle cursor visibility in the captured video stream.</summary>
+    public async Task HandleToggleCursorAsync()
+    {
+        if (_activeDxgi != null)
+        {
+            _activeDxgi.ShowCursor = !_activeDxgi.ShowCursor;
+            _logger.LogInformation("Host cursor visibility: {Visible}", _activeDxgi.ShowCursor);
+
+            if (_transport != null)
+            {
+                await _transport.SendControlAsync(JsonSerializer.Serialize(new
+                {
+                    type = "cursorVisibilityChanged",
+                    visible = _activeDxgi.ShowCursor
+                }));
+            }
+        }
+    }
+
+    /// <summary>Set cursor visibility (e.g., from input lock state).</summary>
+    public void SetCursorVisible(bool visible)
+    {
+        if (_activeDxgi != null)
+            _activeDxgi.ShowCursor = visible;
+    }
+
+    // ------------------------------------------------------------------
+    //  Lossless settle
+    // ------------------------------------------------------------------
+
+    private void OnDxgiFrameUnchanged()
+    {
+        _consecutiveNullFrames++;
+        if (!_losslessRequested || _losslessSent) return;
+        if (_consecutiveNullFrames < 3) return;
+
+        FulfillLosslessRequest();
+    }
+
+    private void FulfillLosslessRequest()
+    {
+        if (_activeDxgi == null || _transport == null || !_transport.IsConnected) return;
+
+        var rawFrame = _activeDxgi.LastRawFrame;
+        var rawW = _activeDxgi.LastRawWidth;
+        var rawH = _activeDxgi.LastRawHeight;
+        var rawStride = _activeDxgi.LastRawStride;
+
+        if (rawFrame == null || rawW <= 0 || rawH <= 0) return;
+
+        _losslessSent = true;
+        _losslessRequested = false;
+
+        var frameCopy = new byte[rawFrame.Length];
+        Buffer.BlockCopy(rawFrame, 0, frameCopy, 0, rawFrame.Length);
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                byte[] bgraToEncode = frameCopy;
+                int encodeW = rawW, encodeH = rawH, encodeStride = rawStride;
+
+                if (_losslessRequestW != rawW || _losslessRequestH != rawH)
+                {
+                    bgraToEncode = DownscaleBgra(frameCopy, rawW, rawH, rawStride,
+                        _losslessRequestW, _losslessRequestH);
+                    encodeW = _losslessRequestW;
+                    encodeH = _losslessRequestH;
+                    encodeStride = encodeW * 4;
+                }
+
+                var sw = Stopwatch.StartNew();
+                var qoiData = QoiCodec.Encode(bgraToEncode, encodeW, encodeH, encodeStride);
+                sw.Stop();
+
+                var sent = await _transport!.SendLosslessFrameAsync(qoiData, 0, qoiData.Length);
+                _logger.LogInformation("Lossless QOI frame: {W}x{H}, {Size}KB, encode={Ms:F1}ms, sent={Sent}",
+                    encodeW, encodeH, qoiData.Length / 1024, sw.Elapsed.TotalMilliseconds, sent);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to encode/send lossless frame");
+            }
+        });
+    }
+
+    private byte[] DownscaleBgra(byte[] srcBgra, int srcW, int srcH, int srcStride, int dstW, int dstH)
+    {
+        try
+        {
+            return FFmpegEncoder.DownscaleBgra(srcBgra, srcW, srcH, srcStride, dstW, dstH);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "sws_scale downscale failed - sending at capture resolution");
+            return srcBgra;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    //  Sleep Prevention (Windows)
+    // ------------------------------------------------------------------
+
+    private const uint ES_CONTINUOUS = 0x80000000;
+    private const uint ES_SYSTEM_REQUIRED = 0x00000001;
+    private const uint ES_DISPLAY_REQUIRED = 0x00000002;
+
+    [DllImport("kernel32.dll")]
+    private static extern uint SetThreadExecutionState(uint esFlags);
+
+    // ------------------------------------------------------------------
+    //  Dispose
+    // ------------------------------------------------------------------
+
+    private void DisposeEncoder()
+    {
+        lock (_encoderLock)
+        {
+            _encoder?.Dispose();
+            _encoder = null;
+        }
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+
+        StopCapture();
+        _transport = null;
+    }
+}
