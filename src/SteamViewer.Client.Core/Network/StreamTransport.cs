@@ -310,7 +310,9 @@ public abstract class StreamTransport : IAsyncDisposable
 
         if (oldBackend != null)
         {
-            oldBackend.OnDataReceived -= HandleDataReceived;
+            // Keep OnDataReceived subscribed on old backend during grace period!
+            // Peer may still be sending on old transport (hasn't switched yet).
+            // Only unsubscribe OnDisconnected to prevent stale disconnect events.
             oldBackend.OnDisconnected -= HandleBackendDisconnected;
         }
 
@@ -321,6 +323,7 @@ public abstract class StreamTransport : IAsyncDisposable
 
         // Don't dispose old backend immediately — keep it alive as safety net.
         // If the peer hasn't switched yet, they may still be sending on the old transport.
+        // OnDataReceived stays subscribed until dispose.
         if (oldBackend != null)
         {
             _ = DisposeAfterGracePeriodAsync(oldBackend);
@@ -333,9 +336,10 @@ public abstract class StreamTransport : IAsyncDisposable
     private async Task DisposeAfterGracePeriodAsync(ITransportBackend oldBackend)
     {
         await Task.Delay(10_000);
+        oldBackend.OnDataReceived -= HandleDataReceived;
         try { await oldBackend.DisposeAsync(); }
         catch { }
-        _logger.LogDebug("[TRANSPORT] Old backend disposed after 10s grace period");
+        _logger.LogDebug("[RELAY] {Backend} disposed (grace period ended)", oldBackend.GetType().Name);
     }
 
     /// <summary>
