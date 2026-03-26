@@ -297,10 +297,12 @@ public sealed class SignalingHandler
                         _registry.TrySendToClient(participantId, new SignalingMessage.ParticipantLeft(register.ClientId));
                 }
 
-                // Kill old WebSocket (causes old receive loop to exit and hit cleanup,
-                // which is a no-op since we already replaced the registration)
+                // Kill old WebSocket and flush relay buffer (causes old receive loop to exit
+                // and hit cleanup, which is a no-op since we already replaced the registration).
+                // TryComplete discards any pending relay data in the old channel.
                 try { oldClient?.MessageWriter.TryComplete(); } catch { }
                 try { oldClient?.WebSocket?.Abort(); } catch { }
+                _logger.LogDebug("Session takeover: old relay buffer flushed for {ClientId}", register.ClientId);
 
                 _logger.LogInformation("Client {ClientId} session takeover (old connection {OldConn} replaced)",
                     register.ClientId, oldClient?.ConnectionId);
