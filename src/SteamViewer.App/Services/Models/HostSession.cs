@@ -785,13 +785,16 @@ public sealed class HostSession : IAsyncDisposable
         if (_transport == null) return;
 
         string? text = null;
-        try
+        if (_jsRuntime != null)
         {
-            text = await _jsRuntime.InvokeAsync<string>("navigator.clipboard.readText");
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Browser clipboard.readText failed — trying native Win32");
+            try
+            {
+                text = await _jsRuntime.InvokeAsync<string>("navigator.clipboard.readText");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Browser clipboard.readText failed — trying native Win32");
+            }
         }
 
         if (string.IsNullOrEmpty(text))
@@ -810,15 +813,24 @@ public sealed class HostSession : IAsyncDisposable
     {
         var data = root.TryGetProperty("data", out var d) ? d.GetString() : null;
         if (data == null) return;
-        try
+
+        bool set = false;
+        if (_jsRuntime != null)
         {
-            await _jsRuntime.InvokeVoidAsync("navigator.clipboard.writeText", data);
-            _logger.LogDebug("Set clipboard from viewer: {Length} chars", data.Length);
+            try
+            {
+                await _jsRuntime.InvokeVoidAsync("navigator.clipboard.writeText", data);
+                set = true;
+                _logger.LogDebug("Set clipboard from viewer: {Length} chars", data.Length);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Browser clipboard.writeText failed — trying native Win32");
+            }
         }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Failed to set clipboard from viewer");
-        }
+
+        if (!set)
+            TrySetClipboardNative(data);
     }
 
     private async Task HandleClipboardPasteAsync(JsonElement root)
@@ -827,15 +839,18 @@ public sealed class HostSession : IAsyncDisposable
         if (data == null) return;
 
         bool clipboardSet = false;
-        try
+        if (_jsRuntime != null)
         {
-            await _jsRuntime.InvokeVoidAsync("navigator.clipboard.writeText", data);
-            clipboardSet = true;
-            _logger.LogDebug("Clipboard paste: set via browser API ({Length} chars)", data.Length);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Browser clipboard.writeText failed — trying native Win32");
+            try
+            {
+                await _jsRuntime.InvokeVoidAsync("navigator.clipboard.writeText", data);
+                clipboardSet = true;
+                _logger.LogDebug("Clipboard paste: set via browser API ({Length} chars)", data.Length);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Browser clipboard.writeText failed — trying native Win32");
+            }
         }
 
         if (!clipboardSet)
