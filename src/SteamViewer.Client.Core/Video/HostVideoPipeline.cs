@@ -57,6 +57,10 @@ public sealed class HostVideoPipeline : IDisposable
     private int _lastSentEncodeW;
     private int _lastSentEncodeH;
 
+    // Pending resolution request (received before encoder exists)
+    private int _pendingResW;
+    private int _pendingResH;
+
     // Frame rate adaptation for constrained connections
     private long _dxgiFrameCounter;
     private ConnectionQuality _lastQuality = ConnectionQuality.Unknown;
@@ -388,9 +392,23 @@ public sealed class HostVideoPipeline : IDisposable
 
                     FFmpegInit.EnsureInitialized();
                     var encoder = new FFmpegEncoder(_loggerFactory.CreateLogger<FFmpegEncoder>());
-                    encoder.Initialize(width, height, 30, 20_000_000, crf: 14);
+                    // Apply pending resolution so first frame encodes at correct size
+                    if (_pendingResW > 0 && _pendingResH > 0)
+                    {
+                        encoder.SetRequestedResolution(_pendingResW, _pendingResH);
+                        // Initialize at pending resolution directly - avoids wasted 1920x1080 keyframe
+                        var initW = Math.Min(_pendingResW, width);
+                        var initH = Math.Min(_pendingResH, height);
+                        encoder.Initialize(initW, initH, 30, 20_000_000, crf: 14);
+                        _logger.LogInformation("Encoder initialized at pending resolution {W}x{H} (capture: {CW}x{CH})",
+                            initW, initH, width, height);
+                    }
+                    else
+                    {
+                        encoder.Initialize(width, height, 30, 20_000_000, crf: 14);
+                        _logger.LogInformation("Encoder initialized at capture resolution {W}x{H}", width, height);
+                    }
                     _encoder = encoder;
-                    _logger.LogInformation("FFmpeg encoder initialized: {W}x{H}", width, height);
                     SendCaptureInfoIfChanged(width, height);
                 }
                 else if (isSecureDesktop && frameIndex == 0)
@@ -499,6 +517,8 @@ public sealed class HostVideoPipeline : IDisposable
         }
 
         _logger.LogInformation("Viewer requested encode resolution: {W}x{H}", w, h);
+        _pendingResW = w;
+        _pendingResH = h;
         _encoder?.SetRequestedResolution(w, h);
     }
 
