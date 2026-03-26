@@ -802,11 +802,6 @@ else
                 connectionState = ConnectionState.Registered;
                 StateHasChanged();
             });
-            _hostSession.OnScreenShareLost += () => InvokeAsync(() =>
-            {
-                Logger.LogWarning("Screen sharing lost — user needs to reshare or click canvas to trigger gesture-backed restart");
-                StateHasChanged();
-            });
             _hostSession.OnPeerSharingChanged += sharing => InvokeAsync(() =>
             {
                 _canvasInitialized = false; // Reset canvas when peer sharing changes

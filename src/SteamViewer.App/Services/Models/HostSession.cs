@@ -119,9 +119,6 @@ public sealed class HostSession : IAsyncDisposable
     /// <summary>Raised when the session disconnects.</summary>
     public event Action<string?>? OnDisconnected;
 
-    /// <summary>Raised when screen sharing was lost and all auto-restart attempts failed.</summary>
-    public event Action? OnScreenShareLost;
-
     /// <summary>Raised when the peer starts/stops sharing their screen.</summary>
     public event Action<bool>? OnPeerSharingChanged;
 
