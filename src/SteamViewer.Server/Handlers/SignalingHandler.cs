@@ -419,7 +419,7 @@ public sealed class SignalingHandler
         _registry.SetPeer(disconnect.PeerId, null);
 
         // Notify peer
-        _registry.TrySendToClient(disconnect.PeerId, new SignalingMessage.Disconnected(fromId, "Peer disconnected"));
+        _registry.TrySendToClient(disconnect.PeerId, new SignalingMessage.Disconnected(fromId, "Peer closed connection"));
         _logger.LogInformation("Disconnect between {FromId} and {PeerId}", fromId, disconnect.PeerId);
         return null;
     }
