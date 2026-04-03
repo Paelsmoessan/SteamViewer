@@ -1038,8 +1038,14 @@ public sealed class HostSession : IAsyncDisposable
             {
                 try
                 {
-                    await _transport.SendFileSignalingAsync(json);
-                    _logger.LogInformation("Sent clipboard file format list: {Count} files", files.Length);
+                    // Send 3x with 500ms gaps for UDP reliability (idempotent on receiver)
+                    for (int i = 0; i < 3; i++)
+                    {
+                        if (_transport == null || !_transport.IsConnected) break;
+                        await _transport.SendFileSignalingAsync(json);
+                        if (i == 0) _logger.LogInformation("Sent clipboard file format list: {Count} files", files.Length);
+                        if (i < 2) await Task.Delay(500);
+                    }
                 }
                 catch (Exception ex)
                 {

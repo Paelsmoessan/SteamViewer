@@ -984,7 +984,8 @@ else
                     }
                     connectedPeerId = "";
                     _canvasInitialized = false;
-                    _isReconnect = true;
+                    // Graceful close = session over, crash/drop = preserve for reconnect
+                    _isReconnect = disconnected.Reason != "Peer closed connection";
                     connectionState = ConnectionState.Registered;
                     break;
 

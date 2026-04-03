@@ -1064,7 +1064,13 @@ public sealed class ViewerSession : IAsyncDisposable
             {
                 try
                 {
-                    await _transport.SendFileSignalingAsync(json);
+                    // Send 3x with 500ms gaps for UDP reliability (idempotent on receiver)
+                    for (int i = 0; i < 3; i++)
+                    {
+                        if (_transport == null || !_transport.IsConnected) break;
+                        await _transport.SendFileSignalingAsync(json);
+                        if (i < 2) await Task.Delay(500);
+                    }
                 }
                 catch (Exception ex)
                 {

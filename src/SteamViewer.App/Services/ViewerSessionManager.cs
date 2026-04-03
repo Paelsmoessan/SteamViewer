@@ -180,6 +180,17 @@ public sealed class ViewerSessionManager : IAsyncDisposable
         {
             _peerToSession.TryRemove(session.PeerId, out _);
 
+            // Notify host via signaling server before tearing down transport
+            try
+            {
+                await _signalingClient.SendAsync(new SignalingMessage.Disconnect(session.PeerId));
+                _logger.LogInformation("Sent disconnect signal for peer {PeerId}", session.PeerId);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Failed to send disconnect signal (best effort)");
+            }
+
             await session.DisconnectAsync();
             await session.DisposeAsync();
 
