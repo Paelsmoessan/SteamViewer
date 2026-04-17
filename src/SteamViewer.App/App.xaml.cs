@@ -53,10 +53,36 @@ public partial class App : Application
             Y = y
         };
 
-        // Save window state, kill child processes, and exit on close
+        // Save window state, disconnect sessions, kill child processes, and exit on close
         _mainWindow.Destroying += (s, e) =>
         {
+            var debugPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SteamViewer", "exit-debug.txt");
+            try { File.AppendAllText(debugPath, $"[{DateTime.Now:HH:mm:ss.fff}] Destroying fired\n"); } catch { }
+
             SaveWindowState();
+            try
+            {
+                var sessionManager = MauiProgram.ServiceProvider?.GetService<ViewerSessionManager>();
+                File.AppendAllText(debugPath, $"[{DateTime.Now:HH:mm:ss.fff}] SessionManager: {sessionManager != null}\n");
+                var signalingClient = MauiProgram.ServiceProvider?.GetService<Client.Core.Network.SignalingClient>();
+                File.AppendAllText(debugPath, $"[{DateTime.Now:HH:mm:ss.fff}] SignalingClient: {signalingClient != null}, connected: {signalingClient?.IsConnected}\n");
+
+                var task = Task.Run(async () =>
+                {
+                    try { File.AppendAllText(debugPath, $"[{DateTime.Now:HH:mm:ss.fff}] Task.Run started\n"); } catch { }
+                    if (sessionManager != null) await sessionManager.DisposeAsync();
+                    try { File.AppendAllText(debugPath, $"[{DateTime.Now:HH:mm:ss.fff}] SessionManager disposed\n"); } catch { }
+                    if (signalingClient != null) await signalingClient.DisposeAsync();
+                    try { File.AppendAllText(debugPath, $"[{DateTime.Now:HH:mm:ss.fff}] SignalingClient disposed\n"); } catch { }
+                });
+                var completed = task.Wait(TimeSpan.FromSeconds(5));
+                File.AppendAllText(debugPath, $"[{DateTime.Now:HH:mm:ss.fff}] Wait completed: {completed}\n");
+            }
+            catch (Exception ex)
+            {
+                try { File.AppendAllText(debugPath, $"[{DateTime.Now:HH:mm:ss.fff}] ERROR: {ex.Message}\n"); } catch { }
+            }
+
             WinUI.Program.KillChildProcesses();
             Environment.Exit(0);
         };
@@ -185,7 +211,17 @@ public partial class App : Application
     private void OnMultiViewerWindowDestroying(string windowId)
     {
         _viewerWindows.TryRemove(windowId, out _);
-        // TabManager will handle cleanup via RemoveWindowAsync
+        // Blazor's DisposeAsync races with Destroying - it wins TryRemove but can't
+        // complete the async Disconnect. Send Disconnect for each session directly.
+        Task.Run(async () =>
+        {
+            var sessionManager = MauiProgram.ServiceProvider?.GetService<ViewerSessionManager>();
+            if (sessionManager == null) return;
+            foreach (var session in sessionManager.Sessions.ToList())
+            {
+                await sessionManager.RemoveSessionAsync(session.SessionId);
+            }
+        }).Wait(TimeSpan.FromSeconds(5));
     }
 
     private void OpenCollabViewerWindow(string peerId)

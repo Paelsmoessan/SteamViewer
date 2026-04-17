@@ -181,6 +181,8 @@ else
     private string incomingPeerId = "";
     private string connectedPeerId = "";
     private bool _isReconnect;
+    private bool _cleaningUp;
+    private string? _pendingReconnectPeerId;
     private IElevationService? _preservedElevationService;
     private ReconnectCredentials.ReconnectResult? _pendingReconnect;
 
@@ -781,25 +783,53 @@ else
             _hostSession.OnReady += () => InvokeAsync(StateHasChanged);
             _hostSession.OnDisconnected += reason => InvokeAsync(async () =>
             {
-                Logger.LogWarning("Host session disconnected: {Reason}. Resetting to accept reconnections.", reason);
-
-                // Detach elevation service before disposing — keeps helper processes alive
-                if (_hostSession != null)
+                if (_cleaningUp)
                 {
-                    _preservedElevationService = _hostSession.DetachElevationService();
-                    if (_preservedElevationService != null)
-                        Logger.LogInformation("Elevation service preserved for reconnect (admin={Admin}, system={System})",
-                            _preservedElevationService.IsAdminConnected, _preservedElevationService.IsSystemConnected);
-
-                    await _hostSession.DisposeAsync();
-                    _hostSession = null;
+                    Logger.LogDebug("OnDisconnected skipped - signaling disconnect handler is active");
+                    return;
                 }
 
-                // Reset to registered state — host is still registered on signaling server
-                connectedPeerId = "";
-                _canvasInitialized = false;
-                _isReconnect = true; // Auto-accept viewer's reconnect
-                connectionState = ConnectionState.Registered;
+                Logger.LogWarning("Host session disconnected: {Reason}. Resetting to accept reconnections.", reason);
+
+                _cleaningUp = true;
+                try
+                {
+                    if (_hostSession != null)
+                    {
+                        _preservedElevationService = _hostSession.DetachElevationService();
+                        if (_preservedElevationService != null)
+                            Logger.LogInformation("Elevation service preserved for reconnect (admin={Admin}, system={System})",
+                                _preservedElevationService.IsAdminConnected, _preservedElevationService.IsSystemConnected);
+
+                        await _hostSession.DisposeAsync();
+                        _hostSession = null;
+                    }
+
+                    connectedPeerId = "";
+                    _canvasInitialized = false;
+                    _isReconnect = true;
+                    connectionState = ConnectionState.Registered;
+                }
+                finally
+                {
+                    _cleaningUp = false;
+                }
+
+                if (!string.IsNullOrEmpty(_pendingReconnectPeerId))
+                {
+                    incomingPeerId = _pendingReconnectPeerId;
+                    _pendingReconnectPeerId = null;
+                    Logger.LogInformation("Processing deferred reconnect from {PeerId} (transport disconnect path)", incomingPeerId);
+                    if (_isReconnect)
+                    {
+                        await AcceptConnection();
+                    }
+                    else
+                    {
+                        connectionState = ConnectionState.Connecting;
+                    }
+                }
+
                 StateHasChanged();
             });
             _hostSession.OnPeerSharingChanged += sharing => InvokeAsync(() =>
@@ -952,6 +982,13 @@ else
             switch (message)
             {
                 case SignalingMessage.IncomingConnection incoming:
+                    if (_cleaningUp)
+                    {
+                        Logger.LogInformation("IncomingConnection from {PeerId} deferred - cleanup in progress", incoming.FromId);
+                        _pendingReconnectPeerId = incoming.FromId;
+                        break;
+                    }
+
                     incomingPeerId = incoming.FromId;
 
                     // Auto-accept during reconnect (post-elevation or post-reboot)
@@ -975,18 +1012,50 @@ else
                     break;
 
                 case SignalingMessage.Disconnected disconnected:
-                    if (disconnected.PeerId != connectedPeerId) break;
-                    if (_hostSession != null)
+                    Logger.LogWarning("[DIAG] Disconnected received: peerId={PeerId}, connectedPeerId={ConnectedPeerId}, connectionState={State}, reason={Reason}",
+                        disconnected.PeerId, connectedPeerId, connectionState, disconnected.Reason);
+                    if (disconnected.PeerId != connectedPeerId)
                     {
-                        _preservedElevationService = _hostSession.DetachElevationService();
-                        await _hostSession.DisposeAsync();
-                        _hostSession = null;
+                        Logger.LogWarning("[DIAG] PeerId mismatch - BREAKING. disconnected.PeerId={DisconnectedPeer} != connectedPeerId={ConnectedPeer}",
+                            disconnected.PeerId, connectedPeerId);
+                        break;
                     }
-                    connectedPeerId = "";
-                    _canvasInitialized = false;
-                    // Graceful close = session over, crash/drop = preserve for reconnect
-                    _isReconnect = disconnected.Reason != "Peer closed connection";
-                    connectionState = ConnectionState.Registered;
+                    _cleaningUp = true;
+                    try
+                    {
+                        if (_hostSession != null)
+                        {
+                            _preservedElevationService = _hostSession.DetachElevationService();
+                            await _hostSession.DisposeAsync();
+                            _hostSession = null;
+                        }
+                        connectedPeerId = "";
+                        _canvasInitialized = false;
+                        _isReconnect = disconnected.Reason != "Peer closed connection";
+                        connectionState = ConnectionState.Registered;
+                        Logger.LogWarning("[DIAG] Disconnected cleanup done: connectionState={State}, _isReconnect={IsReconnect}, _hostSession={HasSession}",
+                            connectionState, _isReconnect, _hostSession != null);
+                    }
+                    finally
+                    {
+                        _cleaningUp = false;
+                    }
+
+                    if (!string.IsNullOrEmpty(_pendingReconnectPeerId))
+                    {
+                        incomingPeerId = _pendingReconnectPeerId;
+                        _pendingReconnectPeerId = null;
+                        Logger.LogInformation("Processing deferred reconnect from {PeerId}, isReconnect={IsReconnect}", incomingPeerId, _isReconnect);
+                        if (_isReconnect)
+                        {
+                            await AcceptConnection();
+                        }
+                        else
+                        {
+                            connectionState = ConnectionState.Connecting;
+                        }
+                    }
+                    Logger.LogWarning("[DIAG] Disconnected handler exit: connectionState={State}, about to StateHasChanged", connectionState);
                     break;
 
                 case SignalingMessage.TransportEndpoint endpoint:
@@ -1013,6 +1082,7 @@ else
                     break;
             }
 
+            Logger.LogDebug("[DIAG] HandleMessage exit: connectionState={State}, calling StateHasChanged", connectionState);
             StateHasChanged();
         });
     }
