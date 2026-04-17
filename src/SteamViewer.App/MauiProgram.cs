@@ -103,6 +103,19 @@ public static class MauiProgram
         // Store service provider for App to access
         ServiceProvider = app.Services;
 
+        // Ensure signaling disconnect on app exit (window close kills process before Blazor DisposeAsync completes)
+        AppDomain.CurrentDomain.ProcessExit += (_, _) =>
+        {
+            try
+            {
+                var sessionManager = ServiceProvider?.GetService<ViewerSessionManager>();
+                sessionManager?.DisposeAsync().AsTask().Wait(TimeSpan.FromSeconds(3));
+                var signalingClient = ServiceProvider?.GetService<SignalingClient>();
+                signalingClient?.DisposeAsync().AsTask().Wait(TimeSpan.FromSeconds(2));
+            }
+            catch { }
+        };
+
         return app;
     }
 

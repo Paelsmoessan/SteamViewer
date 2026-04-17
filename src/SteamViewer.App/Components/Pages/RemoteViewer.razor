@@ -10,7 +10,7 @@
 @inject IJSRuntime JSRuntime
 @inject FileLoggerService FileLogger
 @inject SteamViewer.Client.Core.Capture.ISystemKeyInterceptor SystemKeyInterceptor
-@implements IDisposable
+@implements IAsyncDisposable
 
 <div class="viewer-container" @onclick="CloseMenus" @onclick:stopPropagation="false">
     <div class="viewer-toolbar">
@@ -1470,8 +1470,14 @@
 
     #endregion
 
-    public void Dispose()
+    public async ValueTask DisposeAsync()
     {
+        // Disconnect sessions first (sends signaling Disconnect per tab)
+        if (_windowId != null)
+        {
+            await TabManager.RemoveWindowAsync(_windowId);
+        }
+
         // Clean up system key hook
         SystemKeyInterceptor.SystemKeyIntercepted -= OnSystemKeyIntercepted;
         SystemKeyInterceptor.Uninstall();
@@ -1514,15 +1520,10 @@
         {
             try
             {
-                _ = JSRuntime.InvokeVoidAsync("SteamViewerTabDrag.dispose");
+                await JSRuntime.InvokeVoidAsync("SteamViewerTabDrag.dispose");
             }
+            catch (JSDisconnectedException) { }
             catch { }
-        }
-
-        // Remove window from tab manager
-        if (_windowId != null)
-        {
-            _ = TabManager.RemoveWindowAsync(_windowId);
         }
     }
 }

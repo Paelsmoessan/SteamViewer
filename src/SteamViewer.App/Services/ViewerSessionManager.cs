@@ -432,9 +432,15 @@ public sealed class ViewerSessionManager : IAsyncDisposable
             _signalingClient.OnMessageReceived -= HandleSignalingMessage;
         }
 
-        // Dispose all sessions
+        // Send Disconnect for each active session, then dispose
         foreach (var session in _sessions.Values)
         {
+            try
+            {
+                await _signalingClient.SendAsync(new SignalingMessage.Disconnect(session.PeerId));
+            }
+            catch { }
+            await session.DisconnectAsync();
             await session.DisposeAsync();
         }
 

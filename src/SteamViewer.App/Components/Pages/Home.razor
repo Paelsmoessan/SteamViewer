@@ -1012,7 +1012,14 @@ else
                     break;
 
                 case SignalingMessage.Disconnected disconnected:
-                    if (disconnected.PeerId != connectedPeerId) break;
+                    Logger.LogWarning("[DIAG] Disconnected received: peerId={PeerId}, connectedPeerId={ConnectedPeerId}, connectionState={State}, reason={Reason}",
+                        disconnected.PeerId, connectedPeerId, connectionState, disconnected.Reason);
+                    if (disconnected.PeerId != connectedPeerId)
+                    {
+                        Logger.LogWarning("[DIAG] PeerId mismatch - BREAKING. disconnected.PeerId={DisconnectedPeer} != connectedPeerId={ConnectedPeer}",
+                            disconnected.PeerId, connectedPeerId);
+                        break;
+                    }
                     _cleaningUp = true;
                     try
                     {
@@ -1026,6 +1033,8 @@ else
                         _canvasInitialized = false;
                         _isReconnect = disconnected.Reason != "Peer closed connection";
                         connectionState = ConnectionState.Registered;
+                        Logger.LogWarning("[DIAG] Disconnected cleanup done: connectionState={State}, _isReconnect={IsReconnect}, _hostSession={HasSession}",
+                            connectionState, _isReconnect, _hostSession != null);
                     }
                     finally
                     {
@@ -1046,6 +1055,7 @@ else
                             connectionState = ConnectionState.Connecting;
                         }
                     }
+                    Logger.LogWarning("[DIAG] Disconnected handler exit: connectionState={State}, about to StateHasChanged", connectionState);
                     break;
 
                 case SignalingMessage.TransportEndpoint endpoint:
@@ -1072,6 +1082,7 @@ else
                     break;
             }
 
+            Logger.LogDebug("[DIAG] HandleMessage exit: connectionState={State}, calling StateHasChanged", connectionState);
             StateHasChanged();
         });
     }
