@@ -18,7 +18,6 @@ public sealed class SessionManager : IAsyncDisposable
     private readonly object _stateLock = new();
 
     private SignalingClient? _signalingClient;
-    private IWebRTCManager? _webrtc;
     private IScreenCapture? _screenCapture;
     private VideoEncoder? _encoder;
     private VideoDecoder? _decoder;
@@ -248,9 +247,6 @@ public sealed class SessionManager : IAsyncDisposable
         await _signalingClient.SendAsync(msg, cancellationToken);
 
         _state.ConnectToPeer(peerId);
-
-        // Initialize WebRTC as host
-        await InitializeWebRTCAsHostAsync(peerId, cancellationToken);
     }
 
     /// <summary>
@@ -286,14 +282,6 @@ public sealed class SessionManager : IAsyncDisposable
 
         await StopCaptureAsync();
         _state.Disconnect();
-    }
-
-    /// <summary>
-    /// Sets the WebRTC manager (injected for JS interop).
-    /// </summary>
-    public void SetWebRTCManager(IWebRTCManager webrtc)
-    {
-        _webrtc = webrtc;
     }
 
     /// <summary>
@@ -530,33 +518,6 @@ public sealed class SessionManager : IAsyncDisposable
 
     #endregion
 
-    private async Task InitializeWebRTCAsHostAsync(string peerId, CancellationToken cancellationToken)
-    {
-        if (_webrtc == null)
-        {
-            _logger.LogWarning("WebRTC manager not set, skipping initialization");
-            return;
-        }
-
-        _logger.LogInformation("Initializing WebRTC as host for peer {PeerId}", peerId);
-        await _webrtc.InitializeAsHostAsync(peerId);
-    }
-
-    private async Task InitializeWebRTCAsViewerAsync(CancellationToken cancellationToken)
-    {
-        if (_webrtc == null)
-        {
-            _logger.LogWarning("WebRTC manager not set, skipping initialization");
-            return;
-        }
-
-        _logger.LogInformation("Initializing WebRTC as viewer");
-        await _webrtc.InitializeAsViewerAsync();
-
-        // Initialize decoder for receiving video
-        InitializeDecoder();
-    }
-
     private async Task RunCaptureLoopAsync(CancellationToken cancellationToken)
     {
         var frameInterval = TimeSpan.FromMilliseconds(1000.0 / _config.TargetFps);
@@ -577,12 +538,9 @@ public sealed class SessionManager : IAsyncDisposable
                     var encodedFrames = _encoder.EncodeFrame(frame.Data, frame.Stride, isFirstFrame);
                     isFirstFrame = false;
 
+                    // TODO: Send encoded frames via transport
                     foreach (var encoded in encodedFrames)
                     {
-                        if (_webrtc != null)
-                        {
-                            await _webrtc.SendVideoDataAsync(encoded.Data);
-                        }
                     }
                 }
             }
@@ -637,9 +595,6 @@ public sealed class SessionManager : IAsyncDisposable
                 {
                     _state.ConnectToPeer(response.TargetId);
                     ConnectionApproved?.Invoke(this, response.TargetId);
-
-                    // Initialize WebRTC as viewer (we requested the connection)
-                    _ = InitializeWebRTCAsViewerAsync(CancellationToken.None);
                 }
                 else
                 {
@@ -657,23 +612,6 @@ public sealed class SessionManager : IAsyncDisposable
             case SignalingMessage.Error error:
                 _logger.LogError("Signaling error: {Message}", error.Message);
                 SignalingError?.Invoke(this, error.Message);
-                break;
-
-            case SignalingMessage.SdpOffer offer:
-                _logger.LogInformation("Received SDP offer from {TargetId}", offer.TargetId);
-                _ = _webrtc?.HandleOfferAsync(offer.Sdp, offer.TargetId);
-                break;
-
-            case SignalingMessage.SdpAnswer answer:
-                _logger.LogInformation("Received SDP answer from {TargetId}", answer.TargetId);
-                _ = _webrtc?.HandleAnswerAsync(answer.Sdp);
-                _state.MarkConnected();
-                WebRTCConnected?.Invoke(this, answer.TargetId);
-                break;
-
-            case SignalingMessage.IceCandidate ice:
-                _logger.LogDebug("Received ICE candidate from {TargetId}", ice.TargetId);
-                _ = _webrtc?.HandleIceCandidateAsync(ice.Candidate, ice.SdpMid, ice.SdpMLineIndex);
                 break;
 
             case SignalingMessage.Pong:

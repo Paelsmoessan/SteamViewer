@@ -617,6 +617,9 @@
             var session = SessionManager.GetSession(sessionId);
             if (session == null) return;
 
+            // Send resolution EARLY — host needs this before encoding first frames
+            await SendDisplayResolutionAsync(session);
+
             // Bind WebRTC to this viewer window's JS context
             // (creates PeerConnection here, processes queued SDP/ICE)
             await session.BindToViewerAsync(JSRuntime);
@@ -627,8 +630,6 @@
             if (enabled)
             {
                 Console.WriteLine($"[DirectRender] Session {sessionId}: active");
-                // Send viewer display resolution to host for server-side downscaling
-                await SendDisplayResolutionAsync(session);
                 // Start resize listener to update resolution on window resize
                 await StartResizeListenerAsync();
             }

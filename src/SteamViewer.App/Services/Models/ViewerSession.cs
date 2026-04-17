@@ -174,10 +174,6 @@ public sealed class ViewerSession : IAsyncDisposable
     /// </summary>
     public string? StoredPassword { get; set; }
 
-    // Keep OnIceCandidate/OnSdpMessage properties for ViewerSessionManager compat (unused now)
-    public event Func<string, string?, ushort?, Task>? OnIceCandidate;
-    public event Func<string, string, Task>? OnSdpMessage;
-
     public ViewerSession(
         string sessionId,
         string peerId,
@@ -340,25 +336,6 @@ public sealed class ViewerSession : IAsyncDisposable
 #endif
 
         _logger.LogInformation("Session {SessionId}: Bound to viewer JSRuntime", SessionId);
-    }
-
-    // Legacy SDP/ICE handlers — queue TransportEndpoint instead
-    public Task HandleSdpOfferAsync(string sdp)
-    {
-        _logger.LogDebug("Session {SessionId}: Ignoring legacy SDP offer (using transport endpoint)", SessionId);
-        return Task.CompletedTask;
-    }
-
-    public Task HandleSdpAnswerAsync(string sdp)
-    {
-        _logger.LogDebug("Session {SessionId}: Ignoring legacy SDP answer (using transport endpoint)", SessionId);
-        return Task.CompletedTask;
-    }
-
-    public Task HandleIceCandidateAsync(string candidate, string? sdpMid, int? sdpMLineIndex)
-    {
-        _logger.LogDebug("Session {SessionId}: Ignoring legacy ICE candidate (using transport endpoint)", SessionId);
-        return Task.CompletedTask;
     }
 
     /// <summary>
@@ -1087,7 +1064,13 @@ public sealed class ViewerSession : IAsyncDisposable
             {
                 try
                 {
-                    await _transport.SendFileSignalingAsync(json);
+                    // Send 3x with 500ms gaps for UDP reliability (idempotent on receiver)
+                    for (int i = 0; i < 3; i++)
+                    {
+                        if (_transport == null || !_transport.IsConnected) break;
+                        await _transport.SendFileSignalingAsync(json);
+                        if (i < 2) await Task.Delay(500);
+                    }
                 }
                 catch (Exception ex)
                 {

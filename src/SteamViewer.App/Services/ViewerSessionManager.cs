@@ -180,6 +180,17 @@ public sealed class ViewerSessionManager : IAsyncDisposable
         {
             _peerToSession.TryRemove(session.PeerId, out _);
 
+            // Notify host via signaling server before tearing down transport
+            try
+            {
+                await _signalingClient.SendAsync(new SignalingMessage.Disconnect(session.PeerId));
+                _logger.LogInformation("Sent disconnect signal for peer {PeerId}", session.PeerId);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Failed to send disconnect signal (best effort)");
+            }
+
             await session.DisconnectAsync();
             await session.DisposeAsync();
 
@@ -281,18 +292,6 @@ public sealed class ViewerSessionManager : IAsyncDisposable
                 HandleConnectionResponse(response);
                 break;
 
-            case SignalingMessage.SdpOffer offer:
-                HandleSdpOffer(offer);
-                break;
-
-            case SignalingMessage.SdpAnswer answer:
-                HandleSdpAnswer(answer);
-                break;
-
-            case SignalingMessage.IceCandidate ice:
-                HandleIceCandidate(ice);
-                break;
-
             case SignalingMessage.RelayReady relayReady:
                 HandleRelayReady(relayReady);
                 break;
@@ -332,42 +331,6 @@ public sealed class ViewerSessionManager : IAsyncDisposable
             OnConnectionFailed?.Invoke(response.TargetId, "Connection rejected");
             _ = RemoveSessionAsync(session.SessionId);
         }
-    }
-
-    private void HandleSdpOffer(SignalingMessage.SdpOffer offer)
-    {
-        var session = GetSessionByPeerId(offer.TargetId);
-        if (session == null)
-        {
-            _logger.LogWarning("Received SDP offer for unknown peer {PeerId}", offer.TargetId);
-            return;
-        }
-
-        _ = session.HandleSdpOfferAsync(offer.Sdp);
-    }
-
-    private void HandleSdpAnswer(SignalingMessage.SdpAnswer answer)
-    {
-        var session = GetSessionByPeerId(answer.TargetId);
-        if (session == null)
-        {
-            _logger.LogWarning("Received SDP answer for unknown peer {PeerId}", answer.TargetId);
-            return;
-        }
-
-        _ = session.HandleSdpAnswerAsync(answer.Sdp);
-    }
-
-    private void HandleIceCandidate(SignalingMessage.IceCandidate ice)
-    {
-        var session = GetSessionByPeerId(ice.TargetId);
-        if (session == null)
-        {
-            _logger.LogDebug("Received ICE candidate for unknown peer {PeerId}", ice.TargetId);
-            return;
-        }
-
-        _ = session.HandleIceCandidateAsync(ice.Candidate, ice.SdpMid, ice.SdpMLineIndex);
     }
 
     private void HandlePeerDisconnected(SignalingMessage.Disconnected disconnected)

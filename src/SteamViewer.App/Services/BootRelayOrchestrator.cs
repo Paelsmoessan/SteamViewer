@@ -76,6 +76,7 @@ public static class BootRelayOrchestrator
         {
             builder.SetMinimumLevel(LogLevel.Debug);
             builder.AddConsole();
+            builder.AddProvider(new BootRelayFileLoggerProvider());
         });
 
         _signalingClient = new SignalingClient(
