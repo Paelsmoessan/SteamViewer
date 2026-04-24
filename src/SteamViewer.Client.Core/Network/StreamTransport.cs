@@ -182,7 +182,7 @@ public abstract class StreamTransport : IAsyncDisposable
 
     #region Receive
 
-    private void HandleDataReceived(byte[] data, int length)
+    protected void HandleDataReceived(byte[] data, int length)
     {
         if (_disposed || !_connected) return;
 
@@ -343,18 +343,17 @@ public abstract class StreamTransport : IAsyncDisposable
 
         if (oldBackend != null)
         {
-            oldBackend.OnDataReceived -= HandleDataReceived;
+            // Keep OnDataReceived subscribed — peer may still be sending on old transport
+            // Stale data from prior sessions is handled by encryption tag validation (silent drop)
             oldBackend.OnDisconnected -= HandleBackendDisconnected;
         }
 
         _backend = newBackend;
         _firstDataLogged = false; // Log first data on new backend too
+        // Prevent double-subscribe if this was the pending backend (already subscribed in AcceptUdpPath)
+        newBackend.OnDataReceived -= HandleDataReceived;
         newBackend.OnDataReceived += HandleDataReceived;
         newBackend.OnDisconnected += HandleBackendDisconnected;
-
-        // Don't dispose old backend immediately — keep it alive for SENDING.
-        // Peer may still be sending on old transport (hasn't switched yet).
-        // OnDataReceived is unsubscribed above — we don't want stale data from old sessions.
         if (oldBackend != null)
         {
             _ = DisposeAfterGracePeriodAsync(oldBackend);
@@ -367,9 +366,10 @@ public abstract class StreamTransport : IAsyncDisposable
     private async Task DisposeAfterGracePeriodAsync(ITransportBackend oldBackend)
     {
         await Task.Delay(10_000);
+        oldBackend.OnDataReceived -= HandleDataReceived;
         try { await oldBackend.DisposeAsync(); }
         catch { }
-        _logger.LogDebug("[RELAY] {Backend} disposed (sent-only grace period ended)", oldBackend.GetType().Name);
+        _logger.LogDebug("[RELAY] {Backend} disposed (grace period ended)", oldBackend.GetType().Name);
     }
 
     /// <summary>

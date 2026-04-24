@@ -220,6 +220,7 @@ public sealed class HostStreamTransport : StreamTransport
         if (_udpBackend == null) return;
 
         _udpBackend.ConnectToPeer(endpoint, useTurnRelay);
+        _udpBackend.OnDataReceived += HandleDataReceived; // Receive peer data before switch completes
         _pendingUdpBackend = _udpBackend;
         _localUdpReady = true;
         _logger.LogInformation("Host: UDP probe succeeded via {Endpoint} (turn={Turn}) — waiting for peer confirmation", endpoint, useTurnRelay);
@@ -250,6 +251,7 @@ public sealed class HostStreamTransport : StreamTransport
             if (_localUdpReady && !_remoteUdpReady && _pendingUdpBackend != null)
             {
                 _logger.LogWarning("Host: peer did not confirm UDP within 15s — staying on relay");
+                _pendingUdpBackend.OnDataReceived -= HandleDataReceived;
                 _localUdpReady = false;
                 _pendingUdpBackend = null;
             }
@@ -280,6 +282,10 @@ public sealed class HostStreamTransport : StreamTransport
 
     public override async ValueTask DisposeAsync()
     {
+        if (_pendingUdpBackend != null)
+        {
+            _pendingUdpBackend.OnDataReceived -= HandleDataReceived;
+        }
         if (_udpBackend != null && _udpBackend != _pendingUdpBackend)
         {
             await _udpBackend.DisposeAsync();
