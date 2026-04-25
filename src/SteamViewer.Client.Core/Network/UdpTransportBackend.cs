@@ -714,11 +714,15 @@ public sealed class UdpTransportBackend : ITransportBackend
                     continue;
                 }
 
-                var buffer = _reassemblyBuffers.GetOrAdd(msgId, _ => new FragmentBuffer(totalFrags));
-
                 if (fragIndex >= totalFrags)
                 {
-                    // FEC parity packet — extract meta + parity data
+                    // FEC parity packet — only add to EXISTING buffer.
+                    // If the message already completed and was removed, this is a late
+                    // parity packet — discard it. Using GetOrAdd here would create a
+                    // ghost buffer that never completes, inflating the loss metric.
+                    if (!_reassemblyBuffers.TryGetValue(msgId, out var fecBuffer))
+                        continue;
+
                     if (length >= FragmentHeaderSize + FecMetaSize)
                     {
                         var fecIdx = fragIndex - totalFrags;
@@ -731,29 +735,40 @@ public sealed class UdpTransportBackend : ITransportBackend
                         var parityData = new byte[parityLen];
                         Buffer.BlockCopy(data, FragmentHeaderSize + FecMetaSize, parityData, 0, parityLen);
 
-                        // Validate matrix dimensions
                         if (cols > 0 && cols <= 30 && rows > 0 && rows <= 30 && (int)rows * cols >= totalFrags)
-                            buffer.AddFecPacket(fecIdx, parityData, cols, rows, totalMsgLen);
+                            fecBuffer.AddFecPacket(fecIdx, parityData, cols, rows, totalMsgLen);
+
+                        // Check if FEC enables recovery
+                        if (fecBuffer.TryRecover())
+                        {
+                            _reassemblyBuffers.TryRemove(msgId, out _);
+                            Interlocked.Increment(ref _messagesCompleted);
+                            var assembled = fecBuffer.Assemble();
+                            _logger.LogDebug("FEC recovered message {MsgId} ({Size}KB, {Frags} fragments)",
+                                msgId, assembled.Length / 1024, totalFrags);
+                            OnDataReceived?.Invoke(assembled, assembled.Length);
+                        }
                     }
                 }
                 else
                 {
                     // Data fragment
+                    var buffer = _reassemblyBuffers.GetOrAdd(msgId, _ => new FragmentBuffer(totalFrags));
                     var payload = new byte[length - FragmentHeaderSize];
                     Buffer.BlockCopy(data, FragmentHeaderSize, payload, 0, payload.Length);
                     buffer.AddFragment(fragIndex, payload);
-                }
 
-                // Check if message is ready (direct completion or FEC recovery)
-                if (buffer.IsComplete || buffer.TryRecover())
-                {
-                    _reassemblyBuffers.TryRemove(msgId, out _);
-                    Interlocked.Increment(ref _messagesCompleted);
-                    var assembled = buffer.Assemble();
-                    if (buffer.WasRecovered)
-                        _logger.LogDebug("FEC recovered message {MsgId} ({Size}KB, {Frags} fragments)",
-                            msgId, assembled.Length / 1024, totalFrags);
-                    OnDataReceived?.Invoke(assembled, assembled.Length);
+                    // Check if message is ready (direct completion or FEC recovery)
+                    if (buffer.IsComplete || buffer.TryRecover())
+                    {
+                        _reassemblyBuffers.TryRemove(msgId, out _);
+                        Interlocked.Increment(ref _messagesCompleted);
+                        var assembled = buffer.Assemble();
+                        if (buffer.WasRecovered)
+                            _logger.LogDebug("FEC recovered message {MsgId} ({Size}KB, {Frags} fragments)",
+                                msgId, assembled.Length / 1024, totalFrags);
+                        OnDataReceived?.Invoke(assembled, assembled.Length);
+                    }
                 }
             }
         }

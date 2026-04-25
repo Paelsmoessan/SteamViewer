@@ -245,7 +245,16 @@ public abstract class StreamTransport : IAsyncDisposable
                     var losslessLen = plaintext.Length - 1;
                     var losslessData = new byte[losslessLen];
                     Buffer.BlockCopy(plaintext, 1, losslessData, 0, losslessLen);
-                    OnLosslessFrame?.Invoke(losslessData, losslessLen);
+                    // Lossless frames are infrequent one-shots — Task.Run is fine
+                    if (OnLosslessFrame != null)
+                    {
+                        var handler = OnLosslessFrame;
+                        _ = Task.Run(() =>
+                        {
+                            try { handler.Invoke(losslessData, losslessLen); }
+                            catch (Exception ex) { _logger.LogWarning(ex, "Lossless frame handler error"); }
+                        });
+                    }
                     break;
                 }
                 case ChannelFileData:
@@ -429,7 +438,12 @@ public abstract class StreamTransport : IAsyncDisposable
 
     private void HandleBackendDisconnected()
     {
-        if (!_connected || _disposed) return;
+        if (!_connected || _disposed)
+        {
+            _logger.LogWarning("[DISCONNECT-DIAG] HandleBackendDisconnected SUPPRESSED: connected={Connected}, disposed={Disposed}",
+                _connected, _disposed);
+            return;
+        }
         _connected = false;
         _logger.LogWarning("Transport backend disconnected");
         _videoSendQueue.Writer.TryComplete();

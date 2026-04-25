@@ -9,6 +9,7 @@
 @inject CanvasRenderingService CanvasRenderer
 @inject IJSRuntime JSRuntime
 @inject FileLoggerService FileLogger
+@inject ILogger<RemoteViewer> Logger
 @inject SteamViewer.Client.Core.Capture.ISystemKeyInterceptor SystemKeyInterceptor
 @implements IAsyncDisposable
 
@@ -522,7 +523,8 @@
 
     private void HandleSessionDisconnected(string? reason)
     {
-        Console.WriteLine($"Session disconnected: {reason}");
+        Logger.LogWarning("[RECONNECT-DIAG] HandleSessionDisconnected fired: reason={Reason}, activeSession={Session}, overlay={Overlay}",
+            reason, _activeSessionId, _showReconnectOverlay);
         ShowReconnectOverlay(reason);
     }
 
@@ -1338,6 +1340,8 @@
 
     private void ShowReconnectOverlay(string? reason)
     {
+        Logger.LogWarning("[RECONNECT-DIAG] ShowReconnectOverlay: reason={Reason}, attempts={Attempts}, timerActive={Timer}",
+            reason, _reconnectAttempts, _reconnectTimer != null);
         _showReconnectOverlay = true;
         _reconnectAttempts = 0;
         StartReconnectCountdown();
@@ -1366,6 +1370,7 @@
 
         if (_reconnectCountdown <= 0)
         {
+            Logger.LogWarning("[RECONNECT-DIAG] Timer expired, calling TryReconnect");
             _reconnectTimer?.Dispose();
             _reconnectTimer = null;
             await TryReconnect();
@@ -1379,7 +1384,7 @@
         if (_activeSession == null || _activeSessionId == null) return;
 
         _reconnectAttempts++;
-        Console.WriteLine($"Reconnect attempt {_reconnectAttempts} for session {_activeSessionId}");
+        Logger.LogWarning("[RECONNECT-DIAG] TryReconnect: attempt={Attempt}, session={Session}", _reconnectAttempts, _activeSessionId);
 
         try
         {
@@ -1427,13 +1432,18 @@
                 _showReconnectOverlay = false;
                 _hasReceivedFrame = false;
                 _reconnectAttempts = 0;
+                Logger.LogWarning("[RECONNECT-DIAG] TryReconnect SUCCESS: new session bound, overlay hidden");
                 StateHasChanged();
                 return;
+            }
+            else
+            {
+                Logger.LogWarning("[RECONNECT-DIAG] TryReconnect returned null session");
             }
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Reconnect attempt {_reconnectAttempts} failed: {ex.Message}");
+            Logger.LogWarning(ex, "[RECONNECT-DIAG] TryReconnect FAILED");
         }
 
         // Reconnect failed, try again with backoff
