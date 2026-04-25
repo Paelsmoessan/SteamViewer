@@ -38,6 +38,7 @@ public sealed unsafe class FFmpegEncoder : IDisposable
     private long _maxBitrate;            // Stored for reinit
     private long _pts;
     private bool _forceKeyframe;
+    private int _forceKeyframeBurst;
     private byte[]? _outputBuffer;
     private bool _disposed;
 
@@ -316,6 +317,9 @@ public sealed unsafe class FFmpegEncoder : IDisposable
                 Cleanup();
                 Initialize(encW, encH);
                 RebuildDownscaleContext(captureWidth, captureHeight, encW, encH);
+                // Force IDR burst after reinit so viewer decoder can cleanly start the new stream
+                ForceKeyframe(3);
+                _logger.LogInformation("Encoder reinit: forcing IDR burst for new resolution {W}x{H}", encW, encH);
             }
             else if (captureChanged && _downscaleCtx != null)
             {
@@ -365,7 +369,16 @@ public sealed unsafe class FFmpegEncoder : IDisposable
         {
             _frame->pict_type = AVPictureType.AV_PICTURE_TYPE_I;
             _frame->flags |= ffmpeg.AV_FRAME_FLAG_KEY;
-            _forceKeyframe = false;
+            if (_forceKeyframeBurst > 0)
+            {
+                _forceKeyframeBurst--;
+                _logger.LogInformation("Encoder: forced IDR keyframe at pts={Pts} (burst remaining={Remaining})", _pts - 1, _forceKeyframeBurst);
+            }
+            else
+            {
+                _forceKeyframe = false;
+                _logger.LogInformation("Encoder: forced IDR keyframe at pts={Pts} (final)", _pts - 1);
+            }
         }
         else
         {
@@ -389,8 +402,14 @@ public sealed unsafe class FFmpegEncoder : IDisposable
         return (_outputBuffer, size);
     }
 
-    /// <summary>Force the next frame to be a keyframe (I-frame).</summary>
-    public void ForceKeyframe() => _forceKeyframe = true;
+    /// <summary>Force the next frame(s) to be keyframes (I-frames). Burst count > 1 sends multiple IDRs to survive packet loss.</summary>
+    public void ForceKeyframe(int burstCount = 1)
+    {
+        _logger.LogInformation("Encoder: ForceKeyframe requested (burst={Burst}, encoder {State})",
+            burstCount, _codecCtx != null ? $"{_width}x{_height}" : "not initialized");
+        _forceKeyframe = true;
+        _forceKeyframeBurst = Math.Max(burstCount - 1, 0);
+    }
 
     /// <summary>Change VBV max rate cap dynamically (CRF mode — adjusts transport ceiling, not quality).</summary>
     public void SetMaxBitrate(long bitsPerSecond)
