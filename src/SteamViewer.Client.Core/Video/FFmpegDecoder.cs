@@ -27,6 +27,8 @@ public sealed unsafe class FFmpegDecoder : IDisposable
     private long _totalBytesDecoded;
     private double _lastDecodeMs;
     private bool _gotKeyframe;
+    private int _droppedBeforeKeyframe;
+    private readonly object _decodeLock = new();
 
     public int Width => _width;
     public int Height => _height;
@@ -79,6 +81,14 @@ public sealed unsafe class FFmpegDecoder : IDisposable
     /// <returns>(bgraData, width, height, stride) or null</returns>
     public (byte[] data, int width, int height, int stride)? DecodeFrame(byte[] nalus, int length)
     {
+        lock (_decodeLock)
+        {
+            return DecodeFrameInternal(nalus, length);
+        }
+    }
+
+    private (byte[] data, int width, int height, int stride)? DecodeFrameInternal(byte[] nalus, int length)
+    {
         if (_codecCtx == null || _frame == null || _packet == null)
             return null;
 
@@ -97,14 +107,23 @@ public sealed unsafe class FFmpegDecoder : IDisposable
         ret = ffmpeg.avcodec_receive_frame(_codecCtx, _frame);
         if (ret < 0) return null; // EAGAIN or error
 
-        // Suppress output until first keyframe decoded — prevents green flash artifacts
+        // Suppress output until first keyframe decoded - prevents green flash artifacts
         // from incomplete reference frames on initial connect
         if (!_gotKeyframe)
         {
             if ((_frame->flags & ffmpeg.AV_FRAME_FLAG_KEY) != 0)
+            {
                 _gotKeyframe = true;
+                _logger.LogInformation("Decoder: first keyframe received (dropped {Count} pre-IDR frames, {Bytes} bytes)",
+                    _droppedBeforeKeyframe, length);
+            }
             else
+            {
+                _droppedBeforeKeyframe++;
+                if (_droppedBeforeKeyframe <= 5 || _droppedBeforeKeyframe % 50 == 0)
+                    _logger.LogDebug("Decoder: dropping pre-IDR frame #{Count} ({Bytes} bytes)", _droppedBeforeKeyframe, length);
                 return null;
+            }
         }
 
         var frameWidth = _frame->width;

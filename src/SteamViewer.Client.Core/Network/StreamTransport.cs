@@ -32,6 +32,7 @@ public abstract class StreamTransport : IAsyncDisposable
     private readonly SemaphoreSlim _sendLock = new(1, 1);
     private readonly Channel<(byte[] data, int length)> _videoSendQueue;
     private Task? _videoSendTask;
+    private TaskCompletionSource? _videoSendReady;
     private bool _disposed;
     protected bool _connected;
     private int _controlSendFailures;
@@ -135,6 +136,23 @@ public abstract class StreamTransport : IAsyncDisposable
         var copy = new byte[length];
         Buffer.BlockCopy(data, 0, copy, 0, length);
         _videoSendQueue.Writer.TryWrite((copy, length));
+    }
+
+    /// <summary>
+    /// Wait until the video send loop is ready to consume frames.
+    /// Returns immediately if video send is not enabled (viewer side).
+    /// </summary>
+    public async Task WaitForVideoSendReadyAsync(CancellationToken ct = default)
+    {
+        if (_videoSendReady == null) return;
+        try
+        {
+            await _videoSendReady.Task.WaitAsync(TimeSpan.FromSeconds(5), ct);
+        }
+        catch (TimeoutException)
+        {
+            _logger.LogError("Video send loop did NOT become ready within 5s - auto-share may fail");
+        }
     }
 
     private async ValueTask<bool> SendFrameAsync(byte channel, byte[] payload, int offset, int length)
@@ -330,7 +348,10 @@ public abstract class StreamTransport : IAsyncDisposable
 
         // Start video send loop (host only)
         if (enableVideoSend)
+        {
+            _videoSendReady = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             _videoSendTask = Task.Run(() => VideoSendLoopAsync(_cts.Token));
+        }
 
         _connected = true;
         _transportStartTime.Restart();
@@ -453,7 +474,11 @@ public abstract class StreamTransport : IAsyncDisposable
 
     private async Task VideoSendLoopAsync(CancellationToken ct)
     {
+        _logger.LogInformation("Video send loop started");
+        _videoSendReady?.TrySetResult();
+
         var consecutiveFailures = 0;
+        var firstFrameSent = false;
         try
         {
             await foreach (var (data, length) in _videoSendQueue.Reader.ReadAllAsync(ct))
@@ -481,6 +506,12 @@ public abstract class StreamTransport : IAsyncDisposable
                     }
                     finally { _sendLock.Release(); }
 
+                    if (!firstFrameSent)
+                    {
+                        _logger.LogInformation("Video send loop: first frame sent ({Length} bytes)", length);
+                        firstFrameSent = true;
+                    }
+
                     consecutiveFailures = 0;
                 }
                 catch (OperationCanceledException) { break; }
@@ -492,7 +523,7 @@ public abstract class StreamTransport : IAsyncDisposable
 
                     if (consecutiveFailures >= 10)
                     {
-                        _logger.LogError("Video send: {Count} consecutive failures — disconnecting", consecutiveFailures);
+                        _logger.LogError("Video send: {Count} consecutive failures - disconnecting", consecutiveFailures);
                         HandleBackendDisconnected();
                         break;
                     }
@@ -504,6 +535,7 @@ public abstract class StreamTransport : IAsyncDisposable
         {
             _logger.LogWarning(ex, "Video send loop error");
         }
+        _logger.LogInformation("Video send loop exited (firstFrameSent={FirstFrame})", firstFrameSent);
     }
 
     #endregion

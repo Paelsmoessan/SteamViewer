@@ -37,6 +37,7 @@ public sealed class HostVideoPipeline : IDisposable
         ValueTask<bool> SendControlAsync(string json);
         ValueTask<bool> SendLosslessFrameAsync(byte[] data, int offset, int length);
         UdpTransportBackend? GetUdpBackend();
+        Task WaitForVideoSendReadyAsync(CancellationToken ct = default);
     }
 
     private IVideoTransport? _transport;
@@ -60,6 +61,9 @@ public sealed class HostVideoPipeline : IDisposable
     // Pending resolution request (received before encoder exists)
     private int _pendingResW;
     private int _pendingResH;
+
+    // Deferred ForceKeyframe: set when SetTransport fires before encoder exists
+    private bool _pendingForceKeyframe;
 
     // Frame rate adaptation for constrained connections
     private long _dxgiFrameCounter;
@@ -133,7 +137,20 @@ public sealed class HostVideoPipeline : IDisposable
     /// <summary>Set or replace the transport. Call when transport connects.</summary>
     public void SetTransport(IVideoTransport transport)
     {
+        _logger.LogInformation("SetTransport: wiring new transport (encoder {State})",
+            _encoder != null ? "exists" : "null");
         _transport = transport;
+
+        // Force IDR keyframe burst so the new viewer can decode immediately
+        // without waiting up to 1s for the next natural GOP boundary.
+        // Burst of 3 survives packet loss on initial connect.
+        if (_encoder != null)
+            _encoder.ForceKeyframe(3);
+        else
+        {
+            _logger.LogInformation("SetTransport: encoder not yet initialized - deferring ForceKeyframe to first encode");
+            _pendingForceKeyframe = true;
+        }
     }
 
     /// <summary>Whether a DXGI capture is actively sending frames.</summary>
@@ -410,6 +427,14 @@ public sealed class HostVideoPipeline : IDisposable
                     }
                     _encoder = encoder;
                     SendCaptureInfoIfChanged(width, height);
+
+                    // Apply deferred ForceKeyframe from SetTransport (encoder didn't exist yet)
+                    if (_pendingForceKeyframe)
+                    {
+                        _pendingForceKeyframe = false;
+                        _encoder.ForceKeyframe(3);
+                        _logger.LogInformation("Deferred ForceKeyframe burst applied after encoder init");
+                    }
                 }
                 else if (isSecureDesktop && frameIndex == 0)
                 {

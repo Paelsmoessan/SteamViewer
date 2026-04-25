@@ -233,9 +233,10 @@ public sealed class ViewerSession : IAsyncDisposable
             _transport.ConnectRelay(encryptionNonce, passwordHash);
 
             // Tell host we're ready — host waits for this before sending initial state
+            _logger.LogInformation("Session {SessionId}: Sending viewerReady handshake", SessionId);
             await _transport.SendControlAsync(JsonSerializer.Serialize(new { type = "viewerReady" }));
 
-            _logger.LogInformation("Session {SessionId}: Relay transport connected", SessionId);
+            _logger.LogInformation("Session {SessionId}: Relay transport connected, viewerReady sent", SessionId);
 
             // Initialize FFmpeg decoder
             FFmpegInit.EnsureInitialized();
@@ -260,6 +261,8 @@ public sealed class ViewerSession : IAsyncDisposable
                         SessionId, turnUri ?? "null", turnUser ?? "null", turnCred != null ? "yes" : "no");
                     await _transport!.AttemptUdpUpgradeAsync(
                         _sendSignaling, PeerId, turnUri, turnUser, turnCred);
+                    _logger.LogInformation("Session {SessionId}: UDP upgrade completed (isDirectUdp={IsDirect})",
+                        SessionId, _transport?.IsDirectUdp ?? false);
                 }
                 catch (Exception ex)
                 {

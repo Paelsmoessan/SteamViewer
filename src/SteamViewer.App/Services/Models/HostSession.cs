@@ -249,26 +249,7 @@ public sealed class HostSession : IAsyncDisposable
         // Start clipboard file monitoring (detect CF_HDROP on host clipboard)
         StartClipboardFileTransfer();
 
-        // Fire-and-forget UDP upgrade attempt (relay continues working in background)
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                var turnUri = _configuration["TurnServer:Urls:0"];
-                var turnUser = _configuration["TurnServer:Username"];
-                var turnCred = _configuration["TurnServer:Credential"];
-                _logger.LogInformation("Host: Starting UDP upgrade (TURN uri={TurnUri}, user={TurnUser}, cred={HasCred})",
-                    turnUri ?? "null", turnUser ?? "null", turnCred != null ? "yes" : "no");
-                await _transport!.AttemptUdpUpgradeAsync(
-                    PeerId, _sendSignaling, turnUri, turnUser, turnCred);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "UDP upgrade attempt failed");
-            }
-        });
-
-        // Send elevation status to viewer
+        // Send elevation status to viewer (can go over relay immediately)
         try
         {
             var elevated = _elevationService?.IsAdminConnected ?? false;
@@ -289,13 +270,39 @@ public sealed class HostSession : IAsyncDisposable
         // Send monitor layout to viewer
         await SendMonitorLayoutAsync();
 
+        // Attempt UDP upgrade BEFORE starting video - wait for it to complete or fail
+        // so video starts on a stable transport (no mid-stream relay→UDP switch artifacts)
+        try
+        {
+            var turnUri = _configuration["TurnServer:Urls:0"];
+            var turnUser = _configuration["TurnServer:Username"];
+            var turnCred = _configuration["TurnServer:Credential"];
+            _logger.LogInformation("Host: Starting UDP upgrade (TURN uri={TurnUri}, user={TurnUser}, cred={HasCred})",
+                turnUri ?? "null", turnUser ?? "null", turnCred != null ? "yes" : "no");
+            await _transport!.AttemptUdpUpgradeAsync(
+                PeerId, _sendSignaling, turnUri, turnUser, turnCred);
+            _logger.LogInformation("Host: UDP upgrade completed (isDirectUdp={IsDirect})",
+                _transport?.IsDirectUdp ?? false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "UDP upgrade attempt failed - continuing on relay");
+        }
+
         // Auto-start full screen sharing on reconnect after reboot
         if (AutoShareOnReady)
         {
             AutoShareOnReady = false;
             try
             {
-                _logger.LogInformation("Auto-sharing screen after reboot reconnect");
+                // Ensure video send loop is consuming before pushing frames
+                _logger.LogInformation("Auto-share: waiting for video send loop ready...");
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                await _transport!.WaitForVideoSendReadyAsync();
+                sw.Stop();
+                _logger.LogInformation("Auto-share: video send loop ready ({ElapsedMs}ms)", sw.ElapsedMilliseconds);
+                _logger.LogInformation("Auto-sharing screen on {Transport} transport after reboot reconnect",
+                    _transport.IsDirectUdp ? "UDP direct" : "relay");
                 await StartScreenShareAsync();
             }
             catch (Exception ex)
@@ -1446,6 +1453,7 @@ public sealed class HostSession : IAsyncDisposable
         public ValueTask<bool> SendControlAsync(string json) => _transport.SendControlAsync(json);
         public ValueTask<bool> SendLosslessFrameAsync(byte[] data, int offset, int length) => _transport.SendLosslessFrameAsync(data, offset, length);
         public UdpTransportBackend? GetUdpBackend() => _transport.GetUdpBackend();
+        public Task WaitForVideoSendReadyAsync(CancellationToken ct = default) => _transport.WaitForVideoSendReadyAsync(ct);
     }
 
     /// <summary>
