@@ -499,6 +499,7 @@ window.SteamViewerInput = {
     _boundWheel: null,
     _boundKeyDown: null,
     _boundKeyUp: null,
+    _altGrDown: false,
 
     // PID mouse regulation tuning
     _pidAlpha: 0.35,
@@ -982,28 +983,46 @@ window.SteamViewerInput = {
         if (!this.isCapturing || !this.isLocked || !window.chrome?.webview) return;
         e.preventDefault();
 
-        // Ctrl+V → clipboard paste through C#
-        if (e.ctrlKey && !e.altKey && !e.metaKey && (e.key === 'v' || e.key === 'V')) {
+        // AltGr tracking: WebView2/WinUI bug (microsoft-ui-xaml#10284) strips AltGr composition.
+        // Track AltGr state but let ALL keys through — no filtering.
+        // Host gets matched Control down/up pairs so modifiers won't stick.
+        if (e.code === 'AltRight') {
+            this._altGrDown = true;
+        }
+
+        // Ctrl+V → clipboard paste through C# (only real Ctrl, not AltGr)
+        if (!this._altGrDown && e.ctrlKey && !e.altKey && !e.metaKey && (e.key === 'v' || e.key === 'V')) {
             window.chrome.webview.postMessage(JSON.stringify({
                 type: 'input', method: 'clipboardPaste'
             }));
             return;
         }
 
-        // Ctrl+C/X → send keystroke (host clipboard request handled by menu button)
-        window.chrome.webview.postMessage(JSON.stringify({
+        var msg = {
             type: 'input', method: 'keyDown',
             key: e.key, modifiers: this.getModifiers(e)
-        }));
+        };
+        // When AltGr is held and it's a character key, send code for ToUnicodeEx resolution
+        if (this._altGrDown && e.code !== 'AltRight' && e.key !== 'Control') {
+            msg.code = e.code;
+            msg.altGr = true;
+        }
+        window.chrome.webview.postMessage(JSON.stringify(msg));
     },
 
     handleKeyUp(e) {
         if (!this.isCapturing || !this.isLocked || !window.chrome?.webview) return;
         e.preventDefault();
-        window.chrome.webview.postMessage(JSON.stringify({
+
+        if (e.code === 'AltRight') {
+            this._altGrDown = false;
+        }
+
+        var msg = {
             type: 'input', method: 'keyUp',
             key: e.key, modifiers: this.getModifiers(e)
-        }));
+        };
+        window.chrome.webview.postMessage(JSON.stringify(msg));
     }
 };
 

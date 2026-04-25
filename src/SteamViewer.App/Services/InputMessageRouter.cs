@@ -159,7 +159,8 @@ public sealed class InputMessageRouter : IDisposable
                     if (session == null) return;
                     var key = root.GetProperty("key").GetString() ?? "";
                     var mods = ParseModifiers(root.GetProperty("modifiers"));
-
+                    var code = root.TryGetProperty("code", out var codeProp) ? codeProp.GetString() : null;
+                    var altGr = root.TryGetProperty("altGr", out var altGrProp) && altGrProp.GetBoolean();
                     // Ctrl+Alt+End → Ctrl+Alt+Del (standard RDP convention)
                     if (key == "End" && mods.Ctrl && mods.Alt)
                     {
@@ -167,7 +168,7 @@ public sealed class InputMessageRouter : IDisposable
                         return;
                     }
 
-                    _ = session.SendInputAsync(new InputEvent.KeyDown(key, mods));
+                    _ = session.SendInputAsync(new InputEvent.KeyDown(key, mods, code, altGr));
                     break;
                 }
 
@@ -176,11 +177,13 @@ public sealed class InputMessageRouter : IDisposable
                     if (session == null) return;
                     var key = root.GetProperty("key").GetString() ?? "";
                     var mods = ParseModifiers(root.GetProperty("modifiers"));
+                    var code = root.TryGetProperty("code", out var codeProp) ? codeProp.GetString() : null;
+                    var altGr = root.TryGetProperty("altGr", out var altGrProp) && altGrProp.GetBoolean();
 
                     // Suppress the End key-up for Ctrl+Alt+End→Del
                     if (key == "End" && mods.Ctrl && mods.Alt) return;
 
-                    _ = session.SendInputAsync(new InputEvent.KeyUp(key, mods));
+                    _ = session.SendInputAsync(new InputEvent.KeyUp(key, mods, code, altGr));
                     break;
                 }
 

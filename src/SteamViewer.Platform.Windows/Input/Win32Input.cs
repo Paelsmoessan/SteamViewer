@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using System.Text;
 using SteamViewer.Common.Protocol;
 
 namespace SteamViewer.Platform.Windows.Input;
@@ -198,10 +199,10 @@ internal static class Win32Input
                 InjectMouseWheel(wheel.DeltaX, wheel.DeltaY);
                 break;
             case InputEvent.KeyDown keyDown:
-                InjectKey(keyDown.Key, keyDown.Modifiers, isDown: true);
+                InjectKey(keyDown.Key, keyDown.Modifiers, isDown: true, keyDown.Code, keyDown.AltGr);
                 break;
             case InputEvent.KeyUp keyUp:
-                InjectKey(keyUp.Key, keyUp.Modifiers, isDown: false);
+                InjectKey(keyUp.Key, keyUp.Modifiers, isDown: false, keyUp.Code, keyUp.AltGr);
                 break;
         }
     }
@@ -435,18 +436,44 @@ internal static class Win32Input
         };
     }
 
-    internal static void InjectKey(string key, KeyModifiers modifiers, bool isDown)
+    internal static void InjectKey(string key, KeyModifiers modifiers, bool isDown,
+        string? code = null, bool altGr = false)
     {
         var inputs = new List<INPUT>();
 
-        // AltGr detection: Nordic/European keyboards send Ctrl+Alt for AltGr characters (\ @ { } [ ] etc.)
-        // JS e.key resolves to the actual character — use UNICODE path directly, skip modifier injection.
-        // Sending Ctrl+Alt key presses before the character makes Windows interpret it as a shortcut.
-        var isAltGr = key.Length == 1 && modifiers.Ctrl && modifiers.Alt && !modifiers.Meta;
-
-        if (isAltGr)
+        // AltGr workaround: WebView2/WinUI bug (microsoft-ui-xaml#10284) strips AltGr composition.
+        // JS tracks AltGr via code:"AltRight" and sends altGr:true + e.code.
+        // We resolve the character via ToUnicodeEx using the host's keyboard layout.
+        if (altGr && code != null)
         {
-            // AltGr character — UNICODE path only, no modifiers
+            var resolved = ResolveAltGrCharacter(code);
+            if (resolved != null)
+            {
+                var flags = KEYEVENTF_UNICODE | (isDown ? 0u : KEYEVENTF_KEYUP);
+                inputs.Add(new INPUT
+                {
+                    type = INPUT_KEYBOARD,
+                    union = new InputUnion
+                    {
+                        ki = new KEYBDINPUT
+                        {
+                            wVk = 0,
+                            wScan = (ushort)resolved[0],
+                            dwFlags = flags,
+                            time = 0,
+                            dwExtraInfo = IntPtr.Zero
+                        }
+                    }
+                });
+                SendInputWithRetry((uint)inputs.Count, inputs.ToArray(), Marshal.SizeOf<INPUT>());
+                return;
+            }
+        }
+
+        // Legacy AltGr detection (in case WebView2 fixes the bug and sends proper modifiers)
+        var isAltGrLegacy = key.Length == 1 && modifiers.Ctrl && modifiers.Alt && !modifiers.Meta;
+        if (isAltGrLegacy)
+        {
             var flags = KEYEVENTF_UNICODE | (isDown ? 0u : KEYEVENTF_KEYUP);
             inputs.Add(new INPUT
             {
@@ -629,6 +656,63 @@ internal static class Win32Input
         };
     }
 
+    /// <summary>
+    /// Map JS KeyboardEvent.code (physical key position) to Win32 virtual key code.
+    /// Used for AltGr workaround where e.key is broken by WebView2.
+    /// </summary>
+    private static ushort CodeToVirtualKey(string code) => code switch
+    {
+        "Digit0" => 0x30, "Digit1" => 0x31, "Digit2" => 0x32, "Digit3" => 0x33,
+        "Digit4" => 0x34, "Digit5" => 0x35, "Digit6" => 0x36, "Digit7" => 0x37,
+        "Digit8" => 0x38, "Digit9" => 0x39,
+        "KeyA" => 0x41, "KeyB" => 0x42, "KeyC" => 0x43, "KeyD" => 0x44,
+        "KeyE" => 0x45, "KeyF" => 0x46, "KeyG" => 0x47, "KeyH" => 0x48,
+        "KeyI" => 0x49, "KeyJ" => 0x4A, "KeyK" => 0x4B, "KeyL" => 0x4C,
+        "KeyM" => 0x4D, "KeyN" => 0x4E, "KeyO" => 0x4F, "KeyP" => 0x50,
+        "KeyQ" => 0x51, "KeyR" => 0x52, "KeyS" => 0x53, "KeyT" => 0x54,
+        "KeyU" => 0x55, "KeyV" => 0x56, "KeyW" => 0x57, "KeyX" => 0x58,
+        "KeyY" => 0x59, "KeyZ" => 0x5A,
+        "Minus" => VK_OEM_MINUS, "Equal" => VK_OEM_PLUS,
+        "BracketLeft" => VK_OEM_4, "BracketRight" => VK_OEM_6,
+        "Backslash" => VK_OEM_5, "IntlBackslash" => VK_OEM_102,
+        "Semicolon" => VK_OEM_1, "Quote" => VK_OEM_7,
+        "Backquote" => VK_OEM_3,
+        "Comma" => VK_OEM_COMMA, "Period" => VK_OEM_PERIOD,
+        "Slash" => VK_OEM_2,
+        _ => 0
+    };
+
+    /// <summary>
+    /// Resolve what character AltGr + physical key produces on the host's keyboard layout.
+    /// Uses ToUnicodeEx with a synthetic Ctrl+Alt keyboard state.
+    /// </summary>
+    private static string? ResolveAltGrCharacter(string code)
+    {
+        var vk = CodeToVirtualKey(code);
+        if (vk == 0) return null;
+
+        // Get the active keyboard layout from the foreground window's thread
+        var hwnd = GetForegroundWindow();
+        var threadId = GetWindowThreadProcessId(hwnd, out _);
+        var hkl = GetKeyboardLayout(threadId);
+
+        // Build keyboard state with Ctrl+Alt pressed (= AltGr)
+        var keyState = new byte[256];
+        keyState[VK_CONTROL] = 0x80;   // VK_CONTROL (generic)
+        keyState[0xA2] = 0x80;         // VK_LCONTROL
+        keyState[VK_MENU] = 0x80;      // VK_MENU (generic Alt)
+        keyState[0xA5] = 0x80;         // VK_RMENU (Right Alt = AltGr)
+
+        var scanCode = MapVirtualKeyEx(vk, MAPVK_VK_TO_VSC, hkl);
+        var buffer = new StringBuilder(8);
+        var result = ToUnicodeEx(vk, scanCode, keyState, buffer, buffer.Capacity, 0, hkl);
+
+        if (result >= 1)
+            return buffer.ToString(0, result);
+
+        return null;
+    }
+
     #region Win32 Interop
 
     internal const int INPUT_MOUSE = 0;
@@ -708,9 +792,29 @@ internal static class Win32Input
     internal const ushort VK_OEM_5 = 0xDC;
     internal const ushort VK_OEM_6 = 0xDD;
     internal const ushort VK_OEM_7 = 0xDE;
+    internal const ushort VK_OEM_102 = 0xE2; // IntlBackslash (key between left Shift and Z on ISO keyboards)
+
+    private const uint MAPVK_VK_TO_VSC = 0;
 
     [DllImport("user32.dll", SetLastError = true)]
     internal static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int ToUnicodeEx(uint wVirtKey, uint wScanCode, byte[] lpKeyState,
+        [Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder pwszBuff,
+        int cchBuff, uint wFlags, IntPtr dwhkl);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetKeyboardLayout(uint idThread);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+    [DllImport("user32.dll")]
+    private static extern uint MapVirtualKeyEx(uint uCode, uint uMapType, IntPtr dwhkl);
 
     [DllImport("user32.dll")]
     internal static extern int GetSystemMetrics(int nIndex);

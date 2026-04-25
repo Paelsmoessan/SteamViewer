@@ -44,12 +44,16 @@ public abstract record InputEvent
 
     public sealed record KeyDown(
         [property: JsonPropertyName("key")] string Key,
-        [property: JsonPropertyName("modifiers")] KeyModifiers Modifiers
+        [property: JsonPropertyName("modifiers")] KeyModifiers Modifiers,
+        [property: JsonPropertyName("code")] string? Code = null,
+        [property: JsonPropertyName("altGr")] bool AltGr = false
     ) : InputEvent;
 
     public sealed record KeyUp(
         [property: JsonPropertyName("key")] string Key,
-        [property: JsonPropertyName("modifiers")] KeyModifiers Modifiers
+        [property: JsonPropertyName("modifiers")] KeyModifiers Modifiers,
+        [property: JsonPropertyName("code")] string? Code = null,
+        [property: JsonPropertyName("altGr")] bool AltGr = false
     ) : InputEvent;
 }
 
