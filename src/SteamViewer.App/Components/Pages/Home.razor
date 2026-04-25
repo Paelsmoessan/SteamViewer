@@ -1092,6 +1092,15 @@ else
         InvokeAsync(() =>
         {
             connectionState = ConnectionState.Disconnected;
+
+            // Don't show error toast if an active P2P session is still running —
+            // signaling WebSocket can drop without affecting the video/input stream.
+            if (_isSharingScreen)
+            {
+                Logger.LogInformation("Signaling disconnected but session still active — suppressing error");
+                return;
+            }
+
             errorMessage = reason ?? "Disconnected from server";
             StateHasChanged();
         });
