@@ -30,6 +30,7 @@ public partial class ViewerPage : ContentPage
                 {
                     if (webView2.CoreWebView2 != null)
                     {
+                        webView2.CoreWebView2.Settings.AreDevToolsEnabled = true;
                         InitializeFrameBridge(webView2.CoreWebView2);
                     }
                 };
