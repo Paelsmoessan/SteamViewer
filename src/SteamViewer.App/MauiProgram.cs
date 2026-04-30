@@ -59,8 +59,10 @@ public static class MauiProgram
 
 #if DEBUG
         Console.WriteLine($"Signaling server URL: {serverUrl}");
-        Console.WriteLine($"TURN enabled: {configuration.GetValue<bool>("TurnServer:Enabled")}");
 #endif
+
+        // TURN config fetched from server at runtime (not shipped in binary)
+        builder.Services.AddSingleton<TurnConfigService>();
 
         // Register platform-agnostic services
         builder.Services.AddSingleton(sp =>

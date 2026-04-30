@@ -772,6 +772,7 @@ else
 #if WINDOWS
                 frameBridge: frameBridge,
 #endif
+                turnConfigService: ServiceProvider.GetService<TurnConfigService>(),
                 hostClientId: clientId,
                 hostPasswordHash: passwordHash);
 

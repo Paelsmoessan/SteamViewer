@@ -218,6 +218,23 @@ app.MapPost("/api/remote/stop/{machine?}", (string? machine) =>
 #endif
 // ==================== End Remote Management API ====================
 
+// TURN credential endpoint — clients fetch creds at runtime instead of shipping them in the binary
+app.MapGet("/api/turn-config", () =>
+{
+    var enabled = Environment.GetEnvironmentVariable("TURN_ENABLED");
+    if (string.IsNullOrEmpty(enabled) || !bool.TryParse(enabled, out var isEnabled) || !isEnabled)
+        return Results.Json(new { enabled = false });
+
+    var urls = Environment.GetEnvironmentVariable("TURN_URLS")?.Split(';', StringSplitOptions.RemoveEmptyEntries);
+    var username = Environment.GetEnvironmentVariable("TURN_USERNAME");
+    var credential = Environment.GetEnvironmentVariable("TURN_CREDENTIAL");
+
+    if (urls == null || urls.Length == 0 || string.IsNullOrEmpty(username) || string.IsNullOrEmpty(credential))
+        return Results.Json(new { enabled = false });
+
+    return Results.Json(new { enabled = true, urls, username, credential });
+});
+
 // WebSocket endpoint
 app.Map("/ws", async (HttpContext context, SignalingHandler handler) =>
 {

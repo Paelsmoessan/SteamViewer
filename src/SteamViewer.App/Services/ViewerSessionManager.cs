@@ -20,6 +20,7 @@ public sealed class ViewerSessionManager : IAsyncDisposable
     private readonly ILoggerFactory _loggerFactory;
     private readonly IConfiguration _configuration;
     private readonly SignalingClient _signalingClient;
+    private readonly TurnConfigService? _turnConfigService;
 
     private readonly ConcurrentDictionary<string, ViewerSession> _sessions = new();
     private readonly ConcurrentDictionary<string, string> _peerToSession = new(); // peerId -> sessionId
@@ -65,12 +66,14 @@ public sealed class ViewerSessionManager : IAsyncDisposable
         ILogger<ViewerSessionManager> logger,
         ILoggerFactory loggerFactory,
         IConfiguration configuration,
-        SignalingClient signalingClient)
+        SignalingClient signalingClient,
+        TurnConfigService? turnConfigService = null)
     {
         _logger = logger;
         _loggerFactory = loggerFactory;
         _configuration = configuration;
         _signalingClient = signalingClient;
+        _turnConfigService = turnConfigService;
     }
 
     /// <summary>
@@ -127,7 +130,8 @@ public sealed class ViewerSessionManager : IAsyncDisposable
             _loggerFactory,
             _configuration,
             SendSignalingMessage,
-            _signalingClient);
+            _signalingClient,
+            _turnConfigService);
         session.StoredPassword = password;
 
         // Subscribe to session events
@@ -254,7 +258,8 @@ public sealed class ViewerSessionManager : IAsyncDisposable
             _loggerFactory,
             _configuration,
             SendSignalingMessage,
-            _signalingClient);
+            _signalingClient,
+            _turnConfigService);
         session.StoredPassword = password;
 
         // Subscribe to session events

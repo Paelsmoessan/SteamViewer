@@ -21,6 +21,7 @@ public sealed class ViewerSession : IAsyncDisposable
     private readonly ILogger _logger;
     private readonly ILoggerFactory _loggerFactory;
     private readonly IConfiguration _configuration;
+    private readonly TurnConfigService? _turnConfigService;
     private readonly Func<SignalingMessage, Task> _sendSignaling;
     private readonly SignalingClient _signalingClient;
     private ViewerStreamTransport? _transport;
@@ -181,7 +182,8 @@ public sealed class ViewerSession : IAsyncDisposable
         ILoggerFactory loggerFactory,
         IConfiguration configuration,
         Func<SignalingMessage, Task> sendSignaling,
-        SignalingClient signalingClient)
+        SignalingClient signalingClient,
+        TurnConfigService? turnConfigService = null)
     {
         SessionId = sessionId;
         PeerId = peerId;
@@ -190,6 +192,7 @@ public sealed class ViewerSession : IAsyncDisposable
         _logger = loggerFactory.CreateLogger<ViewerSession>();
         _loggerFactory = loggerFactory;
         _configuration = configuration;
+        _turnConfigService = turnConfigService;
         _sendSignaling = sendSignaling;
         _signalingClient = signalingClient;
     }
@@ -254,9 +257,12 @@ public sealed class ViewerSession : IAsyncDisposable
             {
                 try
                 {
-                    var turnUri = _configuration["TurnServer:Urls:0"];
-                    var turnUser = _configuration["TurnServer:Username"];
-                    var turnCred = _configuration["TurnServer:Credential"];
+                    var turnConfig = _turnConfigService != null
+                        ? await _turnConfigService.GetConfigAsync()
+                        : TurnConfig.Disabled;
+                    var turnUri = turnConfig.Enabled ? turnConfig.Urls.FirstOrDefault() : null;
+                    var turnUser = turnConfig.Username;
+                    var turnCred = turnConfig.Credential;
                     _logger.LogInformation("Session {SessionId}: Starting UDP upgrade (TURN uri={TurnUri}, user={TurnUser}, cred={HasCred})",
                         SessionId, turnUri ?? "null", turnUser ?? "null", turnCred != null ? "yes" : "no");
                     await _transport!.AttemptUdpUpgradeAsync(

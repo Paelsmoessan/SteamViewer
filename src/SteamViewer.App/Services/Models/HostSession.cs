@@ -47,6 +47,7 @@ public sealed class HostSession : IAsyncDisposable
     private readonly IElevationService? _elevationService;
     private readonly IScreenCapture? _screenCapture;
     private readonly IConfiguration _configuration;
+    private readonly TurnConfigService? _turnConfigService;
     private readonly Func<SignalingMessage, Task> _sendSignaling;
     private readonly SignalingClient _signalingClient;
     private readonly string _hostClientId;
@@ -125,6 +126,7 @@ public sealed class HostSession : IAsyncDisposable
 #if WINDOWS
         Services.NativeFrameBridge? frameBridge = null,
 #endif
+        TurnConfigService? turnConfigService = null,
         string hostClientId = "",
         string hostPasswordHash = "")
     {
@@ -137,6 +139,7 @@ public sealed class HostSession : IAsyncDisposable
         _elevationService = elevationService;
         _screenCapture = screenCapture;
         _configuration = configuration;
+        _turnConfigService = turnConfigService;
         _sendSignaling = sendSignaling;
         _signalingClient = signalingClient;
         _hostClientId = hostClientId;
@@ -274,9 +277,12 @@ public sealed class HostSession : IAsyncDisposable
         // so video starts on a stable transport (no mid-stream relay→UDP switch artifacts)
         try
         {
-            var turnUri = _configuration["TurnServer:Urls:0"];
-            var turnUser = _configuration["TurnServer:Username"];
-            var turnCred = _configuration["TurnServer:Credential"];
+            var turnConfig = _turnConfigService != null
+                ? await _turnConfigService.GetConfigAsync()
+                : TurnConfig.Disabled;
+            var turnUri = turnConfig.Enabled ? turnConfig.Urls.FirstOrDefault() : null;
+            var turnUser = turnConfig.Username;
+            var turnCred = turnConfig.Credential;
             _logger.LogInformation("Host: Starting UDP upgrade (TURN uri={TurnUri}, user={TurnUser}, cred={HasCred})",
                 turnUri ?? "null", turnUser ?? "null", turnCred != null ? "yes" : "no");
             await _transport!.AttemptUdpUpgradeAsync(
@@ -1286,9 +1292,12 @@ public sealed class HostSession : IAsyncDisposable
         {
             var serverUrl = _configuration["SignalingServer"];
             var stunUrls = new[] { "stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302" };
-            var turnUrls = _configuration.GetSection("TurnServer:Urls").Get<string[]>();
-            var turnUser = _configuration["TurnServer:Username"];
-            var turnCred = _configuration["TurnServer:Credential"];
+            var rebootTurnConfig = _turnConfigService != null
+                ? await _turnConfigService.GetConfigAsync()
+                : TurnConfig.Disabled;
+            var turnUrls = rebootTurnConfig.Enabled ? rebootTurnConfig.Urls : null;
+            var turnUser = rebootTurnConfig.Username;
+            var turnCred = rebootTurnConfig.Credential;
             var success = await _elevationService.RebootAsync(_hostClientId, _hostPasswordHash, PeerId,
                 serverUrl, stunUrls, turnUrls, turnUser, turnCred);
             if (success)
