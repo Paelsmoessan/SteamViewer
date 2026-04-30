@@ -293,7 +293,7 @@ public static class ElevatedHelperServer
             if (!string.IsNullOrEmpty(appPath))
             {
                 // Create boot relay schtask — runs as SYSTEM at boot (before login)
-                // Streams login screen via SIPSorcery WebRTC so viewer can type password
+                // Streams login screen so viewer can type password
                 try
                 {
                     var schtaskResult = Process.Start(new ProcessStartInfo
