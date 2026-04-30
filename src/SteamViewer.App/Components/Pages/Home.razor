@@ -165,8 +165,12 @@ else
     private static readonly string Version = System.Reflection.CustomAttributeExtensions
         .GetCustomAttribute<System.Reflection.AssemblyInformationalVersionAttribute>(typeof(Home).Assembly)?.InformationalVersion?.Split('+')[0] ?? "0.0.0";
 
-#if DEBUG
     private bool _debugCredsSaved;
+
+#if DEBUG
+    private readonly bool _isDebugBuild = true;
+#else
+    private readonly bool _isDebugBuild = false;
 #endif
 
     private enum AppMode { Select, StartConnection, JoinConnection }
@@ -277,18 +281,19 @@ else
             </div>
 
             @* Debug: save reconnect credentials for boot relay testing *@
-#if DEBUG
-            <div class="debug-controls" style="margin-top: 8px;">
-                <button class="share-btn" style="font-size: 11px; padding: 4px 8px; opacity: 0.6;"
-                        @onclick="SaveDebugReconnectCreds" disabled="@(!_dataChannelReady)">
-                    Save Reconnect Creds (Debug)
-                </button>
-                @if (_debugCredsSaved)
-                {
-                    <span style="color: #4caf50; font-size: 11px; margin-left: 8px;">Saved!</span>
-                }
-            </div>
-#endif
+            @if (_isDebugBuild)
+            {
+                <div class="debug-controls" style="margin-top: 8px;">
+                    <button class="share-btn" style="font-size: 11px; padding: 4px 8px; opacity: 0.6;"
+                            @onclick="SaveDebugReconnectCreds" disabled="@(!_dataChannelReady)">
+                        Save Reconnect Creds (Debug)
+                    </button>
+                    @if (_debugCredsSaved)
+                    {
+                        <span style="color: #4caf50; font-size: 11px; margin-left: 8px;">Saved!</span>
+                    }
+                </div>
+            }
 
             @* Remote screen display (when peer is sharing) *@
             @if (_peerIsSharingScreen)
@@ -554,7 +559,6 @@ else
         StateHasChanged();
     }
 
-#if DEBUG
     private void SaveDebugReconnectCreds()
     {
         if (string.IsNullOrEmpty(clientId) || string.IsNullOrEmpty(passwordHash) || string.IsNullOrEmpty(connectedPeerId))
@@ -569,7 +573,6 @@ else
         Logger.LogInformation("DEBUG: Saved reconnect credentials (clientId={Id}, serverUrl={Url})", clientId, serverUrl);
         StateHasChanged();
     }
-#endif
 
     #endregion
 
