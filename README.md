@@ -33,12 +33,13 @@ In DEBUG builds, predetermined credentials are used for easy testing:
 
 ## How It Works
 
-1. **Host** starts and registers with the signaling server
+1. **Host** starts and registers with the signaling server (WebSocket)
 2. **Viewer** connects using the Host's ID and password
 3. Host approves the connection
-4. WebRTC peer connection is established (SDP/ICE exchange)
-5. Host shares screen via `getDisplayMedia()`
-6. Video streams directly to Viewer over WebRTC
+4. UDP hole-punch establishes a direct peer-to-peer link (with TURN relay fallback)
+5. Host captures the screen via DXGI Desktop Duplication
+6. Video is encoded with FFmpeg (libx264), encrypted with AES-256-GCM, and streamed over UDP
+7. Viewer decodes and renders frames on a canvas via WebView2
 
 ## Architecture
 
@@ -48,7 +49,7 @@ In DEBUG builds, predetermined credentials are used for easy testing:
 │  (MAUI App) │                    │   (ASP.NET)     │
 └──────┬──────┘                    └────────┬────────┘
        │                                    │
-       │ WebRTC (P2P)                       │ WebSocket
+       │ UDP P2P (AES-256-GCM)              │ WebSocket
        │                                    │
        ▼                                    ▼
 ┌─────────────┐                    ┌─────────────────┐
@@ -77,9 +78,13 @@ SteamViewer.NET/
 
 - **.NET 8** with C# 12
 - **MAUI Blazor** - Cross-platform UI
-- **WebRTC** - P2P video/data streaming
-- **ASP.NET Core** - Signaling server
+- **FFmpeg** (libx264) - Hardware-accelerated H.264 video encoding/decoding
+- **DXGI Desktop Duplication** - Native screen capture
+- **QOI** - Lossless image codec for Secure Desktop capture
+- **ASP.NET Core** - WebSocket signaling server
+- **AES-256-GCM** - Transport encryption
 - **BLAKE3** - Password hashing
+- **UDP P2P** - Direct peer-to-peer with NAT traversal and TURN relay fallback
 
 ## Known Limitations
 

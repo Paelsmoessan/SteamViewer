@@ -30,4 +30,3 @@ logs/
 
 # FFmpeg native DLLs (downloaded at build time)
 src/SteamViewer.App/ffmpeg/*.dll
-.vercel/
