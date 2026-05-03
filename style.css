@@ -272,6 +272,16 @@ body {
     margin-top: 8px;
     margin-bottom: 0;
 }
+.download-history {
+    color: var(--text-dim);
+    font-size: 0.8rem;
+    text-decoration: none;
+    margin-top: 12px;
+    display: inline-block;
+}
+.download-history:hover {
+    color: var(--cyan);
+}
 
 .download-card {
     background: var(--bg-card);
