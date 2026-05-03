@@ -95,6 +95,11 @@ public sealed class WindowsSystemKeyInterceptor : ISystemKeyInterceptor
             var kb = Marshal.PtrToStructure<KBDLLHOOKSTRUCT>(lParam);
             var vk = (ushort)kb.vkCode;
 
+            // Murphy gate: confirm 0x21D phantom Ctrl scan code in our environment.
+            // Per Keyman PR #14909: AltGr's synthesized phantom LCtrl arrives with sc=0x21D.
+            // Real LCtrl is 0x1D. Test by holding AltGr and looking for sc=0x21D vs sc=0x1D.
+            Console.WriteLine($"[Hook-Diag] vk=0x{vk:X2} sc=0x{kb.scanCode:X3} flags=0x{kb.flags:X2} wParam=0x{wParam:X}");
+
             if (_firstCallback)
             {
                 Console.WriteLine($"[SystemKeyHook] First callback — vk=0x{vk:X2}, wParam=0x{wParam:X}");
