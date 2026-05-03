@@ -713,6 +713,24 @@ internal static class Win32Input
         return null;
     }
 
+    internal static void ReleaseAllModifiers()
+    {
+        ushort[] modifierVks =
+        [
+            VK_SHIFT, 0xA0, 0xA1,       // VK_SHIFT, VK_LSHIFT, VK_RSHIFT
+            VK_CONTROL, 0xA2, 0xA3,     // VK_CONTROL, VK_LCONTROL, VK_RCONTROL
+            VK_MENU, 0xA4, 0xA5,        // VK_MENU, VK_LMENU, VK_RMENU
+            VK_LWIN, 0x5C               // VK_LWIN, VK_RWIN
+        ];
+
+        var inputs = new List<INPUT>();
+        foreach (var vk in modifierVks)
+            AddKeyInput(inputs, vk, isDown: false);
+
+        if (inputs.Count > 0)
+            SendInputWithRetry((uint)inputs.Count, inputs.ToArray(), Marshal.SizeOf<INPUT>());
+    }
+
     #region Win32 Interop
 
     internal const int INPUT_MOUSE = 0;

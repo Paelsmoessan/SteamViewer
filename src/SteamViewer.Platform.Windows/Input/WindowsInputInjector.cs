@@ -284,6 +284,19 @@ public sealed class WindowsInputInjector : IInputInjector
         return Path.Combine(AppContext.BaseDirectory, "logs");
     }
 
+    public void ReleaseAllModifiers()
+    {
+        _logger.LogInformation("Releasing all modifier keys (disconnect cleanup)");
+        try
+        {
+            Win32Input.ReleaseAllModifiers();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to release modifier keys");
+        }
+    }
+
     public void Dispose()
     {
         _disposed = true;

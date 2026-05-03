@@ -32,6 +32,12 @@ public interface IInputInjector : IDisposable
     void ClearCapturedMonitor() { }
 
     /// <summary>
+    /// Release all modifier keys (Ctrl, Alt, Shift, Win).
+    /// Call on session disconnect to prevent stuck modifiers.
+    /// </summary>
+    void ReleaseAllModifiers() { }
+
+    /// <summary>
     /// Send the Secure Attention Sequence (Ctrl+Alt+Del).
     /// Returns true if successful, false if elevated privileges are required.
     /// </summary>
