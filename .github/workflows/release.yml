@@ -1,0 +1,123 @@
+name: Build Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Install MAUI workload
+        run: dotnet workload install maui-windows
+
+      - name: Download FFmpeg DLLs
+        shell: pwsh
+        run: |
+          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip"
+          $zip = "$env:RUNNER_TEMP\ffmpeg.zip"
+          $extract = "$env:RUNNER_TEMP\ffmpeg"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $extract -Force
+          $binDir = Get-ChildItem -Path $extract -Directory | Select-Object -First 1
+          $dest = "src/SteamViewer.App/ffmpeg"
+          New-Item -ItemType Directory -Path $dest -Force
+          Copy-Item "$($binDir.FullName)/bin/avcodec-62.dll" $dest
+          Copy-Item "$($binDir.FullName)/bin/avutil-60.dll" $dest
+          Copy-Item "$($binDir.FullName)/bin/swscale-9.dll" $dest
+          Copy-Item "$($binDir.FullName)/bin/swresample-6.dll" $dest
+          Write-Host "FFmpeg DLLs:"
+          Get-ChildItem $dest
+
+      - name: Build SteamViewer.App
+        run: dotnet build src/SteamViewer.App -c Release -f net8.0-windows10.0.19041.0
+
+      - name: Get version
+        id: version
+        shell: pwsh
+        run: |
+          $dll = "src/SteamViewer.App/bin/Release/net8.0-windows10.0.19041.0/win10-x64/SteamViewer.App.dll"
+          $ver = (Get-Item $dll).VersionInfo.ProductVersion -replace '\+.*$',''
+          echo "VERSION=$ver" >> $env:GITHUB_OUTPUT
+          Write-Host "Version: $ver"
+
+      - name: Clean build output
+        shell: pwsh
+        run: |
+          $bin = "src/SteamViewer.App/bin/Release/net8.0-windows10.0.19041.0/win10-x64"
+          Remove-Item "$bin/*.pdb" -Force -ErrorAction SilentlyContinue
+          Remove-Item "$bin/gist-id.txt" -Force -ErrorAction SilentlyContinue
+          Remove-Item "$bin/kill-steamviewer.cmd" -Force -ErrorAction SilentlyContinue
+
+      - name: Create payload zip
+        shell: pwsh
+        run: |
+          $bin = "src/SteamViewer.App/bin/Release/net8.0-windows10.0.19041.0/win10-x64"
+          $payload = "tools/app-launcher/payload"
+          New-Item -ItemType Directory -Path $payload -Force
+          Compress-Archive -Path "$bin/*" -DestinationPath "$payload/SteamViewer.zip" -Force
+
+      - name: Publish launcher
+        run: dotnet publish tools/app-launcher/SteamViewer.Launcher.csproj -c Release -o release-output
+
+      - name: Clean release output
+        shell: pwsh
+        run: Remove-Item "release-output/*.pdb" -Force -ErrorAction SilentlyContinue
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SteamViewer-unsigned
+          path: release-output/SteamViewer.exe
+
+      # SignPath signing - uncomment after Foundation approval
+      # - name: Submit signing request
+      #   uses: SignPath/github-action-submit-signing-request@v1
+      #   with:
+      #     api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+      #     organization-id: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
+      #     project-slug: steamviewer
+      #     signing-policy-slug: release-signing
+      #     artifact-configuration-slug: steamviewer-exe
+      #     github-artifact-id: SteamViewer-unsigned
+      #     wait-for-completion: true
+      #     output-artifact-directory: release-output-signed
+
+      - name: Generate release notes
+        shell: pwsh
+        run: |
+          $prev = git describe --tags --abbrev=0 --match "v*" HEAD^ 2>$null
+          if ($prev) {
+            $log = git log --oneline --no-decorate "$prev..HEAD" | ForEach-Object {
+              if ($_.Length -gt 9) { "- $($_.Substring(9))" } else { "- $_" }
+            }
+          } else {
+            $log = git log --oneline --no-decorate -10 | ForEach-Object {
+              if ($_.Length -gt 9) { "- $($_.Substring(9))" } else { "- $_" }
+            }
+          }
+          $body = "## Changes`n`n$($log -join "`n")"
+          $body | Out-File -FilePath release-notes.md -Encoding utf8
+          Write-Host $body
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          gh release create ${{ github.ref_name }} release-output/SteamViewer.exe `
+            --title "SteamViewer ${{ github.ref_name }}" `
+            --notes-file release-notes.md `
+            --latest
