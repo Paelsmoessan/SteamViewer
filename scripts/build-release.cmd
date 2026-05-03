@@ -77,7 +77,7 @@ set "TAG=v%VERSION%-alpha"
 gh release delete "%TAG%" --repo %PUBLIC_REPO% --yes 2>nul
 
 :: Create release and upload exe
-gh release create "%TAG%" "%OUTPUT_DIR%\SteamViewer.exe" --repo %PUBLIC_REPO% --title "SteamViewer %TAG%" --notes "Early alpha release. Expect rough edges and breaking changes." --prerelease
+gh release create "%TAG%" "%OUTPUT_DIR%\SteamViewer.exe" --repo %PUBLIC_REPO% --title "SteamViewer %TAG%" --notes "Early alpha release. Expect rough edges and breaking changes." --latest
 if errorlevel 1 (
     echo [ERROR] GitHub release failed.
     exit /b 1
