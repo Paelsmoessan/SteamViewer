@@ -342,6 +342,13 @@ body {
 .footer-inner a:hover {
     color: var(--text);
 }
+.footer-claude {
+    opacity: 0.4;
+    transition: opacity 0.2s;
+}
+.footer-claude:hover {
+    opacity: 0.8;
+}
 
 /* Mobile */
 @media (max-width: 640px) {
