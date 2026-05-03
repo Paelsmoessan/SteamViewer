@@ -266,6 +266,12 @@ body {
     letter-spacing: 0.5px;
     margin-bottom: 32px;
 }
+.download-version {
+    color: var(--text-dim);
+    font-size: 0.8rem;
+    margin-top: 8px;
+    margin-bottom: 0;
+}
 
 .download-card {
     background: var(--bg-card);

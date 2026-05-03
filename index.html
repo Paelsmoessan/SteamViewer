@@ -93,6 +93,7 @@
                     <span>Windows 10+</span>
                 </div>
                 <a href="https://github.com/Paelsmoessan/SteamViewer/releases/latest/download/SteamViewer.exe" class="btn btn-primary btn-lg">Download Latest Release</a>
+                <p class="download-version" id="version-label"></p>
                 <p class="download-note">Requires <a href="https://dotnet.microsoft.com/en-us/download/dotnet/8.0" style="color: var(--cyan);">.NET 8 Desktop Runtime</a></p>
             </div>
         </div>
@@ -105,5 +106,11 @@
         </div>
     </footer>
 
+<script>
+fetch('https://api.github.com/repos/Paelsmoessan/SteamViewer/releases/latest')
+    .then(r => r.json())
+    .then(d => { if (d.tag_name) document.getElementById('version-label').textContent = d.tag_name; })
+    .catch(() => {});
+</script>
 </body>
 </html>
