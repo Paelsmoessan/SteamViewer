@@ -73,15 +73,46 @@ echo.
 echo [6/6] Publishing to GitHub Releases...
 set "TAG=v%VERSION%-alpha"
 
+:: Generate changelog from commits since last local release tag
+set "NOTES_FILE=%ROOT%\release-output\release-notes.md"
+echo ## Changes> "%NOTES_FILE%"
+
+:: Find previous release tag in local (private) repo
+set "PREV_TAG="
+for /f "tokens=*" %%t in ('git describe --tags --abbrev^=0 --match "v*-alpha" 2^>nul') do set "PREV_TAG=%%t"
+if defined PREV_TAG (
+    echo   Changelog since %PREV_TAG%
+    echo.>> "%NOTES_FILE%"
+    for /f "delims=" %%l in ('git log --oneline --no-decorate "%PREV_TAG%..HEAD"') do (
+        set "LINE=%%l"
+        setlocal enabledelayedexpansion
+        echo - !LINE:~9!>> "%NOTES_FILE%"
+        endlocal
+    )
+) else (
+    echo   No previous release tag found, using last 10 commits
+    echo.>> "%NOTES_FILE%"
+    for /f "delims=" %%l in ('git log --oneline --no-decorate -10') do (
+        set "LINE=%%l"
+        setlocal enabledelayedexpansion
+        echo - !LINE:~9!>> "%NOTES_FILE%"
+        endlocal
+    )
+)
+
+:: Tag this release in the private repo (for next changelog)
+git tag "%TAG%" 2>nul
+
 :: Delete existing release with same tag (if re-running)
 gh release delete "%TAG%" --repo %PUBLIC_REPO% --yes 2>nul
 
 :: Create release and upload exe
-gh release create "%TAG%" "%OUTPUT_DIR%\SteamViewer.exe" --repo %PUBLIC_REPO% --title "SteamViewer %TAG%" --notes "Early alpha release. Expect rough edges and breaking changes." --latest
+gh release create "%TAG%" "%OUTPUT_DIR%\SteamViewer.exe" --repo %PUBLIC_REPO% --title "SteamViewer %TAG%" --notes-file "%NOTES_FILE%" --latest
 if errorlevel 1 (
     echo [ERROR] GitHub release failed.
     exit /b 1
 )
+del /q "%NOTES_FILE%" 2>nul
 
 echo.
 echo ==========================================
