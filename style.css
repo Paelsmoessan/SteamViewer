@@ -282,6 +282,12 @@ body {
 .download-history:hover {
     color: var(--cyan);
 }
+.download-sep {
+    color: var(--text-dim);
+    font-size: 0.8rem;
+    margin: 0 6px;
+    opacity: 0.5;
+}
 
 .download-card {
     background: var(--bg-card);
