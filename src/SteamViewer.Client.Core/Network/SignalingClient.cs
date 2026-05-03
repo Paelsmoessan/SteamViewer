@@ -1,0 +1,434 @@
+using System.Net.WebSockets;
+using System.Text;
+using System.Threading.Channels;
+using Microsoft.Extensions.Logging;
+using SteamViewer.Common.Protocol;
+
+namespace SteamViewer.Client.Core.Network;
+
+/// <summary>
+/// Client-side WebSocket client for signaling server communication.
+/// Supports both text (JSON signaling) and binary (transport relay) messages.
+/// </summary>
+public sealed class SignalingClient : IAsyncDisposable
+{
+    private readonly ILogger<SignalingClient> _logger;
+    private readonly string _serverUrl;
+    private ClientWebSocket? _webSocket;
+    private CancellationTokenSource? _cts;
+    private Task? _receiveTask;
+    private PeriodicTimer? _pingTimer;
+    private Task? _pingTask;
+    private Channel<SignalingMessage> _incomingMessages;
+    private readonly SemaphoreSlim _writeLock = new(1, 1);
+
+    /// <summary>
+    /// Event raised when a text (JSON signaling) message is received from the server.
+    /// </summary>
+    public event Action<SignalingMessage>? OnMessageReceived;
+
+    /// <summary>
+    /// Event raised when a binary message is received (transport relay data).
+    /// Parameters: (byte[] data, int length)
+    /// </summary>
+    public event Action<byte[], int>? OnBinaryReceived;
+
+    /// <summary>
+    /// Event raised when the connection is closed.
+    /// </summary>
+    public event Action<string?>? OnDisconnected;
+
+    /// <summary>
+    /// Event raised when an error occurs.
+    /// </summary>
+    public event Action<Exception>? OnError;
+
+    /// <summary>
+    /// Current connection state.
+    /// </summary>
+    public bool IsConnected => _webSocket?.State == WebSocketState.Open;
+
+    public SignalingClient(string serverUrl, ILogger<SignalingClient> logger)
+    {
+        _serverUrl = serverUrl;
+        _logger = logger;
+        _incomingMessages = Channel.CreateUnbounded<SignalingMessage>(new UnboundedChannelOptions
+        {
+            SingleReader = true,
+            SingleWriter = true
+        });
+    }
+
+    /// <summary>
+    /// Connect to the signaling server.
+    /// </summary>
+    public async Task ConnectAsync(CancellationToken cancellationToken = default)
+    {
+        // Clean up any existing connection first (allows reconnection)
+        if (_webSocket != null)
+        {
+            _logger.LogInformation("Cleaning up previous connection before reconnecting");
+            await DisposeInternalAsync();
+        }
+
+        // Recreate the channel for the new connection (previous channel was completed)
+        _incomingMessages = Channel.CreateUnbounded<SignalingMessage>(new UnboundedChannelOptions
+        {
+            SingleReader = true,
+            SingleWriter = true
+        });
+
+        _webSocket = new ClientWebSocket();
+        _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+
+        try
+        {
+            var uri = new Uri(_serverUrl);
+            await _webSocket.ConnectAsync(uri, _cts.Token);
+            _logger.LogInformation("Connected to signaling server at {Url}", _serverUrl);
+
+            // Start receive loop
+            _receiveTask = ReceiveLoopAsync(_cts.Token);
+
+            // Start keepalive ping timer (prevents Railway proxy from killing idle WS connections)
+            _pingTimer = new PeriodicTimer(TimeSpan.FromSeconds(25));
+            _pingTask = PingLoopAsync(_pingTimer, _cts.Token);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to connect to signaling server");
+            await DisposeInternalAsync();
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Send a text (JSON signaling) message to the server.
+    /// Thread-safe — uses write lock shared with binary sends.
+    /// </summary>
+    public async Task SendAsync(SignalingMessage message, CancellationToken cancellationToken = default)
+    {
+        if (_webSocket == null || _webSocket.State != WebSocketState.Open)
+        {
+            throw new InvalidOperationException("Not connected");
+        }
+
+        var json = SignalingSerializer.Serialize(message);
+        var bytes = Encoding.UTF8.GetBytes(json);
+
+        await _writeLock.WaitAsync(cancellationToken);
+        try
+        {
+            await _webSocket.SendAsync(
+                new ArraySegment<byte>(bytes),
+                WebSocketMessageType.Text,
+                endOfMessage: true,
+                cancellationToken);
+        }
+        finally { _writeLock.Release(); }
+
+        _logger.LogDebug("[SIG] Sent {MessageType}: {Json}", message.GetType().Name,
+            System.Text.Json.JsonSerializer.Serialize(message, message.GetType()));
+    }
+
+    /// <summary>
+    /// Send binary data through the WebSocket (for transport relay).
+    /// Thread-safe — uses write lock shared with text sends.
+    /// </summary>
+    public async Task SendBinaryAsync(byte[] data, int offset, int length, CancellationToken cancellationToken = default)
+    {
+        if (_webSocket == null || _webSocket.State != WebSocketState.Open)
+        {
+            throw new InvalidOperationException("Not connected");
+        }
+
+        await _writeLock.WaitAsync(cancellationToken);
+        try
+        {
+            await _webSocket.SendAsync(
+                new ArraySegment<byte>(data, offset, length),
+                WebSocketMessageType.Binary,
+                endOfMessage: true,
+                cancellationToken);
+        }
+        finally { _writeLock.Release(); }
+    }
+
+    /// <summary>
+    /// Register with the signaling server.
+    /// </summary>
+    public async Task<bool> RegisterAsync(string clientId, string passwordHash, CancellationToken cancellationToken = default)
+    {
+        await SendAsync(new SignalingMessage.Register(clientId, passwordHash), cancellationToken);
+
+        // Wait for response
+        var response = await WaitForMessageAsync<SignalingMessage>(
+            m => m is SignalingMessage.RegisterSuccess or SignalingMessage.RegisterFailed,
+            TimeSpan.FromSeconds(10),
+            cancellationToken);
+
+        return response is SignalingMessage.RegisterSuccess;
+    }
+
+    /// <summary>
+    /// Request connection to a peer.
+    /// </summary>
+    public async Task RequestConnectionAsync(string targetId, string password, CancellationToken cancellationToken = default)
+    {
+        await SendAsync(new SignalingMessage.ConnectRequest(targetId, password), cancellationToken);
+    }
+
+    /// <summary>
+    /// Respond to an incoming connection request.
+    /// </summary>
+    public async Task RespondToConnectionAsync(string targetId, bool approved, CancellationToken cancellationToken = default)
+    {
+        await SendAsync(new SignalingMessage.ConnectionResponse(targetId, approved), cancellationToken);
+    }
+
+    /// <summary>
+    /// Send SDP offer to a peer.
+    /// </summary>
+    public async Task SendSdpOfferAsync(string targetId, string sdp, CancellationToken cancellationToken = default)
+    {
+        await SendAsync(new SignalingMessage.SdpOffer(targetId, sdp), cancellationToken);
+    }
+
+    /// <summary>
+    /// Send SDP answer to a peer.
+    /// </summary>
+    public async Task SendSdpAnswerAsync(string targetId, string sdp, CancellationToken cancellationToken = default)
+    {
+        await SendAsync(new SignalingMessage.SdpAnswer(targetId, sdp), cancellationToken);
+    }
+
+    /// <summary>
+    /// Send ICE candidate to a peer.
+    /// </summary>
+    public async Task SendIceCandidateAsync(string targetId, string candidate, string? sdpMid, ushort? sdpMLineIndex, CancellationToken cancellationToken = default)
+    {
+        await SendAsync(new SignalingMessage.IceCandidate(targetId, candidate, sdpMid, sdpMLineIndex), cancellationToken);
+    }
+
+    /// <summary>
+    /// Disconnect from a peer.
+    /// </summary>
+    public async Task DisconnectFromPeerAsync(string peerId, CancellationToken cancellationToken = default)
+    {
+        await SendAsync(new SignalingMessage.Disconnect(peerId), cancellationToken);
+    }
+
+    /// <summary>
+    /// Send a ping to keep the connection alive.
+    /// </summary>
+    public async Task PingAsync(CancellationToken cancellationToken = default)
+    {
+        await SendAsync(new SignalingMessage.Ping(), cancellationToken);
+    }
+
+    /// <summary>
+    /// Wait for a specific message type.
+    /// </summary>
+    public async Task<T> WaitForMessageAsync<T>(Func<T, bool> predicate, TimeSpan timeout, CancellationToken cancellationToken = default) where T : SignalingMessage
+    {
+        using var timeoutCts = new CancellationTokenSource(timeout);
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token);
+
+        await foreach (var message in _incomingMessages.Reader.ReadAllAsync(linkedCts.Token))
+        {
+            if (message is T typed && predicate(typed))
+            {
+                return typed;
+            }
+
+            // Re-queue non-matching messages by raising the event
+            OnMessageReceived?.Invoke(message);
+        }
+
+        throw new TimeoutException($"Timeout waiting for message of type {typeof(T).Name}");
+    }
+
+    private async Task ReceiveLoopAsync(CancellationToken cancellationToken)
+    {
+        var buffer = new byte[65536]; // 64KB for binary relay frames
+        var messageBuilder = new StringBuilder();
+        var binaryBuffer = new MemoryStream();
+
+        try
+        {
+            while (_webSocket?.State == WebSocketState.Open && !cancellationToken.IsCancellationRequested)
+            {
+                var result = await _webSocket.ReceiveAsync(new ArraySegment<byte>(buffer), cancellationToken);
+
+                if (result.MessageType == WebSocketMessageType.Close)
+                {
+                    OnDisconnected?.Invoke(result.CloseStatusDescription);
+                    break;
+                }
+
+                if (result.MessageType == WebSocketMessageType.Binary)
+                {
+                    // Accumulate binary chunks
+                    binaryBuffer.Write(buffer, 0, result.Count);
+
+                    if (result.EndOfMessage)
+                    {
+                        var data = binaryBuffer.GetBuffer();
+                        var length = (int)binaryBuffer.Length;
+                        OnBinaryReceived?.Invoke(data, length);
+                        binaryBuffer.SetLength(0); // Reset for next message
+                    }
+                }
+                else if (result.MessageType == WebSocketMessageType.Text)
+                {
+                    messageBuilder.Append(Encoding.UTF8.GetString(buffer, 0, result.Count));
+
+                    if (result.EndOfMessage)
+                    {
+                        var json = messageBuilder.ToString();
+                        messageBuilder.Clear();
+
+                        var message = SignalingSerializer.Deserialize(json);
+                        if (message != null)
+                        {
+                            _logger.LogDebug("[SIG] Received {MessageType}: {Json}", message.GetType().Name, json);
+                            await _incomingMessages.Writer.WriteAsync(message, cancellationToken);
+                            OnMessageReceived?.Invoke(message);
+                        }
+                        else
+                        {
+                            _logger.LogWarning("Failed to deserialize message: {Json}", json);
+                        }
+                    }
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected when cancellation is requested
+        }
+        catch (WebSocketException ex)
+        {
+            _logger.LogWarning(ex, "WebSocket error in receive loop");
+            OnError?.Invoke(ex);
+            OnDisconnected?.Invoke($"WebSocket error: {ex.Message}");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Unexpected error in receive loop");
+            OnError?.Invoke(ex);
+            OnDisconnected?.Invoke($"Receive loop error: {ex.Message}");
+        }
+        finally
+        {
+            _incomingMessages.Writer.Complete();
+            binaryBuffer.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Disconnect from the signaling server.
+    /// </summary>
+    public async Task DisconnectAsync()
+    {
+        await DisposeInternalAsync();
+    }
+
+    private async Task PingLoopAsync(PeriodicTimer timer, CancellationToken ct)
+    {
+        try
+        {
+            while (await timer.WaitForNextTickAsync(ct))
+            {
+                try
+                {
+                    await PingAsync(ct);
+                    _logger.LogTrace("Keepalive ping sent");
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Keepalive ping failed");
+                    break;
+                }
+            }
+        }
+        catch (OperationCanceledException) { }
+    }
+
+    private async Task DisposeInternalAsync()
+    {
+        // Stop ping timer
+        _pingTimer?.Dispose();
+        _pingTimer = null;
+
+        // First, cancel the receive loop so it exits cleanly
+        // This prevents WebSocketException from being raised as an error
+        _cts?.Cancel();
+
+        // Wait for ping loop and receive loop to exit
+        if (_pingTask != null)
+        {
+            try { await _pingTask.WaitAsync(TimeSpan.FromSeconds(1)); }
+            catch { }
+        }
+        if (_receiveTask != null)
+        {
+            try
+            {
+                await _receiveTask.WaitAsync(TimeSpan.FromSeconds(2));
+            }
+            catch (TimeoutException)
+            {
+                _logger.LogDebug("Receive loop did not exit in time");
+            }
+            catch
+            {
+                // Ignore other exceptions during cleanup
+            }
+        }
+
+        // Now close the WebSocket (receive loop is already stopped)
+        if (_webSocket != null)
+        {
+            var state = _webSocket.State;
+            if (state == WebSocketState.Open || state == WebSocketState.CloseReceived)
+            {
+                try
+                {
+                    // Use a short timeout for the close handshake
+                    using var closeCts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                    await _webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Closing", closeCts.Token);
+                }
+                catch (OperationCanceledException)
+                {
+                    _logger.LogDebug("WebSocket close handshake timed out");
+                }
+                catch (WebSocketException ex)
+                {
+                    _logger.LogDebug(ex, "WebSocket close handshake failed (expected during cancel)");
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Unexpected error during WebSocket close");
+                }
+            }
+            else if (state == WebSocketState.Connecting)
+            {
+                _logger.LogDebug("Aborting WebSocket connection in progress");
+                _webSocket.Abort();
+            }
+        }
+
+        _webSocket?.Dispose();
+        _webSocket = null;
+        _cts?.Dispose();
+        _cts = null;
+        _receiveTask = null;
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        await DisconnectAsync();
+        _writeLock.Dispose();
+    }
+}

@@ -1,0 +1,218 @@
+@using SteamViewer.Common.Protocol
+@using SteamViewer.App.Services
+@inject IJSRuntime JS
+@inject CollaborationViewerService ViewerService
+@implements IDisposable
+
+<div class="fullscreen-viewer">
+    <div class="viewer-tabs">
+        @foreach (var participant in ViewerService.SharingParticipants)
+        {
+            <button class="tab @(ActivePeerId == participant.Id ? "active" : "")"
+                    @onclick="() => SelectTab(participant.Id)">
+                @participant.DisplayName
+                @if (participant.Id == ViewerService.MyClientId)
+                {
+                    <span class="you-tag">(You)</span>
+                }
+            </button>
+        }
+        <button class="close-btn" @onclick="Close" title="Close viewer window">X</button>
+    </div>
+
+    <div class="viewer-content">
+        <canvas id="fullscreen-canvas" @ref="_canvasRef"></canvas>
+    </div>
+
+    <div class="viewer-toolbar">
+        <button class="toolbar-btn @(_inputLocked ? "active" : "")" @onclick="ToggleInputLock">
+            @(_inputLocked ? "Input Locked (Esc to release)" : "Click to Control")
+        </button>
+        <span class="connection-status">@GetConnectionStatus()</span>
+    </div>
+</div>
+
+<style>
+    .fullscreen-viewer {
+        width: 100%;
+        height: 100vh;
+        background: #11111b;
+        display: flex;
+        flex-direction: column;
+    }
+
+    .viewer-tabs {
+        display: flex;
+        background: #1e1e2e;
+        border-bottom: 1px solid #313244;
+        padding: 0 8px;
+        gap: 4px;
+        align-items: center;
+    }
+
+    .tab {
+        padding: 12px 20px;
+        background: transparent;
+        border: none;
+        color: #9399b2;
+        cursor: pointer;
+        font-size: 14px;
+        border-bottom: 2px solid transparent;
+        transition: all 0.2s;
+    }
+
+    .tab:hover {
+        color: #cdd6f4;
+        background: #313244;
+    }
+
+    .tab.active {
+        color: #89b4fa;
+        border-bottom-color: #89b4fa;
+    }
+
+    .you-tag {
+        color: #a6e3a1;
+        font-size: 11px;
+        margin-left: 4px;
+    }
+
+    .close-btn {
+        margin-left: auto;
+        padding: 8px 16px;
+        background: #f38ba8;
+        border: none;
+        color: #11111b;
+        border-radius: 4px;
+        cursor: pointer;
+        font-weight: bold;
+    }
+
+    .close-btn:hover {
+        background: #eba0ac;
+    }
+
+    .viewer-content {
+        flex: 1;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        overflow: hidden;
+        background: #000;
+    }
+
+    #fullscreen-canvas {
+        max-width: 100%;
+        max-height: 100%;
+        object-fit: contain;
+    }
+
+    .viewer-toolbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 8px 16px;
+        background: #1e1e2e;
+        border-top: 1px solid #313244;
+    }
+
+    .toolbar-btn {
+        padding: 8px 16px;
+        background: #313244;
+        border: 1px solid #45475a;
+        color: #cdd6f4;
+        border-radius: 4px;
+        cursor: pointer;
+    }
+
+    .toolbar-btn:hover {
+        background: #45475a;
+    }
+
+    .toolbar-btn.active {
+        background: #a6e3a1;
+        color: #11111b;
+        border-color: #a6e3a1;
+    }
+
+    .connection-status {
+        color: #9399b2;
+        font-size: 12px;
+    }
+</style>
+
+@code {
+    private ElementReference _canvasRef;
+    private string? ActivePeerId;
+    private bool _inputLocked;
+    private System.Timers.Timer? _renderTimer;
+
+    protected override void OnInitialized()
+    {
+        ActivePeerId = ViewerService.InitialPeerId ?? ViewerService.SharingParticipants.FirstOrDefault()?.Id;
+
+        // Subscribe to tab changes from the service
+        ViewerService.OnActiveTabChanged += OnActiveTabChanged;
+
+        // Full framerate rendering for fullscreen
+        _renderTimer = new System.Timers.Timer(33); // ~30fps
+        _renderTimer.Elapsed += async (_, _) => await RenderActiveAsync();
+        _renderTimer.Start();
+    }
+
+    private void OnActiveTabChanged(string peerId)
+    {
+        ActivePeerId = peerId;
+        _inputLocked = false;
+        InvokeAsync(StateHasChanged);
+    }
+
+    private async Task RenderActiveAsync()
+    {
+        if (ViewerService.RenderPeerToCanvas == null || ActivePeerId == null) return;
+        if (ActivePeerId == ViewerService.MyClientId) return; // Don't render our own stream
+
+        try
+        {
+            await ViewerService.RenderPeerToCanvas(ActivePeerId, "fullscreen-canvas");
+        }
+        catch
+        {
+            // Ignore render errors
+        }
+    }
+
+    private void SelectTab(string peerId)
+    {
+        ActivePeerId = peerId;
+        ViewerService.SwitchTab(peerId);
+        _inputLocked = false; // Reset input lock when switching tabs
+        StateHasChanged();
+    }
+
+    private void ToggleInputLock()
+    {
+        _inputLocked = !_inputLocked;
+        // TODO: Enable/disable input capture to active peer
+    }
+
+    private void Close()
+    {
+        _renderTimer?.Stop();
+        ViewerService.CloseViewer();
+    }
+
+    private string GetConnectionStatus()
+    {
+        if (ActivePeerId == null) return "No active screen";
+        if (ActivePeerId == ViewerService.MyClientId) return "Your screen";
+        return "Connected";
+    }
+
+    public void Dispose()
+    {
+        ViewerService.OnActiveTabChanged -= OnActiveTabChanged;
+        _renderTimer?.Stop();
+        _renderTimer?.Dispose();
+    }
+}

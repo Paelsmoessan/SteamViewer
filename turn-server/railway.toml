@@ -1,0 +1,11 @@
+[build]
+builder = "dockerfile"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+# Railway TCP port - coturn will use this
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 5
+
+# No health check needed for TURN server
+# healthcheckPath is not applicable for non-HTTP services

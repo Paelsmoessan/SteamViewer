@@ -1,0 +1,620 @@
+@page "/collaboration"
+@using Microsoft.Extensions.Configuration
+@using Microsoft.Extensions.Logging
+@using SteamViewer.Client.Core.Session
+@using SteamViewer.Common.Protocol
+@using SteamViewer.App.Components.Collaboration
+@using SteamViewer.App.Services
+@inject IJSRuntime JS
+@inject IConfiguration Configuration
+@inject ILoggerFactory LoggerFactory
+@inject CollaborationViewerService ViewerService
+@implements IAsyncDisposable
+
+<div class="collaboration-page">
+    @if (_sessionState == SessionViewState.SelectMode)
+    {
+        <div class="mode-select">
+            <h1>Collaboration Mode</h1>
+            <p class="subtitle">Share screens with multiple participants</p>
+
+            <div class="mode-buttons">
+                <button class="mode-btn start" @onclick="ShowStartSession">
+                    <span class="icon">+</span>
+                    <span class="label">Start Session</span>
+                    <span class="desc">Create a new collaboration session</span>
+                </button>
+
+                <button class="mode-btn join" @onclick="ShowJoinSession">
+                    <span class="icon">-></span>
+                    <span class="label">Join Session</span>
+                    <span class="desc">Enter a session code to join</span>
+                </button>
+            </div>
+
+            <a href="/" class="back-link">Back to Home</a>
+        </div>
+    }
+    else if (_sessionState == SessionViewState.StartingSession)
+    {
+        <div class="session-form">
+            <h2>Start New Session</h2>
+
+            <div class="form-group">
+                <label>Your Display Name</label>
+                <input type="text" @bind="_displayName" placeholder="Enter your name" />
+            </div>
+
+            <div class="form-group">
+                <label>Session Name (optional)</label>
+                <input type="text" @bind="_sessionName" placeholder="e.g., Team Standup" />
+            </div>
+
+            <div class="form-actions">
+                <button class="btn secondary" @onclick="BackToSelect">Cancel</button>
+                <button class="btn primary" @onclick="CreateSession" disabled="@(string.IsNullOrWhiteSpace(_displayName) || _isLoading)">
+                    @(_isLoading ? "Creating..." : "Create Session")
+                </button>
+            </div>
+        </div>
+    }
+    else if (_sessionState == SessionViewState.JoiningSession)
+    {
+        <div class="session-form">
+            <h2>Join Session</h2>
+
+            <div class="form-group">
+                <label>Session Code</label>
+                <input type="text" @bind="_sessionCode" placeholder="Enter 6-digit code" maxlength="6" />
+            </div>
+
+            <div class="form-group">
+                <label>Your Display Name</label>
+                <input type="text" @bind="_displayName" placeholder="Enter your name" />
+            </div>
+
+            <div class="form-actions">
+                <button class="btn secondary" @onclick="BackToSelect">Cancel</button>
+                <button class="btn primary" @onclick="JoinSession" disabled="@(string.IsNullOrWhiteSpace(_sessionCode) || string.IsNullOrWhiteSpace(_displayName) || _isLoading)">
+                    @(_isLoading ? "Joining..." : "Join Session")
+                </button>
+            </div>
+        </div>
+    }
+    else if (_sessionState == SessionViewState.InSession)
+    {
+        <div class="session-container">
+            <div class="session-header">
+                <div class="session-info">
+                    <span class="session-code">Code: <strong>@_manager?.State.SessionCode</strong></span>
+                    @if (!string.IsNullOrEmpty(_manager?.State.SessionName))
+                    {
+                        <span class="session-name">@_manager.State.SessionName</span>
+                    }
+                </div>
+
+                <div class="session-controls">
+                    @if (_manager?.IsSharing == true)
+                    {
+                        <button class="btn danger" @onclick="StopSharing">Stop Sharing</button>
+                    }
+                    else
+                    {
+                        <button class="btn primary" @onclick="StartSharing">Share My Screen</button>
+                    }
+                    <button class="btn secondary" @onclick="LeaveSession">Leave</button>
+                </div>
+            </div>
+
+            <div class="session-body">
+                <div class="participant-sidebar">
+                    <h3>Participants (@(_manager?.State.ParticipantCount ?? 0))</h3>
+                    <ul class="participant-list">
+                        @foreach (var p in _manager?.State.Participants ?? Enumerable.Empty<ParticipantInfo>())
+                        {
+                            <li class="participant @(p.Id == _manager?.State.MyClientId ? "me" : "")">
+                                <span class="status @(GetParticipantStatusClass(p))"></span>
+                                <span class="name">@p.DisplayName</span>
+                                @if (p.Id == _manager?.State.MyClientId)
+                                {
+                                    <span class="me-tag">(You)</span>
+                                }
+                                @if (p.IsSharing)
+                                {
+                                    <span class="sharing-icon" title="Sharing screen">S</span>
+                                }
+                            </li>
+                        }
+                    </ul>
+                </div>
+
+                <div class="screen-area">
+                    <ScreenGrid
+                        SharingParticipants="@(_manager?.State.SharingParticipants ?? Enumerable.Empty<ParticipantInfo>())"
+                        MyId="@_manager?.State.MyClientId"
+                        SelectedPeerId="@_selectedPeerId"
+                        OnScreenSelected="OnScreenSelected"
+                        OnScreenFullscreen="OnScreenFullscreen"
+                        RenderPeerToCanvas="RenderPeerToCanvas" />
+                </div>
+            </div>
+        </div>
+    }
+
+    @if (!string.IsNullOrEmpty(_errorMessage))
+    {
+        <div class="error-toast">
+            <span>@_errorMessage</span>
+            <button @onclick="() => _errorMessage = null">X</button>
+        </div>
+    }
+</div>
+
+<style>
+    .collaboration-page {
+        height: 100vh;
+        background: #1e1e2e;
+        color: #cdd6f4;
+    }
+
+    /* Mode Select */
+    .mode-select {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        height: 100%;
+        gap: 24px;
+    }
+
+    .mode-select h1 {
+        font-size: 32px;
+        color: #cdd6f4;
+        margin: 0;
+    }
+
+    .subtitle {
+        color: #9399b2;
+        margin: 0;
+    }
+
+    .mode-buttons {
+        display: flex;
+        gap: 24px;
+        margin-top: 24px;
+    }
+
+    .mode-btn {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        padding: 32px 48px;
+        background: #313244;
+        border: 2px solid #45475a;
+        border-radius: 12px;
+        cursor: pointer;
+        transition: all 0.2s;
+        width: 200px;
+    }
+
+    .mode-btn:hover {
+        border-color: #89b4fa;
+        transform: translateY(-2px);
+    }
+
+    .mode-btn .icon {
+        font-size: 32px;
+        color: #89b4fa;
+        margin-bottom: 12px;
+    }
+
+    .mode-btn .label {
+        font-size: 18px;
+        color: #cdd6f4;
+        font-weight: 600;
+    }
+
+    .mode-btn .desc {
+        font-size: 12px;
+        color: #9399b2;
+        margin-top: 8px;
+        text-align: center;
+    }
+
+    .back-link {
+        color: #9399b2;
+        text-decoration: none;
+        margin-top: 32px;
+    }
+
+    .back-link:hover {
+        color: #cdd6f4;
+    }
+
+    /* Session Form */
+    .session-form {
+        max-width: 400px;
+        margin: 100px auto;
+        padding: 32px;
+        background: #313244;
+        border-radius: 12px;
+    }
+
+    .session-form h2 {
+        margin: 0 0 24px 0;
+        color: #cdd6f4;
+    }
+
+    .form-group {
+        margin-bottom: 20px;
+    }
+
+    .form-group label {
+        display: block;
+        margin-bottom: 8px;
+        color: #9399b2;
+        font-size: 14px;
+    }
+
+    .form-group input {
+        width: 100%;
+        padding: 12px;
+        background: #1e1e2e;
+        border: 1px solid #45475a;
+        border-radius: 6px;
+        color: #cdd6f4;
+        font-size: 16px;
+    }
+
+    .form-group input:focus {
+        outline: none;
+        border-color: #89b4fa;
+    }
+
+    .form-actions {
+        display: flex;
+        gap: 12px;
+        justify-content: flex-end;
+        margin-top: 24px;
+    }
+
+    /* Buttons */
+    .btn {
+        padding: 12px 24px;
+        border: none;
+        border-radius: 6px;
+        cursor: pointer;
+        font-size: 14px;
+        font-weight: 600;
+        transition: all 0.2s;
+    }
+
+    .btn:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+    }
+
+    .btn.primary {
+        background: #89b4fa;
+        color: #1e1e2e;
+    }
+
+    .btn.primary:hover:not(:disabled) {
+        background: #b4befe;
+    }
+
+    .btn.secondary {
+        background: #45475a;
+        color: #cdd6f4;
+    }
+
+    .btn.secondary:hover:not(:disabled) {
+        background: #585b70;
+    }
+
+    .btn.danger {
+        background: #f38ba8;
+        color: #1e1e2e;
+    }
+
+    .btn.danger:hover:not(:disabled) {
+        background: #eba0ac;
+    }
+
+    /* In Session */
+    .session-container {
+        display: flex;
+        flex-direction: column;
+        height: 100%;
+    }
+
+    .session-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 12px 24px;
+        background: #313244;
+        border-bottom: 1px solid #45475a;
+    }
+
+    .session-info {
+        display: flex;
+        align-items: center;
+        gap: 16px;
+    }
+
+    .session-code {
+        font-size: 16px;
+        color: #cdd6f4;
+    }
+
+    .session-code strong {
+        color: #a6e3a1;
+        font-family: monospace;
+        letter-spacing: 2px;
+    }
+
+    .session-name {
+        color: #9399b2;
+    }
+
+    .session-controls {
+        display: flex;
+        gap: 12px;
+    }
+
+    .session-body {
+        display: flex;
+        flex: 1;
+        overflow: hidden;
+    }
+
+    .participant-sidebar {
+        width: 240px;
+        background: #181825;
+        border-right: 1px solid #313244;
+        padding: 16px;
+    }
+
+    .participant-sidebar h3 {
+        margin: 0 0 16px 0;
+        font-size: 14px;
+        color: #9399b2;
+        text-transform: uppercase;
+    }
+
+    .participant-list {
+        list-style: none;
+        padding: 0;
+        margin: 0;
+    }
+
+    .participant {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px;
+        border-radius: 4px;
+        margin-bottom: 4px;
+    }
+
+    .participant.me {
+        background: #313244;
+    }
+
+    .participant .status {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #a6e3a1;
+    }
+
+    .participant .status.offline {
+        background: #f38ba8;
+    }
+
+    .participant .name {
+        flex: 1;
+        color: #cdd6f4;
+    }
+
+    .participant .me-tag {
+        color: #9399b2;
+        font-size: 12px;
+    }
+
+    .participant .sharing-icon {
+        background: #89b4fa;
+        color: #1e1e2e;
+        padding: 2px 6px;
+        border-radius: 4px;
+        font-size: 10px;
+        font-weight: bold;
+    }
+
+    .screen-area {
+        flex: 1;
+        overflow: hidden;
+    }
+
+    /* Error Toast */
+    .error-toast {
+        position: fixed;
+        bottom: 24px;
+        left: 50%;
+        transform: translateX(-50%);
+        background: #f38ba8;
+        color: #11111b;
+        padding: 12px 24px;
+        border-radius: 8px;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+    }
+
+    .error-toast button {
+        background: transparent;
+        border: none;
+        color: #11111b;
+        cursor: pointer;
+        font-weight: bold;
+    }
+</style>
+
+@code {
+    private enum SessionViewState { SelectMode, StartingSession, JoiningSession, InSession }
+
+    private SessionViewState _sessionState = SessionViewState.SelectMode;
+    private CollaborationSessionManager? _manager;
+    private string _displayName = "";
+    private string _sessionName = "";
+    private string _sessionCode = "";
+    private string? _selectedPeerId;
+    private bool _isLoading;
+    private string? _errorMessage;
+    private bool _isLeaving; // Track intentional disconnect to suppress error
+
+    private void ShowStartSession() => _sessionState = SessionViewState.StartingSession;
+    private void ShowJoinSession() => _sessionState = SessionViewState.JoiningSession;
+    private void BackToSelect() { _errorMessage = null; _sessionState = SessionViewState.SelectMode; }
+
+    private async Task CreateSession()
+    {
+        if (string.IsNullOrWhiteSpace(_displayName)) return;
+
+        _isLoading = true;
+        _errorMessage = null;
+
+        try
+        {
+            await InitializeManagerAsync();
+            await _manager!.CreateSessionAsync(_displayName, string.IsNullOrWhiteSpace(_sessionName) ? null : _sessionName);
+            _sessionState = SessionViewState.InSession;
+        }
+        catch (Exception ex)
+        {
+            _errorMessage = ex.Message;
+        }
+        finally
+        {
+            _isLoading = false;
+        }
+    }
+
+    private async Task JoinSession()
+    {
+        if (string.IsNullOrWhiteSpace(_sessionCode) || string.IsNullOrWhiteSpace(_displayName)) return;
+
+        _isLoading = true;
+        _errorMessage = null;
+
+        try
+        {
+            await InitializeManagerAsync();
+            await _manager!.JoinSessionAsync(_sessionCode.Trim(), _displayName);
+            _sessionState = SessionViewState.InSession;
+        }
+        catch (Exception ex)
+        {
+            _errorMessage = ex.Message;
+        }
+        finally
+        {
+            _isLoading = false;
+        }
+    }
+
+    private async Task InitializeManagerAsync()
+    {
+        var serverUrl = Configuration["SignalingServer"]
+            ?? throw new InvalidOperationException("SignalingServer not configured in appsettings.json");
+        _manager = new CollaborationSessionManager(serverUrl, JS, LoggerFactory);
+
+        _manager.ParticipantJoined += (_, p) => { UpdateViewerServiceData(); InvokeAsync(StateHasChanged); };
+        _manager.ParticipantLeft += (_, _) => { UpdateViewerServiceData(); InvokeAsync(StateHasChanged); };
+        _manager.PeerVideoReady += (_, _) => { UpdateViewerServiceData(); InvokeAsync(StateHasChanged); };
+        _manager.Error += (_, msg) => { if (!_isLeaving) { _errorMessage = msg; InvokeAsync(StateHasChanged); } };
+
+        await _manager.ConnectAsync();
+    }
+
+    private async Task StartSharing()
+    {
+        if (_manager == null) return;
+
+        var success = await _manager.StartScreenShareAsync();
+        if (!success)
+        {
+            _errorMessage = "Failed to start screen share";
+        }
+        StateHasChanged();
+    }
+
+    private async Task StopSharing()
+    {
+        if (_manager == null) return;
+        await _manager.StopScreenShareAsync();
+        StateHasChanged();
+    }
+
+    private async Task LeaveSession()
+    {
+        if (_manager == null) return;
+
+        _isLeaving = true;
+        _errorMessage = null;
+        await _manager.LeaveSessionAsync();
+        await _manager.DisposeAsync();
+        _manager = null;
+        _sessionState = SessionViewState.SelectMode;
+        _isLeaving = false;
+    }
+
+    private void OnScreenSelected(string peerId)
+    {
+        _selectedPeerId = peerId;
+    }
+
+    private void OnScreenFullscreen(string peerId)
+    {
+        // Update service with current data so FullscreenViewer in separate window can access it
+        UpdateViewerServiceData();
+        // Open in separate window
+        ViewerService.OpenViewer(peerId);
+    }
+
+    private void UpdateViewerServiceData()
+    {
+        if (_manager == null) return;
+        ViewerService.SharingParticipants = _manager.State.SharingParticipants;
+        ViewerService.MyClientId = _manager.State.MyClientId;
+        ViewerService.RenderPeerToCanvas = RenderPeerToCanvas;
+    }
+
+    private async Task<bool> RenderPeerToCanvas(string peerId, string canvasId)
+    {
+        if (_manager == null) return false;
+        return await _manager.RenderPeerToCanvasAsync(peerId, canvasId);
+    }
+
+    private string GetPeerConnectionState(string peerId)
+    {
+        // TODO: Get actual connection state from MeshWebRTCManager
+        return "connected";
+    }
+
+    private string GetParticipantStatusClass(ParticipantInfo p)
+    {
+        // TODO: Check actual connection state
+        return "";
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        _isLeaving = true;
+        if (_manager != null)
+        {
+            await _manager.DisposeAsync();
+        }
+    }
+}

@@ -1,1 +1,32 @@
-.vercel
+# Build outputs
+bin/
+obj/
+out/
+release-output/
+tools/app-launcher/payload/
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+
+# JetBrains Rider
+.idea/
+
+# NuGet
+packages/
+*.nupkg
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Logs
+logs/
+*.log
+
+# Temp files
+*.tmp
+
+# FFmpeg native DLLs (downloaded at build time)
+src/SteamViewer.App/ffmpeg/*.dll

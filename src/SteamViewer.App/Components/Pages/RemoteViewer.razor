@@ -1,0 +1,2151 @@
+@page "/viewer"
+@using Microsoft.JSInterop
+@using SteamViewer.App.Services
+@using SteamViewer.App.Services.Models
+@using SteamViewer.App.Components.Shared
+@using SteamViewer.Common.Protocol
+@inject ViewerSessionManager SessionManager
+@inject ViewerTabManager TabManager
+@inject CanvasRenderingService CanvasRenderer
+@inject IJSRuntime JSRuntime
+@inject FileLoggerService FileLogger
+@inject ILogger<RemoteViewer> Logger
+@inject SteamViewer.Client.Core.Capture.ISystemKeyInterceptor SystemKeyInterceptor
+@implements IAsyncDisposable
+
+<div class="viewer-container" @onclick="CloseMenus" @onclick:stopPropagation="false">
+    <div class="viewer-toolbar">
+        <div class="toolbar-menus">
+            <div class="menu-wrapper">
+                <button class="menu-btn @(_activeMenu == "actions" ? "active" : "")"
+                        @onclick='() => ToggleMenu("actions")'
+                        @onclick:stopPropagation="true"
+                        title="Session actions">Actions ▾</button>
+                @if (_activeMenu == "actions")
+                {
+                    <div class="menu-dropdown" @onclick:stopPropagation="true">
+                        <div class="menu-section">
+                            <span class="menu-section-title">Special Keys</span>
+                            <button class="menu-item" @onclick="SendCtrlShiftEsc" title="Open Task Manager">
+                                <span class="menu-icon"><Icon Name="AppIcon.Keyboard" Size="16" /></span>
+                                <span>Task Manager</span>
+                                <span class="menu-shortcut">Ctrl+Shift+Esc</span>
+                            </button>
+                            <button class="menu-item" @onclick="SendWinD" title="Show Desktop">
+                                <span class="menu-icon"><Icon Name="AppIcon.Monitor" Size="16" /></span>
+                                <span>Show Desktop</span>
+                                <span class="menu-shortcut">Win+D</span>
+                            </button>
+                            <button class="menu-item" @onclick="SendWinL" title="Lock Screen">
+                                <span class="menu-icon"><Icon Name="AppIcon.Lock" Size="16" /></span>
+                                <span>Lock Screen</span>
+                                <span class="menu-shortcut">Win+L</span>
+                            </button>
+                            <button class="menu-item" @onclick="SendAltTab" title="Switch Windows">
+                                <span class="menu-icon"><Icon Name="AppIcon.RotateCw" Size="16" /></span>
+                                <span>Switch Windows</span>
+                                <span class="menu-shortcut">Alt+Tab</span>
+                            </button>
+                            <button class="menu-item" @onclick="SendAltF4" title="Close Active Window">
+                                <span class="menu-icon"><Icon Name="AppIcon.X" Size="16" /></span>
+                                <span>Close Window</span>
+                                <span class="menu-shortcut">Alt+F4</span>
+                            </button>
+                        </div>
+                        <div class="menu-divider"></div>
+                        <div class="menu-section">
+                            <span class="menu-section-title">System</span>
+                            <button class="menu-item @(_hostElevated != true ? "disabled" : "")"
+                                    @onclick="SendCtrlAltDel"
+                                    title="@(_hostElevated != true ? "Host needs admin privileges" : "Send Ctrl+Alt+Del to host")">
+                                <span class="menu-icon"><Icon Name="AppIcon.Shield" Size="16" /></span>
+                                <span>Ctrl+Alt+Del</span>
+                                @if (_hostElevated == true)
+                                {
+                                    <span class="menu-shortcut">Ctrl+Alt+End</span>
+                                }
+                                else
+                                {
+                                    <span class="menu-note">Needs admin</span>
+                                }
+                            </button>
+                            <button class="menu-item" @onclick="SendRebootHost" title="Reboot the remote host">
+                                <span class="menu-icon"><Icon Name="AppIcon.Power" Size="16" /></span>
+                                <span>Reboot Host</span>
+                            </button>
+                            @if (_hostElevated == false)
+                            {
+                                <button class="menu-item" @onclick="RequestElevation" title="Enable admin features on host (UAC prompt will appear on host)">
+                                    <span class="menu-icon"><Icon Name="AppIcon.ArrowUp" Size="16" /></span>
+                                    <span>Enable Admin</span>
+                                </button>
+                            }
+                            @* SYSTEM helper auto-launches with Admin — no separate button needed *@
+                        </div>
+                        <div class="menu-divider"></div>
+                        <div class="menu-section">
+                            <span class="menu-section-title">Clipboard</span>
+                            <button class="menu-item" @onclick="SendClipboardToHost" title="Send your clipboard text to the remote machine">
+                                <span class="menu-icon"><Icon Name="AppIcon.ClipboardPaste" Size="16" /></span>
+                                <span>Paste to Remote</span>
+                            </button>
+                            <button class="menu-item" @onclick="GetClipboardFromHost" title="Copy the remote machine's clipboard text">
+                                <span class="menu-icon"><Icon Name="AppIcon.Clipboard" Size="16" /></span>
+                                <span>Copy from Remote</span>
+                            </button>
+                        </div>
+                    </div>
+                }
+            </div>
+            <div class="menu-wrapper">
+                <button class="menu-btn @(_activeMenu == "view" ? "active" : "")"
+                        @onclick='() => ToggleMenu("view")'
+                        @onclick:stopPropagation="true"
+                        title="Display options">View ▾</button>
+                @if (_activeMenu == "view")
+                {
+                    <div class="menu-dropdown" @onclick:stopPropagation="true">
+                        <button class="menu-item" @onclick="ToggleFullscreen">
+                            <span class="menu-icon"><Icon Name="AppIcon.Fullscreen" Size="16" /></span>
+                            <span>Fullscreen</span>
+                            <span class="menu-shortcut">F11</span>
+                        </button>
+                        @if (_hostMonitors?.Count > 1)
+                        {
+                            <div class="menu-divider"></div>
+                            <div class="menu-section">
+                                <span class="menu-section-title">Displays</span>
+                                @foreach (var mon in _hostMonitors)
+                                {
+                                    var isActive = (int)mon.Id == _activeMonitorId;
+                                    <button class="menu-item @(isActive ? "monitor-active" : "")"
+                                            @onclick="() => SwitchMonitor((int)mon.Id)"
+                                            title="@(mon.Name) (@(mon.Width)x@(mon.Height))">
+                                        <span class="menu-icon">@if (mon.IsPrimary) { <Icon Name="AppIcon.Star" Size="16" /> } else { <Icon Name="AppIcon.Monitor" Size="16" /> }</span>
+                                        <span>@(mon.Name) (@(mon.Width)x@(mon.Height))</span>
+                                        @if (isActive)
+                                        {
+                                            <span class="menu-shortcut">●</span>
+                                        }
+                                    </button>
+                                }
+                            </div>
+                        }
+                    </div>
+                }
+            </div>
+            <div class="menu-wrapper">
+                <button class="menu-btn @(_activeMenu == "files" ? "active" : "")"
+                        @onclick='() => ToggleMenu("files")'
+                        @onclick:stopPropagation="true"
+                        title="File transfer">Files ▾</button>
+                @if (_activeMenu == "files")
+                {
+                    <div class="menu-dropdown" @onclick:stopPropagation="true">
+                        <button class="menu-item disabled">
+                            <span class="menu-icon"><Icon Name="AppIcon.Upload" Size="16" /></span>
+                            <span>Send File...</span>
+                        </button>
+                        <button class="menu-item disabled">
+                            <span class="menu-icon"><Icon Name="AppIcon.Download" Size="16" /></span>
+                            <span>Receive File...</span>
+                        </button>
+                    </div>
+                }
+            </div>
+        </div>
+        <div class="toolbar-icons">
+            <button class="icon-btn @(_inputLocked ? "locked" : "")" @onclick="ToggleInputLock" title="@(_inputLocked ? "Unlock input" : "Lock input")">
+                <Icon Name="@(_inputLocked ? AppIcon.Lock : AppIcon.Unlock)" Size="14" />
+            </button>
+            <button class="icon-btn @(_hostCursorVisible ? "active-toggle" : "")" @onclick="ToggleHostCursor" title="Toggle host cursor"><Icon Name="AppIcon.Mouse" Size="14" /></button>
+            <button class="icon-btn @(_statsVisible ? "active-toggle" : "")" @onclick="ToggleStatsOverlay" title="Toggle stats overlay"><Icon Name="AppIcon.BarChart2" Size="14" /></button>
+            <button class="icon-btn" @onclick="ToggleFullscreen" title="Fullscreen (F11)"><Icon Name="AppIcon.Fullscreen" Size="14" /></button>
+            <button class="icon-btn close-btn" @onclick="CloseWindow" title="Close window"><Icon Name="AppIcon.X" Size="14" /></button>
+        </div>
+    </div>
+    <div class="canvas-wrapper">
+        <div class="tab-bar" data-window-id="@_windowId">
+            <div class="tabs">
+                @foreach (var tab in _tabs)
+                {
+                    <div class="tab @(tab.IsActive ? "active" : "") @(tab.IsConnected ? "" : "disconnected")"
+                         title="@tab.Title"
+                         @onclick="() => SwitchTab(tab.SessionId)"
+                         @onclick:stopPropagation="true"
+                         data-session-id="@tab.SessionId">
+                        <span class="tab-icon"><Icon Name="@GetTabIcon(tab)" Size="12" /></span>
+                        <span class="tab-title">@tab.Title</span>
+                        <button class="tab-close"
+                                title="Close tab"
+                                @onclick="() => CloseTab(tab.SessionId)"
+                                @onclick:stopPropagation="true"><Icon Name="AppIcon.X" Size="10" /></button>
+                    </div>
+                }
+            </div>
+            <button class="tab-add" title="New connection" @onclick="OpenConnectionDialog"><Icon Name="AppIcon.Plus" Size="14" /></button>
+        </div>
+        <div class="canvas-container" id="canvasContainer">
+            <canvas id="viewerCanvas"></canvas>
+            @if (_secureDesktopActive)
+            {
+                <div class="secure-desktop-banner">Secure Desktop (UAC)</div>
+            }
+            @if (_tabs.Count == 0)
+            {
+                <div class="no-tabs-message">
+                    <p>No active sessions</p>
+                    <button class="add-connection-btn" @onclick="OpenConnectionDialog">+ Add Connection</button>
+                </div>
+            }
+            @if (_activeSessionId != null && !_hasReceivedFrame && !_showReconnectOverlay)
+            {
+                <div class="connecting-overlay">
+                    <div class="connecting-spinner"></div>
+                    <p class="connecting-text">Waiting for host screen...</p>
+                    <p class="connecting-subtext">Establishing connection to @(_activeSession?.PeerId ?? "peer")</p>
+                </div>
+            }
+            @if (_statsVisible && _statsText != null)
+            {
+                <div class="stats-overlay">
+                    <pre>@_statsText</pre>
+                </div>
+            }
+            @if (_toastMessage != null)
+            {
+                <div class="toast-notification">@_toastMessage</div>
+            }
+            @if (_showReconnectOverlay)
+            {
+                <div class="reconnect-overlay">
+                    <div class="reconnect-dialog">
+                        <h3>Host Disconnected</h3>
+                        @if (_reconnectCountdown > 0)
+                        {
+                            <p>Reconnecting in @_reconnectCountdown seconds...</p>
+                        }
+                        else
+                        {
+                            <p>Attempting to reconnect...</p>
+                        }
+                        <div class="reconnect-buttons">
+                            <button class="btn-primary" @onclick="ReconnectNow">Reconnect Now</button>
+                            <button class="btn-secondary" @onclick="CancelReconnect">Cancel</button>
+                            <button class="btn-danger" @onclick="CloseDisconnectedTab">Close Tab</button>
+                        </div>
+                        <p class="reconnect-attempts">Attempt @(_reconnectAttempts + 1)</p>
+                    </div>
+                </div>
+            }
+        </div>
+    </div>
+</div>
+
+<ConnectionDialog
+    IsVisible="@_showConnectionDialog"
+    WindowId="@_windowId"
+    OnClose="CloseConnectionDialog"
+    OnConnected="HandleConnected" />
+
+@code {
+    private DotNetObjectReference<RemoteViewer>? _tabDragRef;
+    private DotNetObjectReference<RemoteViewer>? _loggerDotNetRef;
+#if WINDOWS
+    private Services.InputMessageRouter? _inputRouter;
+#endif
+    private bool _canvasInitialized;
+    private bool _inputInitialized;
+    private bool _tabDragInitialized;
+    private bool _inputLocked;
+    private string? _windowId;
+    private List<TabState> _tabs = new();
+    private bool _showConnectionDialog;
+    private string? _activeMenu;
+    private string? _activeSessionId;
+    private ViewerSession? _activeSession;
+    private bool _showReconnectOverlay;
+    private int _reconnectCountdown;
+    private System.Threading.Timer? _reconnectTimer;
+    private int _reconnectAttempts;
+    private bool _statsVisible;
+    private bool _hostCursorVisible = false;
+    private string? _statsText;
+    private string? _toastMessage;
+    private bool? _hostElevated;
+    private bool? _hostSystemLevel;
+    private bool _hasReceivedFrame;
+    private bool _secureDesktopActive;
+    private List<MonitorInfo>? _hostMonitors;
+    private int _activeMonitorId;
+
+    protected override void OnInitialized()
+    {
+        // Claim a pre-created window (from OpenViewerForSession/DetachTab) or create a new one
+        _windowId = TabManager.ClaimOrCreateWindow();
+
+        // Subscribe to tab manager events
+        TabManager.OnTabsChanged += HandleTabsChanged;
+        TabManager.OnActiveTabChanged += HandleActiveTabChanged;
+
+        RefreshTabs();
+
+        // If the window already has an active tab (OpenViewerForSession added it before we subscribed),
+        // manually activate it now since we missed the OnActiveTabChanged event.
+        var activeTab = TabManager.GetActiveTab(_windowId);
+        if (activeTab != null && _activeSessionId == null)
+        {
+            HandleActiveTabChanged(_windowId, activeTab.SessionId);
+        }
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+        {
+            // Initialize canvas
+            await Task.Delay(100); // Wait for DOM
+            try
+            {
+                _canvasInitialized = true;
+
+                // Initialize input capture (without floating lock indicator - we have toolbar button)
+                // Input events route through WebView2 postMessage → InputMessageRouter (no dotNetRef needed)
+                _inputInitialized = await JSRuntime.InvokeAsync<bool>(
+                    "SteamViewerInput.initialize",
+                    "viewerCanvas",
+                    new { showLockIndicator = false });
+
+#if WINDOWS
+                // Wire up InputMessageRouter for postMessage-based input
+                _inputRouter = MauiProgram.ServiceProvider?.GetService<Services.InputMessageRouter>();
+                if (_inputRouter != null)
+                {
+                    _inputRouter.OnCtrlAltDelRequested += HandleCtrlAltDelFromRouter;
+                    _inputRouter.OnClipboardPasteRequested += HandleClipboardPasteFromRouter;
+                    _inputRouter.OnLockChanged += HandleLockChangedFromRouter;
+                    if (_activeSession != null)
+                        _inputRouter.SetActiveSession(_activeSession);
+                }
+#endif
+
+                // Initialize tab drag functionality
+                _tabDragRef = DotNetObjectReference.Create(this);
+                _tabDragInitialized = await JSRuntime.InvokeAsync<bool>(
+                    "SteamViewerTabDrag.initialize",
+                    _tabDragRef);
+
+                // Set window ID on tab bar for cross-window drops
+                if (_windowId != null)
+                {
+                    await JSRuntime.InvokeVoidAsync("SteamViewerTabDrag.setTabBarWindowId", _windowId);
+                }
+
+                // Initialize JS logger bridge so console output reaches the log file
+                _loggerDotNetRef = DotNetObjectReference.Create(this);
+                await JSRuntime.InvokeVoidAsync("SteamViewerLogger.initialize", _loggerDotNetRef);
+
+                // Subscribe to system key interception (Win, Alt+Tab)
+                SystemKeyInterceptor.SystemKeyIntercepted += OnSystemKeyIntercepted;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Failed to initialize viewer canvas: {ex.Message}");
+            }
+        }
+        else if (_canvasInitialized && _inputInitialized)
+        {
+            // After every re-render, verify canvas DOM reference is still valid.
+            // Blazor may destroy/recreate the <canvas> element during re-render,
+            // leaving SteamViewerInput with a stale reference and dead event listeners.
+            try
+            {
+                await JSRuntime.InvokeVoidAsync("SteamViewerInput.reattachIfNeeded");
+            }
+            catch { }
+        }
+    }
+
+    #region Tab Drag Callbacks
+
+    [JSInvokable]
+    public void OnTabDragStart(string sessionId)
+    {
+        // Tab drag started - could update UI state if needed
+        Console.WriteLine($"Tab drag started: {sessionId}");
+    }
+
+    [JSInvokable]
+    public async Task OnTabDetached(string sessionId, int screenX, int screenY)
+    {
+        // Tab dragged outside window - create new window
+        if (_windowId == null) return;
+
+        Console.WriteLine($"Tab detached: {sessionId} at ({screenX}, {screenY})");
+        TabManager.DetachTab(_windowId, sessionId, screenX, screenY);
+        await Task.CompletedTask;
+    }
+
+    [JSInvokable]
+    public async Task OnTabDroppedOnWindow(string sessionId, string targetWindowId)
+    {
+        // Tab dropped on another window's tab bar
+        if (_windowId == null) return;
+
+        Console.WriteLine($"Tab dropped: {sessionId} from {_windowId} to {targetWindowId}");
+        TabManager.MoveTab(_windowId, targetWindowId, sessionId);
+        await Task.CompletedTask;
+    }
+
+    #endregion
+
+    private void RefreshTabs()
+    {
+        if (_windowId == null) return;
+        _tabs = TabManager.GetTabs(_windowId).ToList();
+    }
+
+    private void HandleTabsChanged(string windowId)
+    {
+        if (windowId != _windowId) return;
+        InvokeAsync(() =>
+        {
+            RefreshTabs();
+            StateHasChanged();
+        });
+    }
+
+    private TabState? ActiveTab => _tabs.FirstOrDefault(t => t.SessionId == _activeSessionId);
+
+    private void HandleActiveTabChanged(string windowId, string? sessionId)
+    {
+        if (windowId != _windowId) return;
+
+        // Save current tab's per-tab state before switching
+        var oldTab = _tabs.FirstOrDefault(t => t.SessionId == _activeSessionId);
+        if (oldTab != null)
+        {
+            oldTab.StatsVisible = _statsVisible;
+            oldTab.InputLocked = _inputLocked;
+        }
+
+        // Clean up and unsubscribe from previous session
+        if (_activeSession != null)
+        {
+            var oldSessionId = _activeSession.SessionId;
+            _activeSession.OnVideoStarted -= HandleVideoStarted;
+            _activeSession.OnDisconnected -= HandleSessionDisconnected;
+            _activeSession.OnStatsUpdated -= HandleStatsUpdate;
+            _activeSession.OnControlMessage -= HandleControlMessage;
+            _activeSession.OnClipboardReceived -= HandleClipboardReceived;
+            _activeSession.OnSecureDesktopStateChanged -= HandleSecureDesktopStateChanged;
+            _activeSession.OnMonitorLayoutReceived -= HandleMonitorLayoutReceived;
+            _activeSession.OnCaptureInfoReceived -= HandleCaptureInfoReceived;
+            if (_statsVisible) _ = _activeSession.DisableStatsRelayAsync();
+            _ = JSRuntime.InvokeVoidAsync("SteamViewerVideo.dispose", oldSessionId);
+        }
+
+        _activeSessionId = sessionId;
+        _hasReceivedFrame = false;
+        _showReconnectOverlay = false;
+        _secureDesktopActive = false;
+        _reconnectTimer?.Dispose();
+        _reconnectTimer = null;
+
+        // Update input's active session for stats tracking
+        if (!string.IsNullOrEmpty(sessionId))
+        {
+            _ = JSRuntime.InvokeVoidAsync("SteamViewerInput.setActiveSession", sessionId);
+        }
+
+        // Subscribe to new active session's frames and resume capture
+        if (sessionId != null)
+        {
+            _activeSession = SessionManager.GetSession(sessionId);
+#if WINDOWS
+            _inputRouter?.SetActiveSession(_activeSession);
+#endif
+            if (_activeSession != null)
+            {
+                _activeSession.OnVideoStarted += HandleVideoStarted;
+                _activeSession.OnDisconnected += HandleSessionDisconnected;
+                _activeSession.OnStatsUpdated += HandleStatsUpdate;
+                _activeSession.OnControlMessage += HandleControlMessage;
+                _activeSession.OnClipboardReceived += HandleClipboardReceived;
+                _activeSession.OnSecureDesktopStateChanged += HandleSecureDesktopStateChanged;
+                _activeSession.OnMonitorLayoutReceived += HandleMonitorLayoutReceived;
+                _activeSession.OnCaptureInfoReceived += HandleCaptureInfoReceived;
+
+                // Restore cached monitor layout from session (survives tab switches)
+                _hostMonitors = _activeSession.HostMonitors;
+                _activeMonitorId = _activeSession.ActiveMonitorId;
+
+                // Bind WebRTC to this viewer window's JS context and enable direct rendering.
+                // PeerConnection is created in OUR window → video renders directly to canvas.
+                _ = BindAndEnableDirectRenderAsync(sessionId);
+
+                // Show reconnect overlay if session is already disconnected
+                if (_activeSession.State == ViewerSessionState.Disconnected)
+                {
+                    ShowReconnectOverlay("Session disconnected");
+                }
+            }
+        }
+        else
+        {
+            _activeSession = null;
+#if WINDOWS
+            _inputRouter?.SetActiveSession(null);
+#endif
+        }
+
+        // Restore new tab's per-tab state
+        var newTab = _tabs.FirstOrDefault(t => t.SessionId == sessionId);
+        _statsVisible = newTab?.StatsVisible ?? false;
+        _inputLocked = newTab?.InputLocked ?? false;
+        _hostElevated = _activeSession?.IsHostElevated;
+        if (!_statsVisible) _statsText = null;
+
+        // Enable stats relay on new tab if it had stats on
+        if (_statsVisible && _activeSession != null)
+        {
+            _ = _activeSession.EnableStatsRelayAsync();
+        }
+
+        // Apply restored input lock state to JS
+        if (_inputLocked)
+            _ = JSRuntime.InvokeVoidAsync("SteamViewerInput.lock");
+        else
+            _ = JSRuntime.InvokeVoidAsync("SteamViewerInput.unlock");
+
+        InvokeAsync(StateHasChanged);
+    }
+
+    private void HandleSessionDisconnected(string? reason)
+    {
+        Logger.LogWarning("[RECONNECT-DIAG] HandleSessionDisconnected fired: reason={Reason}, activeSession={Session}, overlay={Overlay}",
+            reason, _activeSessionId, _showReconnectOverlay);
+        ShowReconnectOverlay(reason);
+    }
+
+    private void HandleControlMessage(string type, string? message)
+    {
+        InvokeAsync(() =>
+        {
+            switch (type)
+            {
+                case "hostStatus":
+                    var wasElevated = _hostElevated;
+                    var wasSystemLevel = _hostSystemLevel;
+                    _hostElevated = _activeSession?.IsHostElevated;
+                    _hostSystemLevel = _activeSession?.IsHostSystemLevel;
+                    if (_hostElevated == true && wasElevated != true)
+                        ShowToast("Admin features enabled");
+                    // SYSTEM auto-launches with Admin — no toast (avoids focus race)
+                    StateHasChanged();
+                    break;
+                case "ctrlAltDelFailed":
+                    ShowToast(message ?? "Ctrl+Alt+Del failed");
+                    break;
+                case "rebootFailed":
+                    ShowToast(message ?? "Reboot failed");
+                    break;
+                case "elevationDenied":
+                    ShowToast(message ?? "Elevation denied on host");
+                    break;
+                case "elevationAlready":
+                    _hostElevated = true;
+                    ShowToast("Admin features already enabled");
+                    StateHasChanged();
+                    break;
+                case "systemElevationAlready":
+                    _hostSystemLevel = true;
+                    ShowToast("SYSTEM features already enabled");
+                    StateHasChanged();
+                    break;
+                case "systemElevationDenied":
+                    ShowToast(message ?? "SYSTEM elevation denied");
+                    break;
+                case "systemElevationFailed":
+                    ShowToast(message ?? "SYSTEM elevation failed");
+                    break;
+                case "runAsSystemSuccess":
+                    ShowToast("Launched as SYSTEM");
+                    break;
+                case "runAsSystemFailed":
+                    ShowToast(message ?? "Run as SYSTEM failed");
+                    break;
+                case "cursorVisibilityChanged":
+                    _hostCursorVisible = message == "True";
+                    StateHasChanged();
+                    break;
+            }
+        });
+    }
+
+    private void HandleVideoStarted()
+    {
+        // First video frame rendered via direct rendering — dismiss "Waiting for host screen"
+        if (!_hasReceivedFrame)
+        {
+            _hasReceivedFrame = true;
+            _ = InvokeAsync(StateHasChanged);
+        }
+    }
+
+    private void ShowToast(string message)
+    {
+        _toastMessage = message;
+        StateHasChanged();
+        // Refocus canvas after re-render to preserve keyboard capture
+        _ = RefocusCanvasAsync();
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(4000);
+            await InvokeAsync(() =>
+            {
+                _toastMessage = null;
+                StateHasChanged();
+            });
+        });
+    }
+
+    private async Task BindAndEnableDirectRenderAsync(string sessionId)
+    {
+        try
+        {
+            // Wait briefly for canvas DOM to be ready
+            await Task.Delay(200);
+            var session = SessionManager.GetSession(sessionId);
+            if (session == null) return;
+
+            // Send resolution EARLY — host needs this before encoding first frames
+            await SendDisplayResolutionAsync(session);
+
+            // Bind WebRTC to this viewer window's JS context
+            // (creates PeerConnection here, processes queued SDP/ICE)
+            await session.BindToViewerAsync(JSRuntime);
+
+            // Enable direct rendering — PeerConnection is now in our window
+            var enabled = await session.TryEnableDirectRenderingAsync("viewerCanvas", JSRuntime);
+
+            if (enabled)
+            {
+                Console.WriteLine($"[DirectRender] Session {sessionId}: active");
+                // Start resize listener to update resolution on window resize
+                await StartResizeListenerAsync();
+            }
+            else
+                Console.WriteLine($"[DirectRender] Session {sessionId}: FAILED — no video rendering available");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[BindAndRender] Failed: {ex.Message}");
+        }
+    }
+
+    private System.Timers.Timer? _resizeDebounceTimer;
+
+    /// <summary>
+    /// Send the current canvas display resolution to the host.
+    /// Host will encode at this resolution using Lanczos downscale.
+    /// </summary>
+    private async Task SendDisplayResolutionAsync(ViewerSession? session = null)
+    {
+        session ??= _activeSession;
+        if (session == null) return;
+
+        try
+        {
+            // Get canvas display size in physical pixels from JS
+            var dims = await JSRuntime.InvokeAsync<int[]>("SteamViewerVideo.getDisplaySize", "viewerCanvas");
+            if (dims != null && dims.Length >= 2 && dims[0] > 0 && dims[1] > 0)
+            {
+                await session.SendDesiredResolutionAsync(dims[0], dims[1]);
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Resolution] Failed to send display resolution: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Start a JS window resize listener that calls back to send resolution updates.
+    /// Debounced to avoid spamming encoder reinits.
+    /// </summary>
+    private async Task StartResizeListenerAsync()
+    {
+        try
+        {
+            await JSRuntime.InvokeVoidAsync("SteamViewerVideo.startResizeListener", "viewerCanvas");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[ResizeListener] Failed to start: {ex.Message}");
+        }
+    }
+
+    private async Task RefocusCanvasAsync()
+    {
+        try
+        {
+            // Multiple refocus attempts with increasing delays to combat Blazor re-render stealing focus.
+            // StateHasChanged() triggers an async re-render that can complete at varying times.
+            await Task.Delay(200);
+            await JSRuntime.InvokeVoidAsync("eval", "document.getElementById('viewerCanvas')?.focus()");
+            await Task.Delay(300);
+            await JSRuntime.InvokeVoidAsync("eval", "document.getElementById('viewerCanvas')?.focus()");
+        }
+        catch { }
+    }
+
+    private void SwitchTab(string sessionId)
+    {
+        if (_windowId == null) return;
+
+        TabManager.SetActiveTab(_windowId, sessionId);
+    }
+
+    private async Task CloseTab(string sessionId)
+    {
+        if (_windowId == null) return;
+
+        await TabManager.RemoveTabAsync(_windowId, sessionId);
+
+        // If no tabs left, close window
+        if (_tabs.Count == 0)
+        {
+            CloseWindow();
+        }
+    }
+
+    private AppIcon GetTabIcon(TabState tab)
+    {
+        if (!tab.IsConnected) return AppIcon.AlertTriangle;
+        if (tab.IsPeerSharing) return AppIcon.Monitor;
+        return AppIcon.Link;
+    }
+
+    private void OpenConnectionDialog()
+    {
+        _showConnectionDialog = true;
+        StateHasChanged();
+    }
+
+    private void CloseConnectionDialog()
+    {
+        _showConnectionDialog = false;
+        StateHasChanged();
+    }
+
+    private void HandleConnected(string sessionId)
+    {
+        _showConnectionDialog = false;
+        RefreshTabs();
+        StateHasChanged();
+    }
+
+    private async Task ToggleHostCursor()
+    {
+        if (_activeSession != null)
+            await _activeSession.SendToggleCursorAsync();
+    }
+
+    private async Task ToggleStatsOverlay()
+    {
+        _statsVisible = !_statsVisible;
+
+        if (_activeSession != null)
+        {
+            if (_statsVisible)
+                await _activeSession.EnableStatsRelayAsync();
+            else
+                await _activeSession.DisableStatsRelayAsync();
+        }
+
+        if (!_statsVisible) _statsText = null;
+        if (ActiveTab != null) ActiveTab.StatsVisible = _statsVisible;
+        StateHasChanged();
+    }
+
+    private async Task ToggleInputLock()
+    {
+        _inputLocked = !_inputLocked;
+        if (_inputLocked)
+        {
+            await JSRuntime.InvokeVoidAsync("SteamViewerInput.lock");
+            SystemKeyInterceptor.Install();
+        }
+        else
+        {
+            await JSRuntime.InvokeVoidAsync("SteamViewerInput.unlock");
+            SystemKeyInterceptor.Uninstall();
+        }
+        if (ActiveTab != null) ActiveTab.InputLocked = _inputLocked;
+
+        // Notify host so it can hide/show cursor in video stream
+        if (_activeSession != null)
+            _ = _activeSession.SendInputLockStateAsync(_inputLocked);
+
+        StateHasChanged();
+    }
+
+    // OnInputLockChanged: now routed through InputMessageRouter.OnLockChanged → HandleLockChangedFromRouter
+
+    [JSInvokable]
+    public void OnJSLog(string level, string message)
+    {
+        FileLogger.LogJS(level, message);
+    }
+
+    #region Menu Handling
+
+    private void ToggleMenu(string menuName)
+    {
+        _activeMenu = _activeMenu == menuName ? null : menuName;
+        StateHasChanged();
+    }
+
+    private void CloseMenus()
+    {
+        if (_activeMenu != null)
+        {
+            _activeMenu = null;
+            StateHasChanged();
+        }
+    }
+
+    #endregion
+
+    #region Hard Key Actions
+
+    private void SendCtrlShiftEsc()
+    {
+        // Send Ctrl+Shift+Esc to open Task Manager
+        SendKeyCombo("Escape", ctrl: true, shift: true);
+        CloseMenus();
+    }
+
+    private void SendWinD()
+    {
+        // Send Win+D to show desktop
+        SendKeyCombo("d", meta: true);
+        CloseMenus();
+    }
+
+    private async Task SendWinL()
+    {
+        CloseMenus();
+        if (_activeSession == null) return;
+        try
+        {
+            var json = System.Text.Json.JsonSerializer.Serialize(new { type = "lockWorkstation" });
+            await _activeSession.SendDataAsync(json);
+        }
+        catch (Exception ex)
+        {
+            ShowToast("Failed to lock workstation");
+            Console.WriteLine($"SendWinL error: {ex.Message}");
+        }
+    }
+
+    private void SendAltTab()
+    {
+        // Send Alt+Tab to switch windows
+        SendKeyCombo("Tab", alt: true);
+        CloseMenus();
+    }
+
+    private void SendAltF4()
+    {
+        // Send Alt+F4 to close active window
+        SendKeyCombo("F4", alt: true);
+        CloseMenus();
+    }
+
+    private void SendKeyCombo(string key, bool ctrl = false, bool shift = false, bool alt = false, bool meta = false)
+    {
+        var modifiers = new KeyModifiers(ctrl, shift, alt, meta);
+
+        // Send key down
+        SendInputToActiveSession(new InputEvent.KeyDown(key, modifiers));
+
+        // Small delay then key up (handled asynchronously)
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(50);
+            await InvokeAsync(() => SendInputToActiveSession(new InputEvent.KeyUp(key, modifiers)));
+        });
+    }
+
+    #endregion
+
+    #region System Actions
+
+    private async Task SendCtrlAltDel()
+    {
+        CloseMenus();
+        if (_activeSession == null || _hostElevated != true) return;
+
+        try
+        {
+            var json = System.Text.Json.JsonSerializer.Serialize(new { type = "ctrlAltDel" });
+            await _activeSession.SendDataAsync(json);
+        }
+        catch (Exception ex)
+        {
+            ShowToast("Failed to send Ctrl+Alt+Del");
+            Console.WriteLine($"SendCtrlAltDel error: {ex.Message}");
+        }
+    }
+
+    private async Task SendRebootHost()
+    {
+        CloseMenus();
+        if (_activeSession == null) return;
+
+        try
+        {
+            var json = System.Text.Json.JsonSerializer.Serialize(new { type = "rebootHost" });
+            await _activeSession.SendDataAsync(json);
+        }
+        catch (Exception ex)
+        {
+            ShowToast("Failed to send reboot request");
+            Console.WriteLine($"SendRebootHost error: {ex.Message}");
+        }
+    }
+
+    private async Task RequestElevation()
+    {
+        CloseMenus();
+        if (_activeSession == null) return;
+
+        try
+        {
+            var json = System.Text.Json.JsonSerializer.Serialize(new { type = "requestElevation" });
+            await _activeSession.SendDataAsync(json);
+            ShowToast("Requesting admin features — UAC prompt on host...");
+        }
+        catch (Exception ex)
+        {
+            ShowToast("Failed to request elevation");
+            Console.WriteLine($"RequestElevation error: {ex.Message}");
+        }
+    }
+
+    // SYSTEM helper auto-launches with Admin in WindowsElevationService — no separate request needed
+
+    #endregion
+
+    #region Clipboard
+
+    private async Task SendClipboardToHost()
+    {
+        CloseMenus();
+        if (_activeSession == null) return;
+        try
+        {
+            var text = await JSRuntime.InvokeAsync<string>("navigator.clipboard.readText");
+            if (string.IsNullOrEmpty(text))
+            {
+                ShowToast("Clipboard is empty");
+                return;
+            }
+            await _activeSession.SendClipboardAsync("text", text);
+            ShowToast($"Sent {text.Length} chars to remote");
+        }
+        catch
+        {
+            ShowToast("Failed to read clipboard");
+        }
+    }
+
+    private async Task GetClipboardFromHost()
+    {
+        CloseMenus();
+        if (_activeSession == null) return;
+        await _activeSession.RequestClipboardAsync();
+        ShowToast("Requesting remote clipboard...");
+    }
+
+    private void HandleClipboardReceived(string format, string data)
+    {
+        FileLogger.Log("INFO", "RemoteViewer", $"HandleClipboardReceived ENTERED: format={format}, len={data.Length}");
+        InvokeAsync(() =>
+        {
+            FileLogger.Log("INFO", "RemoteViewer", $"HandleClipboardReceived InvokeAsync: format={format}, len={data.Length}");
+            if (format == "text")
+            {
+                bool written = false;
+                if (OperatingSystem.IsWindows())
+                {
+                    FileLogger.Log("INFO", "RemoteViewer", "Calling TrySetClipboardNative...");
+                    written = TrySetClipboardNative(data);
+                    FileLogger.Log("INFO", "RemoteViewer", $"TrySetClipboardNative returned: {written}");
+                }
+
+                if (written)
+                    ShowToast($"Remote clipboard copied ({data.Length} chars)");
+                else
+                    FileLogger.Log("WARN", "RemoteViewer", $"Failed to write clipboard ({data.Length} chars)");
+            }
+            return Task.CompletedTask;
+        });
+    }
+
+    /// <summary>
+    /// Called from JS when Ctrl+V is pressed on the viewer canvas.
+    /// Reads clipboard via native Win32 (WebView2 blocks clipboard API in keydown context).
+    /// Sends clipboard_paste to host, or falls back to Ctrl+V keystroke if clipboard is empty.
+    /// </summary>
+    private async Task OnClipboardPaste()
+    {
+        if (_activeSession == null) return;
+
+        // Read viewer clipboard — try native Win32 first (reliable), browser API as backup
+        string? text = null;
+        if (OperatingSystem.IsWindows())
+            text = TryGetClipboardNative();
+
+        if (string.IsNullOrEmpty(text))
+        {
+            try
+            {
+                text = await JSRuntime.InvokeAsync<string>("navigator.clipboard.readText");
+            }
+            catch (Exception ex)
+            {
+                FileLogger.Log("WARN", "RemoteViewer", $"OnClipboardPaste browser clipboard failed: {ex.Message}");
+            }
+        }
+
+        if (!string.IsNullOrEmpty(text))
+        {
+            FileLogger.Log("INFO", "RemoteViewer", $"OnClipboardPaste: sending {text.Length} chars to host");
+            await _activeSession.SendClipboardPasteAsync("text", text);
+            return;
+        }
+
+        // Fallback: send Ctrl+V keystroke (host pastes from its own clipboard)
+        FileLogger.Log("INFO", "RemoteViewer", "OnClipboardPaste: clipboard empty, sending Ctrl+V keystroke");
+        SendInputToActiveSession(new InputEvent.KeyDown("Control", new KeyModifiers(Ctrl: true)));
+        SendInputToActiveSession(new InputEvent.KeyDown("v", new KeyModifiers(Ctrl: true)));
+        SendInputToActiveSession(new InputEvent.KeyUp("v", new KeyModifiers(Ctrl: true)));
+        SendInputToActiveSession(new InputEvent.KeyUp("Control", KeyModifiers.None));
+    }
+
+    private static string? TryGetClipboardNative()
+    {
+        try
+        {
+            if (!OpenClipboard(IntPtr.Zero)) return null;
+            try
+            {
+                var hData = GetClipboardData(CF_UNICODETEXT);
+                if (hData == IntPtr.Zero) return null;
+                var pData = GlobalLock(hData);
+                if (pData == IntPtr.Zero) return null;
+                try
+                {
+                    return System.Runtime.InteropServices.Marshal.PtrToStringUni(pData);
+                }
+                finally { GlobalUnlock(hData); }
+            }
+            finally { CloseClipboard(); }
+        }
+        catch { return null; }
+    }
+
+    private static bool TrySetClipboardNative(string text)
+    {
+        if (!OperatingSystem.IsWindows()) return false;
+        try
+        {
+            if (!OpenClipboard(IntPtr.Zero)) return false;
+            try
+            {
+                EmptyClipboard();
+                int byteCount = (text.Length + 1) * 2; // UTF-16 + null terminator
+                var hGlobal = GlobalAlloc(GMEM_MOVEABLE, (UIntPtr)byteCount);
+                if (hGlobal == IntPtr.Zero) return false;
+
+                var pGlobal = GlobalLock(hGlobal);
+                if (pGlobal == IntPtr.Zero) { GlobalFree(hGlobal); return false; }
+                try
+                {
+                    System.Runtime.InteropServices.Marshal.Copy(text.ToCharArray(), 0, pGlobal, text.Length);
+                    System.Runtime.InteropServices.Marshal.WriteInt16(pGlobal + text.Length * 2, 0);
+                }
+                finally { GlobalUnlock(hGlobal); }
+
+                if (SetClipboardData(CF_UNICODETEXT, hGlobal) == IntPtr.Zero)
+                {
+                    GlobalFree(hGlobal);
+                    return false;
+                }
+                // SetClipboardData takes ownership of hGlobal — do NOT free it
+                return true;
+            }
+            finally { CloseClipboard(); }
+        }
+        catch { return false; }
+    }
+
+    private const uint CF_UNICODETEXT = 13;
+    private const uint GMEM_MOVEABLE = 0x0002;
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+    private static extern bool OpenClipboard(IntPtr hWndNewOwner);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+    private static extern bool CloseClipboard();
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+    private static extern bool EmptyClipboard();
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr SetClipboardData(uint uFormat, IntPtr hMem);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr GetClipboardData(uint uFormat);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr GlobalAlloc(uint uFlags, UIntPtr dwBytes);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr GlobalLock(IntPtr hMem);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+    private static extern bool GlobalUnlock(IntPtr hMem);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr GlobalFree(IntPtr hMem);
+
+    #endregion
+
+    #region Secure Desktop
+
+
+    private void HandleCaptureInfoReceived(int width, int height)
+    {
+        if (width <= 0 || height <= 0) return;
+        InvokeAsync(async () =>
+        {
+            // Set AR via JS (not Blazor style) to avoid Blazor/JS style conflicts
+            await JSRuntime.InvokeVoidAsync("SteamViewerVideo.setCaptureAspectRatio",
+                _activeSession?.SessionId ?? "", width, height);
+            await SendDisplayResolutionAsync();
+        });
+    }
+
+    private void HandleSecureDesktopStateChanged(bool active)
+    {
+        FileLogger.Log("INFO", "RemoteViewer", $"HandleSecureDesktopStateChanged: active={active}");
+        InvokeAsync(async () =>
+        {
+            _secureDesktopActive = active;
+            StateHasChanged();
+
+            if (!active)
+            {
+                // Re-negotiate resolution after SD - desktop switch may have changed capture state
+                await Task.Delay(200);
+                await SendDisplayResolutionAsync();
+            }
+
+            _ = RefocusCanvasAsync();
+        });
+    }
+
+    #endregion
+
+    #region Monitor Layout
+
+    private void HandleMonitorLayoutReceived(List<MonitorInfo> monitors, int activeId)
+    {
+        InvokeAsync(() =>
+        {
+            _hostMonitors = monitors;
+            _activeMonitorId = activeId;
+            StateHasChanged();
+        });
+    }
+
+    private async Task OnMonitorSelected(ChangeEventArgs e)
+    {
+        if (_activeSession == null || e.Value == null) return;
+        if (int.TryParse(e.Value.ToString(), out var monitorId) && monitorId != _activeMonitorId)
+        {
+            await SwitchMonitor(monitorId);
+        }
+    }
+
+    private async Task SwitchMonitor(int monitorId)
+    {
+        if (_activeSession == null || monitorId == _activeMonitorId) return;
+        Console.WriteLine($"User selected monitor {monitorId}");
+        CloseMenus();
+        await _activeSession.SendSwitchDisplayAsync(monitorId);
+        ShowToast("Switching display — host will see screen picker...");
+    }
+
+    #endregion
+
+    private async Task ToggleFullscreen()
+    {
+        // Check if currently in fullscreen and toggle
+        await JSRuntime.InvokeVoidAsync("eval", @"
+            if (document.fullscreenElement) {
+                document.exitFullscreen();
+            } else {
+                document.documentElement.requestFullscreen();
+            }
+        ");
+        CloseMenus();
+    }
+
+    private void HandleStatsUpdate(string json)
+    {
+        InvokeAsync(() =>
+        {
+            _statsText = FormatStats(json);
+            StateHasChanged();
+        });
+    }
+
+    private static string FormatStats(string json)
+    {
+        try
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(json);
+            var r = doc.RootElement;
+
+            // FFmpeg transport stats
+            if (r.TryGetProperty("transport", out _))
+            {
+                var fps = r.GetProperty("fps").GetInt64();
+                var decodeMs = r.GetProperty("decodeMs").GetDouble();
+                var res = r.GetProperty("resolution").GetString() ?? "?";
+                var mbps = r.GetProperty("bitrateMbps").GetDouble();
+                var totalFrames = r.GetProperty("totalFrames").GetInt64();
+                var totalBytes = r.GetProperty("totalBytes").GetInt64();
+                var transport = r.GetProperty("transport").GetString() ?? "?";
+
+                return $"Video: {fps} FPS | {mbps:F1} Mbps | {res}\n"
+                     + $"Decode: {decodeMs:F1}ms\n"
+                     + $"Total: {totalFrames} frames | {FmtBytes(totalBytes)}\n"
+                     + $"Mode: [{transport}]";
+            }
+
+            // Legacy WebRTC stats
+            var wFps = r.GetProperty("videoFps").GetDouble();
+            var wMbps = r.GetProperty("bitrateMbps").GetDouble();
+            var wRes = r.GetProperty("resolution").GetString() ?? "?";
+            var rtt = r.GetProperty("rttMs").GetDouble();
+            var loss = r.GetProperty("lossPercent").GetDouble();
+            var jb = r.TryGetProperty("jbAvgMs", out var jbEl) ? jbEl.GetDouble() : 0;
+            var input = r.GetProperty("inputPerSec").GetInt32();
+            var throttled = r.GetProperty("throttledPerSec").GetInt32();
+            var bufKB = r.GetProperty("bufferKB").GetDouble();
+            var videoBytes = r.GetProperty("currentBytes").GetInt64();
+            var ctrlBytes = r.GetProperty("dataChannelBytes").GetInt64();
+            var mode = r.GetProperty("qualityMode").GetString() ?? "HQ";
+
+            var throttledStr = throttled > 0 ? $" ({throttled} throttled)" : "";
+            return $"Video: {wFps:F0} FPS | {wMbps:F1} Mbps | {wRes}\n"
+                 + $"Lat:   JB {jb:F0}ms | RTT {rtt:F0}ms | Loss {loss:F1}%\n"
+                 + $"Input: {input} evt/s{throttledStr} | Buf: {bufKB:F0} KB\n"
+                 + $"Data:  {FmtBytes(videoBytes)} video | {FmtBytes(ctrlBytes)} ctrl\n"
+                 + $"Mode:  [{mode}]";
+        }
+        catch
+        {
+            return json; // Fallback: show raw JSON
+        }
+    }
+
+    private static string FmtBytes(long bytes)
+    {
+        if (bytes < 1024) return $"{bytes} B";
+        if (bytes < 1048576) return $"{bytes / 1024.0:F1} KB";
+        if (bytes < 1073741824) return $"{bytes / 1048576.0:F1} MB";
+        return $"{bytes / 1073741824.0:F2} GB";
+    }
+
+    private void CloseWindow()
+    {
+        if (_windowId != null)
+        {
+            // Remove all tabs (disconnects sessions) then triggers window close
+            _ = TabManager.RemoveWindowAsync(_windowId);
+        }
+    }
+
+    #region Input Callbacks
+
+    private void SendInputToActiveSession(InputEvent inputEvent)
+    {
+        if (_activeSession != null)
+        {
+            _ = _activeSession.SendInputAsync(inputEvent);
+        }
+    }
+
+    /// <summary>
+    /// Called by WH_KEYBOARD_LL hook when a system key (Win, Alt+Tab, Ctrl+Esc) is intercepted.
+    /// Fires on the hook thread — SendInputToActiveSession is fire-and-forget safe.
+    /// </summary>
+    private void OnSystemKeyIntercepted(string key, bool isDown, bool isAltHeld)
+    {
+        var modifiers = new KeyModifiers(Ctrl: false, Shift: false, Alt: isAltHeld, Meta: key == "Meta");
+
+        if (isDown)
+            SendInputToActiveSession(new InputEvent.KeyDown(key, modifiers));
+        else
+            SendInputToActiveSession(new InputEvent.KeyUp(key, modifiers));
+    }
+
+    // --- InputMessageRouter event handlers (WebView2 postMessage → C#) ---
+
+    private void HandleCtrlAltDelFromRouter()
+    {
+        _ = SendCtrlAltDel();
+    }
+
+    private async Task HandleClipboardPasteFromRouter()
+    {
+        await InvokeAsync(async () => await OnClipboardPaste());
+    }
+
+    private void HandleLockChangedFromRouter(bool locked)
+    {
+        _inputLocked = locked;
+        if (locked)
+            SystemKeyInterceptor.Install();
+        else
+            SystemKeyInterceptor.Uninstall();
+
+        if (_activeSession != null)
+            _ = _activeSession.SendInputLockStateAsync(locked);
+
+        InvokeAsync(StateHasChanged);
+    }
+
+    #endregion
+
+    #region Reconnect Logic
+
+    private void ShowReconnectOverlay(string? reason)
+    {
+        Logger.LogWarning("[RECONNECT-DIAG] ShowReconnectOverlay: reason={Reason}, attempts={Attempts}, timerActive={Timer}",
+            reason, _reconnectAttempts, _reconnectTimer != null);
+        _showReconnectOverlay = true;
+        _reconnectAttempts = 0;
+        StartReconnectCountdown();
+        InvokeAsync(StateHasChanged);
+    }
+
+    private void StartReconnectCountdown()
+    {
+        // Exponential backoff: 10s, 20s, 40s, ... max 300s (5 min)
+        var baseDelay = 10;
+        var maxDelay = 300;
+        var delay = Math.Min(baseDelay * (int)Math.Pow(2, _reconnectAttempts), maxDelay);
+        _reconnectCountdown = delay;
+
+        _reconnectTimer?.Dispose();
+        _reconnectTimer = new System.Threading.Timer(
+            async _ => await OnReconnectTimerTick(),
+            null,
+            TimeSpan.FromSeconds(1),
+            TimeSpan.FromSeconds(1));
+    }
+
+    private async Task OnReconnectTimerTick()
+    {
+        _reconnectCountdown--;
+
+        if (_reconnectCountdown <= 0)
+        {
+            Logger.LogWarning("[RECONNECT-DIAG] Timer expired, calling TryReconnect");
+            _reconnectTimer?.Dispose();
+            _reconnectTimer = null;
+            await TryReconnect();
+        }
+
+        await InvokeAsync(StateHasChanged);
+    }
+
+    private async Task TryReconnect()
+    {
+        if (_activeSession == null || _activeSessionId == null) return;
+
+        _reconnectAttempts++;
+        Logger.LogWarning("[RECONNECT-DIAG] TryReconnect: attempt={Attempt}, session={Session}", _reconnectAttempts, _activeSessionId);
+
+        try
+        {
+            var newSession = await SessionManager.ReconnectSessionAsync(_activeSessionId, JSRuntime);
+            if (newSession != null)
+            {
+                // Unsubscribe from old session events
+                _activeSession.OnVideoStarted -= HandleVideoStarted;
+                _activeSession.OnDisconnected -= HandleSessionDisconnected;
+                _activeSession.OnStatsUpdated -= HandleStatsUpdate;
+                _activeSession.OnControlMessage -= HandleControlMessage;
+                _activeSession.OnClipboardReceived -= HandleClipboardReceived;
+                _activeSession.OnSecureDesktopStateChanged -= HandleSecureDesktopStateChanged;
+                    _activeSession.OnMonitorLayoutReceived -= HandleMonitorLayoutReceived;
+                _activeSession.OnCaptureInfoReceived -= HandleCaptureInfoReceived;
+
+                // Update references (session ID stays the same for tab tracking)
+                _activeSessionId = newSession.SessionId;
+                _activeSession = newSession;
+
+                // Subscribe to new session events
+                _activeSession.OnVideoStarted += HandleVideoStarted;
+                _activeSession.OnDisconnected += HandleSessionDisconnected;
+                _activeSession.OnStatsUpdated += HandleStatsUpdate;
+                _activeSession.OnControlMessage += HandleControlMessage;
+                _activeSession.OnClipboardReceived += HandleClipboardReceived;
+                _activeSession.OnSecureDesktopStateChanged += HandleSecureDesktopStateChanged;
+                _activeSession.OnMonitorLayoutReceived += HandleMonitorLayoutReceived;
+                _activeSession.OnCaptureInfoReceived += HandleCaptureInfoReceived;
+
+                // Update input routing
+                await JSRuntime.InvokeVoidAsync("SteamViewerInput.setActiveSession", newSession.SessionId);
+#if WINDOWS
+                _inputRouter?.SetActiveSession(_activeSession);
+#endif
+
+                // Bind new session's WebRTC to this viewer window and enable direct rendering
+                _ = BindAndEnableDirectRenderAsync(newSession.SessionId);
+
+                // Reset monitor layout (host will resend on new capture)
+                _hostMonitors = null;
+                _activeMonitorId = 0;
+
+                // Hide reconnect overlay, show "waiting for host screen"
+                _showReconnectOverlay = false;
+                _hasReceivedFrame = false;
+                _reconnectAttempts = 0;
+                Logger.LogWarning("[RECONNECT-DIAG] TryReconnect SUCCESS: new session bound, overlay hidden");
+                StateHasChanged();
+                return;
+            }
+            else
+            {
+                Logger.LogWarning("[RECONNECT-DIAG] TryReconnect returned null session");
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "[RECONNECT-DIAG] TryReconnect FAILED");
+        }
+
+        // Reconnect failed, try again with backoff
+        StartReconnectCountdown();
+    }
+
+    private async Task ReconnectNow()
+    {
+        _reconnectTimer?.Dispose();
+        _reconnectTimer = null;
+        _reconnectCountdown = 0;
+        await TryReconnect();
+    }
+
+    private void CancelReconnect()
+    {
+        _reconnectTimer?.Dispose();
+        _reconnectTimer = null;
+        _showReconnectOverlay = false;
+        StateHasChanged();
+    }
+
+    private async Task CloseDisconnectedTab()
+    {
+        _reconnectTimer?.Dispose();
+        _reconnectTimer = null;
+        _showReconnectOverlay = false;
+
+        if (_activeSessionId != null)
+        {
+            await CloseTab(_activeSessionId);
+        }
+    }
+
+    #endregion
+
+    public async ValueTask DisposeAsync()
+    {
+        // Disconnect sessions first (sends signaling Disconnect per tab)
+        if (_windowId != null)
+        {
+            await TabManager.RemoveWindowAsync(_windowId);
+        }
+
+        // Clean up system key hook
+        SystemKeyInterceptor.SystemKeyIntercepted -= OnSystemKeyIntercepted;
+        SystemKeyInterceptor.Uninstall();
+
+        // Clean up reconnect timer
+        _reconnectTimer?.Dispose();
+        _reconnectTimer = null;
+
+        TabManager.OnTabsChanged -= HandleTabsChanged;
+        TabManager.OnActiveTabChanged -= HandleActiveTabChanged;
+
+        // Unsubscribe from active session
+        if (_activeSession != null)
+        {
+            _activeSession.OnVideoStarted -= HandleVideoStarted;
+            _activeSession.OnDisconnected -= HandleSessionDisconnected;
+            _activeSession.OnStatsUpdated -= HandleStatsUpdate;
+            _activeSession.OnControlMessage -= HandleControlMessage;
+            _activeSession.OnClipboardReceived -= HandleClipboardReceived;
+            _activeSession.OnSecureDesktopStateChanged -= HandleSecureDesktopStateChanged;
+            _activeSession.OnMonitorLayoutReceived -= HandleMonitorLayoutReceived;
+            _activeSession.OnCaptureInfoReceived -= HandleCaptureInfoReceived;
+        }
+
+        _tabDragRef?.Dispose();
+        _loggerDotNetRef?.Dispose();
+
+#if WINDOWS
+        if (_inputRouter != null)
+        {
+            _inputRouter.OnCtrlAltDelRequested -= HandleCtrlAltDelFromRouter;
+            _inputRouter.OnClipboardPasteRequested -= HandleClipboardPasteFromRouter;
+            _inputRouter.OnLockChanged -= HandleLockChangedFromRouter;
+            _inputRouter.SetActiveSession(null);
+        }
+#endif
+
+        // Dispose tab drag JS
+        if (_tabDragInitialized)
+        {
+            try
+            {
+                await JSRuntime.InvokeVoidAsync("SteamViewerTabDrag.dispose");
+            }
+            catch (JSDisconnectedException) { }
+            catch { }
+        }
+    }
+}
+
+<style>
+    .viewer-container {
+        display: flex;
+        flex-direction: column;
+        height: 100vh;
+        background: #11111b;
+        color: #cdd6f4;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    }
+
+    .viewer-toolbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        height: 28px;
+        padding: 0 6px;
+        background: #1e1e2e;
+        border-bottom: 1px solid #313244;
+        flex-shrink: 0;
+    }
+
+    .toolbar-menus {
+        display: flex;
+        gap: 2px;
+    }
+
+    .menu-btn {
+        background: transparent;
+        border: none;
+        color: #a6adc8;
+        padding: 4px 10px;
+        font-size: 12px;
+        cursor: pointer;
+        border-radius: 3px;
+        transition: all 0.15s;
+    }
+
+    .menu-btn:hover,
+    .menu-btn.active {
+        background: #313244;
+        color: #cdd6f4;
+    }
+
+    .menu-wrapper {
+        position: relative;
+    }
+
+    .menu-dropdown {
+        position: absolute;
+        top: 100%;
+        left: 0;
+        min-width: 220px;
+        background: #1e1e2e;
+        border: 1px solid #313244;
+        border-radius: 6px;
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+        z-index: 1000;
+        padding: 4px 0;
+        margin-top: 2px;
+    }
+
+    .menu-section {
+        padding: 4px 0;
+    }
+
+    .menu-section-title {
+        display: block;
+        padding: 4px 12px;
+        font-size: 10px;
+        font-weight: 600;
+        text-transform: uppercase;
+        color: #6c7086;
+        letter-spacing: 0.5px;
+    }
+
+    .menu-divider {
+        height: 1px;
+        background: #313244;
+        margin: 4px 8px;
+    }
+
+    .menu-item {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        width: 100%;
+        padding: 8px 12px;
+        background: transparent;
+        border: none;
+        color: #cdd6f4;
+        font-size: 13px;
+        cursor: pointer;
+        text-align: left;
+        transition: all 0.1s;
+    }
+
+    .menu-item:hover:not(.disabled) {
+        background: #313244;
+    }
+
+    .menu-item.disabled {
+        color: #6c7086;
+        cursor: not-allowed;
+    }
+
+    .menu-icon {
+        width: 16px;
+        text-align: center;
+        font-size: 14px;
+    }
+
+    .menu-item span:nth-child(2) {
+        flex: 1;
+    }
+
+    .menu-shortcut {
+        font-size: 11px;
+        color: #6c7086;
+        font-family: monospace;
+    }
+
+    .menu-note {
+        font-size: 10px;
+        color: #f38ba8;
+        font-style: italic;
+    }
+
+    .menu-item.monitor-active {
+        background: rgba(137, 180, 250, 0.15);
+    }
+
+    .menu-item.monitor-active span:last-child {
+        color: #89b4fa;
+    }
+
+    .toolbar-icons {
+        display: flex;
+        gap: 2px;
+    }
+
+    .icon-btn {
+        width: 24px;
+        height: 24px;
+        background: transparent;
+        border: none;
+        color: #a6adc8;
+        font-size: 12px;
+        cursor: pointer;
+        border-radius: 3px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        transition: all 0.15s;
+    }
+
+    .icon-btn:hover {
+        background: #313244;
+        color: #cdd6f4;
+    }
+
+    .icon-btn.locked {
+        background: #a6e3a1;
+        color: #1e1e2e;
+    }
+
+    .icon-btn.locked:hover {
+        background: #94e2d5;
+    }
+
+    .icon-btn.active-toggle {
+        background: #89b4fa;
+        color: #1e1e2e;
+    }
+
+    .icon-btn.active-toggle:hover {
+        background: #b4befe;
+    }
+
+    .close-btn:hover {
+        background: #f38ba8;
+        color: #1e1e2e;
+    }
+
+    .canvas-wrapper {
+        flex: 1;
+        position: relative;
+        min-height: 0;
+    }
+
+    /* Floating tab bar - overlays canvas, connects to toolbar */
+    .tab-bar {
+        position: absolute;
+        top: 0;
+        left: 0;
+        z-index: 10;
+        display: flex;
+        align-items: flex-start;
+        height: 36px;
+        padding: 0 8px;
+        background: transparent;
+        transition: opacity 0.2s;
+        pointer-events: none;
+    }
+
+    /* Auto-fade: tabs faded by default, light up on tab-bar hover */
+    .tab-bar {
+        opacity: 0.3;
+        transition: opacity 0.3s ease 0.25s;
+    }
+
+    .tab-bar:hover {
+        opacity: 1;
+        transition: opacity 0.15s ease;
+    }
+
+    .tabs {
+        display: flex;
+        align-items: flex-start;
+        pointer-events: auto;
+    }
+
+    /* Chrome-style slanted tab with frosted glass */
+    .tab {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        height: 30px;
+        padding: 0 16px 0 12px;
+        background: rgba(30, 30, 46, 0.9);
+        backdrop-filter: blur(8px);
+        -webkit-backdrop-filter: blur(8px);
+        cursor: pointer;
+        min-width: 120px;
+        max-width: 200px;
+        margin-top: -1px;
+        clip-path: polygon(
+            0 0,
+            100% 0,
+            calc(100% - 4px) calc(100% - 6px),
+            calc(100% - 10px) 100%,
+            10px 100%,
+            4px calc(100% - 6px)
+        );
+        transition: all 0.15s;
+        position: relative;
+    }
+
+    .tab:hover {
+        background: rgba(69, 71, 90, 0.95);
+    }
+
+    .tab.active {
+        background: rgba(30, 30, 46, 0.95);
+        z-index: 1;
+    }
+
+    .tab.active::after {
+        content: '';
+        position: absolute;
+        bottom: 0;
+        left: 0;
+        right: 0;
+        height: 2px;
+        background: #89b4fa;
+    }
+
+    .tab.disconnected {
+        opacity: 0.6;
+    }
+
+    .tab.disconnected .tab-title {
+        color: #f38ba8;
+    }
+
+    .tab-icon {
+        font-size: 12px;
+        flex-shrink: 0;
+    }
+
+    .tab-title {
+        font-size: 11px;
+        color: #a6adc8;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        flex: 1;
+    }
+
+    .tab.active .tab-title {
+        color: #cdd6f4;
+    }
+
+    .tab-close {
+        width: 16px;
+        height: 16px;
+        border: none;
+        background: transparent;
+        color: #6c7086;
+        font-size: 12px;
+        cursor: pointer;
+        border-radius: 3px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        flex-shrink: 0;
+        opacity: 0;
+        transition: all 0.15s;
+    }
+
+    .tab:hover .tab-close {
+        opacity: 1;
+    }
+
+    .tab-close:hover {
+        background: #f38ba8;
+        color: #1e1e2e;
+    }
+
+    .tab-add {
+        pointer-events: auto;
+        width: 28px;
+        height: 28px;
+        background: rgba(30, 30, 46, 0.7);
+        backdrop-filter: blur(8px);
+        -webkit-backdrop-filter: blur(8px);
+        border: none;
+        border-radius: 0 0 6px 6px;
+        color: #6c7086;
+        font-size: 16px;
+        margin-left: 8px;
+        margin-top: 1px;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        transition: all 0.15s;
+    }
+
+    .tab-add:hover {
+        background: rgba(69, 71, 90, 0.9);
+        color: #cdd6f4;
+    }
+
+    /* Canvas fills entire wrapper, behind tabs */
+    .canvas-container {
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        overflow: hidden;
+        background: #000;
+    }
+
+    .canvas-container canvas {
+        width: 100%;
+        height: 100%;
+        object-fit: contain;
+        /* After encodeInfo: JS sets explicit width/height and clears object-fit.
+           max-width/max-height prevent overflow when encode res = capture res at fullscreen. */
+        max-width: 100%;
+        max-height: 100%;
+        background: #000;
+    }
+
+    /* Secure Desktop - dimmed canvas when UAC active */
+    .canvas-dimmed {
+        filter: brightness(0.3);
+        transition: filter 0.3s ease;
+    }
+
+    /* Secure Desktop overlay */
+    .secure-desktop-overlay {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        z-index: 10;
+        object-fit: contain;
+        pointer-events: none;
+    }
+
+    .secure-desktop-banner {
+        position: absolute;
+        top: 8px;
+        left: 50%;
+        transform: translateX(-50%);
+        z-index: 11;
+        background: rgba(220, 50, 50, 0.85);
+        color: #fff;
+        padding: 4px 16px;
+        border-radius: 4px;
+        font-size: 13px;
+        font-weight: 600;
+        letter-spacing: 0.5px;
+        pointer-events: none;
+    }
+
+    /* No tabs message */
+    .no-tabs-message {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        text-align: center;
+        color: #6c7086;
+    }
+
+    .no-tabs-message p {
+        margin-bottom: 16px;
+        font-size: 14px;
+    }
+
+    .add-connection-btn {
+        padding: 12px 24px;
+        background: #313244;
+        border: 1px solid #45475a;
+        border-radius: 8px;
+        color: #cdd6f4;
+        font-size: 14px;
+        cursor: pointer;
+        transition: all 0.15s;
+    }
+
+    .add-connection-btn:hover {
+        background: #45475a;
+        border-color: #89b4fa;
+        color: #89b4fa;
+    }
+
+    /* Reconnect overlay */
+    .reconnect-overlay {
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: rgba(17, 17, 27, 0.9);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 100;
+    }
+
+    .reconnect-dialog {
+        background: #1e1e2e;
+        border: 1px solid #313244;
+        border-radius: 12px;
+        padding: 32px 48px;
+        text-align: center;
+        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+    }
+
+    .reconnect-dialog h3 {
+        margin: 0 0 16px 0;
+        color: #f38ba8;
+        font-size: 18px;
+        font-weight: 500;
+    }
+
+    .reconnect-dialog p {
+        margin: 0 0 20px 0;
+        color: #a6adc8;
+        font-size: 14px;
+    }
+
+    .reconnect-buttons {
+        display: flex;
+        gap: 12px;
+        justify-content: center;
+        margin-bottom: 16px;
+    }
+
+    .reconnect-buttons button {
+        padding: 10px 20px;
+        border: none;
+        border-radius: 6px;
+        font-size: 13px;
+        cursor: pointer;
+        transition: all 0.15s;
+    }
+
+    .btn-primary {
+        background: #89b4fa;
+        color: #1e1e2e;
+    }
+
+    .btn-primary:hover {
+        background: #b4befe;
+    }
+
+    .btn-secondary {
+        background: #313244;
+        color: #cdd6f4;
+    }
+
+    .btn-secondary:hover {
+        background: #45475a;
+    }
+
+    .btn-danger {
+        background: #f38ba8;
+        color: #1e1e2e;
+    }
+
+    .btn-danger:hover {
+        background: #eba0ac;
+    }
+
+    .reconnect-attempts {
+        color: #6c7086;
+        font-size: 12px;
+        margin: 0;
+    }
+
+    /* Stats overlay */
+    .stats-overlay {
+        position: absolute;
+        top: 40px;
+        right: 10px;
+        z-index: 50;
+        background: rgba(17, 17, 27, 0.85);
+        color: #a6adc8;
+        font-family: 'Consolas', 'Courier New', monospace;
+        font-size: 12px;
+        padding: 8px 12px;
+        border-radius: 6px;
+        border: 1px solid #45475a;
+        pointer-events: none;
+        line-height: 1.6;
+        min-width: 260px;
+        backdrop-filter: blur(4px);
+    }
+
+    .stats-overlay pre {
+        margin: 0;
+        font-family: inherit;
+        font-size: inherit;
+        color: inherit;
+        white-space: pre;
+    }
+
+    /* Toast notification */
+    .toast-notification {
+        position: absolute;
+        bottom: 20px;
+        left: 50%;
+        transform: translateX(-50%);
+        z-index: 200;
+        background: rgba(243, 139, 168, 0.95);
+        color: #1e1e2e;
+        padding: 12px 24px;
+        border-radius: 8px;
+        font-size: 13px;
+        font-weight: 500;
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+        pointer-events: none;
+        animation: toast-fade-in 0.2s ease;
+    }
+
+    @@keyframes toast-fade-in {
+        from { opacity: 0; transform: translateX(-50%) translateY(10px); }
+        to { opacity: 1; transform: translateX(-50%) translateY(0); }
+    }
+
+    /* Connecting / waiting overlay */
+    .connecting-overlay {
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        z-index: 50;
+        background: rgba(17, 17, 27, 0.95);
+    }
+
+    .connecting-spinner {
+        width: 48px;
+        height: 48px;
+        border: 3px solid #313244;
+        border-top-color: #89b4fa;
+        border-radius: 50%;
+        animation: spin 1s linear infinite;
+        margin-bottom: 20px;
+    }
+
+    @@keyframes spin {
+        to { transform: rotate(360deg); }
+    }
+
+    .connecting-text {
+        color: #cdd6f4;
+        font-size: 16px;
+        font-weight: 500;
+        margin: 0 0 8px 0;
+    }
+
+    .connecting-subtext {
+        color: #6c7086;
+        font-size: 13px;
+        margin: 0;
+    }
+</style>

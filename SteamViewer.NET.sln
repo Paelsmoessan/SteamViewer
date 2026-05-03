@@ -1,0 +1,78 @@
+
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "SteamViewer.Common", "src\SteamViewer.Common\SteamViewer.Common.csproj", "{A1B2C3D4-1111-1111-1111-111111111111}"
+EndProject
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "SteamViewer.Server", "src\SteamViewer.Server\SteamViewer.Server.csproj", "{A1B2C3D4-2222-2222-2222-222222222222}"
+EndProject
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "SteamViewer.Client.Core", "src\SteamViewer.Client.Core\SteamViewer.Client.Core.csproj", "{A1B2C3D4-3333-3333-3333-333333333333}"
+EndProject
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "SteamViewer.Platform.Windows", "src\SteamViewer.Platform.Windows\SteamViewer.Platform.Windows.csproj", "{A1B2C3D4-4444-4444-4444-444444444444}"
+EndProject
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "SteamViewer.Platform.macOS", "src\SteamViewer.Platform.macOS\SteamViewer.Platform.macOS.csproj", "{A1B2C3D4-5555-5555-5555-555555555555}"
+EndProject
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "SteamViewer.App", "src\SteamViewer.App\SteamViewer.App.csproj", "{A1B2C3D4-6666-6666-6666-666666666666}"
+EndProject
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "SteamViewer.Server.Tests", "tests\SteamViewer.Server.Tests\SteamViewer.Server.Tests.csproj", "{A1B2C3D4-7777-7777-7777-777777777777}"
+EndProject
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "SteamViewer.Client.Core.Tests", "tests\SteamViewer.Client.Core.Tests\SteamViewer.Client.Core.Tests.csproj", "{A1B2C3D4-8888-8888-8888-888888888888}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{F1E2D3C4-0001-0001-0001-000000000001}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{F1E2D3C4-0002-0002-0002-000000000002}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{A1B2C3D4-1111-1111-1111-111111111111}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{A1B2C3D4-1111-1111-1111-111111111111}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{A1B2C3D4-1111-1111-1111-111111111111}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{A1B2C3D4-1111-1111-1111-111111111111}.Release|Any CPU.Build.0 = Release|Any CPU
+		{A1B2C3D4-2222-2222-2222-222222222222}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{A1B2C3D4-2222-2222-2222-222222222222}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{A1B2C3D4-2222-2222-2222-222222222222}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{A1B2C3D4-2222-2222-2222-222222222222}.Release|Any CPU.Build.0 = Release|Any CPU
+		{A1B2C3D4-3333-3333-3333-333333333333}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{A1B2C3D4-3333-3333-3333-333333333333}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{A1B2C3D4-3333-3333-3333-333333333333}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{A1B2C3D4-3333-3333-3333-333333333333}.Release|Any CPU.Build.0 = Release|Any CPU
+		{A1B2C3D4-4444-4444-4444-444444444444}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{A1B2C3D4-4444-4444-4444-444444444444}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{A1B2C3D4-4444-4444-4444-444444444444}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{A1B2C3D4-4444-4444-4444-444444444444}.Release|Any CPU.Build.0 = Release|Any CPU
+		{A1B2C3D4-5555-5555-5555-555555555555}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{A1B2C3D4-5555-5555-5555-555555555555}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{A1B2C3D4-5555-5555-5555-555555555555}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{A1B2C3D4-5555-5555-5555-555555555555}.Release|Any CPU.Build.0 = Release|Any CPU
+		{A1B2C3D4-6666-6666-6666-666666666666}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{A1B2C3D4-6666-6666-6666-666666666666}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{A1B2C3D4-6666-6666-6666-666666666666}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{A1B2C3D4-6666-6666-6666-666666666666}.Release|Any CPU.Build.0 = Release|Any CPU
+		{A1B2C3D4-7777-7777-7777-777777777777}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{A1B2C3D4-7777-7777-7777-777777777777}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{A1B2C3D4-7777-7777-7777-777777777777}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{A1B2C3D4-7777-7777-7777-777777777777}.Release|Any CPU.Build.0 = Release|Any CPU
+		{A1B2C3D4-8888-8888-8888-888888888888}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{A1B2C3D4-8888-8888-8888-888888888888}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{A1B2C3D4-8888-8888-8888-888888888888}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{A1B2C3D4-8888-8888-8888-888888888888}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{A1B2C3D4-1111-1111-1111-111111111111} = {F1E2D3C4-0001-0001-0001-000000000001}
+		{A1B2C3D4-2222-2222-2222-222222222222} = {F1E2D3C4-0001-0001-0001-000000000001}
+		{A1B2C3D4-3333-3333-3333-333333333333} = {F1E2D3C4-0001-0001-0001-000000000001}
+		{A1B2C3D4-4444-4444-4444-444444444444} = {F1E2D3C4-0001-0001-0001-000000000001}
+		{A1B2C3D4-5555-5555-5555-555555555555} = {F1E2D3C4-0001-0001-0001-000000000001}
+		{A1B2C3D4-6666-6666-6666-666666666666} = {F1E2D3C4-0001-0001-0001-000000000001}
+		{A1B2C3D4-7777-7777-7777-777777777777} = {F1E2D3C4-0002-0002-0002-000000000002}
+		{A1B2C3D4-8888-8888-8888-888888888888} = {F1E2D3C4-0002-0002-0002-000000000002}
+	EndGlobalSection
+EndGlobal
