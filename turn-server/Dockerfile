@@ -1,8 +1,8 @@
 FROM coturn/coturn:latest
 
+USER root
 COPY turnserver.conf /etc/turnserver.conf
-COPY start.sh /start.sh
-RUN chmod +x /start.sh
+COPY --chmod=755 start.sh /start.sh
 
 ENV PORT=3478
 
