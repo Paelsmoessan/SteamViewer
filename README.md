@@ -1,14 +1,16 @@
 # SteamViewer.NET
 
-A cross-platform remote desktop application built with .NET 8 MAUI Blazor. Enables secure, peer-to-peer screen sharing and remote control similar to TeamViewer.
+A portable remote desktop and support tool built with .NET 8 MAUI Blazor. No installation required - run the executable, share your ID and password, and connect. Supports full system-level elevation including UAC prompts, Secure Desktop, and lock screen access.
 
 ## Features
 
-- **P2P Screen Sharing** - Direct WebRTC connection between host and viewer
-- **Low Latency** - Browser-native video encoding with H264 hardware acceleration
-- **Secure** - DTLS-SRTP encryption, BLAKE3 password hashing
-- **File Transfer** - Chunked transfers over WebRTC data channel
-- **Cross-Platform** - Windows and macOS support (macOS requires Mac to build)
+- **Portable** - Single executable, no installation, no account required
+- **Full Elevation** - Control UAC prompts, Secure Desktop, and lock screen remotely
+- **P2P Connection** - Direct UDP with NAT traversal and TURN relay fallback
+- **Low Latency** - DXGI capture with hardware-accelerated H.264 encoding
+- **Encrypted** - AES-256-GCM transport encryption, BLAKE3 password hashing
+- **File Transfer** - Clipboard sync and chunked file transfers
+- **Multi-Session** - Connect to multiple machines in tabbed sessions
 
 ## Quick Start
 
