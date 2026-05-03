@@ -103,6 +103,25 @@ if defined PREV_TAG (
 :: Tag this release in the private repo (for next changelog)
 git tag "%TAG%" 2>nul
 
+:: Update CHANGELOG.md - prepend new version after header
+set "CHANGELOG=%ROOT%\CHANGELOG.md"
+if exist "%CHANGELOG%" (
+    set "TEMP_CL=%ROOT%\release-output\changelog-temp.md"
+    echo # Changelog> "!TEMP_CL!"
+    echo.>> "!TEMP_CL!"
+    for /f "tokens=1-3 delims=/" %%a in ("%DATE%") do set "TODAY=%%c-%%a-%%b"
+    echo ## %TAG% ^(!TODAY!^)>> "!TEMP_CL!"
+    echo.>> "!TEMP_CL!"
+    type "%NOTES_FILE%" >> "!TEMP_CL!"
+    echo.>> "!TEMP_CL!"
+    :: Append old changelog (skip first two lines: header + blank)
+    powershell -Command "Get-Content '%CHANGELOG%' | Select-Object -Skip 2 | Set-Content -Encoding utf8 '%ROOT%\release-output\old-cl.tmp'"
+    type "%ROOT%\release-output\old-cl.tmp" >> "!TEMP_CL!"
+    copy /y "!TEMP_CL!" "%CHANGELOG%" >nul
+    del /q "!TEMP_CL!" "%ROOT%\release-output\old-cl.tmp" 2>nul
+    echo   Updated CHANGELOG.md
+)
+
 :: Delete existing release with same tag (if re-running)
 gh release delete "%TAG%" --repo %PUBLIC_REPO% --yes 2>nul
 
