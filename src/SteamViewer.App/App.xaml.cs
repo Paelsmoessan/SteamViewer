@@ -1,5 +1,6 @@
 using SteamViewer.App.Services;
 using System.Collections.Concurrent;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 
 namespace SteamViewer.App;
@@ -12,6 +13,9 @@ public partial class App : Application
     private Window? _mainWindow;
     private readonly ConcurrentDictionary<string, Window> _viewerWindows = new();
     private bool _initialized;
+
+    [DllImport("user32.dll")] private static extern IntPtr GetActiveWindow();
+    [DllImport("user32.dll")] private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 
     private static readonly string WindowStateFile = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
@@ -58,6 +62,11 @@ public partial class App : Application
         {
             var debugPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SteamViewer", "exit-debug.txt");
             try { File.AppendAllText(debugPath, $"[{DateTime.Now:HH:mm:ss.fff}] Destroying fired\n"); } catch { }
+
+            // Hide window immediately so close feels instant (Win32 — works even if MAUI handler is torn down)
+            var hwnd = GetActiveWindow();
+            if (hwnd != IntPtr.Zero)
+                ShowWindow(hwnd, 0); // SW_HIDE
 
             SaveWindowState();
             try

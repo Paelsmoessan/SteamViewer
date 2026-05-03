@@ -1,60 +1,46 @@
 # SteamViewer TURN Server
 
-Self-hosted coturn TURN server for NAT traversal.
+Self-hosted coturn TURN server for NAT traversal, deployed on Railway (TCP only).
 
 ## Credentials
-- **Username**: `steamviewer`
-- **Password**: `SteamViewer2026SecureRelay!`
 
-## Deploy to Railway (Recommended)
+Credentials are in `turnserver.conf` (baked into Docker image at deploy time).
+They are **not** stored in the app binary - the app fetches them at runtime from the signaling server's `/api/turn-config` endpoint.
 
-1. **Create new Railway project:**
+To rotate credentials:
+1. Update `turnserver.conf` with new `user=<username>:<password>`
+2. Redeploy: `railway up`
+3. Update signaling server env vars: `TURN_USERNAME` and `TURN_CREDENTIAL`
+
+## Deploy to Railway
+
+1. **Link and deploy:**
    ```bash
    cd turn-server
-   railway login
-   railway init
+   railway link
    railway up
    ```
 
 2. **Get your Railway URL:**
-   - Go to Railway dashboard → your project → Settings → Networking
+   - Go to Railway dashboard -> Settings -> Networking
    - Generate a public domain (e.g., `steamviewer-turn-production.up.railway.app`)
-   - Note the port (usually shown as `443` for HTTPS or the mapped port)
 
-3. **Update appsettings.json:**
-   ```json
-   {
-     "TurnServer": {
-       "Enabled": true,
-       "Urls": [
-         "turn:steamviewer-turn-production.up.railway.app:443?transport=tcp"
-       ],
-       "Username": "steamviewer",
-       "Credential": "SteamViewer2026SecureRelay!"
-     }
-   }
+3. **Set signaling server env vars:**
+   ```bash
+   railway link -p SteamViewer-Signaling
+   railway variable set TURN_ENABLED=true
+   railway variable set TURN_URLS="turn:<your-turn-domain>:443?transport=tcp"
+   railway variable set TURN_USERNAME="<username from turnserver.conf>"
+   railway variable set TURN_CREDENTIAL="<password from turnserver.conf>"
    ```
 
-4. **Test the connection** - you should see `ICE candidate gathered: RELAY` in logs
-
-## Alternative: VPS (Full UDP support)
-
-For best performance with UDP, use a VPS (~$5/month):
-
-```bash
-# On Ubuntu VPS
-sudo apt update && sudo apt install coturn -y
-# Edit /etc/turnserver.conf, add: external-ip=YOUR_PUBLIC_IP
-sudo systemctl enable coturn && sudo systemctl start coturn
-sudo ufw allow 3478/udp && sudo ufw allow 3478/tcp
-```
+4. **Test** - you should see `ICE candidate gathered: RELAY` in logs
 
 ## Testing TURN Server
 
 Use https://webrtc.github.io/samples/src/content/peerconnection/trickle-ice/
 
-- TURN URI: `turn:YOUR_SERVER:PORT?transport=tcp`
-- Username: `steamviewer`
-- Password: `SteamViewer2026SecureRelay!`
+- TURN URI: `turn:<your-turn-domain>:443?transport=tcp`
+- Username/password: from `turnserver.conf`
 
 If you see "relay" candidates, it's working!

@@ -239,17 +239,16 @@ public static class BootRelayOrchestrator
                 BootRelayService.DebugLog("Using DxgiScreenCapture (real mode - SecureDesktopCapture TODO)");
             }
 
-            // Build IConfiguration with TURN config from reconnect credentials
-            var configDict = new Dictionary<string, string?>();
-            if (creds.TurnUrls?.Length > 0)
-                configDict["TurnServer:Urls:0"] = creds.TurnUrls[0];
-            if (!string.IsNullOrEmpty(creds.TurnUsername))
-                configDict["TurnServer:Username"] = creds.TurnUsername;
-            if (!string.IsNullOrEmpty(creds.TurnCredential))
-                configDict["TurnServer:Credential"] = creds.TurnCredential;
+            // Build minimal IConfiguration with signaling server URL
+            // (TURN config is fetched at runtime via TurnConfigService)
             var config = new ConfigurationBuilder()
-                .AddInMemoryCollection(configDict)
+                .AddInMemoryCollection(new Dictionary<string, string?>
+                {
+                    ["SignalingServer"] = creds.ServerUrl
+                })
                 .Build();
+            var turnConfigService = new TurnConfigService(
+                config, _loggerFactory.CreateLogger<TurnConfigService>());
 
             // Create input injector (same as DI provides to Home.razor)
             var inputInjector = new WindowsInputInjector(_loggerFactory.CreateLogger<WindowsInputInjector>());
@@ -266,6 +265,7 @@ public static class BootRelayOrchestrator
                 elevationService: null,
                 monitorEnumerator: null,
                 screenCapture: screenCapture,
+                turnConfigService: turnConfigService,
                 hostClientId: creds.ClientId,
                 hostPasswordHash: creds.PasswordHash);
 
