@@ -48,15 +48,14 @@ jobs:
         id: version
         shell: pwsh
         run: |
-          $dll = "src/SteamViewer.App/bin/Release/net8.0-windows10.0.19041.0/win10-x64/SteamViewer.App.dll"
-          $ver = (Get-Item $dll).VersionInfo.ProductVersion -replace '\+.*$',''
+          $ver = $env:GitBuildVersionSimple
           echo "VERSION=$ver" >> $env:GITHUB_OUTPUT
           Write-Host "Version: $ver"
 
       - name: Clean build output
         shell: pwsh
         run: |
-          $bin = "src/SteamViewer.App/bin/Release/net8.0-windows10.0.19041.0/win10-x64"
+          $bin = "src/SteamViewer.App/bin/Release/net8.0-windows10.0.19041.0"
           Remove-Item "$bin/*.pdb" -Force -ErrorAction SilentlyContinue
           Remove-Item "$bin/gist-id.txt" -Force -ErrorAction SilentlyContinue
           Remove-Item "$bin/kill-steamviewer.cmd" -Force -ErrorAction SilentlyContinue
@@ -64,7 +63,7 @@ jobs:
       - name: Create payload zip
         shell: pwsh
         run: |
-          $bin = "src/SteamViewer.App/bin/Release/net8.0-windows10.0.19041.0/win10-x64"
+          $bin = "src/SteamViewer.App/bin/Release/net8.0-windows10.0.19041.0"
           $payload = "tools/app-launcher/payload"
           New-Item -ItemType Directory -Path $payload -Force
           Compress-Archive -Path "$bin/*" -DestinationPath "$payload/SteamViewer.zip" -Force
