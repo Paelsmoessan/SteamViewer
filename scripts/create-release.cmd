@@ -8,42 +8,56 @@ echo ==========================================
 echo.
 
 set "PUBLIC_REPO=D:\_Development\SteamViewer"
+set "GH_REPO=Paelsmoessan/SteamViewer"
 
 if not exist "%PUBLIC_REPO%\.git" (
     echo ERROR: Public repo not found at %PUBLIC_REPO%
     exit /b 1
 )
 
-:: Get version from the app DLL if available, otherwise prompt
-set "VERSION="
-if "%~1" neq "" (
-    set "VERSION=%~1"
-) else (
-    set "APP_DLL=src\SteamViewer.App\bin\Release\net8.0-windows10.0.19041.0\win10-x64\SteamViewer.App.dll"
-    if exist "%APP_DLL%" (
-        for /f "tokens=*" %%v in ('powershell -Command "(Get-Item '%APP_DLL%').VersionInfo.ProductVersion -replace '\+.*$',''"') do set "AUTO_VER=%%v"
-        echo   Detected version from build: !AUTO_VER!
-    )
-    echo.
-    set /p VERSION="Tag version (e.g., 0.1.42): "
+:: Get latest release tag from GitHub
+set "LATEST="
+for /f "tokens=*" %%t in ('gh release list --repo %GH_REPO% --limit 1 --json tagName -q ".[0].tagName" 2^>nul') do set "LATEST=%%t"
+
+if not defined LATEST (
+    echo   No previous releases found. Starting at v0.1.0-alpha
+    set "NEXT_PATCH=0"
+    goto :show_tag
 )
 
-if "%VERSION%"=="" (
-    echo ERROR: No version specified.
+echo   Latest release: %LATEST%
+
+:: Parse patch number from tag like v0.1.2-alpha or v0.1.0-alpha.1
+:: Strip "v" prefix
+set "VER=%LATEST:~1%"
+:: Strip "-alpha" and anything after
+for /f "tokens=1 delims=-" %%v in ("%VER%") do set "VER_CLEAN=%%v"
+:: Get patch number (third segment): 0.1.2 -> 2
+for /f "tokens=3 delims=." %%p in ("%VER_CLEAN%") do set "CURRENT_PATCH=%%p"
+
+if not defined CURRENT_PATCH (
+    echo ERROR: Could not parse patch number from %LATEST%
     exit /b 1
 )
 
-:: Ensure v prefix
-set "TAG=v%VERSION%"
-echo %VERSION% | findstr /b "v" >nul && set "TAG=%VERSION%"
+set /a NEXT_PATCH=CURRENT_PATCH+1
 
-echo.
-echo   Tag: %TAG%
-echo   Repo: %PUBLIC_REPO%
+:show_tag
+set "TAG=v0.1.%NEXT_PATCH%-alpha"
+
+echo   Next release:   %TAG%
 echo.
 
-:: Check if tag already exists on public repo
+:: Allow override if passed as argument
+if "%~1" neq "" (
+    set "TAG=%~1"
+    echo   Override tag:   %TAG%
+    echo.
+)
+
 cd /d "%PUBLIC_REPO%"
+
+:: Check if tag already exists
 git tag -l "%TAG%" | findstr "%TAG%" >nul 2>&1
 if %errorlevel%==0 (
     echo ERROR: Tag %TAG% already exists on public repo.
@@ -66,6 +80,6 @@ git push origin "%TAG%"
 echo.
 echo ==========================================
 echo   Tag %TAG% pushed - release build triggered
-echo   https://github.com/Paelsmoessan/SteamViewer/actions
+echo   https://github.com/%GH_REPO%/actions
 echo ==========================================
 echo.

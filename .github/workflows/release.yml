@@ -99,13 +99,9 @@ jobs:
         run: |
           $prev = git describe --tags --abbrev=0 --match "v*" HEAD^ 2>$null
           if ($prev) {
-            $log = git log --oneline --no-decorate "$prev..HEAD" | ForEach-Object {
-              if ($_.Length -gt 9) { "- $($_.Substring(9))" } else { "- $_" }
-            }
+            $log = git log --format="- %s" "$prev..HEAD"
           } else {
-            $log = git log --oneline --no-decorate -10 | ForEach-Object {
-              if ($_.Length -gt 9) { "- $($_.Substring(9))" } else { "- $_" }
-            }
+            $log = git log --format="- %s" -10
           }
           $body = "## Changes`n`n$($log -join "`n")"
           $body | Out-File -FilePath release-notes.md -Encoding utf8
