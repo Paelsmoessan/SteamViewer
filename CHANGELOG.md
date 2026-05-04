@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.1.0 (2026-05-04)
+## v0.1 (2026-05-04)
 
 ### Native Keyboard Capture
 - Replace WebView2/JS keyboard pipeline with native Win32 WH_KEYBOARD_LL hook (Sunshine pattern)
