@@ -345,8 +345,9 @@
                 _loggerDotNetRef = DotNetObjectReference.Create(this);
                 await JSRuntime.InvokeVoidAsync("SteamViewerLogger.initialize", _loggerDotNetRef);
 
-                // Subscribe to system key interception (Win, Alt+Tab)
+                // Subscribe to system key interception (Win, Alt+Tab) and full keyboard capture
                 SystemKeyInterceptor.SystemKeyIntercepted += OnSystemKeyIntercepted;
+                SystemKeyInterceptor.KeyEventCaptured += OnKeyEventCaptured;
             }
             catch (Exception ex)
             {
@@ -776,10 +777,12 @@
         {
             await JSRuntime.InvokeVoidAsync("SteamViewerInput.lock");
             SystemKeyInterceptor.Install();
+            SetupKeyboardCapture();
         }
         else
         {
             await JSRuntime.InvokeVoidAsync("SteamViewerInput.unlock");
+            SystemKeyInterceptor.FullCapture = false;
             SystemKeyInterceptor.Uninstall();
         }
         if (ActiveTab != null) ActiveTab.InputLocked = _inputLocked;
@@ -1308,6 +1311,51 @@
             SendInputToActiveSession(new InputEvent.KeyUp(key, modifiers));
     }
 
+    /// <summary>
+    /// Called by WH_KEYBOARD_LL hook for ALL keystrokes when Active capture mode.
+    /// Sends raw scan codes to host for Sunshine-pattern injection.
+    /// In LogOnly mode this is never fired - hook only logs.
+    /// </summary>
+    private void OnKeyEventCaptured(ushort scanCode, ushort vkCode, bool isDown, bool isExtended, KeyModifiers modifiers)
+    {
+        InputEvent ev = isDown
+            ? new InputEvent.KeyDownScan(scanCode, vkCode, modifiers, isExtended)
+            : new InputEvent.KeyUpScan(scanCode, vkCode, modifiers, isExtended);
+        SendInputToActiveSession(ev);
+    }
+
+    private void SetupKeyboardCapture()
+    {
+        var hwnd = GetViewerWindowHandle();
+        if (hwnd != IntPtr.Zero)
+        {
+            SystemKeyInterceptor.SetViewerHwnd(hwnd);
+            // Phase A: LogOnly - hook logs scan codes but JS still handles input
+            // Phase B will change this to Active mode
+            if (SystemKeyInterceptor is SteamViewer.Platform.Windows.Input.WindowsSystemKeyInterceptor winInterceptor)
+                winInterceptor.Mode = SteamViewer.Platform.Windows.Input.CaptureMode.LogOnly;
+        }
+        else
+        {
+            Logger.LogWarning("[Viewer] Could not get window handle - keyboard capture disabled, JS fallback only");
+        }
+    }
+
+    private static IntPtr GetViewerWindowHandle()
+    {
+#if WINDOWS
+        if (Application.Current?.Windows.Count > 0)
+        {
+            var platformWindow = Application.Current.Windows[0].Handler?.PlatformView;
+            if (platformWindow is Microsoft.UI.Xaml.Window winUIWindow)
+            {
+                return WinRT.Interop.WindowNative.GetWindowHandle(winUIWindow);
+            }
+        }
+#endif
+        return IntPtr.Zero;
+    }
+
     // --- InputMessageRouter event handlers (WebView2 postMessage → C#) ---
 
     private void HandleCtrlAltDelFromRouter()
@@ -1324,9 +1372,15 @@
     {
         _inputLocked = locked;
         if (locked)
+        {
             SystemKeyInterceptor.Install();
+            SetupKeyboardCapture();
+        }
         else
+        {
+            SystemKeyInterceptor.FullCapture = false;
             SystemKeyInterceptor.Uninstall();
+        }
 
         if (_activeSession != null)
             _ = _activeSession.SendInputLockStateAsync(locked);
@@ -1489,7 +1543,9 @@
         }
 
         // Clean up system key hook
+        SystemKeyInterceptor.KeyEventCaptured -= OnKeyEventCaptured;
         SystemKeyInterceptor.SystemKeyIntercepted -= OnSystemKeyIntercepted;
+        SystemKeyInterceptor.FullCapture = false;
         SystemKeyInterceptor.Uninstall();
 
         // Clean up reconnect timer
