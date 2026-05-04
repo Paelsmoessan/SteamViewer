@@ -204,6 +204,12 @@ internal static class Win32Input
             case InputEvent.KeyUp keyUp:
                 InjectKey(keyUp.Key, keyUp.Modifiers, isDown: false, keyUp.Code, keyUp.AltGr);
                 break;
+            case InputEvent.KeyDownScan scanDown:
+                InjectScanCode(scanDown.ScanCode, isDown: true, scanDown.IsExtended);
+                break;
+            case InputEvent.KeyUpScan scanUp:
+                InjectScanCode(scanUp.ScanCode, isDown: false, scanUp.IsExtended);
+                break;
         }
     }
 
@@ -713,6 +719,30 @@ internal static class Win32Input
         return null;
     }
 
+    internal static void InjectScanCode(ushort scanCode, bool isDown, bool isExtended)
+    {
+        var flags = KEYEVENTF_SCANCODE | (isDown ? 0u : KEYEVENTF_KEYUP);
+        if (isExtended) flags |= KEYEVENTF_EXTENDEDKEY;
+
+        var input = new INPUT
+        {
+            type = INPUT_KEYBOARD,
+            union = new InputUnion
+            {
+                ki = new KEYBDINPUT
+                {
+                    wVk = 0,
+                    wScan = scanCode,
+                    dwFlags = flags,
+                    time = 0,
+                    dwExtraInfo = IntPtr.Zero
+                }
+            }
+        };
+
+        SendInputWithRetry(1, new[] { input }, Marshal.SizeOf<INPUT>());
+    }
+
     internal static void ReleaseAllModifiers()
     {
         ushort[] modifierVks =
@@ -753,6 +783,7 @@ internal static class Win32Input
     internal const uint KEYEVENTF_EXTENDEDKEY = 0x0001;
     internal const uint KEYEVENTF_KEYUP = 0x0002;
     internal const uint KEYEVENTF_UNICODE = 0x0004;
+    internal const uint KEYEVENTF_SCANCODE = 0x0008;
 
     internal const int WHEEL_DELTA = 120;
     internal const uint XBUTTON1 = 0x0001;

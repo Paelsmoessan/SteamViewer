@@ -513,11 +513,19 @@
             _ = _activeSession.EnableStatsRelayAsync();
         }
 
-        // Apply restored input lock state to JS
+        // Apply restored input lock state to JS and native capture
         if (_inputLocked)
+        {
             _ = JSRuntime.InvokeVoidAsync("SteamViewerInput.lock");
+            SystemKeyInterceptor.Install();
+            _ = SetupKeyboardCapture();
+        }
         else
+        {
+            _ = JSRuntime.InvokeVoidAsync("SteamViewerInput.setNativeKeyboardActive", false);
             _ = JSRuntime.InvokeVoidAsync("SteamViewerInput.unlock");
+            SystemKeyInterceptor.FullCapture = false;
+        }
 
         InvokeAsync(StateHasChanged);
     }
@@ -777,10 +785,11 @@
         {
             await JSRuntime.InvokeVoidAsync("SteamViewerInput.lock");
             SystemKeyInterceptor.Install();
-            SetupKeyboardCapture();
+            await SetupKeyboardCapture();
         }
         else
         {
+            await JSRuntime.InvokeVoidAsync("SteamViewerInput.setNativeKeyboardActive", false);
             await JSRuntime.InvokeVoidAsync("SteamViewerInput.unlock");
             SystemKeyInterceptor.FullCapture = false;
             SystemKeyInterceptor.Uninstall();
@@ -1324,16 +1333,18 @@
         SendInputToActiveSession(ev);
     }
 
-    private void SetupKeyboardCapture()
+    private async Task SetupKeyboardCapture()
     {
         var hwnd = GetViewerWindowHandle();
         if (hwnd != IntPtr.Zero)
         {
             SystemKeyInterceptor.SetViewerHwnd(hwnd);
-            // Phase A: LogOnly - hook logs scan codes but JS still handles input
-            // Phase B will change this to Active mode
             if (SystemKeyInterceptor is SteamViewer.Platform.Windows.Input.WindowsSystemKeyInterceptor winInterceptor)
-                winInterceptor.Mode = SteamViewer.Platform.Windows.Input.CaptureMode.LogOnly;
+            {
+                winInterceptor.Mode = SteamViewer.Platform.Windows.Input.CaptureMode.Active;
+                await JSRuntime.InvokeVoidAsync("SteamViewerInput.setNativeKeyboardActive", true);
+                Logger.LogInformation("[Viewer] Native keyboard capture active, JS keyboard silenced");
+            }
         }
         else
         {
@@ -1368,16 +1379,17 @@
         await InvokeAsync(async () => await OnClipboardPaste());
     }
 
-    private void HandleLockChangedFromRouter(bool locked)
+    private async void HandleLockChangedFromRouter(bool locked)
     {
         _inputLocked = locked;
         if (locked)
         {
             SystemKeyInterceptor.Install();
-            SetupKeyboardCapture();
+            await SetupKeyboardCapture();
         }
         else
         {
+            await JSRuntime.InvokeVoidAsync("SteamViewerInput.setNativeKeyboardActive", false);
             SystemKeyInterceptor.FullCapture = false;
             SystemKeyInterceptor.Uninstall();
         }
@@ -1385,7 +1397,7 @@
         if (_activeSession != null)
             _ = _activeSession.SendInputLockStateAsync(locked);
 
-        InvokeAsync(StateHasChanged);
+        await InvokeAsync(StateHasChanged);
     }
 
     #endregion

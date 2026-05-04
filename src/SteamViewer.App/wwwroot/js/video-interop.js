@@ -535,6 +535,8 @@ window.SteamViewerInput = {
     _regulationTimer: null,
     // Remote cursor shape from host
     _remoteCursorShape: 'default',
+    // Native keyboard capture (WH_KEYBOARD_LL) - when true, JS keyboard handlers are silent
+    _nativeKeyboardActive: false,
 
     // === Lifecycle ===
 
@@ -654,12 +656,18 @@ window.SteamViewerInput = {
 
     unlock() {
         this.isLocked = false;
+        this._nativeKeyboardActive = false;
         this.updateLockIndicator();
         this.notifyLockChange();
         this._stopRegulationTimer();
         // Restore default cursor
         if (this.canvas) this.canvas.style.cursor = '';
         console.log('[Input] UNLOCKED');
+    },
+
+    setNativeKeyboardActive(active) {
+        this._nativeKeyboardActive = active;
+        console.log('[Input] nativeKeyboardActive=' + active);
     },
 
     notifyLockChange() {
@@ -1003,6 +1011,7 @@ window.SteamViewerInput = {
     handleKeyDown(e) {
         if (!this.isCapturing || !this.isLocked || !window.chrome?.webview) return;
         e.preventDefault();
+        if (this._nativeKeyboardActive) return;
 
         // Drop autorepeat Control keydowns. WebView2 autorepeats the phantom ControlLeft
         // during AltGr hold without re-firing AltRight; each repeat would otherwise hit
@@ -1082,6 +1091,7 @@ window.SteamViewerInput = {
     handleKeyUp(e) {
         if (!this.isCapturing || !this.isLocked || !window.chrome?.webview) return;
         e.preventDefault();
+        if (this._nativeKeyboardActive) return;
 
         // Flush any pending Control on keyup (noVNC pattern)
         this._flushPendingCtrl();
