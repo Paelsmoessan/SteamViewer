@@ -2,15 +2,23 @@
 
 A portable remote desktop and support tool built with .NET 8 MAUI Blazor. No installation required - run the executable, share your ID and password, and connect. Supports full system-level elevation including UAC prompts, Secure Desktop, and lock screen access.
 
+## Download
+
+Grab the latest release from [GitHub Releases](https://github.com/Paelsmoessan/SteamViewer/releases/latest). Single portable executable - no installation needed.
+
+> **Windows SmartScreen:** The binary is not yet code-signed. Right-click the exe → Properties → check "Unblock" → OK, then run.
+
 ## Features
 
 - **Portable** - Single executable, no installation, no account required
 - **Full Elevation** - Control UAC prompts, Secure Desktop, and lock screen remotely
+- **Native Keyboard Capture** - Win32 low-level hook with raw scan codes (Sunshine pattern), AltGr handled correctly
 - **P2P Connection** - Direct UDP with NAT traversal and TURN relay fallback
 - **Low Latency** - DXGI capture with hardware-accelerated H.264 encoding
-- **Encrypted** - AES-256-GCM transport encryption, BLAKE3 password hashing
+- **Encrypted** - DTLS-SRTP end-to-end encryption, BLAKE3 password hashing
 - **File Transfer** - Clipboard sync and chunked file transfers
 - **Multi-Session** - Connect to multiple machines in tabbed sessions
+- **Auto-Reconnect** - Saved credentials with automatic reconnection
 
 ## Quick Start
 
@@ -30,7 +38,7 @@ dotnet run --project src/SteamViewer.App -f net8.0-windows10.0.19041.0
 
 ### Debug Credentials
 In DEBUG builds, predetermined credentials are used for easy testing:
-- **Host ID**: `123456789`
+- **Host ID**: Machine name (e.g. `DEV1`)
 - **Password**: `TESTPASS`
 
 ## How It Works
@@ -40,7 +48,7 @@ In DEBUG builds, predetermined credentials are used for easy testing:
 3. Host approves the connection
 4. UDP hole-punch establishes a direct peer-to-peer link (with TURN relay fallback)
 5. Host captures the screen via DXGI Desktop Duplication
-6. Video is encoded with FFmpeg (libx264), encrypted with AES-256-GCM, and streamed over UDP
+6. Video is encoded with FFmpeg (libx264), encrypted via DTLS-SRTP, and streamed over UDP
 7. Viewer decodes and renders frames on a canvas via WebView2
 
 ## Architecture
@@ -51,7 +59,7 @@ In DEBUG builds, predetermined credentials are used for easy testing:
 │  (MAUI App) │                    │   (ASP.NET)     │
 └──────┬──────┘                    └────────┬────────┘
        │                                    │
-       │ UDP P2P (AES-256-GCM)              │ WebSocket
+       │ UDP P2P (DTLS-SRTP)                │ WebSocket
        │                                    │
        ▼                                    ▼
 ┌─────────────┐                    ┌─────────────────┐
@@ -84,7 +92,7 @@ SteamViewer.NET/
 - **DXGI Desktop Duplication** - Native screen capture
 - **QOI** - Lossless image codec for Secure Desktop capture
 - **ASP.NET Core** - WebSocket signaling server
-- **AES-256-GCM** - Transport encryption
+- **DTLS-SRTP** - End-to-end transport encryption
 - **BLAKE3** - Password hashing
 - **UDP P2P** - Direct peer-to-peer with NAT traversal and TURN relay fallback
 
