@@ -524,6 +524,8 @@ public sealed class HostSession : IAsyncDisposable
         _logger.LogInformation("Transport state changed: {State}", state);
         if (state == "disconnected")
         {
+            _inputInjector.ReleaseAllModifiers();
+
             if (State == HostSessionState.Connected)
             {
                 SetState(HostSessionState.Disconnected);
@@ -1514,6 +1516,8 @@ public sealed class HostSession : IAsyncDisposable
     /// <summary>Disconnect and clean up the session.</summary>
     public async Task DisconnectAsync()
     {
+        _inputInjector.ReleaseAllModifiers();
+
         if (_transport != null)
         {
             await _transport.DisposeAsync();

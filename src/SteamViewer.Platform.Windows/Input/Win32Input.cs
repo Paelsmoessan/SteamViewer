@@ -204,6 +204,12 @@ internal static class Win32Input
             case InputEvent.KeyUp keyUp:
                 InjectKey(keyUp.Key, keyUp.Modifiers, isDown: false, keyUp.Code, keyUp.AltGr);
                 break;
+            case InputEvent.KeyDownScan scanDown:
+                InjectScanCode(scanDown.ScanCode, isDown: true, scanDown.IsExtended);
+                break;
+            case InputEvent.KeyUpScan scanUp:
+                InjectScanCode(scanUp.ScanCode, isDown: false, scanUp.IsExtended);
+                break;
         }
     }
 
@@ -713,6 +719,48 @@ internal static class Win32Input
         return null;
     }
 
+    internal static void InjectScanCode(ushort scanCode, bool isDown, bool isExtended)
+    {
+        var flags = KEYEVENTF_SCANCODE | (isDown ? 0u : KEYEVENTF_KEYUP);
+        if (isExtended) flags |= KEYEVENTF_EXTENDEDKEY;
+
+        var input = new INPUT
+        {
+            type = INPUT_KEYBOARD,
+            union = new InputUnion
+            {
+                ki = new KEYBDINPUT
+                {
+                    wVk = 0,
+                    wScan = scanCode,
+                    dwFlags = flags,
+                    time = 0,
+                    dwExtraInfo = IntPtr.Zero
+                }
+            }
+        };
+
+        SendInputWithRetry(1, new[] { input }, Marshal.SizeOf<INPUT>());
+    }
+
+    internal static void ReleaseAllModifiers()
+    {
+        ushort[] modifierVks =
+        [
+            VK_SHIFT, 0xA0, 0xA1,       // VK_SHIFT, VK_LSHIFT, VK_RSHIFT
+            VK_CONTROL, 0xA2, 0xA3,     // VK_CONTROL, VK_LCONTROL, VK_RCONTROL
+            VK_MENU, 0xA4, 0xA5,        // VK_MENU, VK_LMENU, VK_RMENU
+            VK_LWIN, 0x5C               // VK_LWIN, VK_RWIN
+        ];
+
+        var inputs = new List<INPUT>();
+        foreach (var vk in modifierVks)
+            AddKeyInput(inputs, vk, isDown: false);
+
+        if (inputs.Count > 0)
+            SendInputWithRetry((uint)inputs.Count, inputs.ToArray(), Marshal.SizeOf<INPUT>());
+    }
+
     #region Win32 Interop
 
     internal const int INPUT_MOUSE = 0;
@@ -735,6 +783,7 @@ internal static class Win32Input
     internal const uint KEYEVENTF_EXTENDEDKEY = 0x0001;
     internal const uint KEYEVENTF_KEYUP = 0x0002;
     internal const uint KEYEVENTF_UNICODE = 0x0004;
+    internal const uint KEYEVENTF_SCANCODE = 0x0008;
 
     internal const int WHEEL_DELTA = 120;
     internal const uint XBUTTON1 = 0x0001;

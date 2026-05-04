@@ -500,6 +500,13 @@ window.SteamViewerInput = {
     _boundKeyDown: null,
     _boundKeyUp: null,
     _altGrDown: false,
+    _altGrArmed: false,
+    _altGrCtrlTime: 0,
+    _altGrTimeout: null,
+    _altGrCtrlMsg: null,
+    _altGrRecentlyReleased: false,
+    _altGrReleaseTimeout: null,
+    _realCtrlDownSent: false,
 
     // PID mouse regulation tuning
     _pidAlpha: 0.35,
@@ -528,6 +535,8 @@ window.SteamViewerInput = {
     _regulationTimer: null,
     // Remote cursor shape from host
     _remoteCursorShape: 'default',
+    // Native keyboard capture (WH_KEYBOARD_LL) - when true, JS keyboard handlers are silent
+    _nativeKeyboardActive: false,
 
     // === Lifecycle ===
 
@@ -647,12 +656,18 @@ window.SteamViewerInput = {
 
     unlock() {
         this.isLocked = false;
+        this._nativeKeyboardActive = false;
         this.updateLockIndicator();
         this.notifyLockChange();
         this._stopRegulationTimer();
         // Restore default cursor
         if (this.canvas) this.canvas.style.cursor = '';
         console.log('[Input] UNLOCKED');
+    },
+
+    setNativeKeyboardActive(active) {
+        this._nativeKeyboardActive = active;
+        console.log('[Input] nativeKeyboardActive=' + active);
     },
 
     notifyLockChange() {
@@ -979,15 +994,77 @@ window.SteamViewerInput = {
 
     // === Keyboard Handlers ===
 
+    _flushPendingCtrl() {
+        if (this._altGrArmed) {
+            this._altGrArmed = false;
+            clearTimeout(this._altGrTimeout);
+            if (this._altGrCtrlMsg) {
+                console.log('[AltGr] flush buffered Ctrl as real keydown, _realCtrlDownSent=true');
+                window.chrome.webview.postMessage(JSON.stringify(this._altGrCtrlMsg));
+                this._realCtrlDownSent = true;
+            }
+            this._altGrCtrlMsg = null;
+            this._altGrTimeout = null;
+        }
+    },
+
     handleKeyDown(e) {
         if (!this.isCapturing || !this.isLocked || !window.chrome?.webview) return;
         e.preventDefault();
+        if (this._nativeKeyboardActive) return;
 
-        // AltGr tracking: WebView2/WinUI bug (microsoft-ui-xaml#10284) strips AltGr composition.
-        // Track AltGr state but let ALL keys through — no filtering.
-        // Host gets matched Control down/up pairs so modifiers won't stick.
+        // Drop autorepeat Control keydowns. WebView2 autorepeats the phantom ControlLeft
+        // during AltGr hold without re-firing AltRight; each repeat would otherwise hit
+        // the noVNC 100ms safety timeout and ship as real Ctrl, leaving Ctrl stuck on
+        // the host. The first phantom (repeat=false) still flows through the buffer and
+        // is suppressed if AltRight follows. For real Ctrl held alone, Windows handles
+        // VK_CONTROL autorepeat at the OS level once pressed, so dropping JS autorepeats
+        // is invisible to the user. Discriminator confirmed via [AltGr-Diag] log:
+        // phantom autorepeats have repeat=true, real single-press has repeat=false.
+        if (e.key === 'Control' && e.repeat) {
+            return;
+        }
+
+        // AltGr phantom Control suppression (noVNC pattern).
+        // WebView2/WinUI bug: AltGr fires phantom ControlLeft BEFORE AltRight.
+        // Buffer the Control and check if AltRight follows within 50ms.
+        if (e.key === 'Control' && !this._altGrDown) {
+            var msg = {
+                type: 'input', method: 'keyDown',
+                key: e.key, modifiers: this.getModifiers(e)
+            };
+            this._altGrArmed = true;
+            this._altGrCtrlTime = e.timeStamp;
+            this._altGrCtrlMsg = msg;
+            this._altGrTimeout = setTimeout(() => {
+                console.log('[AltGr] 100ms timeout - flush Ctrl as real');
+                this._flushPendingCtrl();
+            }, 100);
+            console.log('[AltGr] Control buffered, armed=true, code=' + e.code + ', ts=' + e.timeStamp.toFixed(1));
+            return;
+        }
+
         if (e.code === 'AltRight') {
+            if (this._altGrArmed && (e.timeStamp - this._altGrCtrlTime) < 50) {
+                var delta = (e.timeStamp - this._altGrCtrlTime).toFixed(1);
+                console.log('[AltGr] phantom Ctrl SUPPRESSED (delta=' + delta + 'ms)');
+                this._altGrArmed = false;
+                clearTimeout(this._altGrTimeout);
+                this._altGrCtrlMsg = null;
+                this._altGrTimeout = null;
+            } else {
+                console.log('[AltGr] AltRight arrived but delta too large, flushing Ctrl');
+                this._flushPendingCtrl();
+            }
             this._altGrDown = true;
+            console.log('[AltGr] altGrDown=true');
+            return;
+        }
+
+        // Any other key while armed: flush the buffered Control first (it was real Ctrl)
+        if (this._altGrArmed) {
+            console.log('[AltGr] other key="' + e.key + '" code=' + e.code + ' while armed, flushing Ctrl as real');
+            this._flushPendingCtrl();
         }
 
         // Ctrl+V → clipboard paste through C# (only real Ctrl, not AltGr)
@@ -1006,6 +1083,7 @@ window.SteamViewerInput = {
         if (this._altGrDown && e.code !== 'AltRight' && e.key !== 'Control') {
             msg.code = e.code;
             msg.altGr = true;
+            console.log('[AltGr] sending key="' + e.key + '" code=' + e.code + ' altGr=true');
         }
         window.chrome.webview.postMessage(JSON.stringify(msg));
     },
@@ -1013,9 +1091,33 @@ window.SteamViewerInput = {
     handleKeyUp(e) {
         if (!this.isCapturing || !this.isLocked || !window.chrome?.webview) return;
         e.preventDefault();
+        if (this._nativeKeyboardActive) return;
+
+        // Flush any pending Control on keyup (noVNC pattern)
+        this._flushPendingCtrl();
 
         if (e.code === 'AltRight') {
             this._altGrDown = false;
+            this._altGrRecentlyReleased = true;
+            clearTimeout(this._altGrReleaseTimeout);
+            this._altGrReleaseTimeout = setTimeout(() => {
+                this._altGrRecentlyReleased = false;
+            }, 50);
+            console.log('[AltGr] altGrDown=false, recentlyReleased=true');
+            return;
+        }
+
+        // Suppress phantom Control keyup ONLY if we never sent a real Ctrl keydown.
+        // If _realCtrlDownSent is true, the host has Ctrl pressed and MUST receive the keyup
+        // regardless of AltGr flag state - otherwise Ctrl gets stuck.
+        if (e.key === 'Control' && (this._altGrDown || this._altGrRecentlyReleased) && !this._realCtrlDownSent) {
+            console.log('[AltGr] phantom Ctrl keyup SUPPRESSED (altGrDown=' + this._altGrDown + ', recent=' + this._altGrRecentlyReleased + ', realSent=false)');
+            return;
+        }
+
+        if (e.key === 'Control' && this._realCtrlDownSent) {
+            console.log('[AltGr] real Ctrl keyup ALLOWED through (altGrDown=' + this._altGrDown + ', recent=' + this._altGrRecentlyReleased + ', realSent=true), clearing _realCtrlDownSent');
+            this._realCtrlDownSent = false;
         }
 
         var msg = {

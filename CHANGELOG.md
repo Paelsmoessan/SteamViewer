@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.1 (2026-05-04)
+
+### Native Keyboard Capture
+- Replace WebView2/JS keyboard pipeline with native Win32 WH_KEYBOARD_LL hook (Sunshine pattern)
+- Raw scan codes sent via KEYEVENTF_SCANCODE - host keyboard driver composes characters naturally
+- AltGr phantom Ctrl (scan code 0x21D) dropped at hook level - eliminates the entire class of AltGr bugs
+- JS keyboard path preserved as automatic fallback for UAC-elevated foreground apps
+- PID-based foreground detection (fixes MAUI/WinUI3 window hierarchy HWND mismatch)
+- Race-free modifier bitfield replaces GetAsyncKeyState
+
+### Improvements
+- ILogger replaces Console.WriteLine in keyboard hook (Console output silently swallowed in MAUI Windows)
+- Two-step capture enable/disable: native capture activates before JS silenced, JS re-enabled before capture disabled
+- Release tagger script for tag-triggered GitHub Actions builds
+
+### Fixes
+- Fix AltGr-hold stuck Ctrl on host (WebView2 autorepeat phantom ControlLeft)
+- Fix modifier keys stuck on host after disconnect (ReleaseAllModifiers safety net)
+
 ## v0.1.2-alpha (2026-05-03)
 
 ### Security

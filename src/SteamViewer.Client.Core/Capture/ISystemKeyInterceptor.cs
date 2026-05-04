@@ -1,3 +1,5 @@
+using SteamViewer.Common.Protocol;
+
 namespace SteamViewer.Client.Core.Capture;
 
 /// <summary>
@@ -20,4 +22,10 @@ public interface ISystemKeyInterceptor : IDisposable
     /// Parameters: (key string matching JS e.key format, isKeyDown)
     /// </summary>
     event Action<string, bool, bool>? SystemKeyIntercepted; // (key, isDown, isAltHeld)
+
+    event Action<ushort, ushort, bool, bool, KeyModifiers>? KeyEventCaptured; // (scanCode, vkCode, isDown, isExtended, modifiers)
+
+    bool FullCapture { get; set; }
+
+    void SetViewerHwnd(IntPtr hwnd);
 }

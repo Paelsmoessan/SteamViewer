@@ -1,4 +1,5 @@
 using SteamViewer.Client.Core.Capture;
+using SteamViewer.Common.Protocol;
 
 namespace SteamViewer.Platform.macOS.Input;
 
@@ -8,8 +9,11 @@ namespace SteamViewer.Platform.macOS.Input;
 public sealed class MacSystemKeyInterceptor : ISystemKeyInterceptor
 {
     public bool IsInstalled => false;
+    public bool FullCapture { get; set; }
     public event Action<string, bool, bool>? SystemKeyIntercepted;
+    public event Action<ushort, ushort, bool, bool, KeyModifiers>? KeyEventCaptured;
     public void Install() { }
     public void Uninstall() { }
+    public void SetViewerHwnd(IntPtr hwnd) { }
     public void Dispose() { }
 }

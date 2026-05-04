@@ -12,6 +12,8 @@ namespace SteamViewer.Common.Protocol;
 [JsonDerivedType(typeof(MouseWheel), "mouse_wheel")]
 [JsonDerivedType(typeof(KeyDown), "key_down")]
 [JsonDerivedType(typeof(KeyUp), "key_up")]
+[JsonDerivedType(typeof(KeyDownScan), "key_down_scan")]
+[JsonDerivedType(typeof(KeyUpScan), "key_up_scan")]
 public abstract record InputEvent
 {
     public sealed record MouseMove(
@@ -54,6 +56,23 @@ public abstract record InputEvent
         [property: JsonPropertyName("modifiers")] KeyModifiers Modifiers,
         [property: JsonPropertyName("code")] string? Code = null,
         [property: JsonPropertyName("altGr")] bool AltGr = false
+    ) : InputEvent;
+
+    // Sunshine-pattern raw scan code events from the native WH_KEYBOARD_LL hook.
+    // Host injects via KEYEVENTF_SCANCODE; the host's keyboard driver composes
+    // characters (including AltGr) naturally from the scan code + active layout.
+    public sealed record KeyDownScan(
+        [property: JsonPropertyName("scan")] ushort ScanCode,
+        [property: JsonPropertyName("vk")] ushort VkCode,
+        [property: JsonPropertyName("modifiers")] KeyModifiers Modifiers,
+        [property: JsonPropertyName("ext")] bool IsExtended = false
+    ) : InputEvent;
+
+    public sealed record KeyUpScan(
+        [property: JsonPropertyName("scan")] ushort ScanCode,
+        [property: JsonPropertyName("vk")] ushort VkCode,
+        [property: JsonPropertyName("modifiers")] KeyModifiers Modifiers,
+        [property: JsonPropertyName("ext")] bool IsExtended = false
     ) : InputEvent;
 }
 
