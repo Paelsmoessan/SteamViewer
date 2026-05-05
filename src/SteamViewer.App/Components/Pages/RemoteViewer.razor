@@ -348,6 +348,7 @@
                 // Subscribe to system key interception (Win, Alt+Tab) and full keyboard capture
                 SystemKeyInterceptor.SystemKeyIntercepted += OnSystemKeyIntercepted;
                 SystemKeyInterceptor.KeyEventCaptured += OnKeyEventCaptured;
+                SystemKeyInterceptor.LayoutChanged += OnKeyboardLayoutChanged;
             }
             catch (Exception ex)
             {
@@ -1322,15 +1323,36 @@
 
     /// <summary>
     /// Called by WH_KEYBOARD_LL hook for ALL keystrokes when Active capture mode.
-    /// Sends raw scan codes to host for Sunshine-pattern injection.
+    /// Sends scan codes + resolved Unicode char for hybrid injection on host.
     /// In LogOnly mode this is never fired - hook only logs.
     /// </summary>
-    private void OnKeyEventCaptured(ushort scanCode, ushort vkCode, bool isDown, bool isExtended, KeyModifiers modifiers)
+    private void OnKeyEventCaptured(ushort scanCode, ushort vkCode, bool isDown, bool isExtended, KeyModifiers modifiers, uint unicodeChar)
     {
         InputEvent ev = isDown
-            ? new InputEvent.KeyDownScan(scanCode, vkCode, modifiers, isExtended)
-            : new InputEvent.KeyUpScan(scanCode, vkCode, modifiers, isExtended);
+            ? new InputEvent.KeyDownScan(scanCode, vkCode, modifiers, isExtended, unicodeChar)
+            : new InputEvent.KeyUpScan(scanCode, vkCode, modifiers, isExtended, unicodeChar);
         SendInputToActiveSession(ev);
+    }
+
+    private void OnKeyboardLayoutChanged(string klid)
+    {
+        Logger.LogInformation("[Viewer] Keyboard layout changed: {Klid}", klid);
+        _ = SendKeyboardLayoutAsync(klid);
+    }
+
+    private async Task SendKeyboardLayoutAsync(string klid)
+    {
+        if (_activeSession == null) return;
+        try
+        {
+            var json = System.Text.Json.JsonSerializer.Serialize(new { type = "keyboardLayout", klid });
+            await _activeSession.SendDataAsync(json);
+            Logger.LogInformation("[Viewer] Sent keyboard layout {Klid} to host", klid);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "[Viewer] Failed to send keyboard layout");
+        }
     }
 
     private async Task SetupKeyboardCapture()
@@ -1344,6 +1366,11 @@
                 winInterceptor.Mode = SteamViewer.Platform.Windows.Input.CaptureMode.Active;
                 await JSRuntime.InvokeVoidAsync("SteamViewerInput.setNativeKeyboardActive", true);
                 Logger.LogInformation("[Viewer] Native keyboard capture active, JS keyboard silenced");
+
+                // Send initial keyboard layout to host
+                var klid = winInterceptor.GetCurrentKeyboardLayoutId();
+                if (klid != null)
+                    _ = SendKeyboardLayoutAsync(klid);
             }
         }
         else
@@ -1557,6 +1584,7 @@
         // Clean up system key hook
         SystemKeyInterceptor.KeyEventCaptured -= OnKeyEventCaptured;
         SystemKeyInterceptor.SystemKeyIntercepted -= OnSystemKeyIntercepted;
+        SystemKeyInterceptor.LayoutChanged -= OnKeyboardLayoutChanged;
         SystemKeyInterceptor.FullCapture = false;
         SystemKeyInterceptor.Uninstall();
 

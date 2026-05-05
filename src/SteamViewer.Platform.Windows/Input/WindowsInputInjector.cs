@@ -196,6 +196,12 @@ public sealed class WindowsInputInjector : IInputInjector
                 case InputEvent.KeyUp ku:
                     LogKeyEvent(ku.Key, isDown: false, ku.Modifiers);
                     break;
+                case InputEvent.KeyDownScan kds:
+                    LogScanKeyEvent(kds.ScanCode, kds.VkCode, kds.UnicodeChar, isDown: true);
+                    break;
+                case InputEvent.KeyUpScan kus:
+                    LogScanKeyEvent(kus.ScanCode, kus.VkCode, kus.UnicodeChar, isDown: false);
+                    break;
             }
         }
 
@@ -267,6 +273,35 @@ public sealed class WindowsInputInjector : IInputInjector
         }
     }
 
+    private void LogScanKeyEvent(ushort scanCode, ushort vkCode, uint unicodeChar, bool isDown)
+    {
+        try
+        {
+            lock (LogLock)
+            {
+                if (_logCount < MaxLogEntries)
+                {
+                    var ucStr = unicodeChar >= 0x20 ? $" uc='{(char)unicodeChar}' (0x{unicodeChar:X})" : "";
+                    var method = unicodeChar >= 0x20 && Win32Input.IsTextVk(vkCode) ? "UNICODE" : "SCANCODE";
+                    var logLine = $"[{DateTime.Now:HH:mm:ss.fff}] " +
+                        $"KEY: {(isDown ? "DOWN" : "UP  ")} sc=0x{scanCode:X3} vk=0x{vkCode:X2}{ucStr} [{method}]\n";
+                    File.AppendAllText(DebugLogPath, logLine);
+                    _logCount++;
+
+                    if (_logCount == MaxLogEntries)
+                    {
+                        File.AppendAllText(DebugLogPath,
+                            $"\n=== Max log entries ({MaxLogEntries}) reached, logging stopped ===\n");
+                    }
+                }
+            }
+        }
+        catch
+        {
+            // Ignore logging errors to not disrupt input
+        }
+    }
+
     /// <summary>
     /// Finds the logs directory by walking up from base directory looking for solution root markers.
     /// </summary>
@@ -282,6 +317,19 @@ public sealed class WindowsInputInjector : IInputInjector
             dir = dir.Parent;
         }
         return Path.Combine(AppContext.BaseDirectory, "logs");
+    }
+
+    public bool ActivateKeyboardLayout(string klid)
+    {
+        var success = Win32Input.ActivateKeyboardLayout(klid);
+        _logger.LogInformation("Keyboard layout sync: KLID={Klid}, activated={Success}", klid, success);
+        return success;
+    }
+
+    public void RestoreKeyboardLayout()
+    {
+        Win32Input.RestoreKeyboardLayout();
+        _logger.LogInformation("Restored original keyboard layout");
     }
 
     public void ReleaseAllModifiers()

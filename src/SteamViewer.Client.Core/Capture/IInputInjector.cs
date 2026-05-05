@@ -38,6 +38,17 @@ public interface IInputInjector : IDisposable
     void ReleaseAllModifiers() { }
 
     /// <summary>
+    /// Activate a keyboard layout on the host by KLID string.
+    /// Called when the viewer reports its active keyboard layout.
+    /// </summary>
+    bool ActivateKeyboardLayout(string klid) => false;
+
+    /// <summary>
+    /// Restore the host's original keyboard layout (call on session disconnect).
+    /// </summary>
+    void RestoreKeyboardLayout() { }
+
+    /// <summary>
     /// Send the Secure Attention Sequence (Ctrl+Alt+Del).
     /// Returns true if successful, false if elevated privileges are required.
     /// </summary>

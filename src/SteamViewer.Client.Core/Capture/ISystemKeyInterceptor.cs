@@ -23,9 +23,13 @@ public interface ISystemKeyInterceptor : IDisposable
     /// </summary>
     event Action<string, bool, bool>? SystemKeyIntercepted; // (key, isDown, isAltHeld)
 
-    event Action<ushort, ushort, bool, bool, KeyModifiers>? KeyEventCaptured; // (scanCode, vkCode, isDown, isExtended, modifiers)
+    event Action<ushort, ushort, bool, bool, KeyModifiers, uint>? KeyEventCaptured; // (scanCode, vkCode, isDown, isExtended, modifiers, unicodeChar)
 
     bool FullCapture { get; set; }
 
     void SetViewerHwnd(IntPtr hwnd);
+
+    event Action<string>? LayoutChanged; // fires with KLID string on viewer layout change
+
+    string? GetCurrentKeyboardLayoutId() => null;
 }

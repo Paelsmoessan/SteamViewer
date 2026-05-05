@@ -205,10 +205,12 @@ internal static class Win32Input
                 InjectKey(keyUp.Key, keyUp.Modifiers, isDown: false, keyUp.Code, keyUp.AltGr);
                 break;
             case InputEvent.KeyDownScan scanDown:
-                InjectScanCode(scanDown.ScanCode, isDown: true, scanDown.IsExtended);
+                InjectHybridKey(scanDown.ScanCode, scanDown.VkCode, isDown: true,
+                    scanDown.IsExtended, scanDown.UnicodeChar);
                 break;
             case InputEvent.KeyUpScan scanUp:
-                InjectScanCode(scanUp.ScanCode, isDown: false, scanUp.IsExtended);
+                InjectHybridKey(scanUp.ScanCode, scanUp.VkCode, isDown: false,
+                    scanUp.IsExtended, scanUp.UnicodeChar);
                 break;
         }
     }
@@ -743,6 +745,148 @@ internal static class Win32Input
         SendInputWithRetry(1, new[] { input }, Marshal.SizeOf<INPUT>());
     }
 
+    /// <summary>
+    /// Hybrid injection: use Unicode for text keys with a resolved character,
+    /// scan codes for everything else (modifiers, function keys, navigation).
+    /// This is the AnyDesk "Auto" mode pattern - correct text across layouts,
+    /// correct shortcuts/modifiers via scan codes.
+    /// </summary>
+    internal static void InjectHybridKey(ushort scanCode, ushort vkCode, bool isDown,
+        bool isExtended, uint unicodeChar)
+    {
+        if (unicodeChar >= 0x20 && IsTextVk(vkCode))
+        {
+            InjectUnicodeChar(unicodeChar, isDown);
+            return;
+        }
+
+        InjectScanCode(scanCode, isDown, isExtended);
+    }
+
+    /// <summary>
+    /// Inject a Unicode character via KEYEVENTF_UNICODE. The character arrives at
+    /// apps as WM_CHAR regardless of the host's active keyboard layout.
+    /// Handles supplementary characters (emoji, CJK Extension B) via surrogate pairs.
+    /// </summary>
+    internal static void InjectUnicodeChar(uint codepoint, bool isDown)
+    {
+        if (codepoint <= 0xFFFF)
+        {
+            var flags = KEYEVENTF_UNICODE | (isDown ? 0u : KEYEVENTF_KEYUP);
+            var input = new INPUT
+            {
+                type = INPUT_KEYBOARD,
+                union = new InputUnion
+                {
+                    ki = new KEYBDINPUT
+                    {
+                        wVk = 0,
+                        wScan = (ushort)codepoint,
+                        dwFlags = flags,
+                        time = 0,
+                        dwExtraInfo = IntPtr.Zero
+                    }
+                }
+            };
+            SendInputWithRetry(1, new[] { input }, Marshal.SizeOf<INPUT>());
+        }
+        else
+        {
+            // Supplementary character (U+10000 and above): surrogate pair.
+            // Keydown: high surrogate first, then low. Keyup: low first, then high.
+            var high = (ushort)(0xD800 + ((codepoint - 0x10000) >> 10));
+            var low = (ushort)(0xDC00 + ((codepoint - 0x10000) & 0x3FF));
+
+            var flags = KEYEVENTF_UNICODE | (isDown ? 0u : KEYEVENTF_KEYUP);
+            INPUT[] inputs;
+
+            if (isDown)
+            {
+                inputs = new[]
+                {
+                    MakeUnicodeInput(high, flags),
+                    MakeUnicodeInput(low, flags),
+                };
+            }
+            else
+            {
+                inputs = new[]
+                {
+                    MakeUnicodeInput(low, flags),
+                    MakeUnicodeInput(high, flags),
+                };
+            }
+
+            SendInputWithRetry((uint)inputs.Length, inputs, Marshal.SizeOf<INPUT>());
+        }
+    }
+
+    private static INPUT MakeUnicodeInput(ushort scan, uint flags)
+    {
+        return new INPUT
+        {
+            type = INPUT_KEYBOARD,
+            union = new InputUnion
+            {
+                ki = new KEYBDINPUT
+                {
+                    wVk = 0,
+                    wScan = scan,
+                    dwFlags = flags,
+                    time = 0,
+                    dwExtraInfo = IntPtr.Zero
+                }
+            }
+        };
+    }
+
+    internal static bool IsTextVk(ushort vk) => vk is
+        (>= 0x30 and <= 0x39) or  // 0-9
+        (>= 0x41 and <= 0x5A) or  // A-Z
+        (>= 0xBA and <= 0xC0) or  // OEM_1 through OEM_3 (punctuation)
+        (>= 0xDB and <= 0xDF) or  // OEM_4 through OEM_8
+        0xE2 or                     // OEM_102 (ISO backslash)
+        0x20;                       // Space
+
+    /// <summary>
+    /// Activate a keyboard layout on the host by KLID string. Returns true if
+    /// the layout was loaded. Saves the original layout for RestoreKeyboardLayout.
+    /// Note: LoadKeyboardLayout with KLF_ACTIVATE is system-wide on Win8+.
+    /// </summary>
+    internal static bool ActivateKeyboardLayout(string klid)
+    {
+        if (_savedHostLayout == IntPtr.Zero)
+        {
+            var fgHwnd = GetForegroundWindow();
+            var fgThread = GetWindowThreadProcessId(fgHwnd, out _);
+            _savedHostLayout = GetKeyboardLayout(fgThread);
+        }
+
+        var hkl = LoadKeyboardLayout(klid, KLF_ACTIVATE | KLF_SUBSTITUTE_OK);
+        if (hkl == IntPtr.Zero) return false;
+
+        _activeHostKlid = klid;
+        return true;
+    }
+
+    /// <summary>
+    /// Restore the host's original keyboard layout (call on session disconnect).
+    /// </summary>
+    internal static void RestoreKeyboardLayout()
+    {
+        if (_savedHostLayout != IntPtr.Zero)
+        {
+            ActivateKeyboardLayoutApi(_savedHostLayout, 0);
+            _savedHostLayout = IntPtr.Zero;
+            _activeHostKlid = null;
+        }
+    }
+
+    internal static string? ActiveHostKlid => _activeHostKlid;
+
+    private static IntPtr _savedHostLayout;
+    private static string? _activeHostKlid;
+
     internal static void ReleaseAllModifiers()
     {
         ushort[] modifierVks =
@@ -878,6 +1022,16 @@ internal static class Win32Input
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     private static extern bool GetMonitorInfoW(IntPtr hMonitor, ref MONITORINFOEXW lpmi);
+
+    // Keyboard layout sync
+    private const uint KLF_ACTIVATE = 0x00000001;
+    private const uint KLF_SUBSTITUTE_OK = 0x00000002;
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr LoadKeyboardLayout(string pwszKLID, uint Flags);
+
+    [DllImport("user32.dll", SetLastError = true, EntryPoint = "ActivateKeyboardLayout")]
+    private static extern IntPtr ActivateKeyboardLayoutApi(IntPtr hkl, uint Flags);
 
     // Desktop sync retry P/Invoke
     private const uint DESKTOP_SWITCHDESKTOP = 0x0100;
