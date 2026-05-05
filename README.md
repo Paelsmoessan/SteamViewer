@@ -38,7 +38,7 @@ dotnet run --project src/SteamViewer.App -f net8.0-windows10.0.19041.0
 
 ### Debug Credentials
 In DEBUG builds, predetermined credentials are used for easy testing:
-- **Host ID**: Machine name (e.g. `DEV1`)
+- **Host ID**: Machine name (e.g. `MYPC`)
 - **Password**: `TESTPASS`
 
 ## How It Works
