@@ -65,14 +65,16 @@ public abstract record InputEvent
         [property: JsonPropertyName("scan")] ushort ScanCode,
         [property: JsonPropertyName("vk")] ushort VkCode,
         [property: JsonPropertyName("modifiers")] KeyModifiers Modifiers,
-        [property: JsonPropertyName("ext")] bool IsExtended = false
+        [property: JsonPropertyName("ext")] bool IsExtended = false,
+        [property: JsonPropertyName("uc")] uint UnicodeChar = 0
     ) : InputEvent;
 
     public sealed record KeyUpScan(
         [property: JsonPropertyName("scan")] ushort ScanCode,
         [property: JsonPropertyName("vk")] ushort VkCode,
         [property: JsonPropertyName("modifiers")] KeyModifiers Modifiers,
-        [property: JsonPropertyName("ext")] bool IsExtended = false
+        [property: JsonPropertyName("ext")] bool IsExtended = false,
+        [property: JsonPropertyName("uc")] uint UnicodeChar = 0
     ) : InputEvent;
 }
 

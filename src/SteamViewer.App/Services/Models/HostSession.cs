@@ -503,6 +503,10 @@ public sealed class HostSession : IAsyncDisposable
                         if (ackType != null)
                             _pendingAcks[ackType] = true;
                         return;
+
+                    case "keyboardLayout":
+                        HandleKeyboardLayoutMessage(root);
+                        return;
                 }
             }
 
@@ -525,6 +529,7 @@ public sealed class HostSession : IAsyncDisposable
         if (state == "disconnected")
         {
             _inputInjector.ReleaseAllModifiers();
+            _inputInjector.RestoreKeyboardLayout();
 
             if (State == HostSessionState.Connected)
             {
@@ -613,6 +618,22 @@ public sealed class HostSession : IAsyncDisposable
     }
 
     private int? _requestedMonitorId;
+
+    #endregion
+
+    #region Keyboard Layout Sync
+
+    private void HandleKeyboardLayoutMessage(JsonElement root)
+    {
+        var klid = root.TryGetProperty("klid", out var klidProp) ? klidProp.GetString() : null;
+        if (string.IsNullOrEmpty(klid))
+        {
+            _logger.LogWarning("Received keyboardLayout message with empty KLID");
+            return;
+        }
+
+        _inputInjector.ActivateKeyboardLayout(klid);
+    }
 
     #endregion
 
@@ -1517,6 +1538,7 @@ public sealed class HostSession : IAsyncDisposable
     public async Task DisconnectAsync()
     {
         _inputInjector.ReleaseAllModifiers();
+        _inputInjector.RestoreKeyboardLayout();
 
         if (_transport != null)
         {

@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using System.Text;
 using Microsoft.Extensions.Logging;
 using SteamViewer.Client.Core.Capture;
 using SteamViewer.Common.Protocol;
@@ -11,7 +12,8 @@ public enum CaptureMode { Disabled, LogOnly, Active }
 /// Low-level keyboard hook (WH_KEYBOARD_LL) that intercepts system keys
 /// like Win, Alt+Tab, Ctrl+Esc when viewer input is locked. When CaptureMode
 /// is LogOnly or Active, processes ALL keystrokes for the native keyboard
-/// capture pipeline (Sunshine pattern).
+/// capture pipeline (Sunshine pattern). In Active mode, resolves Unicode
+/// characters via ToUnicodeEx for cross-layout hybrid injection.
 /// </summary>
 public sealed class WindowsSystemKeyInterceptor : ISystemKeyInterceptor
 {
@@ -27,17 +29,29 @@ public sealed class WindowsSystemKeyInterceptor : ISystemKeyInterceptor
     private uint _viewerPid;
     private volatile CaptureMode _captureMode = CaptureMode.Disabled;
 
-    // Modifier bitfield maintained synchronously in the hook callback.
-    // Avoids GetAsyncKeyState races with rapid keystroke sequences.
-    private byte _modBits;
-    private const byte MOD_CTRL = 0x01;
-    private const byte MOD_SHIFT = 0x02;
-    private const byte MOD_ALT = 0x04;
-    private const byte MOD_META = 0x08;
+    // Side-specific modifier tracking for accurate ToUnicodeEx keyState.
+    private bool _lCtrlDown, _rCtrlDown;
+    private bool _lShiftDown, _rShiftDown;
+    private bool _lAltDown, _rAltDown;
+    private bool _lWinDown, _rWinDown;
+    private bool _capsLockOn, _numLockOn;
+
+    // Reusable keyboard state array for ToUnicodeEx (avoid per-callback allocation).
+    private readonly byte[] _keyState = new byte[256];
+    private readonly char[] _charBuffer = new char[4];
+
+    // Cache keydown Unicode char per VK so keyup sends the same char.
+    // Prevents stuck keys from modifier state changing between down/up.
+    private readonly Dictionary<ushort, uint> _activeUnicodeKeys = new();
+
+    // Layout change detection: last known HKL from foreground thread.
+    private IntPtr _lastKnownHkl;
+    private string? _lastKnownKlid;
 
     public bool IsInstalled => _hookId != IntPtr.Zero;
     public event Action<string, bool, bool>? SystemKeyIntercepted;
-    public event Action<ushort, ushort, bool, bool, KeyModifiers>? KeyEventCaptured;
+    public event Action<ushort, ushort, bool, bool, KeyModifiers, uint>? KeyEventCaptured;
+    public event Action<string>? LayoutChanged;
 
     public bool FullCapture
     {
@@ -47,7 +61,7 @@ public sealed class WindowsSystemKeyInterceptor : ISystemKeyInterceptor
             if (!value)
             {
                 _captureMode = CaptureMode.Disabled;
-                _modBits = 0;
+                ResetModifierState();
             }
         }
     }
@@ -59,7 +73,9 @@ public sealed class WindowsSystemKeyInterceptor : ISystemKeyInterceptor
         {
             _captureMode = value;
             if (value == CaptureMode.Disabled)
-                _modBits = 0;
+                ResetModifierState();
+            else if (value == CaptureMode.Active)
+                InitializeToggleState();
             _logger.LogInformation("[Hook] CaptureMode set to {Mode}", value);
         }
     }
@@ -80,6 +96,12 @@ public sealed class WindowsSystemKeyInterceptor : ISystemKeyInterceptor
         GetWindowThreadProcessId(hwnd, out var pid);
         _viewerPid = pid;
         _logger.LogInformation("[Hook] HWND set to 0x{Hwnd:X}, PID={Pid}", hwnd, pid);
+    }
+
+    public string? GetCurrentKeyboardLayoutId()
+    {
+        var sb = new StringBuilder(KL_NAMELENGTH);
+        return GetKeyboardLayoutName(sb) ? sb.ToString() : null;
     }
 
     public void Install()
@@ -128,7 +150,7 @@ public sealed class WindowsSystemKeyInterceptor : ISystemKeyInterceptor
         _logger.LogDebug("[SystemKeyHook] Uninstalling...");
         _running = false;
         _captureMode = CaptureMode.Disabled;
-        _modBits = 0;
+        ResetModifierState();
 
         if (_hookId != IntPtr.Zero)
         {
@@ -167,8 +189,7 @@ public sealed class WindowsSystemKeyInterceptor : ISystemKeyInterceptor
                 _firstCallback = false;
             }
 
-            // Update modifier bitfield synchronously (race-free)
-            UpdateModBits(vk, isDown);
+            UpdateModState(vk, isDown, isUp);
 
             var mode = _captureMode;
             var isForeground = IsViewerForeground();
@@ -180,7 +201,6 @@ public sealed class WindowsSystemKeyInterceptor : ISystemKeyInterceptor
                 {
                     _logger.LogDebug("[Hook-Capture] vk=0x{Vk:X2} sc=0x{Sc:X3} ext={Ext} {State}",
                         vk, scanCode, isExtended, isDown ? "DOWN" : "UP");
-                    // LogOnly: always CallNextHookEx, never suppress, never fire event
                 }
                 else if (mode == CaptureMode.Active)
                 {
@@ -193,13 +213,40 @@ public sealed class WindowsSystemKeyInterceptor : ISystemKeyInterceptor
                     }
 
                     var modSnapshot = SnapshotModifiers();
+                    uint unicodeChar = 0;
+
+                    if (isDown)
+                    {
+                        unicodeChar = ResolveUnicodeChar(vk, scanCode);
+                        if (unicodeChar != 0)
+                            _activeUnicodeKeys[vk] = unicodeChar;
+                        else
+                            _activeUnicodeKeys.Remove(vk);
+                    }
+                    else
+                    {
+                        // Keyup must use same char as keydown to avoid stuck keys.
+                        if (_activeUnicodeKeys.TryGetValue(vk, out var cached))
+                        {
+                            unicodeChar = cached;
+                            _activeUnicodeKeys.Remove(vk);
+                        }
+                    }
+
+                    _logger.LogDebug("[Hook-Active] vk=0x{Vk:X2} sc=0x{Sc:X3} uc=0x{Uc:X} ({Char}) {State}",
+                        vk, scanCode, unicodeChar, unicodeChar >= 0x20 ? (char)unicodeChar : ' ', isDown ? "DOWN" : "UP");
+
+                    // Detect layout change
+                    DetectLayoutChange();
+
                     var capturedSc = scanCode;
                     var capturedVk = vk;
                     var capturedDown = isDown;
                     var capturedExt = isExtended;
+                    var capturedUc = unicodeChar;
 
                     ThreadPool.QueueUserWorkItem(_ =>
-                        KeyEventCaptured?.Invoke(capturedSc, capturedVk, capturedDown, capturedExt, modSnapshot));
+                        KeyEventCaptured?.Invoke(capturedSc, capturedVk, capturedDown, capturedExt, modSnapshot, capturedUc));
 
                     return (IntPtr)1; // Suppress - don't deliver to WebView2
                 }
@@ -207,7 +254,7 @@ public sealed class WindowsSystemKeyInterceptor : ISystemKeyInterceptor
 
             // --- Legacy system key interception (Win, Alt+Tab, Ctrl+Esc) ---
             var altDown = (kb.flags & LLKHF_ALTDOWN) != 0;
-            var ctrlDown = (_modBits & MOD_CTRL) != 0;
+            var ctrlDown = _lCtrlDown || _rCtrlDown;
 
             bool shouldIntercept = vk switch
             {
@@ -235,34 +282,167 @@ public sealed class WindowsSystemKeyInterceptor : ISystemKeyInterceptor
         return CallNextHookEx(_hookId, nCode, wParam, lParam);
     }
 
-    private void UpdateModBits(ushort vk, bool isDown)
+    private void UpdateModState(ushort vk, bool isDown, bool isUp)
     {
-        byte bit = vk switch
+        switch (vk)
         {
-            VK_CONTROL or 0xA2 or 0xA3 => MOD_CTRL,
-            VK_SHIFT or 0xA0 or 0xA1 => MOD_SHIFT,
-            VK_MENU or 0xA4 or 0xA5 => MOD_ALT,
-            VK_LWIN or VK_RWIN => MOD_META,
-            _ => 0
-        };
-
-        if (bit == 0) return;
-
-        if (isDown)
-            _modBits |= bit;
-        else
-            _modBits &= (byte)~bit;
+            case 0xA2: _lCtrlDown = isDown; break;   // VK_LCONTROL
+            case 0xA3: _rCtrlDown = isDown; break;    // VK_RCONTROL
+            case 0xA0: _lShiftDown = isDown; break;   // VK_LSHIFT
+            case 0xA1: _rShiftDown = isDown; break;   // VK_RSHIFT
+            case 0xA4: _lAltDown = isDown; break;     // VK_LMENU
+            case 0xA5: _rAltDown = isDown; break;     // VK_RMENU
+            case VK_LWIN: _lWinDown = isDown; break;
+            case VK_RWIN: _rWinDown = isDown; break;
+            // Generic modifiers (some keyboard drivers send these)
+            case VK_CONTROL: _lCtrlDown = isDown; break;
+            case VK_SHIFT: _lShiftDown = isDown; break;
+            case VK_MENU: _lAltDown = isDown; break;
+            // Toggle keys: flip on keydown only
+            case VK_CAPITAL when isDown: _capsLockOn = !_capsLockOn; break;
+            case VK_NUMLOCK when isDown: _numLockOn = !_numLockOn; break;
+        }
     }
 
     private KeyModifiers SnapshotModifiers()
     {
-        var bits = _modBits;
         return new KeyModifiers(
-            Ctrl: (bits & MOD_CTRL) != 0,
-            Shift: (bits & MOD_SHIFT) != 0,
-            Alt: (bits & MOD_ALT) != 0,
-            Meta: (bits & MOD_META) != 0
+            Ctrl: _lCtrlDown || _rCtrlDown,
+            Shift: _lShiftDown || _rShiftDown,
+            Alt: _lAltDown || _rAltDown,
+            Meta: _lWinDown || _rWinDown
         );
+    }
+
+    /// <summary>
+    /// Resolve the Unicode character produced by this key press using the viewer's
+    /// active keyboard layout. Uses ToUnicodeEx with wFlags=0x4 (non-destructive
+    /// peek - does not consume dead key buffer, Win10 1607+).
+    /// Returns 0 for modifier keys, function keys, dead keys, and keys that don't
+    /// produce printable characters.
+    /// </summary>
+    private uint ResolveUnicodeChar(ushort vk, ushort scanCode)
+    {
+        // Skip modifiers, function keys, navigation - they never produce characters.
+        if (IsNonTextVk(vk))
+            return 0;
+
+        BuildKeyState();
+
+        var fgHwnd = GetForegroundWindow();
+        var fgThread = GetWindowThreadProcessId(fgHwnd, out _);
+        var hkl = GetKeyboardLayout(fgThread);
+
+        var result = ToUnicodeEx(vk, scanCode, _keyState, _charBuffer, _charBuffer.Length, 0x4, hkl);
+
+        if (result >= 1)
+        {
+            uint ch = _charBuffer[0];
+            // Filter control characters (Ctrl+letter produces ASCII 1-26).
+            // Only return printable characters for Unicode injection.
+            if (ch >= 0x20)
+                return ch;
+        }
+
+        // result == -1: dead key (accent waiting for next key) - let scan code handle it
+        // result == 0: no translation for this key
+        return 0;
+    }
+
+    private void BuildKeyState()
+    {
+        Array.Clear(_keyState, 0, 256);
+
+        if (_lShiftDown) _keyState[0xA0] = 0x80;
+        if (_rShiftDown) _keyState[0xA1] = 0x80;
+        if (_lShiftDown || _rShiftDown) _keyState[VK_SHIFT] = 0x80;
+
+        if (_lCtrlDown) _keyState[0xA2] = 0x80;
+        if (_rCtrlDown) _keyState[0xA3] = 0x80;
+        if (_lCtrlDown || _rCtrlDown) _keyState[VK_CONTROL] = 0x80;
+
+        if (_lAltDown) _keyState[0xA4] = 0x80;
+        if (_rAltDown) _keyState[0xA5] = 0x80;
+        if (_lAltDown || _rAltDown) _keyState[VK_MENU] = 0x80;
+
+        // AltGr = RAlt, but ToUnicodeEx expects LCtrl+RAlt for AltGr chars.
+        // The phantom LCtrl (0x21D) is dropped before UpdateModState, so _lCtrlDown
+        // won't be set by it. Synthesize LCtrl when RAlt is held.
+        if (_rAltDown)
+        {
+            _keyState[0xA2] = 0x80; // VK_LCONTROL
+            _keyState[VK_CONTROL] = 0x80;
+        }
+
+        if (_capsLockOn) _keyState[VK_CAPITAL] = 0x01;
+        if (_numLockOn) _keyState[VK_NUMLOCK] = 0x01;
+    }
+
+    private static bool IsNonTextVk(ushort vk) => vk switch
+    {
+        // Modifiers
+        VK_SHIFT or VK_CONTROL or VK_MENU or VK_LWIN or VK_RWIN => true,
+        0xA0 or 0xA1 or 0xA2 or 0xA3 or 0xA4 or 0xA5 => true,
+        // Function keys
+        >= 0x70 and <= 0x87 => true, // F1-F24
+        // Navigation / editing
+        VK_TAB or VK_ESCAPE or VK_BACK or VK_RETURN => true,
+        0x2D or 0x2E or 0x24 or 0x23 or 0x21 or 0x22 => true, // Ins/Del/Home/End/PgUp/PgDn
+        0x25 or 0x26 or 0x27 or 0x28 => true, // Arrow keys
+        // Lock keys
+        VK_CAPITAL or VK_NUMLOCK or 0x91 => true, // Caps/Num/Scroll
+        // System keys
+        0x2C or 0x13 or 0x03 => true, // PrintScreen/Pause/Cancel
+        // Browser/media keys
+        >= 0xA6 and <= 0xB7 => true,
+        _ => false
+    };
+
+    /// <summary>
+    /// Check if the foreground thread's keyboard layout changed since last call.
+    /// Fires LayoutChanged event with the new KLID string.
+    /// Called on every Active mode keystroke (sub-microsecond pointer comparison).
+    /// </summary>
+    private void DetectLayoutChange()
+    {
+        var fgHwnd = GetForegroundWindow();
+        var fgThread = GetWindowThreadProcessId(fgHwnd, out _);
+        var hkl = GetKeyboardLayout(fgThread);
+
+        if (hkl == _lastKnownHkl)
+            return;
+
+        _lastKnownHkl = hkl;
+        var sb = new StringBuilder(KL_NAMELENGTH);
+        if (GetKeyboardLayoutName(sb))
+        {
+            var klid = sb.ToString();
+            if (klid != _lastKnownKlid)
+            {
+                _lastKnownKlid = klid;
+                _logger.LogInformation("[Hook] Keyboard layout changed: {Klid}", klid);
+                ThreadPool.QueueUserWorkItem(_ => LayoutChanged?.Invoke(klid));
+            }
+        }
+    }
+
+    private void InitializeToggleState()
+    {
+        _capsLockOn = (GetKeyState(VK_CAPITAL) & 0x01) != 0;
+        _numLockOn = (GetKeyState(VK_NUMLOCK) & 0x01) != 0;
+        _logger.LogDebug("[Hook] Toggle state: CapsLock={Caps} NumLock={Num}", _capsLockOn, _numLockOn);
+    }
+
+    private void ResetModifierState()
+    {
+        _lCtrlDown = _rCtrlDown = false;
+        _lShiftDown = _rShiftDown = false;
+        _lAltDown = _rAltDown = false;
+        _lWinDown = _rWinDown = false;
+        _capsLockOn = _numLockOn = false;
+        _activeUnicodeKeys.Clear();
+        _lastKnownHkl = IntPtr.Zero;
+        _lastKnownKlid = null;
     }
 
     private bool IsViewerForeground()
@@ -288,14 +468,19 @@ public sealed class WindowsSystemKeyInterceptor : ISystemKeyInterceptor
     private const int WH_KEYBOARD_LL = 13;
     private const uint LLKHF_ALTDOWN = 0x20;
     private const uint LLKHF_EXTENDED = 0x01;
+    private const int KL_NAMELENGTH = 9;
 
     private const ushort VK_LWIN = 0x5B;
     private const ushort VK_RWIN = 0x5C;
     private const ushort VK_TAB = 0x09;
+    private const ushort VK_BACK = 0x08;
+    private const ushort VK_RETURN = 0x0D;
     private const ushort VK_ESCAPE = 0x1B;
     private const ushort VK_CONTROL = 0x11;
     private const ushort VK_SHIFT = 0x10;
     private const ushort VK_MENU = 0x12;
+    private const ushort VK_CAPITAL = 0x14;
+    private const ushort VK_NUMLOCK = 0x90;
 
     private static readonly IntPtr WM_KEYDOWN = (IntPtr)0x0100;
     private static readonly IntPtr WM_KEYUP = (IntPtr)0x0101;
@@ -367,6 +552,21 @@ public sealed class WindowsSystemKeyInterceptor : ISystemKeyInterceptor
 
     [DllImport("user32.dll")]
     private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int ToUnicodeEx(uint wVirtKey, uint wScanCode, byte[] lpKeyState,
+        [Out, MarshalAs(UnmanagedType.LPArray)] char[] pwszBuff,
+        int cchBuff, uint wFlags, IntPtr dwhkl);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetKeyboardLayout(uint idThread);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetKeyboardLayoutName([Out] StringBuilder pwszKLID);
+
+    [DllImport("user32.dll")]
+    private static extern short GetKeyState(int nVirtKey);
 
     #endregion
 }
