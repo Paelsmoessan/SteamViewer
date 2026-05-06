@@ -218,21 +218,46 @@ app.MapPost("/api/remote/stop/{machine?}", (string? machine) =>
 #endif
 // ==================== End Remote Management API ====================
 
-// TURN credential endpoint — clients fetch creds at runtime instead of shipping them in the binary
-app.MapGet("/api/turn-config", () =>
+// TURN credential endpoint - gated by clientId registration check, optionally issues
+// ephemeral REST API creds (RFC 8489 §9.2) bound to the requesting clientId.
+//
+// Closes F4: previously this endpoint was public, anyone on the internet could grab
+// the TURN credentials and use the relay for free. Now:
+//   - clientId query param is required
+//   - clientId must currently be registered with the signaling server
+//   - if TURN_SHARED_SECRET env var is set, creds are HMAC-signed with 10-minute expiry
+//     (ephemeral; bound to the clientId; refreshed by clients periodically)
+//   - if not set, the endpoint refuses (static creds are no longer exposed publicly)
+app.MapGet("/api/turn-config", (string? clientId, ClientRegistry registry) =>
 {
     var enabled = Environment.GetEnvironmentVariable("TURN_ENABLED");
     if (string.IsNullOrEmpty(enabled) || !bool.TryParse(enabled, out var isEnabled) || !isEnabled)
         return Results.Json(new { enabled = false });
 
-    var urls = Environment.GetEnvironmentVariable("TURN_URLS")?.Split(';', StringSplitOptions.RemoveEmptyEntries);
-    var username = Environment.GetEnvironmentVariable("TURN_USERNAME");
-    var credential = Environment.GetEnvironmentVariable("TURN_CREDENTIAL");
+    if (string.IsNullOrEmpty(clientId) || !registry.IsOnline(clientId))
+        return Results.Unauthorized();
 
-    if (urls == null || urls.Length == 0 || string.IsNullOrEmpty(username) || string.IsNullOrEmpty(credential))
+    var urls = Environment.GetEnvironmentVariable("TURN_URLS")?.Split(';', StringSplitOptions.RemoveEmptyEntries);
+    if (urls == null || urls.Length == 0)
         return Results.Json(new { enabled = false });
 
-    return Results.Json(new { enabled = true, urls, username, credential });
+    // Preferred path: ephemeral HMAC-signed creds (TURN REST API, RFC 8489 §9.2)
+    var sharedSecret = Environment.GetEnvironmentVariable("TURN_SHARED_SECRET");
+    if (!string.IsNullOrEmpty(sharedSecret))
+    {
+        var expiryUnixSeconds = DateTimeOffset.UtcNow.AddMinutes(10).ToUnixTimeSeconds();
+        var ephemeralUsername = $"{expiryUnixSeconds}:{clientId}";
+        var hmac = new System.Security.Cryptography.HMACSHA1(System.Text.Encoding.UTF8.GetBytes(sharedSecret));
+        var hash = hmac.ComputeHash(System.Text.Encoding.UTF8.GetBytes(ephemeralUsername));
+        var ephemeralCredential = Convert.ToBase64String(hash);
+        return Results.Json(new { enabled = true, urls, username = ephemeralUsername, credential = ephemeralCredential });
+    }
+
+    // Fallback intentionally removed: static creds are no longer issued. Operators must
+    // configure TURN_SHARED_SECRET (and the TURN server in shared-secret mode) for relay
+    // to work. Refusing here is safer than re-exposing the static cred to anyone with a
+    // valid clientId.
+    return Results.Json(new { enabled = false });
 });
 
 // WebSocket endpoint

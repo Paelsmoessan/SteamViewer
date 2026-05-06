@@ -175,9 +175,14 @@ public sealed class ViewerSession : IAsyncDisposable
     /// </summary>
     public string? StoredPassword { get; set; }
 
+    /// <summary>The viewer's own clientId (registered with the signaling server).
+    /// Required for fetching TURN credentials, which are now bound to the registered clientId.</summary>
+    private readonly string _localClientId;
+
     public ViewerSession(
         string sessionId,
         string peerId,
+        string localClientId,
         IJSRuntime jsRuntime,
         ILoggerFactory loggerFactory,
         IConfiguration configuration,
@@ -187,6 +192,7 @@ public sealed class ViewerSession : IAsyncDisposable
     {
         SessionId = sessionId;
         PeerId = peerId;
+        _localClientId = localClientId;
         Title = peerId;
         _jsRuntime = jsRuntime;
         _logger = loggerFactory.CreateLogger<ViewerSession>();
@@ -256,7 +262,7 @@ public sealed class ViewerSession : IAsyncDisposable
                 try
                 {
                     var turnConfig = _turnConfigService != null
-                        ? await _turnConfigService.GetConfigAsync()
+                        ? await _turnConfigService.GetConfigAsync(_localClientId)
                         : TurnConfig.Disabled;
                     var turnUri = turnConfig.Enabled ? turnConfig.Urls.FirstOrDefault() : null;
                     var turnUser = turnConfig.Username;

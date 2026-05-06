@@ -26,6 +26,7 @@ public sealed class ViewerSessionManager : IAsyncDisposable
     private readonly ConcurrentDictionary<string, string> _peerToSession = new(); // peerId -> sessionId
     private bool _signalingSubscribed;
     private bool _disposed;
+    private string _localClientId = "";
 
 #if DEBUG
     // Counter for generating short test viewer IDs
@@ -119,6 +120,7 @@ public sealed class ViewerSessionManager : IAsyncDisposable
             ).ToLowerInvariant();
 
             await _signalingClient.RegisterAsync(joinerId, joinerPasswordHash);
+            _localClientId = joinerId;
         }
 
         // Create session
@@ -126,6 +128,7 @@ public sealed class ViewerSessionManager : IAsyncDisposable
         var session = new ViewerSession(
             sessionId,
             peerId,
+            _localClientId,
             jsRuntime,
             _loggerFactory,
             _configuration,
@@ -248,12 +251,14 @@ public sealed class ViewerSessionManager : IAsyncDisposable
             ).ToLowerInvariant();
 
             await _signalingClient.RegisterAsync(joinerId, joinerPasswordHash);
+            _localClientId = joinerId;
         }
 
         // Create new session with the SAME session ID (preserves tab tracking)
         var session = new ViewerSession(
             sessionId,
             peerId,
+            _localClientId,
             jsRuntime,
             _loggerFactory,
             _configuration,

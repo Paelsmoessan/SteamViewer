@@ -278,7 +278,7 @@ public sealed class HostSession : IAsyncDisposable
         try
         {
             var turnConfig = _turnConfigService != null
-                ? await _turnConfigService.GetConfigAsync()
+                ? await _turnConfigService.GetConfigAsync(_hostClientId)
                 : TurnConfig.Disabled;
             var turnUri = turnConfig.Enabled ? turnConfig.Urls.FirstOrDefault() : null;
             var turnUser = turnConfig.Username;
@@ -1316,7 +1316,7 @@ public sealed class HostSession : IAsyncDisposable
             var serverUrl = _configuration["SignalingServer"];
             var stunUrls = new[] { "stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302" };
             var rebootTurnConfig = _turnConfigService != null
-                ? await _turnConfigService.GetConfigAsync()
+                ? await _turnConfigService.GetConfigAsync(_hostClientId)
                 : TurnConfig.Disabled;
             var turnUrls = rebootTurnConfig.Enabled ? rebootTurnConfig.Urls : null;
             var turnUser = rebootTurnConfig.Username;
