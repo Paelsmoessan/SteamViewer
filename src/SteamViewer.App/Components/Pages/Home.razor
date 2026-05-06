@@ -1035,7 +1035,7 @@ else
                         }
                         connectedPeerId = "";
                         _canvasInitialized = false;
-                        _isReconnect = disconnected.Reason != "Peer closed connection";
+                        _isReconnect = false;
                         connectionState = ConnectionState.Registered;
                         Logger.LogWarning("[DIAG] Disconnected cleanup done: connectionState={State}, _isReconnect={IsReconnect}, _hostSession={HasSession}",
                             connectionState, _isReconnect, _hostSession != null);
