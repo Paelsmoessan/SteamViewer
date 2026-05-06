@@ -17,7 +17,9 @@ public enum RegisterResult
     /// <summary>Existing registration replaced (session takeover). Old client info returned.</summary>
     Takeover,
     /// <summary>Client ID exists but password hash doesn't match.</summary>
-    PasswordMismatch
+    PasswordMismatch,
+    /// <summary>Existing registration is still active (recent activity); takeover refused.</summary>
+    AlreadyActive
 }
 
 /// <summary>
@@ -43,6 +45,10 @@ public sealed class ClientInfo
     /// <summary>Timestamp when client registered</summary>
     public required DateTimeOffset RegisteredAt { get; init; }
 
+    /// <summary>Last time we received any data from this client (ping, pong, signaling, binary relay).
+    /// Used by the takeover-liveness check to refuse hijack attempts against active sessions (F1).</summary>
+    public DateTimeOffset LastActivityUtc { get; set; } = DateTimeOffset.UtcNow;
+
     /// <summary>Raw WebSocket reference for binary relay.</summary>
     public WebSocket? WebSocket { get; set; }
 
@@ -61,8 +67,17 @@ public sealed class ClientRegistry
     private readonly object _peerLock = new();
 
     /// <summary>
+    /// Window during which an existing registration is considered "still active" and takeover is refused.
+    /// Tighter than the WebSocket receive timeout: we want a healthy client to keep its registration even
+    /// if a hijacker tries to register concurrently.
+    /// </summary>
+    private static readonly TimeSpan ActivityWindow = TimeSpan.FromSeconds(15);
+
+    /// <summary>
     /// Register a client. If the client ID already exists with matching password,
-    /// performs session takeover (replaces old registration, returns old ClientInfo).
+    /// performs session takeover only if the existing registration is no longer active
+    /// (no activity in the last <see cref="ActivityWindow"/>).
+    /// Refusing takeover against a live client closes F1 (signaling session hijack).
     /// </summary>
     public (RegisterResult Result, ClientInfo? OldClient) Register(
         string clientId,
@@ -106,11 +121,32 @@ public sealed class ClientRegistry
                 return (RegisterResult.PasswordMismatch, null);
             }
 
-            // Password matches - takeover: replace registration
+            // Even with a matching hash, refuse takeover if the existing client is demonstrably alive.
+            // Their ping interval is 25s; we allow 15s of grace before considering them dead.
+            var idleTime = DateTimeOffset.UtcNow - existing.LastActivityUtc;
+            if (idleTime < ActivityWindow)
+            {
+                return (RegisterResult.AlreadyActive, existing);
+            }
+
+            // Password matches and existing client appears dead - takeover: replace registration
             _connections.TryRemove(existing.ConnectionId, out _);
             _clients[clientId] = info;
             _connections[connectionId] = clientId;
             return (RegisterResult.Takeover, existing);
+        }
+    }
+
+    /// <summary>
+    /// Mark a client's connection as having received activity (ping, message, binary relay frame).
+    /// Used by the takeover-liveness gate.
+    /// </summary>
+    public void TouchActivity(Guid connectionId)
+    {
+        if (_connections.TryGetValue(connectionId, out var clientId)
+            && _clients.TryGetValue(clientId, out var client))
+        {
+            client.LastActivityUtc = DateTimeOffset.UtcNow;
         }
     }
 

@@ -115,9 +115,12 @@ public sealed class SignalingHandler
 
     /// <summary>
     /// Receive timeout: if no data arrives within this window, assume connection is dead.
-    /// Client sends pings every 25s, so 90s = 3 missed pings + margin.
+    /// Client sends pings every 25s. 35s = one missed ping + 10s margin.
+    /// Tightened from 90s as part of F1 hardening: dead clients evict faster, so legitimate
+    /// reconnects after a transport drop don't have to wait three minutes for the takeover gate
+    /// to allow them through.
     /// </summary>
-    private static readonly TimeSpan ReceiveTimeout = TimeSpan.FromSeconds(90);
+    private static readonly TimeSpan ReceiveTimeout = TimeSpan.FromSeconds(35);
 
     private async Task ReceiveLoopAsync(
         WebSocket webSocket,
@@ -143,6 +146,9 @@ public sealed class SignalingHandler
                 {
                     break;
                 }
+
+                // Any incoming data (text, binary, ping) counts as liveness for the takeover gate (F1).
+                _registry.TouchActivity(connectionId);
 
                 if (result.MessageType == WebSocketMessageType.Binary)
                 {
@@ -306,6 +312,11 @@ public sealed class SignalingHandler
                 _logger.LogInformation("Client {ClientId} session takeover (old connection {OldConn} replaced)",
                     register.ClientId, oldClient?.ConnectionId);
                 return new SignalingMessage.RegisterSuccess(register.ClientId);
+
+            case RegisterResult.AlreadyActive:
+                _logger.LogWarning("Client ID {ClientId} takeover refused - existing session is still active",
+                    register.ClientId);
+                return new SignalingMessage.RegisterFailed("This client ID has an active session. Please wait or close the other instance.");
 
             case RegisterResult.PasswordMismatch:
             default:
