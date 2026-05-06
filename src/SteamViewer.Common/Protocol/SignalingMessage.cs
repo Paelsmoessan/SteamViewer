@@ -59,10 +59,11 @@ public abstract record SignalingMessage
         [property: JsonPropertyName("reason")] string Reason
     ) : SignalingMessage;
 
-    /// <summary>Request connection to peer</summary>
+    /// <summary>Request connection to peer. PasswordHash is the salted BLAKE3 hash
+    /// (see SteamViewer.Client.Core.Session.PasswordHash); the server never sees plaintext.</summary>
     public sealed record ConnectRequest(
         [property: JsonPropertyName("target_id")] string TargetId,
-        [property: JsonPropertyName("password")] string Password
+        [property: JsonPropertyName("password_hash")] string PasswordHash
     ) : SignalingMessage;
 
     /// <summary>Server forwards connection request to target</summary>

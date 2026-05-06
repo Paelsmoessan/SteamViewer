@@ -225,7 +225,8 @@ public sealed class SessionManager : IAsyncDisposable
 
         _logger.LogInformation("Requesting connection to peer {PeerId}", peerId);
 
-        var msg = new SignalingMessage.ConnectRequest(peerId, password);
+        var passwordHash = PasswordHash.Compute(peerId, password);
+        var msg = new SignalingMessage.ConnectRequest(peerId, passwordHash);
         await _signalingClient.SendAsync(msg, cancellationToken);
 
         _state.ConnectToPeer(peerId);

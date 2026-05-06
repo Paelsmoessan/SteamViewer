@@ -217,10 +217,8 @@ public sealed class ViewerSession : IAsyncDisposable
 
         try
         {
-            // Compute password hash from stored password
-            var passwordHash = Convert.ToHexString(
-                Blake3.Hasher.Hash(System.Text.Encoding.UTF8.GetBytes(StoredPassword ?? "")).AsSpan()
-            ).ToLowerInvariant();
+            // Compute salted password hash (must match what host uses for register and key derivation).
+            var passwordHash = SteamViewer.Client.Core.Session.PasswordHash.Compute(PeerId, StoredPassword ?? "");
 
             _transport = new ViewerStreamTransport(_signalingClient, _loggerFactory.CreateLogger<ViewerStreamTransport>());
             _transport.OnControlMessage += HandleControlMessage;

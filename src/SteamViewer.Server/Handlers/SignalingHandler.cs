@@ -2,7 +2,6 @@
 using System.Net.WebSockets;
 using System.Text;
 using System.Threading.Channels;
-using Blake3;
 using Microsoft.Extensions.Logging;
 using SteamViewer.Common.Protocol;
 using SteamViewer.Server.Services;
@@ -328,9 +327,10 @@ public sealed class SignalingHandler
             return new SignalingMessage.Error($"Target client {request.TargetId} is not online");
         }
 
-        // Verify password by hashing and comparing
-        var passwordHash = Convert.ToHexString(Hasher.Hash(Encoding.UTF8.GetBytes(request.Password)).AsSpan()).ToLowerInvariant();
-        if (!_registry.VerifyPassword(request.TargetId, passwordHash))
+        // Compare the viewer's salted password hash to the host's stored hash via constant-time compare.
+        // The viewer pre-hashes (SteamViewer.Client.Core.Session.PasswordHash); the server never sees
+        // plaintext passwords (closes F3 - server credential harvesting).
+        if (!_registry.VerifyPassword(request.TargetId, request.PasswordHash))
         {
             return new SignalingMessage.Error("Invalid password");
         }

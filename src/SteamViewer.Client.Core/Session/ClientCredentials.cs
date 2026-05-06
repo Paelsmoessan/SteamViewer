@@ -43,12 +43,12 @@ public sealed class ClientCredentials
     }
 
     /// <summary>
-    /// Gets the BLAKE3 hash of the password for authentication.
+    /// Gets the salted BLAKE3 hash of the password for authentication.
+    /// Salt is the clientId — matches what the server stores and what the viewer sends.
     /// </summary>
     public string PasswordHash()
     {
-        var hash = Hasher.Hash(Encoding.UTF8.GetBytes(Password));
-        return Convert.ToHexString(hash.AsSpan()).ToLowerInvariant();
+        return Session.PasswordHash.Compute(ClientId, Password);
     }
 
     private static string GenerateClientId()

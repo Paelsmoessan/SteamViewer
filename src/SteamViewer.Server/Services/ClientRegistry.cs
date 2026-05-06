@@ -1,5 +1,7 @@
 using System.Collections.Concurrent;
 using System.Net.WebSockets;
+using System.Security.Cryptography;
+using System.Text;
 using System.Threading.Channels;
 using SteamViewer.Common.Protocol;
 
@@ -99,7 +101,7 @@ public sealed class ClientRegistry
                 return (RegisterResult.PasswordMismatch, null);
             }
 
-            if (existing.PasswordHash != passwordHash)
+            if (!ConstantTimeStringEquals(existing.PasswordHash, passwordHash))
             {
                 return (RegisterResult.PasswordMismatch, null);
             }
@@ -143,15 +145,24 @@ public sealed class ClientRegistry
     }
 
     /// <summary>
-    /// Verify password for a client.
+    /// Verify password hash for a client. Constant-time comparison to prevent timing attacks
+    /// that could otherwise recover the stored hash byte-by-byte (F11).
     /// </summary>
     public bool VerifyPassword(string clientId, string passwordHash)
     {
         if (_clients.TryGetValue(clientId, out var client))
         {
-            return client.PasswordHash == passwordHash;
+            return ConstantTimeStringEquals(client.PasswordHash, passwordHash);
         }
         return false;
+    }
+
+    private static bool ConstantTimeStringEquals(string a, string b)
+    {
+        if (a.Length != b.Length) return false;
+        var aBytes = Encoding.UTF8.GetBytes(a);
+        var bBytes = Encoding.UTF8.GetBytes(b);
+        return CryptographicOperations.FixedTimeEquals(aBytes, bBytes);
     }
 
     /// <summary>

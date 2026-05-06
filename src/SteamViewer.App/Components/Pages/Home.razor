@@ -606,9 +606,8 @@ else
                 clientId = new Random().Next(100000000, 999999999).ToString();
                 password = Guid.NewGuid().ToString("N")[..8].ToUpperInvariant();
 #endif
-                passwordHash = Convert.ToHexString(
-                    Hasher.Hash(Encoding.UTF8.GetBytes(password)).AsSpan()
-                ).ToLowerInvariant();
+                // Use salted hash (clientId + domain tag) - matches what the viewer sends in ConnectRequest.
+                passwordHash = SteamViewer.Client.Core.Session.PasswordHash.Compute(clientId, password);
             }
 
             var success = await SignalingClient.RegisterAsync(clientId, passwordHash);

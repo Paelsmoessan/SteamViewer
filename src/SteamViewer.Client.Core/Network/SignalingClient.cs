@@ -171,11 +171,12 @@ public sealed class SignalingClient : IAsyncDisposable
     }
 
     /// <summary>
-    /// Request connection to a peer.
+    /// Request connection to a peer. Pre-hashes the password (server never sees plaintext).
     /// </summary>
     public async Task RequestConnectionAsync(string targetId, string password, CancellationToken cancellationToken = default)
     {
-        await SendAsync(new SignalingMessage.ConnectRequest(targetId, password), cancellationToken);
+        var passwordHash = SteamViewer.Client.Core.Session.PasswordHash.Compute(targetId, password);
+        await SendAsync(new SignalingMessage.ConnectRequest(targetId, passwordHash), cancellationToken);
     }
 
     /// <summary>

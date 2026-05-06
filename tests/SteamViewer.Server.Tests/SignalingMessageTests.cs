@@ -54,7 +54,7 @@ public class SignalingMessageTests
     public void ConnectRequest_SerializesCorrectly()
     {
         // Arrange
-        var message = new SignalingMessage.ConnectRequest("987654321", "secret123");
+        var message = new SignalingMessage.ConnectRequest("987654321", "abcdef0123456789");
 
         // Act
         var json = SignalingSerializer.Serialize(message);
@@ -63,7 +63,7 @@ public class SignalingMessageTests
         // Assert
         var request = Assert.IsType<SignalingMessage.ConnectRequest>(deserialized);
         Assert.Equal("987654321", request.TargetId);
-        Assert.Equal("secret123", request.Password);
+        Assert.Equal("abcdef0123456789", request.PasswordHash);
     }
 
     [Fact]
