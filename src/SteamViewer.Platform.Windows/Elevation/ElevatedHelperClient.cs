@@ -41,7 +41,8 @@ public sealed class ElevatedHelperClient : IAsyncDisposable
     {
         if (IsConnected) return true;
 
-        _pipeName = $"SteamViewer-Elevated-{Environment.ProcessId}";
+        // Random pipe name (was PID-based, but PID is observable; random Guid is harder to race)
+        _pipeName = $"SteamViewer-Elevated-{Guid.NewGuid():N}";
 
         var exePath = Environment.ProcessPath;
         if (string.IsNullOrEmpty(exePath))
@@ -50,14 +51,17 @@ public sealed class ElevatedHelperClient : IAsyncDisposable
             return false;
         }
 
-        _logger.LogInformation("Launching elevated helper: {ExePath} --elevated-helper {PipeName}", exePath, _pipeName);
+        // Parent PID is passed so the helper can verify we (and only we) are the expected client.
+        var parentPid = Environment.ProcessId;
+        _logger.LogInformation("Launching elevated helper: {ExePath} --elevated-helper {PipeName} {ParentPid}",
+            exePath, _pipeName, parentPid);
 
         try
         {
             var psi = new ProcessStartInfo
             {
                 FileName = exePath,
-                Arguments = $"--elevated-helper {_pipeName}",
+                Arguments = $"--elevated-helper {_pipeName} {parentPid}",
                 UseShellExecute = true,
                 Verb = "runas"
             };

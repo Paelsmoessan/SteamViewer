@@ -172,8 +172,10 @@ public static class SystemHelperServer
     /// <summary>
     /// Run the SYSTEM helper pipe server. Blocks until the client disconnects or sends "exit".
     /// First message from client must be authenticate with the correct nonce.
+    /// expectedClientPid + allowedUserSid restrict pipe access to one specific process running
+    /// as the launching user; without this, any local user could connect (LPE).
     /// </summary>
-    public static void Run(string pipeName, string expectedNonce)
+    public static void Run(string pipeName, string expectedNonce, uint expectedClientPid, string allowedUserSid)
     {
         // Use CommonApplicationData (C:\ProgramData) — SYSTEM user's %LOCALAPPDATA% is different
         _debugPath = Path.Combine(
@@ -223,14 +225,22 @@ public static class SystemHelperServer
         _inputThread.SetApartmentState(ApartmentState.MTA);
         _inputThread.Start();
 
+        // Resolve the allowed user SID once - reused for all three pipes.
+        SecurityIdentifier userSid;
         try
         {
-            // Allow authenticated users to connect (main app runs as regular user)
-            var pipeSecurity = new PipeSecurity();
-            pipeSecurity.AddAccessRule(new PipeAccessRule(
-                new SecurityIdentifier(WellKnownSidType.AuthenticatedUserSid, null),
-                PipeAccessRights.ReadWrite,
-                AccessControlType.Allow));
+            userSid = new SecurityIdentifier(allowedUserSid);
+        }
+        catch (Exception ex)
+        {
+            DebugLog($"Invalid allowedUserSid '{allowedUserSid}': {ex.Message}");
+            return;
+        }
+
+        try
+        {
+            // ACL: only the launching user. Replaces AuthenticatedUserSid which allowed any local user (LPE).
+            var pipeSecurity = PipeAcl.ForUserSid(userSid);
 
             using var pipeServer = NamedPipeServerStreamAcl.Create(
                 pipeName,
@@ -270,7 +280,18 @@ public static class SystemHelperServer
                 return;
             }
 
-            DebugLog("Client connected. Waiting for authentication...");
+            // Defense in depth: verify the connected client is the expected admin helper PID.
+            if (!PipeAuth.TryGetClientProcessId(pipeServer, out var actualClientPid))
+            {
+                DebugLog("Could not determine client PID. Refusing connection.");
+                return;
+            }
+            if (actualClientPid != expectedClientPid)
+            {
+                DebugLog($"Client PID mismatch: expected {expectedClientPid}, got {actualClientPid}. Refusing connection.");
+                return;
+            }
+            DebugLog($"Client PID {actualClientPid} matches expected. Waiting for authentication...");
 
             using var reader = new StreamReader(pipeServer, PipeEncoding);
             using var writer = new StreamWriter(pipeServer, PipeEncoding) { AutoFlush = true };
@@ -286,11 +307,7 @@ public static class SystemHelperServer
 
             // Create video pipe for binary BGRA frames (server -> client, outbound only)
             var videoPipeName = $"{pipeName}_video";
-            var videoPipeSecurity = new PipeSecurity();
-            videoPipeSecurity.AddAccessRule(new PipeAccessRule(
-                new SecurityIdentifier(WellKnownSidType.AuthenticatedUserSid, null),
-                PipeAccessRights.ReadWrite,
-                AccessControlType.Allow));
+            var videoPipeSecurity = PipeAcl.ForUserSid(userSid);
 
             _videoPipeServer = NamedPipeServerStreamAcl.Create(
                 videoPipeName,
@@ -319,12 +336,22 @@ public static class SystemHelperServer
                 try
                 {
                     _videoPipeServer.WaitForConnection();
+
+                    // Verify client PID matches the expected admin helper.
+                    if (!PipeAuth.TryGetClientProcessId(_videoPipeServer, out var videoClientPid)
+                        || videoClientPid != expectedClientPid)
+                    {
+                        DebugLog($"Video pipe: client PID {videoClientPid} != expected {expectedClientPid}. Refusing.");
+                        try { _videoPipeServer.Disconnect(); } catch { }
+                        return;
+                    }
+
                     lock (_videoWriteLock)
                     {
                         _videoWriter = new BinaryWriter(_videoPipeServer);
                         _videoConnected = true;
                     }
-                    DebugLog("Video pipe client connected");
+                    DebugLog($"Video pipe client connected (PID {videoClientPid})");
 
                     // Start capture AFTER pipe is connected — frames go directly to pipe
                     _capture.Start();
@@ -343,11 +370,7 @@ public static class SystemHelperServer
 
             // Create notify pipe for server-push notifications (server → client, outbound only)
             var notifyPipeName = $"{pipeName}_notify";
-            var notifyPipeSecurity = new PipeSecurity();
-            notifyPipeSecurity.AddAccessRule(new PipeAccessRule(
-                new SecurityIdentifier(WellKnownSidType.AuthenticatedUserSid, null),
-                PipeAccessRights.ReadWrite,
-                AccessControlType.Allow));
+            var notifyPipeSecurity = PipeAcl.ForUserSid(userSid);
 
             _notifyPipeServer = NamedPipeServerStreamAcl.Create(
                 notifyPipeName,
@@ -365,12 +388,22 @@ public static class SystemHelperServer
                 try
                 {
                     _notifyPipeServer.WaitForConnection();
+
+                    // Verify client PID matches the expected admin helper.
+                    if (!PipeAuth.TryGetClientProcessId(_notifyPipeServer, out var notifyClientPid)
+                        || notifyClientPid != expectedClientPid)
+                    {
+                        DebugLog($"Notify pipe: client PID {notifyClientPid} != expected {expectedClientPid}. Refusing.");
+                        try { _notifyPipeServer.Disconnect(); } catch { }
+                        return;
+                    }
+
                     lock (_notifyWriteLock)
                     {
                         _notifyWriter = new StreamWriter(_notifyPipeServer, PipeEncoding) { AutoFlush = true };
                         _notifyConnected = true;
                     }
-                    DebugLog("Notify pipe client connected");
+                    DebugLog($"Notify pipe client connected (PID {notifyClientPid})");
                 }
                 catch (Exception ex)
                 {

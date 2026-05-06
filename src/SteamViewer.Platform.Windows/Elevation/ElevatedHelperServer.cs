@@ -38,8 +38,10 @@ public static class ElevatedHelperServer
 
     /// <summary>
     /// Run the elevated helper pipe server. Blocks until the client disconnects or sends "exit".
+    /// expectedClientPid is the parent SteamViewer process that launched us via UAC; only that
+    /// PID is allowed to connect (defense in depth on top of the same-user ACL).
     /// </summary>
-    public static void Run(string pipeName)
+    public static void Run(string pipeName, uint expectedClientPid)
     {
         _debugPath = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
@@ -54,16 +56,14 @@ public static class ElevatedHelperServer
             try { Directory.CreateDirectory(Path.GetDirectoryName(_debugPathLocal)!); } catch { }
         }
 
-        DebugLog($"Starting pipe server: {pipeName} (PID {Environment.ProcessId})");
+        DebugLog($"Starting pipe server: {pipeName} (PID {Environment.ProcessId}, expecting client PID {expectedClientPid})");
 
         try
         {
-            // Allow non-elevated (authenticated) users to connect to this elevated pipe
-            var pipeSecurity = new PipeSecurity();
-            pipeSecurity.AddAccessRule(new PipeAccessRule(
-                new SecurityIdentifier(WellKnownSidType.AuthenticatedUserSid, null),
-                PipeAccessRights.ReadWrite,
-                AccessControlType.Allow));
+            // ACL: restrict to the user SID that launched us. UAC elevation does not change user identity,
+            // so the current user SID matches the parent SteamViewer's user SID.
+            // Replaces the previous AuthenticatedUserSid ACL which allowed any local user to connect — LPE.
+            var pipeSecurity = PipeAcl.CurrentUserOnly();
 
             // PipeOptions.None (synchronous) — sync ReadLine() hangs on async pipes
             using var pipeServer = NamedPipeServerStreamAcl.Create(
@@ -104,7 +104,19 @@ public static class ElevatedHelperServer
                 return;
             }
 
-            DebugLog("Client connected. Processing commands...");
+            // Defense in depth: verify the connected client is the expected parent PID.
+            // Without this, any process running as the same user (e.g. malware) could connect.
+            if (!PipeAuth.TryGetClientProcessId(pipeServer, out var actualClientPid))
+            {
+                DebugLog("Could not determine client PID. Refusing connection.");
+                return;
+            }
+            if (actualClientPid != expectedClientPid)
+            {
+                DebugLog($"Client PID mismatch: expected {expectedClientPid}, got {actualClientPid}. Refusing connection.");
+                return;
+            }
+            DebugLog($"Client PID {actualClientPid} matches expected. Processing commands...");
 
             using var reader = new StreamReader(pipeServer, PipeEncoding);
             using var writer = new StreamWriter(pipeServer, PipeEncoding) { AutoFlush = true };
@@ -442,9 +454,15 @@ public static class ElevatedHelperServer
             if (string.IsNullOrEmpty(exePath))
                 return JsonSerializer.Serialize(new HelperResponse(false, "Cannot determine exe path"));
 
-            DebugLog($"LaunchSystemHelper: pipe={pipeName}, exe={exePath}");
+            // Pass our PID (admin helper) and user SID so SYSTEM helper can pin its pipe ACL
+            // to our user and refuse connections from any other PID.
+            var expectedClientPid = Environment.ProcessId;
+            var allowedUserSid = System.Security.Principal.WindowsIdentity.GetCurrent().User?.Value
+                ?? throw new InvalidOperationException("Cannot determine user SID for SYSTEM helper ACL");
 
-            var arguments = $"--system-helper {pipeName} {nonce}";
+            DebugLog($"LaunchSystemHelper: pipe={pipeName}, exe={exePath}, clientPid={expectedClientPid}, userSid={allowedUserSid}");
+
+            var arguments = $"--system-helper {pipeName} {nonce} {expectedClientPid} {allowedUserSid}";
             if (ProcessLauncher.LaunchAsSystemFromAdmin(exePath, arguments, out var pid, out var launchError))
             {
                 DebugLog($"SYSTEM helper launched via token duplication: PID {pid}");

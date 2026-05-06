@@ -60,12 +60,17 @@ public static class Program
             return;
         }
 
-        // --system-helper <pipeName> <nonce>: SYSTEM-level pipe server (launched via scheduled task as SYSTEM)
+        // --system-helper <pipeName> <nonce> <expectedClientPid> <allowedUserSid>: SYSTEM-level pipe server
         var systemIdx = Array.IndexOf(args, "--system-helper");
-        if (systemIdx >= 0 && systemIdx + 2 < args.Length)
+        if (systemIdx >= 0 && systemIdx + 4 < args.Length)
         {
             var sysPipeName = args[systemIdx + 1];
             var nonce = args[systemIdx + 2];
+            if (!uint.TryParse(args[systemIdx + 3], out var sysExpectedClientPid))
+            {
+                return; // Invalid args - refuse to run
+            }
+            var allowedUserSid = args[systemIdx + 4];
             var sysDebugPath = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                 "SteamViewer", "system-helper-debug.txt");
@@ -74,7 +79,7 @@ public static class Program
                 Directory.CreateDirectory(Path.GetDirectoryName(sysDebugPath)!);
                 File.AppendAllText(sysDebugPath,
                     $"[{DateTime.Now:HH:mm:ss}] System helper intercepted. PID: {Environment.ProcessId}\n" +
-                    $"[{DateTime.Now:HH:mm:ss}] PipeName: {sysPipeName}, User: {Environment.UserName}\n");
+                    $"[{DateTime.Now:HH:mm:ss}] PipeName: {sysPipeName}, User: {Environment.UserName}, ExpectedClientPid: {sysExpectedClientPid}, AllowedUserSid: {allowedUserSid}\n");
             }
             catch { /* best-effort debug log */ }
 
@@ -82,7 +87,7 @@ public static class Program
 
             try
             {
-                SteamViewer.Platform.Windows.Elevation.SystemHelperServer.Run(sysPipeName, nonce);
+                SteamViewer.Platform.Windows.Elevation.SystemHelperServer.Run(sysPipeName, nonce, sysExpectedClientPid, allowedUserSid);
             }
             catch (Exception ex)
             {
@@ -91,11 +96,16 @@ public static class Program
             return;
         }
 
-        // --elevated-helper <pipeName>: named pipe server for privileged operations
+        // --elevated-helper <pipeName> <expectedClientPid>: named pipe server for privileged operations
         var helperIdx = Array.IndexOf(args, "--elevated-helper");
-        if (helperIdx >= 0 && helperIdx + 1 < args.Length)
+        if (helperIdx >= 0 && helperIdx + 2 < args.Length)
         {
             var pipeName = args[helperIdx + 1];
+            if (!uint.TryParse(args[helperIdx + 2], out var expectedClientPid))
+            {
+                return; // Invalid args - refuse to run
+            }
+
             var debugPath = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                 "SteamViewer", "helper-debug.txt");
@@ -104,13 +114,13 @@ public static class Program
                 Directory.CreateDirectory(Path.GetDirectoryName(debugPath)!);
                 File.AppendAllText(debugPath,
                     $"[{DateTime.Now:HH:mm:ss}] Helper intercepted. Args: {string.Join(" ", args)}\n" +
-                    $"[{DateTime.Now:HH:mm:ss}] PipeName: {pipeName}, PID: {Environment.ProcessId}\n");
+                    $"[{DateTime.Now:HH:mm:ss}] PipeName: {pipeName}, PID: {Environment.ProcessId}, ExpectedClientPid: {expectedClientPid}\n");
             }
             catch { /* best-effort debug log */ }
 
             try
             {
-                SteamViewer.Platform.Windows.Elevation.ElevatedHelperServer.Run(pipeName);
+                SteamViewer.Platform.Windows.Elevation.ElevatedHelperServer.Run(pipeName, expectedClientPid);
             }
             catch (Exception ex)
             {
