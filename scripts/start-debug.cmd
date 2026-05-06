@@ -44,7 +44,7 @@ echo  App started!
 echo ========================================
 echo.
 echo  Server:  Railway (remote)
-echo  Host:    ID=123456789  Pass=TESTPASS
+echo  Host:    ID and password shown in the app window
 echo.
 echo  Press any key to stop app...
 pause >nul

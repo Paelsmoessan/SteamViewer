@@ -8,6 +8,14 @@ misc/.AI.md
 .claude/session-memory.md
 .claude/local-config.md
 .claude/scripts/
+
+# Security audit + revision plan (private — exploit detail for live binaries
+# until fixes are widely deployed and a CVE-style summary replaces it)
+.claude/research/security-audit/
+.claude/plans/security-revision-v0.2.md
+
+# Cross-session coordination notes (contain user paths / personal context)
+.claude/NOTE-FROM-PUBLIC-CLEANUP.md
 gist-comms-temp.md
 gist-id.txt
 

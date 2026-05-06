@@ -39,17 +39,21 @@ app.MapGet("/health", () => "OK");
 // ==================== Remote Management API (DEBUG ONLY) ====================
 #if DEBUG
 
-// Whitelist of allowed machine names (prevents command injection)
+// Whitelist of allowed machine names (prevents command injection).
+// Reads from REMOTE_API_ALLOWED_MACHINES env var (semicolon-separated) so private
+// hostnames are not hardcoded in source. Always includes the local machine name.
+var allowedMachinesEnv = Environment.GetEnvironmentVariable("REMOTE_API_ALLOWED_MACHINES") ?? "";
 var allowedMachines = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
 {
-    "MEDIASERVER",
     Environment.MachineName
 };
+foreach (var name in allowedMachinesEnv.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+    allowedMachines.Add(name);
 
 // Validate machine name - must be alphanumeric/hyphen only and in whitelist
 bool IsValidMachine(string? machine, out string machineName)
 {
-    machineName = machine ?? "MEDIASERVER";
+    machineName = machine ?? Environment.MachineName;
 
     // Must match pattern: alphanumeric, hyphens, underscores only
     if (!System.Text.RegularExpressions.Regex.IsMatch(machineName, @"^[a-zA-Z0-9_-]+$"))
