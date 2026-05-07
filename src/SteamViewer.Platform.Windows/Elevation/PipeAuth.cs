@@ -1,5 +1,6 @@
 using System.IO.Pipes;
 using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
 
 namespace SteamViewer.Platform.Windows.Elevation;
 
@@ -11,32 +12,21 @@ namespace SteamViewer.Platform.Windows.Elevation;
 /// </summary>
 internal static class PipeAuth
 {
+    // Take SafePipeHandle directly so the marshaller manages handle lifetime
+    // (no DangerousGetHandle needed, no race against the SafeHandle being closed).
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool GetNamedPipeClientProcessId(IntPtr hPipe, out uint clientProcessId);
+    private static extern bool GetNamedPipeClientProcessId(SafePipeHandle hPipe, out uint clientProcessId);
 
     /// <summary>
     /// Get the PID of the process at the other end of an accepted pipe connection.
-    /// Uses DangerousAddRef/DangerousRelease so the SafeHandle cannot be released
-    /// concurrently while we're calling the underlying Win32 API.
     /// </summary>
     public static bool TryGetClientProcessId(NamedPipeServerStream pipe, out uint pid)
     {
         pid = 0;
         var handle = pipe.SafePipeHandle;
         if (handle == null || handle.IsInvalid) return false;
-
-        var added = false;
-        try
-        {
-            handle.DangerousAddRef(ref added);
-            if (!added) return false;
-            return GetNamedPipeClientProcessId(handle.DangerousGetHandle(), out pid);
-        }
-        finally
-        {
-            if (added) handle.DangerousRelease();
-        }
+        return GetNamedPipeClientProcessId(handle, out pid);
     }
 
     /// <summary>

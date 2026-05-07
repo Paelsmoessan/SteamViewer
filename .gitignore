@@ -61,3 +61,4 @@ misc/*.lnk
 src.zip
 .claude/scheduled_tasks.lock
 sonar-*.json
+.scratch/
