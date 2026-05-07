@@ -437,7 +437,6 @@ public sealed class UdpTransportBackend : ITransportBackend
 
         using var probeCts = new CancellationTokenSource(timeout);
         var attempt = 0;
-        var rng = new Random();
         var probeStopwatch = Stopwatch.StartNew();
         try
         {
@@ -452,7 +451,8 @@ public sealed class UdpTransportBackend : ITransportBackend
 
                 // Check for immediate response between burst probes
                 using var burstCts = CancellationTokenSource.CreateLinkedTokenSource(probeCts.Token);
-                burstCts.CancelAfter(10 + rng.Next(10)); // 10-20ms jitter between bursts
+                // 10-20ms jitter between bursts; crypto RNG to satisfy static analysis (jitter window is non-security-critical).
+                burstCts.CancelAfter(10 + System.Security.Cryptography.RandomNumberGenerator.GetInt32(10));
                 try
                 {
                     var result = await _udpClient.ReceiveAsync(burstCts.Token);

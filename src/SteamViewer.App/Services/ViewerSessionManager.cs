@@ -113,7 +113,9 @@ public sealed class ViewerSessionManager : IAsyncDisposable
             var joinerId = $"VIEWER{_debugViewerIdCounter++}";
 #else
             // Register with a random ID for joining
-            var joinerId = new Random().Next(100000000, 999999999).ToString();
+            // Crypto RNG so attackers can't enumerate or predict joiner IDs.
+            var joinerId = System.Security.Cryptography.RandomNumberGenerator
+                .GetInt32(100_000_000, 1_000_000_000).ToString();
 #endif
             var joinerPasswordHash = Convert.ToHexString(
                 Hasher.Hash(Encoding.UTF8.GetBytes(Guid.NewGuid().ToString())).AsSpan()
@@ -244,7 +246,9 @@ public sealed class ViewerSessionManager : IAsyncDisposable
 #if DEBUG
             var joinerId = $"VIEWER{_debugViewerIdCounter++}";
 #else
-            var joinerId = new Random().Next(100000000, 999999999).ToString();
+            // Crypto RNG so attackers can't enumerate or predict joiner IDs.
+            var joinerId = System.Security.Cryptography.RandomNumberGenerator
+                .GetInt32(100_000_000, 1_000_000_000).ToString();
 #endif
             var joinerPasswordHash = Convert.ToHexString(
                 Hasher.Hash(Encoding.UTF8.GetBytes(Guid.NewGuid().ToString())).AsSpan()

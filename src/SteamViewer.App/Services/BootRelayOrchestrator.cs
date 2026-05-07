@@ -83,45 +83,53 @@ public static class BootRelayOrchestrator
             creds.ServerUrl!,
             _loggerFactory.CreateLogger<SignalingClient>());
 
-        var cts = new CancellationTokenSource(TimeSpan.FromMinutes(60));
-
-        // Connect + register with retry
-        if (!await ConnectAndRegisterWithRetry(creds, cts.Token))
+        using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(60));
+        CancellationTokenSource? logonCts = null;
+        try
         {
-            BootRelayService.DebugLog("All connection attempts failed. Exiting.");
-            return;
-        }
-
-        // Logon monitor (skip in test mode)
-        if (!_isTestMode)
-        {
-            var logonCts = CancellationTokenSource.CreateLinkedTokenSource(cts.Token);
-            _ = Task.Run(() => BootRelayService.MonitorUserLogon(creds, logonCts.Token, () => _stopping = true), logonCts.Token);
-        }
-        else
-        {
-            BootRelayService.DebugLog("Test mode: skipping logon monitor");
-        }
-
-        // Main loop
-        while (!cts.Token.IsCancellationRequested && !_stopping)
-        {
-            if (_signalingDisconnected)
+            // Connect + register with retry
+            if (!await ConnectAndRegisterWithRetry(creds, cts.Token))
             {
-                _signalingDisconnected = false;
-                BootRelayService.DebugLog("Signaling disconnected - attempting reconnect...");
-                if (!await ConnectAndRegisterWithRetry(creds, cts.Token))
-                {
-                    BootRelayService.DebugLog("Reconnect failed. Exiting.");
-                    _stopping = true;
-                    break;
-                }
+                BootRelayService.DebugLog("All connection attempts failed. Exiting.");
+                return;
             }
 
-            await Task.Delay(1000, cts.Token).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
-        }
+            // Logon monitor (skip in test mode)
+            if (!_isTestMode)
+            {
+                logonCts = CancellationTokenSource.CreateLinkedTokenSource(cts.Token);
+                var logonToken = logonCts.Token;
+                _ = Task.Run(() => BootRelayService.MonitorUserLogon(creds, logonToken, () => _stopping = true), logonToken);
+            }
+            else
+            {
+                BootRelayService.DebugLog("Test mode: skipping logon monitor");
+            }
 
-        BootRelayService.DebugLog("Main loop ended");
+            // Main loop
+            while (!cts.Token.IsCancellationRequested && !_stopping)
+            {
+                if (_signalingDisconnected)
+                {
+                    _signalingDisconnected = false;
+                    BootRelayService.DebugLog("Signaling disconnected - attempting reconnect...");
+                    if (!await ConnectAndRegisterWithRetry(creds, cts.Token))
+                    {
+                        BootRelayService.DebugLog("Reconnect failed. Exiting.");
+                        _stopping = true;
+                        break;
+                    }
+                }
+
+                await Task.Delay(1000, cts.Token).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+            }
+
+            BootRelayService.DebugLog("Main loop ended");
+        }
+        finally
+        {
+            logonCts?.Dispose();
+        }
     }
 
     private static async Task<bool> ConnectAndRegisterWithRetry(

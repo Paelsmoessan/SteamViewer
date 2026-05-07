@@ -17,13 +17,26 @@ internal static class PipeAuth
 
     /// <summary>
     /// Get the PID of the process at the other end of an accepted pipe connection.
+    /// Uses DangerousAddRef/DangerousRelease so the SafeHandle cannot be released
+    /// concurrently while we're calling the underlying Win32 API.
     /// </summary>
     public static bool TryGetClientProcessId(NamedPipeServerStream pipe, out uint pid)
     {
         pid = 0;
         var handle = pipe.SafePipeHandle;
         if (handle == null || handle.IsInvalid) return false;
-        return GetNamedPipeClientProcessId(handle.DangerousGetHandle(), out pid);
+
+        var added = false;
+        try
+        {
+            handle.DangerousAddRef(ref added);
+            if (!added) return false;
+            return GetNamedPipeClientProcessId(handle.DangerousGetHandle(), out pid);
+        }
+        finally
+        {
+            if (added) handle.DangerousRelease();
+        }
     }
 
     /// <summary>
