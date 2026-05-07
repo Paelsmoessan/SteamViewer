@@ -60,3 +60,4 @@ misc/*.lnk
 .Claude.zip
 src.zip
 .claude/scheduled_tasks.lock
+sonar-*.json
