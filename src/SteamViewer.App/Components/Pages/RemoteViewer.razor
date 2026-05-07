@@ -1466,7 +1466,12 @@
             Logger.LogWarning("[RECONNECT-DIAG] Timer expired, calling TryReconnect");
             _reconnectTimer?.Dispose();
             _reconnectTimer = null;
-            await TryReconnect();
+            // Marshal TryReconnect onto the dispatcher: the Timer callback is on a thread-pool
+            // thread, so without InvokeAsync the awaits inside TryReconnect resume off-thread
+            // and the StateHasChanged() at the success path throws cross-thread. The catch
+            // block then reschedules StartReconnectCountdown(), creating a 10-second reconnect
+            // loop that runs forever even after the session has actually recovered.
+            await InvokeAsync(TryReconnect);
         }
 
         await InvokeAsync(StateHasChanged);
