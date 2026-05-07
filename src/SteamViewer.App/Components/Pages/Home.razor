@@ -775,12 +775,12 @@ else
                 hostClientId: clientId,
                 hostPasswordHash: passwordHash);
 
-            // Auto-share full screen on reconnect after reboot
-            if (_isReconnect)
-            {
-                _hostSession.AutoShareOnReady = true;
-                _isReconnect = false; // One-time
-            }
+            // Auto-share on every accepted connection. The viewer pressed Connect, the host
+            // accepted (either via the modal or the boot-relay reconnect path); intent is to
+            // share. Was previously gated on _isReconnect, but that gate became too narrow
+            // after the F1 security fix tied _isReconnect to transport disconnects only.
+            _hostSession.AutoShareOnReady = true;
+            _isReconnect = false; // One-time consume of the reconnect flag (still needed by deferred-reconnect path)
 
             _hostSession.OnStateChanged += state => InvokeAsync(StateHasChanged);
             _hostSession.OnReady += () => InvokeAsync(StateHasChanged);
