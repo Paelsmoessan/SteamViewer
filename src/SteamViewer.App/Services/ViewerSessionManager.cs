@@ -24,6 +24,10 @@ public sealed class ViewerSessionManager : IAsyncDisposable
 
     private readonly ConcurrentDictionary<string, ViewerSession> _sessions = new();
     private readonly ConcurrentDictionary<string, string> _peerToSession = new(); // peerId -> sessionId
+    // Per-session callback invoked when the host approves the connection. Used to defer
+    // opening the viewer window until we know the password was correct AND the host accepted -
+    // otherwise a wrong-password attempt flashes a viewer window that opens and immediately closes.
+    private readonly ConcurrentDictionary<string, Action<ViewerSession>> _onApprovedCallbacks = new();
     private bool _signalingSubscribed;
     private bool _disposed;
     private string _localClientId = "";
@@ -83,16 +87,15 @@ public sealed class ViewerSessionManager : IAsyncDisposable
     /// <param name="peerId">The peer ID to connect to.</param>
     /// <param name="password">The password for the peer.</param>
     /// <param name="jsRuntime">The JS runtime from the calling Blazor context.</param>
-    /// <param name="afterSessionCreated">
-    /// Optional synchronous callback invoked after the session is in the registry but
-    /// BEFORE the ConnectRequest is sent over signaling. The caller should use this to
-    /// open/bind the viewer window so any error response can find the window in a
-    /// fully-formed state. Without this, server Error replies (e.g. "Invalid password")
-    /// can race ahead of the window setup and tear the session down before the UI binds.
+    /// <param name="onApproved">
+    /// Optional callback invoked when the host approves the connection (server returns
+    /// ConnectionResponse with approved=true). The caller uses this to open the viewer
+    /// window only AFTER approval - so a wrong-password attempt or rejection by the
+    /// host never causes a viewer window to flash open and closed.
     /// </param>
     /// <returns>The created session, or null if max sessions reached or connection failed.</returns>
     public async Task<ViewerSession?> CreateSessionAsync(string peerId, string password, IJSRuntime jsRuntime,
-        Action<ViewerSession>? afterSessionCreated = null)
+        Action<ViewerSession>? onApproved = null)
     {
         if (_sessions.Count >= MaxSessions)
         {
@@ -153,26 +156,20 @@ public sealed class ViewerSessionManager : IAsyncDisposable
 
         _sessions[sessionId] = session;
         _peerToSession[peerId] = sessionId;
+        if (onApproved != null)
+        {
+            _onApprovedCallbacks[sessionId] = onApproved;
+        }
 
         _logger.LogInformation("Created session {SessionId} for peer {PeerId}", sessionId, peerId);
-
-        // Synchronous window setup BEFORE we hit the network. Closes the race where
-        // the server's Error response could arrive (and HandleError could fire
-        // RemoveSessionAsync) before the caller had a chance to wire up the UI.
-        try
-        {
-            afterSessionCreated?.Invoke(session);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "afterSessionCreated callback failed for session {SessionId}", sessionId);
-        }
 
         // Transport initialization is DEFERRED — host sends RelayReady via signaling,
         // which triggers HandleRelayReadyAsync to setup encrypted relay.
         // RemoteViewer calls session.BindToViewerAsync() for rendering setup.
 
-        // Request connection via signaling
+        // Request connection via signaling. Window won't open until host approves
+        // (HandleConnectionResponse fires onApproved callback). If password is wrong
+        // or host rejects, the callback never fires and no window appears.
         await _signalingClient.RequestConnectionAsync(peerId, password);
 
         OnSessionCreated?.Invoke(session);
@@ -357,11 +354,24 @@ public sealed class ViewerSessionManager : IAsyncDisposable
         {
             _logger.LogInformation("Session {SessionId}: Connection approved by peer {PeerId}",
                 session.SessionId, response.TargetId);
+
+            // Now that the host has approved, fire the deferred onApproved callback
+            // which opens the viewer window. We do NOT open the window earlier (e.g.
+            // on send) so that wrong-password or rejection paths never produce a flash.
+            if (_onApprovedCallbacks.TryRemove(session.SessionId, out var cb))
+            {
+                try { cb(session); }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "onApproved callback failed for session {SessionId}", session.SessionId);
+                }
+            }
         }
         else
         {
             _logger.LogWarning("Session {SessionId}: Connection rejected by peer {PeerId}",
                 session.SessionId, response.TargetId);
+            _onApprovedCallbacks.TryRemove(session.SessionId, out _);
             OnConnectionFailed?.Invoke(response.TargetId, "Connection rejected");
             _ = RemoveSessionAsync(session.SessionId);
         }
@@ -382,8 +392,10 @@ public sealed class ViewerSessionManager : IAsyncDisposable
     {
         _logger.LogWarning("Signaling error: {Message}", error.Message);
 
-        // Server error likely means connection request failed (e.g. "Target client X is not online").
-        // Clean up any sessions that haven't established transport yet — they're the ones that failed.
+        // Server error likely means connection request failed (e.g. "Target client X is not online"
+        // or "Invalid password"). Clean up any sessions that haven't established transport yet -
+        // they're the ones that failed. Their pending onApproved callbacks are dropped without
+        // firing so no viewer window opens for a failed attempt.
         var staleSessionIds = _sessions
             .Where(kvp => !kvp.Value.IsInitialized)
             .Select(kvp => kvp.Key)
@@ -392,8 +404,13 @@ public sealed class ViewerSessionManager : IAsyncDisposable
         foreach (var sessionId in staleSessionIds)
         {
             _logger.LogInformation("Cleaning up stale session {SessionId} after signaling error", sessionId);
+            _onApprovedCallbacks.TryRemove(sessionId, out _);
             _ = RemoveSessionAsync(sessionId);
         }
+
+        // Surface the error to UI. JoinSession's catch handler doesn't see this - the Error
+        // arrives via the signaling receive loop, not as a return value from RequestConnectionAsync.
+        OnConnectionFailed?.Invoke("", error.Message);
     }
 
     private void HandleSessionStateChanged(string sessionId, ViewerSessionState state)

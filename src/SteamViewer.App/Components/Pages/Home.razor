@@ -702,18 +702,15 @@ else
             errorMessage = "";
             StateHasChanged();
 
-            // Delegate entirely to ViewerSessionManager. Open the viewer window via the
-            // afterSessionCreated callback so the window is fully wired up BEFORE the
-            // ConnectRequest is sent — otherwise a server Error response (e.g. wrong
-            // password) can race ahead of OpenViewerForSession and tear the session down
-            // before the UI binds, leaving a stale windowId polluting the ClaimOrCreate
-            // queue for the next attempt.
+            // Delegate entirely to ViewerSessionManager. Open the viewer window only AFTER
+            // the host has accepted (onApproved fires from HandleConnectionResponse with
+            // approved=true). Wrong-password or rejection paths never open a viewer window.
             var session = await ViewerSessionManager.CreateSessionAsync(
                 targetId, targetPassword, JSRuntime,
-                afterSessionCreated: s =>
+                onApproved: s =>
                 {
                     TabManager.OpenViewerForSession(s.SessionId, targetId);
-                    Logger.LogInformation("Opened viewer for peer {PeerId} via ViewerSessionManager", targetId);
+                    Logger.LogInformation("Opened viewer for peer {PeerId} after host approval", targetId);
                 });
 
             if (session == null)
