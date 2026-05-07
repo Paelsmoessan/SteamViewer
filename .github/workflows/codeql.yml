@@ -1,0 +1,70 @@
+name: "CodeQL"
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  schedule:
+    # Weekly Monday 06:00 UTC - catches new query updates from GitHub.
+    - cron: '0 6 * * 1'
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: windows-latest
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        language: ['csharp']
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Install MAUI workload
+        run: dotnet workload install maui-windows
+
+      - name: Download FFmpeg DLLs (mirrors release.yml so CodeQL builds the same code)
+        shell: pwsh
+        run: |
+          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip"
+          $zip = "$env:RUNNER_TEMP\ffmpeg.zip"
+          $extract = "$env:RUNNER_TEMP\ffmpeg"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $extract -Force
+          $binDir = Get-ChildItem -Path $extract -Directory | Select-Object -First 1
+          $dest = "src/SteamViewer.App/ffmpeg"
+          New-Item -ItemType Directory -Path $dest -Force
+          Copy-Item "$($binDir.FullName)/bin/avcodec-62.dll" $dest
+          Copy-Item "$($binDir.FullName)/bin/avutil-60.dll" $dest
+          Copy-Item "$($binDir.FullName)/bin/swscale-9.dll" $dest
+          Copy-Item "$($binDir.FullName)/bin/swresample-6.dll" $dest
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          # security-and-quality is the broadest suite - includes security-extended
+          # plus maintainability/reliability queries. Tightens the net for a security-
+          # critical app at the cost of more findings to triage.
+          queries: security-and-quality
+
+      - name: Build solution
+        run: dotnet build SteamViewer.Windows.sln -c Release
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
