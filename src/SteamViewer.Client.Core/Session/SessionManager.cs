@@ -572,7 +572,7 @@ public sealed class SessionManager : IAsyncDisposable
 
         switch (message)
         {
-            case SignalingMessage.RegisterSuccess success:
+            case SignalingMessage.RegisterSuccess:
                 _state.SetConnectionState(ConnectionState.Registered);
                 Registered?.Invoke(this, EventArgs.Empty);
                 break;

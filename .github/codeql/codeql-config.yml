@@ -1,0 +1,9 @@
+name: "SteamViewer CodeQL config"
+
+# Suppress generated and build-output paths so generated XAML/AOT code does not
+# clutter security scan results.
+paths-ignore:
+  - "**/obj/**"
+  - "**/bin/**"
+  - "**/*.g.cs"
+  - "**/*.designer.cs"

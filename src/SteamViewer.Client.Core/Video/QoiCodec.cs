@@ -156,8 +156,9 @@ public static class QoiCodec
 
         width = (int)ReadBE32(qoiData, ref p);
         height = (int)ReadBE32(qoiData, ref p);
-        var channels = qoiData[p++];
-        var colorspace = qoiData[p++];
+        // Channels (3=RGB, 4=RGBA) and colorspace (0=sRGB, 1=linear) are part of the QOI
+        // header but our pipeline always uses 4-channel BGRA in sRGB; just advance past them.
+        p += 2;
 
         var pixelCount = width * height;
         var stride = width * 4;

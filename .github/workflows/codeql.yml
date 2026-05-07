@@ -67,6 +67,7 @@ jobs:
           # plus maintainability/reliability queries. Tightens the net for a security-
           # critical app at the cost of more findings to triage.
           queries: security-and-quality
+          config-file: ./.github/codeql/codeql-config.yml
 
       - name: Build solution
         run: dotnet build SteamViewer.Windows.sln -c Release
