@@ -378,11 +378,20 @@ public sealed class ViewerTabManager
     /// <summary>
     /// Claim a pre-created window ID (from OpenViewerForSession/DetachTab) or create a new one.
     /// Used by RemoteViewer.OnInitialized to avoid creating a duplicate empty window.
+    /// Skips dequeued IDs that no longer exist in _windows (e.g. failed-connect window that
+    /// was opened-then-closed before its RemoteViewer initialized — those IDs would otherwise
+    /// pollute the queue and cause the NEXT RemoteViewer to bind to a dead window).
     /// </summary>
     public string ClaimOrCreateWindow()
     {
-        if (_pendingWindowIds.TryDequeue(out var windowId))
-            return windowId;
+        while (_pendingWindowIds.TryDequeue(out var windowId))
+        {
+            if (_windows.ContainsKey(windowId))
+            {
+                return windowId;
+            }
+            _logger.LogDebug("ClaimOrCreateWindow: skipping stale windowId {WindowId} (window already closed)", windowId);
+        }
         return CreateWindow();
     }
 
@@ -395,7 +404,10 @@ public sealed class ViewerTabManager
 
     private void HandleSessionRemoved(string sessionId)
     {
-        // Remove from all windows
+        // Snapshot windowIds we need to drop AFTER iterating so we don't mutate _windows
+        // mid-iteration. Each entry is the windowId of a window whose last tab was just removed.
+        var emptiedWindows = new List<string>();
+
         foreach (var (windowId, window) in _windows)
         {
             if (window.TabIds.Contains(sessionId))
@@ -412,9 +424,19 @@ public sealed class ViewerTabManager
 
                 if (window.TabIds.Count == 0)
                 {
-                    OnWindowCloseRequested?.Invoke(windowId);
+                    emptiedWindows.Add(windowId);
                 }
             }
+        }
+
+        // Now drop the dead windows from _windows so ClaimOrCreateWindow can skip them
+        // when validating dequeued IDs. Without this, _pendingWindowIds keeps polluted IDs
+        // and the next RemoteViewer binds to a window that no longer has tabs (leading
+        // to "No active sessions" UI on a freshly-opened MAUI window).
+        foreach (var windowId in emptiedWindows)
+        {
+            _windows.TryRemove(windowId, out _);
+            OnWindowCloseRequested?.Invoke(windowId);
         }
 
         _tabs.TryRemove(sessionId, out _);

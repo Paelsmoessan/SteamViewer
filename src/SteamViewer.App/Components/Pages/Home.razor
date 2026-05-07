@@ -702,16 +702,21 @@ else
             errorMessage = "";
             StateHasChanged();
 
-            // Delegate entirely to ViewerSessionManager
+            // Delegate entirely to ViewerSessionManager. Open the viewer window via the
+            // afterSessionCreated callback so the window is fully wired up BEFORE the
+            // ConnectRequest is sent — otherwise a server Error response (e.g. wrong
+            // password) can race ahead of OpenViewerForSession and tear the session down
+            // before the UI binds, leaving a stale windowId polluting the ClaimOrCreate
+            // queue for the next attempt.
             var session = await ViewerSessionManager.CreateSessionAsync(
-                targetId, targetPassword, JSRuntime);
+                targetId, targetPassword, JSRuntime,
+                afterSessionCreated: s =>
+                {
+                    TabManager.OpenViewerForSession(s.SessionId, targetId);
+                    Logger.LogInformation("Opened viewer for peer {PeerId} via ViewerSessionManager", targetId);
+                });
 
-            if (session != null)
-            {
-                TabManager.OpenViewerForSession(session.SessionId, targetId);
-                Logger.LogInformation("Opened viewer for peer {PeerId} via ViewerSessionManager", targetId);
-            }
-            else
+            if (session == null)
             {
                 errorMessage = "Failed to create session";
             }

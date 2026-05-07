@@ -83,8 +83,16 @@ public sealed class ViewerSessionManager : IAsyncDisposable
     /// <param name="peerId">The peer ID to connect to.</param>
     /// <param name="password">The password for the peer.</param>
     /// <param name="jsRuntime">The JS runtime from the calling Blazor context.</param>
+    /// <param name="afterSessionCreated">
+    /// Optional synchronous callback invoked after the session is in the registry but
+    /// BEFORE the ConnectRequest is sent over signaling. The caller should use this to
+    /// open/bind the viewer window so any error response can find the window in a
+    /// fully-formed state. Without this, server Error replies (e.g. "Invalid password")
+    /// can race ahead of the window setup and tear the session down before the UI binds.
+    /// </param>
     /// <returns>The created session, or null if max sessions reached or connection failed.</returns>
-    public async Task<ViewerSession?> CreateSessionAsync(string peerId, string password, IJSRuntime jsRuntime)
+    public async Task<ViewerSession?> CreateSessionAsync(string peerId, string password, IJSRuntime jsRuntime,
+        Action<ViewerSession>? afterSessionCreated = null)
     {
         if (_sessions.Count >= MaxSessions)
         {
@@ -147,6 +155,18 @@ public sealed class ViewerSessionManager : IAsyncDisposable
         _peerToSession[peerId] = sessionId;
 
         _logger.LogInformation("Created session {SessionId} for peer {PeerId}", sessionId, peerId);
+
+        // Synchronous window setup BEFORE we hit the network. Closes the race where
+        // the server's Error response could arrive (and HandleError could fire
+        // RemoveSessionAsync) before the caller had a chance to wire up the UI.
+        try
+        {
+            afterSessionCreated?.Invoke(session);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "afterSessionCreated callback failed for session {SessionId}", sessionId);
+        }
 
         // Transport initialization is DEFERRED — host sends RelayReady via signaling,
         // which triggers HandleRelayReadyAsync to setup encrypted relay.
