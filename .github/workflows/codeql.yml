@@ -24,9 +24,16 @@ jobs:
       matrix:
         language: ['csharp']
 
+    # Skip on private repo without GHAS - the upload step would fail anyway.
+    # Public repo = free, runs normally. Private = needs GHAS enabled to opt in.
+    if: ${{ !github.event.repository.private || vars.CODEQL_ENABLED == 'true' }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # Nerdbank.GitVersioning needs full history to compute version height.
+          fetch-depth: 0
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
