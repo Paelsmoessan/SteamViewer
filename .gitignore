@@ -1,24 +1,3 @@
-# AI assistant context (private)
-misc/.AI.md
-.claude/settings.local.json
-.claude/ClaudeToClaude-communication.md
-.claude/test-findings-gist.md
-.claude/lessons-learned-gist.md
-.claude/test-notes.md
-.claude/session-memory.md
-.claude/local-config.md
-.claude/scripts/
-
-# Security audit + revision plan (private — exploit detail for live binaries
-# until fixes are widely deployed and a CVE-style summary replaces it)
-.claude/research/security-audit/
-.claude/plans/security-revision-v0.2.md
-
-# Cross-session coordination notes (contain user paths / personal context)
-.claude/NOTE-FROM-PUBLIC-CLEANUP.md
-gist-comms-temp.md
-gist-id.txt
-
 # Build outputs
 bin/
 obj/
@@ -48,17 +27,6 @@ logs/
 
 # Temp files
 *.tmp
-nul
 
-# FFmpeg native DLLs (BtbN GPL-shared, ~98MB total — not tracked in git)
+# FFmpeg native DLLs (downloaded at build time)
 src/SteamViewer.App/ffmpeg/*.dll
-
-# Local development helpers
-misc/SteamViewerMainSession.cmd
-misc/*.lnk
-
-.Claude.zip
-src.zip
-.claude/scheduled_tasks.lock
-sonar-*.json
-.scratch/

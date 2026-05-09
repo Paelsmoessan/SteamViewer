@@ -28,6 +28,9 @@ public static class ElevatedHelperServer
     private static string? _debugPath;
     private static string? _debugPathLocal;
 
+    // Host app PID — the SYSTEM helper's pipe gate must check this, not Environment.ProcessId.
+    private static uint _hostClientPid;
+
     private static void DebugLog(string message)
     {
         var line = $"[{DateTime.Now:HH:mm:ss.fff}] {message}";
@@ -57,6 +60,7 @@ public static class ElevatedHelperServer
         }
 
         DebugLog($"Starting pipe server: {pipeName} (PID {Environment.ProcessId}, expecting client PID {expectedClientPid})");
+        _hostClientPid = expectedClientPid;
 
         try
         {
@@ -365,52 +369,8 @@ public static class ElevatedHelperServer
         try
         {
             var (defaultW, defaultH) = Win32Input.GetPrimaryMonitorSize();
-            var sw = root.TryGetProperty("sw", out var swProp) ? swProp.GetInt32() : defaultW;
-            var sh = root.TryGetProperty("sh", out var shProp) ? shProp.GetInt32() : defaultH;
-            var type = root.GetProperty("type").GetString();
-
-            // Extract fields directly from JSON — avoids InputEvent polymorphic deserialization
-            // (System.Text.Json can't deserialize InputEvent when extra fields like "command" are present)
-            switch (type)
-            {
-                case "mouse_move":
-                    Win32Input.InjectMouseMove(
-                        root.GetProperty("x").GetDouble(),
-                        root.GetProperty("y").GetDouble(),
-                        sw, sh);
-                    break;
-                case "mouse_down":
-                    Win32Input.InjectMouseButton(
-                        ParseMouseButton(root.GetProperty("button").GetString()),
-                        root.GetProperty("x").GetDouble(),
-                        root.GetProperty("y").GetDouble(),
-                        sw, sh, isDown: true);
-                    break;
-                case "mouse_up":
-                    Win32Input.InjectMouseButton(
-                        ParseMouseButton(root.GetProperty("button").GetString()),
-                        root.GetProperty("x").GetDouble(),
-                        root.GetProperty("y").GetDouble(),
-                        sw, sh, isDown: false);
-                    break;
-                case "mouse_wheel":
-                    Win32Input.InjectMouseWheel(
-                        root.GetProperty("delta_x").GetDouble(),
-                        root.GetProperty("delta_y").GetDouble());
-                    break;
-                case "key_down":
-                    Win32Input.InjectKey(
-                        root.GetProperty("key").GetString()!,
-                        ParseModifiers(root),
-                        isDown: true);
-                    break;
-                case "key_up":
-                    Win32Input.InjectKey(
-                        root.GetProperty("key").GetString()!,
-                        ParseModifiers(root),
-                        isDown: false);
-                    break;
-            }
+            Win32Input.InjectInputFromJson(root, defaultW, defaultH,
+                msg => DebugLog($"InjectInput: {msg}"));
         }
         catch (Exception ex)
         {
@@ -418,26 +378,6 @@ public static class ElevatedHelperServer
         }
 
         return null;
-    }
-
-    private static MouseButton ParseMouseButton(string? button) => button switch
-    {
-        "Left" => MouseButton.Left,
-        "Right" => MouseButton.Right,
-        "Middle" => MouseButton.Middle,
-        _ => MouseButton.Left
-    };
-
-    private static KeyModifiers ParseModifiers(JsonElement root)
-    {
-        if (!root.TryGetProperty("modifiers", out var mods))
-            return KeyModifiers.None;
-
-        return new KeyModifiers(
-            mods.TryGetProperty("ctrl", out var c) && c.GetBoolean(),
-            mods.TryGetProperty("shift", out var s) && s.GetBoolean(),
-            mods.TryGetProperty("alt", out var a) && a.GetBoolean(),
-            mods.TryGetProperty("meta", out var m) && m.GetBoolean());
     }
 
     private static string HandleLaunchSystemHelper(JsonElement root)
@@ -454,13 +394,17 @@ public static class ElevatedHelperServer
             if (string.IsNullOrEmpty(exePath))
                 return JsonSerializer.Serialize(new HelperResponse(false, "Cannot determine exe path"));
 
-            // Pass our PID (admin helper) and user SID so SYSTEM helper can pin its pipe ACL
-            // to our user and refuse connections from any other PID.
-            var expectedClientPid = Environment.ProcessId;
+            // SYSTEM helper's PID gate must match the host app (the actual connector), not this admin helper.
+            if (_hostClientPid == 0)
+            {
+                DebugLog("LaunchSystemHelper: _hostClientPid not set — Run() did not initialize");
+                return JsonSerializer.Serialize(new HelperResponse(false, "Admin helper not initialized"));
+            }
+            var expectedClientPid = _hostClientPid;
             var allowedUserSid = System.Security.Principal.WindowsIdentity.GetCurrent().User?.Value
                 ?? throw new InvalidOperationException("Cannot determine user SID for SYSTEM helper ACL");
 
-            DebugLog($"LaunchSystemHelper: pipe={pipeName}, exe={exePath}, clientPid={expectedClientPid}, userSid={allowedUserSid}");
+            DebugLog($"LaunchSystemHelper: pipe={pipeName}, exe={exePath}, hostClientPid={expectedClientPid}, adminHelperPid={Environment.ProcessId}, userSid={allowedUserSid}");
 
             var arguments = $"--system-helper {pipeName} {nonce} {expectedClientPid} {allowedUserSid}";
             if (ProcessLauncher.LaunchAsSystemFromAdmin(exePath, arguments, out var pid, out var launchError))

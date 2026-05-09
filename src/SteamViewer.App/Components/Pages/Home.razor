@@ -12,20 +12,18 @@
 @using Microsoft.JSInterop
 @using Microsoft.Extensions.Configuration
 @using Microsoft.Extensions.DependencyInjection
-@using SteamViewer.Client.Core.Elevation
 @using SteamViewer.Platform.Windows.ScreenCapture
 @using SteamViewer.Common.Protocol
 @implements IAsyncDisposable
-@inject IServiceProvider ServiceProvider
 @inject SignalingClient SignalingClient
 @inject CanvasRenderingService CanvasRenderer
 @inject IJSRuntime JSRuntime
 @inject ILoggerFactory LoggerFactory
 @inject ILogger<Home> Logger
-@inject IInputInjector InputInjector
 @inject IConfiguration Configuration
 @inject FileLoggerService FileLogger
 @inject ViewerSessionManager ViewerSessionManager
+@inject HostSessionManager HostSessionManager
 @inject ViewerTabManager TabManager
 
 @if (connectionState == ConnectionState.Connected)
@@ -128,12 +126,12 @@ else
     </div>
 
     @* === Incoming connection modal === *@
-    @if (connectionState == ConnectionState.Connecting && !string.IsNullOrEmpty(incomingPeerId))
+    @if (connectionState == ConnectionState.Connecting && !string.IsNullOrEmpty(HostSessionManager.IncomingPeerId))
     {
         <div class="modal-backdrop">
             <div class="modal-card">
                 <h3>Incoming Connection</h3>
-                <p class="modal-peer-id">@incomingPeerId</p>
+                <p class="modal-peer-id">@HostSessionManager.IncomingPeerId</p>
                 <p class="modal-subtitle">wants to connect to your desktop</p>
                 <div class="modal-actions">
                     <button class="modal-btn accept" @onclick="AcceptConnection">
@@ -178,16 +176,10 @@ else
     private AppMode currentMode = AppMode.StartConnection;
     private ConnectionState connectionState = ConnectionState.Idle;
 
-    // Session state
+    // Session state (credentials displayed in UI, registration logic stays here)
     private string clientId = "";
     private string password = "";
     private string passwordHash = "";
-    private string incomingPeerId = "";
-    private string connectedPeerId = "";
-    private bool _isReconnect;
-    private bool _cleaningUp;
-    private string? _pendingReconnectPeerId;
-    private IElevationService? _preservedElevationService;
     private ReconnectCredentials.ReconnectResult? _pendingReconnect;
 
     // Join mode state
@@ -212,9 +204,6 @@ else
     private DotNetObjectReference<Home>? _loggerDotNetRef;
     private bool _jsLoggerInitialized;
 
-    // Host session (encapsulates WebRTC, input injection, screen sharing)
-    private HostSession? _hostSession;
-
     // File transfer state
     private bool _showFileTransferDialog;
     private FileTransferDialog.DialogMode _fileDialogMode;
@@ -225,10 +214,10 @@ else
     private List<MonitorInfo>? _availableMonitors;
     private uint _selectedMonitorId;
 
-    // UI helper properties that delegate to HostSession
-    private bool _isSharingScreen => _hostSession?.IsSharingScreen ?? false;
-    private bool _peerIsSharingScreen => _hostSession?.IsPeerSharingScreen ?? false;
-    private bool _dataChannelReady => _hostSession?.IsDataChannelReady ?? false;
+    // UI helper properties that delegate to HostSessionManager
+    private bool _isSharingScreen => HostSessionManager.IsSharingScreen;
+    private bool _peerIsSharingScreen => HostSessionManager.IsPeerSharingScreen;
+    private bool _dataChannelReady => HostSessionManager.IsDataChannelReady;
 
     // Render the connected view (same for both Start and Join modes)
     private RenderFragment RenderConnectedView() => __builder =>
@@ -322,9 +311,35 @@ else
 
     protected override void OnInitialized()
     {
-        SignalingClient.OnMessageReceived += HandleMessage;
         SignalingClient.OnDisconnected += HandleDisconnected;
         SignalingClient.OnError += HandleError;
+
+        HostSessionManager.OnStateChanged += state => InvokeAsync(() =>
+        {
+            connectionState = state;
+            StateHasChanged();
+        });
+        HostSessionManager.OnIncomingConnection += peerId => InvokeAsync(() =>
+        {
+            connectionState = ConnectionState.Connecting;
+            StateHasChanged();
+        });
+        HostSessionManager.OnError += msg => InvokeAsync(() =>
+        {
+            errorMessage = msg;
+            StateHasChanged();
+        });
+        HostSessionManager.OnSessionReady += () => InvokeAsync(StateHasChanged);
+        HostSessionManager.OnSessionDisposed += () => InvokeAsync(() =>
+        {
+            _canvasInitialized = false;
+            StateHasChanged();
+        });
+        HostSessionManager.OnPeerSharingChanged += () => InvokeAsync(() =>
+        {
+            _canvasInitialized = false;
+            StateHasChanged();
+        });
     }
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
@@ -502,7 +517,7 @@ else
 
     private async Task StartSharingScreen()
     {
-        if (_hostSession == null) return;
+        if (HostSessionManager.CurrentSession == null) return;
 
         // Enumerate DXGI monitors to decide: auto-start or show picker
         try
@@ -526,7 +541,7 @@ else
 
         // Single monitor (or enumeration failed) — start directly
         var outputIndex = _availableMonitors?.FirstOrDefault()?.Id;
-        var success = await _hostSession.StartScreenShareAsync(outputIndex);
+        var success = await HostSessionManager.CurrentSession!.StartScreenShareAsync(outputIndex);
         if (!success)
         {
             errorMessage = "Failed to start screen capture";
@@ -537,12 +552,12 @@ else
 
     private async Task SelectAndShareMonitor(uint monitorId)
     {
-        if (_hostSession == null) return;
+        if (HostSessionManager.CurrentSession == null) return;
 
         _showMonitorPicker = false;
         StateHasChanged();
 
-        var success = await _hostSession.StartScreenShareAsync(outputIndex: monitorId);
+        var success = await HostSessionManager.CurrentSession!.StartScreenShareAsync(outputIndex: monitorId);
         if (!success)
         {
             errorMessage = "Failed to start screen capture";
@@ -552,23 +567,23 @@ else
 
     private async Task StopSharingScreen()
     {
-        if (_hostSession == null) return;
+        if (HostSessionManager.CurrentSession == null) return;
 
-        await _hostSession.StopScreenShareAsync();
+        await HostSessionManager.CurrentSession!.StopScreenShareAsync();
         _showMonitorPicker = false;
         StateHasChanged();
     }
 
     private void SaveDebugReconnectCreds()
     {
-        if (string.IsNullOrEmpty(clientId) || string.IsNullOrEmpty(passwordHash) || string.IsNullOrEmpty(connectedPeerId))
+        if (string.IsNullOrEmpty(clientId) || string.IsNullOrEmpty(passwordHash) || string.IsNullOrEmpty(HostSessionManager.ConnectedPeerId))
         {
             Logger.LogWarning("Cannot save reconnect creds: missing session data");
             return;
         }
 
         var serverUrl = Configuration["SignalingServer"] ?? "";
-        ReconnectCredentials.Save(clientId, passwordHash, connectedPeerId, serverUrl);
+        ReconnectCredentials.Save(clientId, passwordHash, HostSessionManager.ConnectedPeerId, serverUrl);
         _debugCredsSaved = true;
         Logger.LogInformation("DEBUG: Saved reconnect credentials (clientId={Id}, serverUrl={Url})", clientId, serverUrl);
         StateHasChanged();
@@ -587,13 +602,14 @@ else
             await SignalingClient.ConnectAsync();
 
             // Check for pre-loaded reconnect data (from reboot or elevation restart)
+            var isReconnect = false;
             if (_pendingReconnect != null)
             {
                 clientId = _pendingReconnect.ClientId;
                 passwordHash = _pendingReconnect.PasswordHash;
-                password = "(reconnecting)"; // Plain password not available — hash is sufficient for registration
-                _isReconnect = true;
-                _pendingReconnect = null; // Consume — one-time use
+                password = "(reconnecting)";
+                isReconnect = true;
+                _pendingReconnect = null;
                 Logger.LogInformation("Reconnecting with saved credentials - ID: {Id}", clientId);
             }
             else
@@ -615,6 +631,7 @@ else
             if (success)
             {
                 connectionState = ConnectionState.Registered;
+                HostSessionManager.Initialize(clientId, passwordHash, JSRuntime, isReconnect);
             }
             else
             {
@@ -671,17 +688,8 @@ else
     {
         try
         {
+            await HostSessionManager.DisconnectAsync();
             await SignalingClient.DisconnectAsync();
-            if (_hostSession != null)
-            {
-                await _hostSession.DisposeAsync();
-                _hostSession = null;
-            }
-            if (_preservedElevationService != null)
-            {
-                await _preservedElevationService.DisposeAsync();
-                _preservedElevationService = null;
-            }
         }
         catch (Exception ex)
         {
@@ -733,123 +741,7 @@ else
 
     private async Task AcceptConnection()
     {
-        try
-        {
-            await SignalingClient.RespondToConnectionAsync(incomingPeerId, true);
-            connectedPeerId = incomingPeerId;
-            connectionState = ConnectionState.Connected;
-
-            // Reuse preserved elevation service on reconnect (helpers stay alive),
-            // otherwise create fresh instance from DI
-            var elevationService = _preservedElevationService;
-            if (elevationService != null)
-            {
-                Logger.LogInformation("Reusing preserved elevation service (admin={Admin}, system={System})",
-                    elevationService.IsAdminConnected, elevationService.IsSystemConnected);
-                _preservedElevationService = null;
-            }
-            else
-            {
-                elevationService = ServiceProvider.GetService<IElevationService>();
-            }
-
-            // Create and initialize host session
-            var monitorEnumerator = ServiceProvider.GetService<IMonitorEnumerator>();
-            var screenCapture = ServiceProvider.GetService<IScreenCapture>();
-#if WINDOWS
-            var frameBridge = ServiceProvider.GetService<Services.NativeFrameBridge>();
-#endif
-            _hostSession = new HostSession(
-                connectedPeerId,
-                JSRuntime,
-                LoggerFactory,
-                InputInjector,
-                Configuration,
-                msg => SignalingClient.SendAsync(msg),
-                signalingClient: SignalingClient,
-                elevationService: elevationService,
-                monitorEnumerator: monitorEnumerator,
-                screenCapture: screenCapture,
-#if WINDOWS
-                frameBridge: frameBridge,
-#endif
-                turnConfigService: ServiceProvider.GetService<TurnConfigService>(),
-                hostClientId: clientId,
-                hostPasswordHash: passwordHash);
-
-            // Auto-share full screen on reconnect after reboot
-            if (_isReconnect)
-            {
-                _hostSession.AutoShareOnReady = true;
-                _isReconnect = false; // One-time
-            }
-
-            _hostSession.OnStateChanged += state => InvokeAsync(StateHasChanged);
-            _hostSession.OnReady += () => InvokeAsync(StateHasChanged);
-            _hostSession.OnDisconnected += reason => InvokeAsync(async () =>
-            {
-                if (_cleaningUp)
-                {
-                    Logger.LogDebug("OnDisconnected skipped - signaling disconnect handler is active");
-                    return;
-                }
-
-                Logger.LogWarning("Host session disconnected: {Reason}. Resetting to accept reconnections.", reason);
-
-                _cleaningUp = true;
-                try
-                {
-                    if (_hostSession != null)
-                    {
-                        _preservedElevationService = _hostSession.DetachElevationService();
-                        if (_preservedElevationService != null)
-                            Logger.LogInformation("Elevation service preserved for reconnect (admin={Admin}, system={System})",
-                                _preservedElevationService.IsAdminConnected, _preservedElevationService.IsSystemConnected);
-
-                        await _hostSession.DisposeAsync();
-                        _hostSession = null;
-                    }
-
-                    connectedPeerId = "";
-                    _canvasInitialized = false;
-                    _isReconnect = true;
-                    connectionState = ConnectionState.Registered;
-                }
-                finally
-                {
-                    _cleaningUp = false;
-                }
-
-                if (!string.IsNullOrEmpty(_pendingReconnectPeerId))
-                {
-                    incomingPeerId = _pendingReconnectPeerId;
-                    _pendingReconnectPeerId = null;
-                    Logger.LogInformation("Processing deferred reconnect from {PeerId} (transport disconnect path)", incomingPeerId);
-                    if (_isReconnect)
-                    {
-                        await AcceptConnection();
-                    }
-                    else
-                    {
-                        connectionState = ConnectionState.Connecting;
-                    }
-                }
-
-                StateHasChanged();
-            });
-            _hostSession.OnPeerSharingChanged += sharing => InvokeAsync(() =>
-            {
-                _canvasInitialized = false; // Reset canvas when peer sharing changes
-                StateHasChanged();
-            });
-
-            await _hostSession.InitializeAsync();
-        }
-        catch (Exception ex)
-        {
-            Logger.LogError(ex, "Failed to accept connection");
-            errorMessage = ex.Message;
-        }
+        await HostSessionManager.AcceptConnectionAsync();
         StateHasChanged();
     }
 
@@ -868,21 +760,21 @@ else
     [JSInvokable]
     public async Task OnMouseMove(double x, double y, int captureWidth = 0, int captureHeight = 0)
     {
-        if (_hostSession == null || !_hostSession.IsDataChannelReady) return;
+        if (!HostSessionManager.IsDataChannelReady) return;
         await SendInputEventAsync(new InputEvent.MouseMove(x, y, captureWidth, captureHeight));
     }
 
     [JSInvokable]
     public async Task OnMouseDown(string button, double x, double y, int captureWidth = 0, int captureHeight = 0)
     {
-        if (_hostSession == null || !_hostSession.IsDataChannelReady) return;
+        if (!HostSessionManager.IsDataChannelReady) return;
         await SendInputEventAsync(new InputEvent.MouseDown(ParseMouseButton(button), x, y, captureWidth, captureHeight));
     }
 
     [JSInvokable]
     public async Task OnMouseUp(string button, double x, double y, int captureWidth = 0, int captureHeight = 0)
     {
-        if (_hostSession == null || !_hostSession.IsDataChannelReady) return;
+        if (!HostSessionManager.IsDataChannelReady) return;
         await SendInputEventAsync(new InputEvent.MouseUp(ParseMouseButton(button), x, y, captureWidth, captureHeight));
     }
 
@@ -899,21 +791,21 @@ else
     [JSInvokable]
     public async Task OnMouseWheel(double deltaX, double deltaY)
     {
-        if (_hostSession == null || !_hostSession.IsDataChannelReady) return;
+        if (!HostSessionManager.IsDataChannelReady) return;
         await SendInputEventAsync(new InputEvent.MouseWheel(deltaX, deltaY));
     }
 
     [JSInvokable]
     public async Task OnKeyDown(string key, JsonElement modifiers)
     {
-        if (_hostSession == null || !_hostSession.IsDataChannelReady) return;
+        if (!HostSessionManager.IsDataChannelReady) return;
         await SendInputEventAsync(new InputEvent.KeyDown(key, ParseModifiers(modifiers)));
     }
 
     [JSInvokable]
     public async Task OnKeyUp(string key, JsonElement modifiers)
     {
-        if (_hostSession == null || !_hostSession.IsDataChannelReady) return;
+        if (!HostSessionManager.IsDataChannelReady) return;
         await SendInputEventAsync(new InputEvent.KeyUp(key, ParseModifiers(modifiers)));
     }
 
@@ -932,7 +824,7 @@ else
         try
         {
             var json = JsonSerializer.Serialize(inputEvent);
-            await _hostSession!.SendDataAsync(json);
+            await HostSessionManager.CurrentSession!.SendDataAsync(json);
         }
         catch
         {
@@ -944,152 +836,15 @@ else
 
     private async Task RejectConnection()
     {
-        await SignalingClient.RespondToConnectionAsync(incomingPeerId, false);
-        connectionState = ConnectionState.Registered;
-        incomingPeerId = "";
+        await HostSessionManager.RejectConnectionAsync();
         StateHasChanged();
     }
 
     private async Task Disconnect()
     {
-        if (!string.IsNullOrEmpty(connectedPeerId))
-        {
-            await SignalingClient.DisconnectFromPeerAsync(connectedPeerId);
-        }
-
-        if (_hostSession != null)
-        {
-            await _hostSession.DisposeAsync();
-            _hostSession = null;
-        }
-
-        // User-initiated disconnect — fully dispose any preserved elevation
-        if (_preservedElevationService != null)
-        {
-            await _preservedElevationService.DisposeAsync();
-            _preservedElevationService = null;
-        }
-
-        connectedPeerId = "";
+        await HostSessionManager.DisconnectAsync();
         _canvasInitialized = false;
-        connectionState = ConnectionState.Registered;
         StateHasChanged();
-    }
-
-    private void HandleMessage(SignalingMessage message)
-    {
-        // Home.razor only handles HOST-side signaling.
-        // Viewer-side signaling is handled by ViewerSessionManager (subscribed to same event).
-        if (currentMode != AppMode.StartConnection) return;
-
-        InvokeAsync(async () =>
-        {
-            switch (message)
-            {
-                case SignalingMessage.IncomingConnection incoming:
-                    if (_cleaningUp)
-                    {
-                        Logger.LogInformation("IncomingConnection from {PeerId} deferred - cleanup in progress", incoming.FromId);
-                        _pendingReconnectPeerId = incoming.FromId;
-                        break;
-                    }
-
-                    incomingPeerId = incoming.FromId;
-
-                    // Auto-accept during reconnect (post-elevation or post-reboot)
-                    if (_isReconnect)
-                    {
-                        Logger.LogInformation("Auto-accepting reconnect from {PeerId}", incoming.FromId);
-                        await AcceptConnection();
-                        break;
-                    }
-
-                    connectionState = ConnectionState.Connecting;
-                    break;
-
-                case SignalingMessage.ConnectionResponse response:
-                    if (response.TargetId != incomingPeerId) break;
-                    if (!response.Approved)
-                    {
-                        errorMessage = "Connection rejected";
-                        connectionState = ConnectionState.Registered;
-                    }
-                    break;
-
-                case SignalingMessage.Disconnected disconnected:
-                    Logger.LogWarning("[DIAG] Disconnected received: peerId={PeerId}, connectedPeerId={ConnectedPeerId}, connectionState={State}, reason={Reason}",
-                        disconnected.PeerId, connectedPeerId, connectionState, disconnected.Reason);
-                    if (disconnected.PeerId != connectedPeerId)
-                    {
-                        Logger.LogWarning("[DIAG] PeerId mismatch - BREAKING. disconnected.PeerId={DisconnectedPeer} != connectedPeerId={ConnectedPeer}",
-                            disconnected.PeerId, connectedPeerId);
-                        break;
-                    }
-                    _cleaningUp = true;
-                    try
-                    {
-                        if (_hostSession != null)
-                        {
-                            _preservedElevationService = _hostSession.DetachElevationService();
-                            await _hostSession.DisposeAsync();
-                            _hostSession = null;
-                        }
-                        connectedPeerId = "";
-                        _canvasInitialized = false;
-                        _isReconnect = false;
-                        connectionState = ConnectionState.Registered;
-                        Logger.LogWarning("[DIAG] Disconnected cleanup done: connectionState={State}, _isReconnect={IsReconnect}, _hostSession={HasSession}",
-                            connectionState, _isReconnect, _hostSession != null);
-                    }
-                    finally
-                    {
-                        _cleaningUp = false;
-                    }
-
-                    if (!string.IsNullOrEmpty(_pendingReconnectPeerId))
-                    {
-                        incomingPeerId = _pendingReconnectPeerId;
-                        _pendingReconnectPeerId = null;
-                        Logger.LogInformation("Processing deferred reconnect from {PeerId}, isReconnect={IsReconnect}", incomingPeerId, _isReconnect);
-                        if (_isReconnect)
-                        {
-                            await AcceptConnection();
-                        }
-                        else
-                        {
-                            connectionState = ConnectionState.Connecting;
-                        }
-                    }
-                    Logger.LogWarning("[DIAG] Disconnected handler exit: connectionState={State}, about to StateHasChanged", connectionState);
-                    break;
-
-                case SignalingMessage.TransportEndpoint endpoint:
-                    // Viewer's UDP candidates — forward to host session
-                    if (_hostSession != null)
-                    {
-                        Logger.LogInformation("Routing viewer TransportEndpoint to HostSession ({CandidateCount} candidates)",
-                            endpoint.Candidates.Length);
-                        _ = _hostSession.HandleViewerTransportEndpointAsync(endpoint.Candidates);
-                    }
-                    break;
-
-                case SignalingMessage.TransportConfirmed:
-                    // Viewer confirmed UDP probe succeeded — forward to host session
-                    if (_hostSession != null)
-                    {
-                        Logger.LogInformation("Routing TransportConfirmed to HostSession");
-                        _ = _hostSession.HandleTransportConfirmedAsync();
-                    }
-                    break;
-
-                case SignalingMessage.Error error:
-                    errorMessage = error.Message;
-                    break;
-            }
-
-            Logger.LogDebug("[DIAG] HandleMessage exit: connectionState={State}, calling StateHasChanged", connectionState);
-            StateHasChanged();
-        });
     }
 
     private void HandleDisconnected(string? reason)
@@ -1122,23 +877,9 @@ else
 
     public async ValueTask DisposeAsync()
     {
-        SignalingClient.OnMessageReceived -= HandleMessage;
         SignalingClient.OnDisconnected -= HandleDisconnected;
         SignalingClient.OnError -= HandleError;
 
-        if (_hostSession != null)
-        {
-            await _hostSession.DisposeAsync();
-            _hostSession = null;
-        }
-
-        if (_preservedElevationService != null)
-        {
-            await _preservedElevationService.DisposeAsync();
-            _preservedElevationService = null;
-        }
-
-        // JS interop calls can throw if WebView is already torn down during app exit
         try
         {
             if (_canvasInitialized)

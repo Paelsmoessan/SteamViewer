@@ -164,51 +164,10 @@ public sealed class SecureDesktopCapture : IDisposable
                 return;
             }
 
-            // Parse and inject using the existing Win32Input infrastructure
+            // Parse and inject via canonical dispatcher
             using var doc = System.Text.Json.JsonDocument.Parse(inputJson);
-            var root = doc.RootElement;
-            var type = root.GetProperty("type").GetString();
-
-            switch (type)
-            {
-                case "mouse_move":
-                    Win32Input.InjectMouseMove(
-                        root.GetProperty("x").GetDouble(),
-                        root.GetProperty("y").GetDouble(),
-                        screenWidth, screenHeight);
-                    break;
-                case "mouse_down":
-                    Win32Input.InjectMouseButton(
-                        ParseMouseButton(root.GetProperty("button").GetString()),
-                        root.GetProperty("x").GetDouble(),
-                        root.GetProperty("y").GetDouble(),
-                        screenWidth, screenHeight, isDown: true);
-                    break;
-                case "mouse_up":
-                    Win32Input.InjectMouseButton(
-                        ParseMouseButton(root.GetProperty("button").GetString()),
-                        root.GetProperty("x").GetDouble(),
-                        root.GetProperty("y").GetDouble(),
-                        screenWidth, screenHeight, isDown: false);
-                    break;
-                case "mouse_wheel":
-                    Win32Input.InjectMouseWheel(
-                        root.GetProperty("delta_x").GetDouble(),
-                        root.GetProperty("delta_y").GetDouble());
-                    break;
-                case "key_down":
-                    Win32Input.InjectKey(
-                        root.GetProperty("key").GetString()!,
-                        ParseModifiers(root),
-                        isDown: true);
-                    break;
-                case "key_up":
-                    Win32Input.InjectKey(
-                        root.GetProperty("key").GetString()!,
-                        ParseModifiers(root),
-                        isDown: false);
-                    break;
-            }
+            Win32Input.InjectInputFromJson(doc.RootElement, screenWidth, screenHeight,
+                msg => DebugLog($"InjectInput: {msg}"));
         }
         catch (Exception ex)
         {
@@ -545,26 +504,6 @@ public sealed class SecureDesktopCapture : IDisposable
             return System.Text.Encoding.Unicode.GetString(buffer, 0, charCount * 2);
         }
         return null;
-    }
-
-    private static Common.Protocol.MouseButton ParseMouseButton(string? button) => button switch
-    {
-        "Left" => Common.Protocol.MouseButton.Left,
-        "Right" => Common.Protocol.MouseButton.Right,
-        "Middle" => Common.Protocol.MouseButton.Middle,
-        _ => Common.Protocol.MouseButton.Left
-    };
-
-    private static Common.Protocol.KeyModifiers ParseModifiers(System.Text.Json.JsonElement root)
-    {
-        if (!root.TryGetProperty("modifiers", out var mods))
-            return Common.Protocol.KeyModifiers.None;
-
-        return new Common.Protocol.KeyModifiers(
-            mods.TryGetProperty("ctrl", out var c) && c.GetBoolean(),
-            mods.TryGetProperty("shift", out var s) && s.GetBoolean(),
-            mods.TryGetProperty("alt", out var a) && a.GetBoolean(),
-            mods.TryGetProperty("meta", out var m) && m.GetBoolean());
     }
 
     public void Dispose()

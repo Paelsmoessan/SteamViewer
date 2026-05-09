@@ -12,6 +12,7 @@ public partial class App : Application
     private Window? _collabViewerWindow;
     private Window? _mainWindow;
     private readonly ConcurrentDictionary<string, Window> _viewerWindows = new();
+    private readonly ConcurrentDictionary<string, byte> _pendingWindowCloses = new();
     private bool _initialized;
 
     [DllImport("user32.dll")] private static extern IntPtr GetActiveWindow();
@@ -200,6 +201,11 @@ public partial class App : Application
             _tabManager?.RegisterWindow(windowId, window);
 
             Application.Current?.OpenWindow(window);
+
+            if (_pendingWindowCloses.TryRemove(windowId, out _))
+            {
+                Application.Current?.CloseWindow(window);
+            }
         });
     }
 
@@ -214,23 +220,30 @@ public partial class App : Application
             {
                 Application.Current?.CloseWindow(window);
             }
+            else
+            {
+                _pendingWindowCloses[windowId] = 0;
+            }
         });
     }
 
     private void OnMultiViewerWindowDestroying(string windowId)
     {
         _viewerWindows.TryRemove(windowId, out _);
-        // Blazor's DisposeAsync races with Destroying - it wins TryRemove but can't
-        // complete the async Disconnect. Send Disconnect for each session directly.
-        Task.Run(async () =>
+        // Only disconnect sessions belonging to THIS window, not all sessions.
+        _ = Task.Run(async () =>
         {
+            if (_tabManager == null) return;
+            var sessionIds = _tabManager.GetSessionIdsForWindow(windowId);
+            if (sessionIds.Count == 0) return;
+
             var sessionManager = MauiProgram.ServiceProvider?.GetService<ViewerSessionManager>();
             if (sessionManager == null) return;
-            foreach (var session in sessionManager.Sessions.ToList())
+            foreach (var sessionId in sessionIds)
             {
-                await sessionManager.RemoveSessionAsync(session.SessionId);
+                await sessionManager.RemoveSessionAsync(sessionId);
             }
-        }).Wait(TimeSpan.FromSeconds(5));
+        });
     }
 
     private void OpenCollabViewerWindow(string peerId)

@@ -1,5 +1,6 @@
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.Json;
 using SteamViewer.Common.Protocol;
 
 namespace SteamViewer.Platform.Windows.Input;
@@ -213,6 +214,95 @@ internal static class Win32Input
                     scanUp.IsExtended, scanUp.UnicodeChar);
                 break;
         }
+    }
+
+    /// <summary>
+    /// JSON twin of InjectInputEvent — single canonical dispatch for the JSON wire format.
+    /// Replaces the duplicated switches in ElevatedHelperServer, SystemHelperServer, and
+    /// SecureDesktopCapture. Reads sw/sh from the JSON if present, else falls back to
+    /// defaults. Calls logUnknownType for any case the switch can't handle so future
+    /// additions to InputEvent are loud instead of silent.
+    /// </summary>
+    internal static void InjectInputFromJson(JsonElement root, int defaultSw, int defaultSh, Action<string>? logUnknownType = null)
+    {
+        var sw = root.TryGetProperty("sw", out var swProp) ? swProp.GetInt32() : defaultSw;
+        var sh = root.TryGetProperty("sh", out var shProp) ? shProp.GetInt32() : defaultSh;
+        var type = root.GetProperty("type").GetString();
+
+        switch (type)
+        {
+            case "mouse_move":
+                InjectMouseMove(
+                    root.GetProperty("x").GetDouble(),
+                    root.GetProperty("y").GetDouble(), sw, sh);
+                break;
+            case "mouse_down":
+                InjectMouseButton(
+                    ParseMouseButtonFromJson(root.GetProperty("button").GetString()),
+                    root.GetProperty("x").GetDouble(),
+                    root.GetProperty("y").GetDouble(), sw, sh, isDown: true);
+                break;
+            case "mouse_up":
+                InjectMouseButton(
+                    ParseMouseButtonFromJson(root.GetProperty("button").GetString()),
+                    root.GetProperty("x").GetDouble(),
+                    root.GetProperty("y").GetDouble(), sw, sh, isDown: false);
+                break;
+            case "mouse_wheel":
+                InjectMouseWheel(
+                    root.GetProperty("delta_x").GetDouble(),
+                    root.GetProperty("delta_y").GetDouble());
+                break;
+            case "key_down":
+                InjectKey(
+                    root.GetProperty("key").GetString()!,
+                    ParseModifiersFromJson(root), isDown: true);
+                break;
+            case "key_up":
+                InjectKey(
+                    root.GetProperty("key").GetString()!,
+                    ParseModifiersFromJson(root), isDown: false);
+                break;
+            case "key_down_scan":
+                InjectHybridKey(
+                    root.GetProperty("scan").GetUInt16(),
+                    root.GetProperty("vk").GetUInt16(),
+                    isDown: true,
+                    root.TryGetProperty("ext", out var extD) && extD.GetBoolean(),
+                    root.TryGetProperty("uc", out var ucD) ? ucD.GetUInt32() : 0u);
+                break;
+            case "key_up_scan":
+                InjectHybridKey(
+                    root.GetProperty("scan").GetUInt16(),
+                    root.GetProperty("vk").GetUInt16(),
+                    isDown: false,
+                    root.TryGetProperty("ext", out var extU) && extU.GetBoolean(),
+                    root.TryGetProperty("uc", out var ucU) ? ucU.GetUInt32() : 0u);
+                break;
+            default:
+                logUnknownType?.Invoke($"Unknown input type \"{type}\" — dropped (no switch case)");
+                break;
+        }
+    }
+
+    private static MouseButton ParseMouseButtonFromJson(string? button) => button switch
+    {
+        "Left" => MouseButton.Left,
+        "Right" => MouseButton.Right,
+        "Middle" => MouseButton.Middle,
+        _ => MouseButton.Left
+    };
+
+    private static KeyModifiers ParseModifiersFromJson(JsonElement root)
+    {
+        if (!root.TryGetProperty("modifiers", out var mods))
+            return KeyModifiers.None;
+
+        return new KeyModifiers(
+            mods.TryGetProperty("ctrl", out var c) && c.GetBoolean(),
+            mods.TryGetProperty("shift", out var s) && s.GetBoolean(),
+            mods.TryGetProperty("alt", out var a) && a.GetBoolean(),
+            mods.TryGetProperty("meta", out var m) && m.GetBoolean());
     }
 
     /// <summary>

@@ -216,6 +216,16 @@
             {
                 <div class="toast-notification">@_toastMessage</div>
             }
+            @if (_showSharingPaused && !_showReconnectOverlay)
+            {
+                <div class="reconnect-overlay">
+                    <div class="reconnect-dialog">
+                        <h3>Sharing Paused</h3>
+                        <p>Host has paused screen sharing.</p>
+                        <p>Waiting for host to resume...</p>
+                    </div>
+                </div>
+            }
             @if (_showReconnectOverlay)
             {
                 <div class="reconnect-overlay">
@@ -265,6 +275,7 @@
     private string? _activeSessionId;
     private ViewerSession? _activeSession;
     private bool _showReconnectOverlay;
+    private bool _showSharingPaused;
     private int _reconnectCountdown;
     private System.Threading.Timer? _reconnectTimer;
     private int _reconnectAttempts;
@@ -443,6 +454,7 @@
             _activeSession.OnSecureDesktopStateChanged -= HandleSecureDesktopStateChanged;
             _activeSession.OnMonitorLayoutReceived -= HandleMonitorLayoutReceived;
             _activeSession.OnCaptureInfoReceived -= HandleCaptureInfoReceived;
+            _activeSession.OnPeerSharingChanged -= HandlePeerSharingChanged;
             if (_statsVisible) _ = _activeSession.DisableStatsRelayAsync();
             _ = JSRuntime.InvokeVoidAsync("SteamViewerVideo.dispose", oldSessionId);
         }
@@ -450,6 +462,7 @@
         _activeSessionId = sessionId;
         _hasReceivedFrame = false;
         _showReconnectOverlay = false;
+        _showSharingPaused = false;
         _secureDesktopActive = false;
         _reconnectTimer?.Dispose();
         _reconnectTimer = null;
@@ -477,6 +490,9 @@
                 _activeSession.OnSecureDesktopStateChanged += HandleSecureDesktopStateChanged;
                 _activeSession.OnMonitorLayoutReceived += HandleMonitorLayoutReceived;
                 _activeSession.OnCaptureInfoReceived += HandleCaptureInfoReceived;
+                _activeSession.OnPeerSharingChanged += HandlePeerSharingChanged;
+
+                _showSharingPaused = !_activeSession.IsPeerSharing && _hasReceivedFrame;
 
                 // Restore cached monitor layout from session (survives tab switches)
                 _hostMonitors = _activeSession.HostMonitors;
@@ -1173,6 +1189,15 @@
         });
     }
 
+    private void HandlePeerSharingChanged(bool isSharing)
+    {
+        InvokeAsync(() =>
+        {
+            _showSharingPaused = !isSharing && _hasReceivedFrame;
+            StateHasChanged();
+        });
+    }
+
     #endregion
 
     #region Monitor Layout
@@ -1498,6 +1523,7 @@
                 _activeSession.OnSecureDesktopStateChanged -= HandleSecureDesktopStateChanged;
                     _activeSession.OnMonitorLayoutReceived -= HandleMonitorLayoutReceived;
                 _activeSession.OnCaptureInfoReceived -= HandleCaptureInfoReceived;
+                _activeSession.OnPeerSharingChanged -= HandlePeerSharingChanged;
 
                 // Update references (session ID stays the same for tab tracking)
                 _activeSessionId = newSession.SessionId;
@@ -1512,6 +1538,7 @@
                 _activeSession.OnSecureDesktopStateChanged += HandleSecureDesktopStateChanged;
                 _activeSession.OnMonitorLayoutReceived += HandleMonitorLayoutReceived;
                 _activeSession.OnCaptureInfoReceived += HandleCaptureInfoReceived;
+                _activeSession.OnPeerSharingChanged += HandlePeerSharingChanged;
 
                 // Update input routing
                 await JSRuntime.InvokeVoidAsync("SteamViewerInput.setActiveSession", newSession.SessionId);
@@ -1611,6 +1638,7 @@
             _activeSession.OnSecureDesktopStateChanged -= HandleSecureDesktopStateChanged;
             _activeSession.OnMonitorLayoutReceived -= HandleMonitorLayoutReceived;
             _activeSession.OnCaptureInfoReceived -= HandleCaptureInfoReceived;
+            _activeSession.OnPeerSharingChanged -= HandlePeerSharingChanged;
         }
 
         _tabDragRef?.Dispose();

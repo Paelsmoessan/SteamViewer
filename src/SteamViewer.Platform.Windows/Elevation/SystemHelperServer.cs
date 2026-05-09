@@ -1114,49 +1114,10 @@ public static class SystemHelperServer
                             DebugLog($"SD input #{_sdInputLogCount}: injecting on Winlogon");
                     }
 
-                    // Parse and inject input
+                    // Parse and inject input via canonical dispatcher
                     using var doc = JsonDocument.Parse(json);
-                    var root = doc.RootElement;
-                    var type = root.GetProperty("type").GetString();
-
-                    switch (type)
-                    {
-                        case "mouse_move":
-                            Win32Input.InjectMouseMove(
-                                root.GetProperty("x").GetDouble(),
-                                root.GetProperty("y").GetDouble(), sw, sh);
-                            break;
-                        case "mouse_down":
-                            Win32Input.InjectMouseButton(
-                                ParseMouseButton(root.GetProperty("button").GetString()),
-                                root.GetProperty("x").GetDouble(),
-                                root.GetProperty("y").GetDouble(), sw, sh, isDown: true);
-                            break;
-                        case "mouse_up":
-                            Win32Input.InjectMouseButton(
-                                ParseMouseButton(root.GetProperty("button").GetString()),
-                                root.GetProperty("x").GetDouble(),
-                                root.GetProperty("y").GetDouble(), sw, sh, isDown: false);
-                            break;
-                        case "mouse_wheel":
-                            Win32Input.InjectMouseWheel(
-                                root.GetProperty("delta_x").GetDouble(),
-                                root.GetProperty("delta_y").GetDouble());
-                            break;
-                        case "key_down":
-                            Win32Input.InjectKey(
-                                root.GetProperty("key").GetString()!,
-                                ParseModifiers(root),
-                                isDown: true);
-                            break;
-                        case "key_up":
-                            Win32Input.InjectKey(
-                                root.GetProperty("key").GetString()!,
-                                ParseModifiers(root),
-                                isDown: false);
-                            break;
-                    }
-
+                    Win32Input.InjectInputFromJson(doc.RootElement, sw, sh,
+                        msg => DebugLog($"Input thread: {msg}"));
                 }
                 catch (Exception ex)
                 {
@@ -1174,26 +1135,6 @@ public static class SystemHelperServer
         {
             DebugLog($"Input thread fatal: {ex.Message}");
         }
-    }
-
-    private static MouseButton ParseMouseButton(string? button) => button switch
-    {
-        "Left" => MouseButton.Left,
-        "Right" => MouseButton.Right,
-        "Middle" => MouseButton.Middle,
-        _ => MouseButton.Left
-    };
-
-    private static KeyModifiers ParseModifiers(JsonElement root)
-    {
-        if (!root.TryGetProperty("modifiers", out var mods))
-            return KeyModifiers.None;
-
-        return new KeyModifiers(
-            mods.TryGetProperty("ctrl", out var c) && c.GetBoolean(),
-            mods.TryGetProperty("shift", out var s) && s.GetBoolean(),
-            mods.TryGetProperty("alt", out var a) && a.GetBoolean(),
-            mods.TryGetProperty("meta", out var m) && m.GetBoolean());
     }
 
     private static string HandleExit()

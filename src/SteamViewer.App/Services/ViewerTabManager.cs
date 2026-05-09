@@ -361,6 +361,18 @@ public sealed class ViewerTabManager
     }
 
     /// <summary>
+    /// Get all session IDs for a specific window.
+    /// </summary>
+    public IReadOnlyList<string> GetSessionIdsForWindow(string windowId)
+    {
+        if (_windows.TryGetValue(windowId, out var window))
+        {
+            return window.TabIds.ToList();
+        }
+        return Array.Empty<string>();
+    }
+
+    /// <summary>
     /// Find which window contains a session.
     /// </summary>
     public string? FindWindowForSession(string sessionId)
