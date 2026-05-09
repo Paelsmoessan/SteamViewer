@@ -1,0 +1,40 @@
+name: Private Content Gate
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan tree for internal-only files
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          violations=$(git ls-files -- \
+            '.claude' '.claude/**' \
+            'CLAUDE.md' \
+            'TODO.md' \
+            '*-gist.md' \
+          )
+
+          if [ -n "$violations" ]; then
+            echo "::error::Internal-only files detected in tree:"
+            while IFS= read -r f; do
+              echo "::error file=$f::Must not be committed to this repo"
+            done <<< "$violations"
+            echo ""
+            echo "These files are AI-tooling / internal artifacts and should not"
+            echo "be present in the published source tree."
+            exit 1
+          fi
+
+          echo "Private content gate: PASS"
