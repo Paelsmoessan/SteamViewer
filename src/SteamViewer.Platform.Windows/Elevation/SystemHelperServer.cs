@@ -1014,104 +1014,80 @@ public static class SystemHelperServer
                 DebugLog($"Input thread OpenInputDesktop failed (error {Marshal.GetLastWin32Error()})");
             }
 
-            // Cached Winlogon desktop handle — kept open during SD active to avoid per-event churn
-            IntPtr hCachedWinlogon = IntPtr.Zero;
+            // Transition flag — used to detect SD→normal transitions so we re-acquire the
+            // Default desktop handle (preserves load-bearing piece of 210eaf3). The Winlogon
+            // handle is NOT cached across events: per-event open/switch/inject/close avoids
+            // the leak (pre-210eaf3 bug) and the stale-handle race (post-210eaf3 bug). See
+            // .claude/plans/fix-sd-input-stale-handle.md for the full reasoning.
             bool wasOnSecureDesktop = false;
 
             // Process input commands from queue
             foreach (var (json, sw, sh) in _inputQueue!.GetConsumingEnumerable())
             {
+                IntPtr hCurrent = IntPtr.Zero;
                 try
                 {
                     var onSecureDesktop = _capture != null && _capture.IsActive;
 
-                    // Transition: normal → SD — acquire Winlogon desktop handle
-                    if (onSecureDesktop && !wasOnSecureDesktop)
+                    if (onSecureDesktop)
                     {
-                        _sdInputLogCount = 0;
-                        _sdInputFailCount = 0;
-                        // OpenInputDesktop gets the CURRENT input desktop (more robust than hardcoded "Winlogon")
-                        hCachedWinlogon = OpenInputDesktop(0, false, GENERIC_ALL);
-                        if (hCachedWinlogon == IntPtr.Zero)
+                        // Per-event: open current input desktop, switch, inject, close.
+                        // OpenInputDesktop returns whichever desktop has user input focus right
+                        // now — robust to mid-flow desktop swaps (e.g. lock-screen Phase 1↔2).
+                        hCurrent = OpenInputDesktop(0, false, GENERIC_ALL);
+                        if (hCurrent == IntPtr.Zero)
                         {
-                            // Fallback to explicit name
-                            hCachedWinlogon = OpenDesktop("Winlogon", 0, false, GENERIC_ALL);
-                            DebugLog($"SD input: OpenInputDesktop failed, OpenDesktop(Winlogon)={hCachedWinlogon != IntPtr.Zero} (err {Marshal.GetLastWin32Error()})");
+                            // Fallback to explicit name (matches pre-existing fallback)
+                            hCurrent = OpenDesktop("Winlogon", 0, false, GENERIC_ALL);
                         }
-                        else
-                        {
-                            DebugLog($"SD input: OpenInputDesktop succeeded for SD transition");
-                        }
-
-                        if (hCachedWinlogon != IntPtr.Zero)
-                        {
-                            var switched = SetThreadDesktop(hCachedWinlogon);
-                            DebugLog($"SD input: SetThreadDesktop(Winlogon) on transition: {switched} (err {Marshal.GetLastWin32Error()})");
-                            if (!switched)
-                            {
-                                CloseDesktop(hCachedWinlogon);
-                                hCachedWinlogon = IntPtr.Zero;
-                            }
-                        }
-                        wasOnSecureDesktop = true;
-                    }
-                    // Transition: SD → normal — release Winlogon handle, re-acquire Default, switch back
-                    else if (!onSecureDesktop && wasOnSecureDesktop)
-                    {
-                        if (hCachedWinlogon != IntPtr.Zero)
-                        {
-                            // Re-acquire Default desktop handle — old one is stale after SD round-trip
-                            var hNewDefault = OpenInputDesktop(0, false, DESKTOP_SWITCHDESKTOP);
-                            if (hNewDefault != IntPtr.Zero)
-                            {
-                                if (hDefaultDesk != IntPtr.Zero)
-                                    CloseDesktop(hDefaultDesk);
-                                hDefaultDesk = hNewDefault;
-                                DebugLog($"SD input: re-acquired Default desktop handle on SD→normal transition");
-                            }
-                            else
-                            {
-                                DebugLog($"SD input: WARNING — failed to re-acquire Default desktop (err {Marshal.GetLastWin32Error()}), using old handle");
-                            }
-
-                            var switchedBack = SetThreadDesktop(hDefaultDesk);
-                            DebugLog($"SD input: leaving SD, SetThreadDesktop(Default)={switchedBack}, total SD events={_sdInputLogCount}, failures={_sdInputFailCount}");
-                            CloseDesktop(hCachedWinlogon);
-                            hCachedWinlogon = IntPtr.Zero;
-                        }
-                        wasOnSecureDesktop = false;
-                    }
-
-                    // If on SD but no valid handle, try to re-acquire
-                    if (onSecureDesktop && hCachedWinlogon == IntPtr.Zero)
-                    {
-                        hCachedWinlogon = OpenInputDesktop(0, false, GENERIC_ALL);
-                        if (hCachedWinlogon == IntPtr.Zero)
-                            hCachedWinlogon = OpenDesktop("Winlogon", 0, false, GENERIC_ALL);
-                        if (hCachedWinlogon != IntPtr.Zero)
-                        {
-                            var switched = SetThreadDesktop(hCachedWinlogon);
-                            DebugLog($"SD input: re-acquired desktop handle, SetThreadDesktop={switched}");
-                            if (!switched)
-                            {
-                                CloseDesktop(hCachedWinlogon);
-                                hCachedWinlogon = IntPtr.Zero;
-                            }
-                        }
-                        else
+                        if (hCurrent == IntPtr.Zero)
                         {
                             _sdInputFailCount++;
                             if (_sdInputFailCount <= 10 || _sdInputFailCount % 100 == 0)
-                                DebugLog($"SD input: can't open Winlogon desktop (fail #{_sdInputFailCount}, err {Marshal.GetLastWin32Error()})");
+                                DebugLog($"SD input: can't open input desktop (fail #{_sdInputFailCount}, err {Marshal.GetLastWin32Error()})");
                             continue;
                         }
-                    }
 
-                    _sdInputLogCount++;
-                    if (_sdInputLogCount <= 3 || _sdInputLogCount % 200 == 0)
+                        if (!SetThreadDesktop(hCurrent))
+                        {
+                            DebugLog($"SD input: SetThreadDesktop failed (err {Marshal.GetLastWin32Error()})");
+                            CloseDesktop(hCurrent);
+                            hCurrent = IntPtr.Zero;
+                            continue;
+                        }
+
+                        if (!wasOnSecureDesktop)
+                        {
+                            _sdInputLogCount = 0;
+                            _sdInputFailCount = 0;
+                            DebugLog("SD input: entered SD (per-event re-acquire pattern)");
+                            wasOnSecureDesktop = true;
+                        }
+
+                        _sdInputLogCount++;
+                        if (_sdInputLogCount <= 3 || _sdInputLogCount % 200 == 0)
+                            DebugLog($"SD input #{_sdInputLogCount}: injecting on current input desktop");
+                    }
+                    else if (wasOnSecureDesktop)
                     {
-                        if (onSecureDesktop)
-                            DebugLog($"SD input #{_sdInputLogCount}: injecting on Winlogon");
+                        // Transition: SD → normal. Re-acquire Default desktop handle —
+                        // the startup handle may be stale after SD round-trip (210eaf3 fix).
+                        var hNewDefault = OpenInputDesktop(0, false, DESKTOP_SWITCHDESKTOP);
+                        if (hNewDefault != IntPtr.Zero)
+                        {
+                            if (hDefaultDesk != IntPtr.Zero)
+                                CloseDesktop(hDefaultDesk);
+                            hDefaultDesk = hNewDefault;
+                            DebugLog("SD input: re-acquired Default desktop handle on SD→normal transition");
+                        }
+                        else
+                        {
+                            DebugLog($"SD input: WARNING — failed to re-acquire Default desktop (err {Marshal.GetLastWin32Error()}), using old handle");
+                        }
+
+                        var switchedBack = SetThreadDesktop(hDefaultDesk);
+                        DebugLog($"SD input: leaving SD, SetThreadDesktop(Default)={switchedBack}, total SD events={_sdInputLogCount}, failures={_sdInputFailCount}");
+                        wasOnSecureDesktop = false;
                     }
 
                     // Parse and inject input via canonical dispatcher
@@ -1123,11 +1099,15 @@ public static class SystemHelperServer
                 {
                     DebugLog($"Input thread error: {ex.Message}");
                 }
+                finally
+                {
+                    // Always close the per-event SD handle — never cache across events.
+                    if (hCurrent != IntPtr.Zero)
+                        CloseDesktop(hCurrent);
+                }
             }
 
             // Cleanup
-            if (hCachedWinlogon != IntPtr.Zero)
-                CloseDesktop(hCachedWinlogon);
             if (hDefaultDesk != IntPtr.Zero)
                 CloseDesktop(hDefaultDesk);
         }

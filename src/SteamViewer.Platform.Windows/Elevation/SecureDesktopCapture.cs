@@ -135,53 +135,6 @@ public sealed class SecureDesktopCapture : IDisposable
     }
 
     /// <summary>
-    /// Inject input on the Winlogon desktop. Called from the control pipe thread.
-    /// The calling thread must not have any windows (SystemHelperServer's reader thread qualifies).
-    /// Switches the calling thread's desktop to Winlogon, injects input via SendInput, then switches back.
-    /// </summary>
-    public void InjectInputOnWinlogon(string inputJson, int screenWidth, int screenHeight)
-    {
-        if (!_isSecureDesktopActive) return;
-
-        // Notify event-driven capture that input happened
-        NotifyInputActivity();
-
-        // Open a fresh handle for this thread
-        var hDesk = OpenInputDesktop(0, false, DESKTOP_SWITCHDESKTOP);
-        if (hDesk == IntPtr.Zero)
-        {
-            DebugLog($"InjectInput: OpenInputDesktop failed (error {Marshal.GetLastWin32Error()})");
-            return;
-        }
-
-        var originalDesktop = GetThreadDesktop(GetCurrentThreadId());
-
-        try
-        {
-            if (!SetThreadDesktop(hDesk))
-            {
-                DebugLog($"InjectInput: SetThreadDesktop(winlogon) failed (error {Marshal.GetLastWin32Error()})");
-                return;
-            }
-
-            // Parse and inject via canonical dispatcher
-            using var doc = System.Text.Json.JsonDocument.Parse(inputJson);
-            Win32Input.InjectInputFromJson(doc.RootElement, screenWidth, screenHeight,
-                msg => DebugLog($"InjectInput: {msg}"));
-        }
-        catch (Exception ex)
-        {
-            DebugLog($"InjectInput error: {ex.Message}");
-        }
-        finally
-        {
-            // Switch back to original desktop
-            SetThreadDesktop(originalDesktop);
-            CloseDesktop(hDesk);
-        }
-    }
-
-    /// <summary>
     /// Main capture loop running on a dedicated clean thread.
     /// Polls OpenInputDesktop every 150ms. When "Winlogon" is detected, switches desktop
     /// and captures event-driven (on input activity) via BitBlt -> raw BGRA.
