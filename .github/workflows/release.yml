@@ -55,7 +55,9 @@ jobs:
       - name: Clean build output
         shell: pwsh
         run: |
-          $bin = "src/SteamViewer.App/bin/Release/net8.0-windows10.0.19041.0"
+          # Newer .NET 8 SDK / MAUI workload writes output into a RID subfolder.
+          # Point at the subfolder so these Remove-Item calls actually hit files.
+          $bin = "src/SteamViewer.App/bin/Release/net8.0-windows10.0.19041.0/win10-x64"
           Remove-Item "$bin/*.pdb" -Force -ErrorAction SilentlyContinue
           Remove-Item "$bin/gist-id.txt" -Force -ErrorAction SilentlyContinue
           Remove-Item "$bin/kill-steamviewer.cmd" -Force -ErrorAction SilentlyContinue
@@ -63,10 +65,29 @@ jobs:
       - name: Create payload zip
         shell: pwsh
         run: |
-          $bin = "src/SteamViewer.App/bin/Release/net8.0-windows10.0.19041.0"
+          # Zip from inside the RID subfolder so SteamViewer.App.exe lands at zip root.
+          $bin = "src/SteamViewer.App/bin/Release/net8.0-windows10.0.19041.0/win10-x64"
           $payload = "tools/app-launcher/payload"
           New-Item -ItemType Directory -Path $payload -Force
           Compress-Archive -Path "$bin/*" -DestinationPath "$payload/SteamViewer.zip" -Force
+
+      - name: Smoke-check zip layout
+        shell: pwsh
+        run: |
+          $zip = "tools/app-launcher/payload/SteamViewer.zip"
+          $archive = [System.IO.Compression.ZipFile]::OpenRead((Get-Item $zip).FullName)
+          try {
+            $entries = @($archive.Entries | Select-Object -ExpandProperty FullName)
+          } finally {
+            $archive.Dispose()
+          }
+          if (-not ($entries -contains "SteamViewer.App.exe")) {
+            Write-Error "Release zip does not contain SteamViewer.App.exe at root."
+            Write-Host "Entries found:"
+            $entries | ForEach-Object { Write-Host "  $_" }
+            exit 1
+          }
+          Write-Host "Zip layout OK: SteamViewer.App.exe present at root ($($entries.Count) entries)."
 
       - name: Publish launcher
         run: dotnet publish tools/app-launcher/SteamViewer.Launcher.csproj -c Release -o release-output

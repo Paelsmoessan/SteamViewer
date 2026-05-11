@@ -126,9 +126,21 @@ static class Program
             var totalEntries = archive.Entries.Count(e => !string.IsNullOrEmpty(e.Name));
             var extracted = 0;
 
+            // If every file entry sits under a single top-level folder (e.g. "win10-x64/"),
+            // strip that prefix during extraction so the install root contains the exe directly.
+            // Survives future MAUI/SDK output-layout shifts without needing a workflow change.
+            var commonPrefix = DetectCommonTopLevelFolder(archive);
+
             foreach (var entry in archive.Entries)
             {
-                var destPath = Path.Combine(tempDir, entry.FullName);
+                var relativePath = commonPrefix != null && entry.FullName.StartsWith(commonPrefix, StringComparison.Ordinal)
+                    ? entry.FullName.Substring(commonPrefix.Length)
+                    : entry.FullName;
+
+                if (string.IsNullOrEmpty(relativePath))
+                    continue;
+
+                var destPath = Path.Combine(tempDir, relativePath);
 
                 var destDir = Path.GetDirectoryName(destPath);
                 if (destDir != null)
@@ -171,6 +183,31 @@ static class Program
                 Directory.Delete(tempDir, true);
             throw;
         }
+    }
+
+    /// <summary>
+    /// Returns the common top-level folder prefix (with trailing '/') if every file entry
+    /// in the archive sits under the same single top-level folder, otherwise null.
+    /// </summary>
+    private static string? DetectCommonTopLevelFolder(ZipArchive archive)
+    {
+        string? prefix = null;
+        foreach (var entry in archive.Entries)
+        {
+            if (string.IsNullOrEmpty(entry.Name))
+                continue;
+
+            var slash = entry.FullName.IndexOf('/');
+            if (slash <= 0)
+                return null;
+
+            var top = entry.FullName.Substring(0, slash + 1);
+            if (prefix == null)
+                prefix = top;
+            else if (!string.Equals(prefix, top, StringComparison.Ordinal))
+                return null;
+        }
+        return prefix;
     }
 
     private static void KillRunningInstances()
