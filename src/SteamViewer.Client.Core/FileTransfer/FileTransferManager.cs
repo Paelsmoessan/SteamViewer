@@ -175,6 +175,7 @@ public sealed class FileTransferManager : IAsyncDisposable
 
     private async Task HandleRequestAsync(FileTransferMessage.Request request, CancellationToken ct)
     {
+        await Task.CompletedTask; // currently sync body; reserve async sugar for future awaits
         _logger.LogInformation("Incoming file transfer request: {Filename} ({Size} bytes)",
             request.Filename, request.FileSize);
 
@@ -349,6 +350,7 @@ public sealed class FileTransferManager : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        await Task.CompletedTask; // currently sync body; reserve async sugar for future awaits
         if (_disposed) return;
         _disposed = true;
 

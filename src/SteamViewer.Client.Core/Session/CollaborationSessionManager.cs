@@ -336,6 +336,7 @@ public sealed class CollaborationSessionManager : IAsyncDisposable
 
     private async Task HandleParticipantJoinedAsync(SignalingMessage.ParticipantJoined joined)
     {
+        await Task.CompletedTask; // currently sync body; reserve async sugar for future awaits
         _state.AddParticipant(joined.Participant);
         ParticipantJoined?.Invoke(this, joined.Participant);
 

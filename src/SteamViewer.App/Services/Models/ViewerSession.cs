@@ -328,6 +328,7 @@ public sealed class ViewerSession : IAsyncDisposable
     /// </summary>
     public async Task BindToViewerAsync(IJSRuntime viewerJsRuntime)
     {
+        await Task.CompletedTask; // currently sync body; reserve async sugar for future awaits
         _jsRuntime = viewerJsRuntime;
 
 #if WINDOWS

@@ -256,16 +256,16 @@ public static class BootRelayOrchestrator
                 })
                 .Build();
             var turnConfigService = new TurnConfigService(
-                config, _loggerFactory.CreateLogger<TurnConfigService>());
+                config, _loggerFactory!.CreateLogger<TurnConfigService>());
 
             // Create input injector (same as DI provides to Home.razor)
-            var inputInjector = new WindowsInputInjector(_loggerFactory.CreateLogger<WindowsInputInjector>());
+            var inputInjector = new WindowsInputInjector(_loggerFactory!.CreateLogger<WindowsInputInjector>());
 
             // Create HostSession - same as Home.razor:756, but jsRuntime=null (no WebView)
             _hostSession = new HostSession(
                 viewerPeerId,
                 jsRuntime: null, // No MAUI WebView in boot relay
-                _loggerFactory,
+                _loggerFactory!,
                 inputInjector,
                 config,
                 msg => _signalingClient.SendAsync(msg, ct),

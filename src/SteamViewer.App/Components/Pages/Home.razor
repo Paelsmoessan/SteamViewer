@@ -171,9 +171,6 @@ else
     private readonly bool _isDebugBuild = false;
 #endif
 
-    private enum AppMode { Select, StartConnection, JoinConnection }
-
-    private AppMode currentMode = AppMode.StartConnection;
     private ConnectionState connectionState = ConnectionState.Idle;
 
     // Session state (credentials displayed in UI, registration logic stays here)
@@ -456,19 +453,6 @@ else
 
     #endregion
 
-    private void SelectJoinMode()
-    {
-        currentMode = AppMode.JoinConnection;
-        StateHasChanged();
-    }
-
-    private void GoBack()
-    {
-        currentMode = AppMode.StartConnection;
-        errorMessage = "";
-        StateHasChanged();
-    }
-
     private async Task CopySessionId()
     {
         await CopyToClipboard(clientId);
@@ -727,7 +711,6 @@ else
             }
 
             // Return to host view - viewer window handles everything
-            currentMode = AppMode.StartConnection;
             connectionState = ConnectionState.Registered;
         }
         catch (Exception ex)

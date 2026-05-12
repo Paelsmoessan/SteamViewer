@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.2.7-alpha (2026-05-12)
+
+### Zero build warnings
+
+Cleaned up all pre-existing build warnings (18 -> 0) across the solution.
+Four independent commits, each behavior-preserving:
+
+- Removed dead code: 4 unused members (HostSession.OnScreenShareLost,
+  SessionManager.WebRTCConnected from the WebRTC era, RemoteViewer
+  _resizeDebounceTimer C# field whose JS counterpart is still alive,
+  Home.razor AppMode/currentMode/SelectJoinMode/GoBack orphan UI cluster)
+- Silenced CS1998 on 5 sync method bodies with async signatures
+  (await Task.CompletedTask preserves async sugar for future awaits)
+- Silenced CS8604 possible-null-ref on 2 sites where runtime guarantees
+  non-null but analyzer can't prove it
+- Pragma-suppressed CS0618 obsolete STUNXORAddressAttribute (x2) - SIPSorcery
+  RFC5389 migration deferred; suppression is documented in source
+
+Full clean build: 0 errors, 0 warnings. App.dll shrunk 512 bytes from
+dead-code removal.
+
 ## v0.2.6-alpha (2026-05-12)
 
 ### Full Clean Delivery refactor cycle (8 sub-branches, all behavior-preserving)

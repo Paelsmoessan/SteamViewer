@@ -672,10 +672,14 @@ public sealed class UdpTransportBackend : ITransportBackend
                     continue;
                 }
 
-                // Check if this is a TURN DataIndication (unwrap it)
+                // Check if this is a TURN DataIndication (unwrap it).
+                // `data!` asserts non-null - `data` was just initialized from
+                // result.Buffer (non-null) and not reassigned before this call;
+                // the analyzer can't track that across the tuple-deconstruction
+                // reassignment that follows.
                 if (length > 20 && IsTurnDataIndication(data))
                 {
-                    (data, length) = UnwrapDataIndication(data, length);
+                    (data, length) = UnwrapDataIndication(data!, length);
                     if (data == null || length < FragmentHeaderSize) continue;
                 }
 
@@ -805,9 +809,17 @@ public sealed class UdpTransportBackend : ITransportBackend
 
         _logger.LogDebug("[UDP-DIAG] TURN relay probe: creating permission for {Peer}", peerRelayEndPoint);
 
-        // Send CreatePermission for peer's relay address
+        // Send CreatePermission for peer's relay address.
+        // The (type, port, IPAddress) STUNXORAddressAttribute constructor is marked
+        // obsolete by SIPSorcery ("Provided for backward compatibility with RFC3489
+        // clients"), but it still XORs correctly for our coturn/Metered TURN servers
+        // and the path is in the smoke-tested critical TURN-relay invariant. Migrating
+        // to the RFC5389 ctor (which requires the message transaction ID) is deferred
+        // until SIPSorcery clarifies the supported migration path.
         var permReq = new STUNMessage(STUNMessageTypesEnum.CreatePermission);
+#pragma warning disable CS0618 // Obsolete STUNXORAddressAttribute ctor - see note above
         permReq.Attributes.Add(new STUNXORAddressAttribute(STUNAttributeTypesEnum.XORPeerAddress, peerRelayEndPoint.Port, peerRelayEndPoint.Address));
+#pragma warning restore CS0618
         if (_turnUsername != null)
             permReq.Attributes.Add(new STUNAttribute(STUNAttributeTypesEnum.Username, Encoding.UTF8.GetBytes(_turnUsername)));
         if (_turnNonce != null)
@@ -908,7 +920,9 @@ public sealed class UdpTransportBackend : ITransportBackend
         // Type: 0x0016 (SendIndication), Length: varies
         // Attributes: XOR-PEER-ADDRESS, DATA
         var msg = new STUNMessage(STUNMessageTypesEnum.SendIndication);
+#pragma warning disable CS0618 // Obsolete STUNXORAddressAttribute ctor - see note on ProbeViaTurnRelayAsync
         msg.Attributes.Add(new STUNXORAddressAttribute(STUNAttributeTypesEnum.XORPeerAddress, peer.Port, peer.Address));
+#pragma warning restore CS0618
         msg.Attributes.Add(new STUNAttribute(STUNAttributeTypesEnum.Data, data));
         return msg.ToByteBuffer(null, false);
     }

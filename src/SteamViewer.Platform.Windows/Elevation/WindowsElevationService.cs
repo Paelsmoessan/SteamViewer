@@ -189,6 +189,7 @@ public sealed class WindowsElevationService : IElevationService
 
     public async Task<bool> LockWorkStationAsync()
     {
+        await Task.CompletedTask; // currently sync body; reserve async sugar for future awaits
         try
         {
             if (LockWorkStation())

@@ -61,11 +61,6 @@ public sealed class SessionManager : IAsyncDisposable
     public event EventHandler<string>? SignalingError;
 
     /// <summary>
-    /// Fired when WebRTC connection is established.
-    /// </summary>
-    public event EventHandler<string>? WebRTCConnected;
-
-    /// <summary>
     /// Fired when a video frame is decoded (for viewer).
     /// </summary>
     public event EventHandler<DecodedFrame>? VideoFrameDecoded;
