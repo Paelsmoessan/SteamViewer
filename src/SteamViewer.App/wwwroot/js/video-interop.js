@@ -279,6 +279,172 @@ function fmtBytes(bytes) {
 }
 
 // === SharedBuffer Receiver (decoded BGRA frames from C# FFmpeg decoder) ===
+
+// Shared display-fit geometry used by raw-fallback and JPEG paths.
+function computeDisplayFit(canvas, frameW, frameH) {
+    const rect = canvas.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    const displayW = Math.round(rect.width * dpr);
+    const displayH = Math.round(rect.height * dpr);
+    const scale = Math.min(displayW / frameW, displayH / frameH);
+    const isDownscaling = scale < 0.95;
+    const fitW = Math.round(frameW * scale);
+    const fitH = Math.round(frameH * scale);
+    const dx = Math.round((displayW - fitW) / 2);
+    const dy = Math.round((displayH - fitH) / 2);
+    return { displayW, displayH, scale, isDownscaling, fitW, fitH, dx, dy };
+}
+
+// Lossless QOI-decoded BGRA frame — paint into existing canvas (no resize, prevents jitter).
+// Dimensions match H.264 (viewer requests at decoder resolution), nearest-neighbor.
+function paintLosslessFrame(buf, meta, session) {
+    const bgraCopy = new Uint8Array(buf, 0, meta.len).slice();
+    chrome.webview.releaseBuffer(buf);
+
+    const frame = new VideoFrame(bgraCopy, {
+        format: 'BGRA',
+        codedWidth: meta.w,
+        codedHeight: meta.h,
+        timestamp: performance.now() * 1000,
+    });
+
+    const canvas = session.canvas;
+    const ctx = session.ctx;
+
+    const savedSmoothing = ctx.imageSmoothingEnabled;
+    ctx.imageSmoothingEnabled = false;
+
+    if (session.isDownscaling) {
+        const scale = Math.min(canvas.width / meta.w, canvas.height / meta.h);
+        const fitW = Math.round(meta.w * scale);
+        const fitH = Math.round(meta.h * scale);
+        const dx = Math.round((canvas.width - fitW) / 2);
+        const dy = Math.round((canvas.height - fitH) / 2);
+        if (dx > 0 || dy > 0) ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(frame, dx, dy, fitW, fitH);
+    } else {
+        ctx.drawImage(frame, 0, 0);
+    }
+
+    ctx.imageSmoothingEnabled = savedSmoothing;
+    frame.close();
+}
+
+// Raw BGRA VideoFrame: 1:1 path — canvas bitmap = encode resolution, CSS synced.
+function paintRawFrame1to1(frame, meta, session) {
+    const canvas = session.canvas;
+    const ctx = session.ctx;
+
+    if (canvas.width !== meta.w || canvas.height !== meta.h) {
+        canvas.width = meta.w;
+        canvas.height = meta.h;
+    }
+    // Sync CSS to bitmap so CSS never leads the frame data (no fractional smear).
+    const dpr = window.devicePixelRatio || 1;
+    const targetCssW = `${meta.w / dpr}px`;
+    const targetCssH = `${meta.h / dpr}px`;
+    if (canvas.style.width !== targetCssW || canvas.style.height !== targetCssH) {
+        canvas.style.width = targetCssW;
+        canvas.style.height = targetCssH;
+        canvas.style.objectFit = '';
+        canvas.style.aspectRatio = '';
+        canvas.style.maxHeight = '';
+    }
+    ctx.drawImage(frame, 0, 0);
+    session.isDownscaling = false;
+}
+
+// Raw BGRA VideoFrame: display-pixel fallback path. Used before encodeInfo arrives,
+// or when frame doesn't match encode resolution. Letterbox-downscale or 1:1.
+function paintRawFrameFallback(frame, meta, session) {
+    const canvas = session.canvas;
+    const ctx = session.ctx;
+    const fit = computeDisplayFit(canvas, meta.w, meta.h);
+    if (fit.isDownscaling) {
+        const displayChanged = fit.displayW !== session.lastDisplayW || fit.displayH !== session.lastDisplayH;
+        if (canvas.width !== fit.displayW || canvas.height !== fit.displayH || displayChanged) {
+            canvas.width = fit.displayW;
+            canvas.height = fit.displayH;
+            ctx.imageSmoothingEnabled = true;
+            ctx.imageSmoothingQuality = 'high';
+            session.lastDisplayW = fit.displayW;
+            session.lastDisplayH = fit.displayH;
+        }
+        if (fit.dx > 0 || fit.dy > 0) ctx.clearRect(0, 0, fit.displayW, fit.displayH);
+        ctx.drawImage(frame, fit.dx, fit.dy, fit.fitW, fit.fitH);
+        session.isDownscaling = true;
+    } else {
+        if (canvas.width !== meta.w || canvas.height !== meta.h) {
+            canvas.width = meta.w;
+            canvas.height = meta.h;
+            session.lastDisplayW = 0;
+            session.lastDisplayH = 0;
+        }
+        ctx.drawImage(frame, 0, 0);
+        session.isDownscaling = false;
+    }
+}
+
+// Raw BGRA VideoFrame from C# FFmpeg decoder.
+// 1:1 when canvas matches encode resolution, else display-pixel fallback with letterbox.
+function paintRawFrame(buf, meta, session) {
+    const bgraCopy = new Uint8Array(buf, 0, meta.len).slice();
+    chrome.webview.releaseBuffer(buf);
+
+    const frame = new VideoFrame(bgraCopy, {
+        format: 'BGRA',
+        codedWidth: meta.w,
+        codedHeight: meta.h,
+        timestamp: performance.now() * 1000,
+    });
+
+    if (session.videoW !== meta.w || session.videoH !== meta.h) {
+        session.videoW = meta.w;
+        session.videoH = meta.h;
+    }
+
+    const use1to1 = session.encodeW > 0 && session.encodeH > 0 &&
+        meta.w === session.encodeW && meta.h === session.encodeH;
+
+    if (use1to1) paintRawFrame1to1(frame, meta, session);
+    else paintRawFrameFallback(frame, meta, session);
+
+    frame.close();
+}
+
+// JPEG fallback path (if ever needed). Async via createImageBitmap.
+function paintJpegFrame(buf, meta, session) {
+    const jpegBytes = new Uint8Array(buf, 0, meta.len).slice();
+    chrome.webview.releaseBuffer(buf);
+
+    const blob = new Blob([jpegBytes], { type: 'image/jpeg' });
+    createImageBitmap(blob).then(bitmap => {
+        if (!session.canvas || !session.ctx) { bitmap.close(); return; }
+
+        const canvas = session.canvas;
+        const ctx = session.ctx;
+        session.videoW = meta.w;
+        session.videoH = meta.h;
+
+        const fit = computeDisplayFit(canvas, meta.w, meta.h);
+        if (fit.isDownscaling) {
+            if (canvas.width !== fit.displayW || canvas.height !== fit.displayH) {
+                canvas.width = fit.displayW; canvas.height = fit.displayH;
+                ctx.imageSmoothingEnabled = true;
+                ctx.imageSmoothingQuality = 'high';
+            }
+            if (fit.dx > 0 || fit.dy > 0) ctx.clearRect(0, 0, fit.displayW, fit.displayH);
+            ctx.drawImage(bitmap, fit.dx, fit.dy, fit.fitW, fit.fitH);
+        } else {
+            if (canvas.width !== meta.w || canvas.height !== meta.h) {
+                canvas.width = meta.w; canvas.height = meta.h;
+            }
+            ctx.drawImage(bitmap, 0, 0);
+        }
+        bitmap.close();
+    }).catch(() => {});
+}
+
 if (window.chrome?.webview) {
     window.chrome.webview.addEventListener('sharedbufferreceived', (e) => {
         try {
@@ -291,178 +457,19 @@ if (window.chrome?.webview) {
                 return;
             }
 
+            // Lossless paths return early — first-frame callback is suppressed for QOI
+            // settle frames (preserved from pre-refactor behavior).
             if (meta.lossless) {
-                // Lossless QOI-decoded BGRA frame — paint into existing canvas (no resize!)
-                // Dimensions match H.264 (viewer requests at decoder resolution), so
-                // we paint exactly like the last H.264 frame but with nearest-neighbor.
-                const bgraCopy = new Uint8Array(buf, 0, meta.len).slice();
-                chrome.webview.releaseBuffer(buf);
-
-                const frame = new VideoFrame(bgraCopy, {
-                    format: 'BGRA',
-                    codedWidth: meta.w,
-                    codedHeight: meta.h,
-                    timestamp: performance.now() * 1000,
-                });
-
-                const canvas = session.canvas;
-                const ctx = session.ctx;
-
-                // Paint into current canvas — never resize (prevents jitter)
-                const savedSmoothing = ctx.imageSmoothingEnabled;
-                ctx.imageSmoothingEnabled = false;
-
-                if (session.isDownscaling) {
-                    // Canvas is at display pixels — use same letterbox as H.264
-                    const scale = Math.min(canvas.width / meta.w, canvas.height / meta.h);
-                    const fitW = Math.round(meta.w * scale);
-                    const fitH = Math.round(meta.h * scale);
-                    const dx = Math.round((canvas.width - fitW) / 2);
-                    const dy = Math.round((canvas.height - fitH) / 2);
-                    if (dx > 0 || dy > 0) ctx.clearRect(0, 0, canvas.width, canvas.height);
-                    ctx.drawImage(frame, dx, dy, fitW, fitH);
-                } else {
-                    // Canvas is at video resolution — draw 1:1
-                    ctx.drawImage(frame, 0, 0);
-                }
-
-                ctx.imageSmoothingEnabled = savedSmoothing;
-                frame.close();
+                paintLosslessFrame(buf, meta, session);
                 session.frameCount++;
                 return;
             }
 
-            if (meta.raw) {
-                // Raw BGRA path — VideoFrame directly from pixel data
-                const bgraCopy = new Uint8Array(buf, 0, meta.len).slice();
-                chrome.webview.releaseBuffer(buf);
-
-                const frame = new VideoFrame(bgraCopy, {
-                    format: 'BGRA',
-                    codedWidth: meta.w,
-                    codedHeight: meta.h,
-                    timestamp: performance.now() * 1000,
-                });
-
-                const canvas = session.canvas;
-                const ctx = session.ctx;
-
-                // Update session video dims for mouse coordinate mapping
-                if (session.videoW !== meta.w || session.videoH !== meta.h) {
-                    session.videoW = meta.w;
-                    session.videoH = meta.h;
-                }
-
-                // When encodeResolution is known, canvas = video resolution → 1:1 drawImage.
-                // CSS object-fit: contain handles display scaling (GPU compositor).
-                // Host already downscaled to near-display size, so CSS upscale is ≤7px (imperceptible).
-                const use1to1 = session.encodeW > 0 && session.encodeH > 0 &&
-                    meta.w === session.encodeW && meta.h === session.encodeH;
-
-                if (use1to1) {
-                    // 1:1 pixel-perfect: canvas bitmap = encode resolution
-                    if (canvas.width !== meta.w || canvas.height !== meta.h) {
-                        canvas.width = meta.w;
-                        canvas.height = meta.h;
-                    }
-                    // Sync CSS to bitmap — deferred from setEncodeResolution so CSS
-                    // never leads the frame data (eliminates race → no fractional smear)
-                    const dpr = window.devicePixelRatio || 1;
-                    const targetCssW = `${meta.w / dpr}px`;
-                    const targetCssH = `${meta.h / dpr}px`;
-                    if (canvas.style.width !== targetCssW || canvas.style.height !== targetCssH) {
-                        canvas.style.width = targetCssW;
-                        canvas.style.height = targetCssH;
-                        canvas.style.objectFit = '';
-                        canvas.style.aspectRatio = '';
-                        canvas.style.maxHeight = '';
-                    }
-                    ctx.drawImage(frame, 0, 0);
-                    session.isDownscaling = false;
-                } else {
-                    // Fallback: display-pixel canvas with Canvas 2D scaling
-                    // (before encodeInfo arrives, or if frame doesn't match encode resolution)
-                    const rect = canvas.getBoundingClientRect();
-                    const dpr = window.devicePixelRatio || 1;
-                    const displayW = Math.round(rect.width * dpr);
-                    const displayH = Math.round(rect.height * dpr);
-                    const scale = Math.min(displayW / meta.w, displayH / meta.h);
-                    const isDownscaling = scale < 0.95;
-
-                    if (isDownscaling) {
-                        const displayChanged = displayW !== session.lastDisplayW || displayH !== session.lastDisplayH;
-                        if (canvas.width !== displayW || canvas.height !== displayH || displayChanged) {
-                            canvas.width = displayW;
-                            canvas.height = displayH;
-                            ctx.imageSmoothingEnabled = true;
-                            ctx.imageSmoothingQuality = 'high';
-                            session.lastDisplayW = displayW;
-                            session.lastDisplayH = displayH;
-                        }
-                        const fitW = Math.round(meta.w * scale);
-                        const fitH = Math.round(meta.h * scale);
-                        const dx = Math.round((displayW - fitW) / 2);
-                        const dy = Math.round((displayH - fitH) / 2);
-                        if (dx > 0 || dy > 0) ctx.clearRect(0, 0, displayW, displayH);
-                        ctx.drawImage(frame, dx, dy, fitW, fitH);
-                        session.isDownscaling = true;
-                    } else {
-                        if (canvas.width !== meta.w || canvas.height !== meta.h) {
-                            canvas.width = meta.w;
-                            canvas.height = meta.h;
-                            session.lastDisplayW = 0;
-                            session.lastDisplayH = 0;
-                        }
-                        ctx.drawImage(frame, 0, 0);
-                        session.isDownscaling = false;
-                    }
-                }
-                frame.close();
-            } else {
-                // JPEG fallback (if ever needed)
-                const jpegBytes = new Uint8Array(buf, 0, meta.len).slice();
-                chrome.webview.releaseBuffer(buf);
-
-                const blob = new Blob([jpegBytes], { type: 'image/jpeg' });
-                createImageBitmap(blob).then(bitmap => {
-                    if (!session.canvas || !session.ctx) { bitmap.close(); return; }
-
-                    const canvas = session.canvas;
-                    const ctx = session.ctx;
-                    session.videoW = meta.w;
-                    session.videoH = meta.h;
-
-                    const rect = canvas.getBoundingClientRect();
-                    const dpr = window.devicePixelRatio || 1;
-                    const displayW = Math.round(rect.width * dpr);
-                    const displayH = Math.round(rect.height * dpr);
-                    const scale = Math.min(displayW / meta.w, displayH / meta.h);
-
-                    if (scale < 0.95) {
-                        if (canvas.width !== displayW || canvas.height !== displayH) {
-                            canvas.width = displayW; canvas.height = displayH;
-                            ctx.imageSmoothingEnabled = true;
-                            ctx.imageSmoothingQuality = 'high';
-                        }
-                        const fitW = Math.round(meta.w * scale);
-                        const fitH = Math.round(meta.h * scale);
-                        const dx = Math.round((displayW - fitW) / 2);
-                        const dy = Math.round((displayH - fitH) / 2);
-                        if (dx > 0 || dy > 0) ctx.clearRect(0, 0, displayW, displayH);
-                        ctx.drawImage(bitmap, dx, dy, fitW, fitH);
-                    } else {
-                        if (canvas.width !== meta.w || canvas.height !== meta.h) {
-                            canvas.width = meta.w; canvas.height = meta.h;
-                        }
-                        ctx.drawImage(bitmap, 0, 0);
-                    }
-                    bitmap.close();
-                }).catch(() => {});
-            }
+            if (meta.raw) paintRawFrame(buf, meta, session);
+            else paintJpegFrame(buf, meta, session);
 
             session.frameCount++;
 
-            // Report dimensions on first frame
             if (session.frameCount === 1 && session.dotNetRef) {
                 try {
                     session.dotNetRef.invokeMethodAsync('OnVideoStartedCallback');

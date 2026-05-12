@@ -665,28 +665,10 @@ public sealed class UdpTransportBackend : ITransportBackend
                 // Update keepalive timestamp on any received data
                 _lastReceivedTick = Environment.TickCount64;
 
-                // Handle probe/echo/keepalive packets (single byte)
+                // Single-byte probe/echo/keepalive packets handled by dedicated path
                 if (length <= 2)
                 {
-                    if (length == 1 && _udpClient != null)
-                    {
-                        switch (data[0])
-                        {
-                            case 0xFF: // Probe — echo back
-                                LastProbeReceivedFrom = result.RemoteEndPoint;
-                                _logger.LogDebug("[UDP-DIAG] ReceiveLoop echoing probe from {Source}", result.RemoteEndPoint);
-                                try { await _udpClient.SendAsync(new byte[] { 0xFE }, 1, result.RemoteEndPoint); }
-                                catch { }
-                                break;
-                            case 0xFD: // Keepalive ping — respond with pong
-                                try { await _udpClient.SendAsync(new byte[] { 0xFC }, 1, result.RemoteEndPoint); }
-                                catch { }
-                                break;
-                            case 0xFE: // Probe echo — handled
-                            case 0xFC: // Keepalive pong — timestamp already updated above
-                                break;
-                        }
-                    }
+                    if (length == 1) await HandleControlByteAsync(data, result.RemoteEndPoint);
                     continue;
                 }
 
@@ -704,72 +686,16 @@ public sealed class UdpTransportBackend : ITransportBackend
                 var fragIndex = (data[2] << 8) | data[3];
                 var totalFrags = (data[4] << 8) | data[5];
 
-                // Single fragment — deliver immediately (no FEC possible)
                 if (fragIndex == 0 && totalFrags == 1)
                 {
-                    Interlocked.Increment(ref _messagesCompleted);
-                    var payload = new byte[length - FragmentHeaderSize];
-                    Buffer.BlockCopy(data, FragmentHeaderSize, payload, 0, payload.Length);
-                    OnDataReceived?.Invoke(payload, payload.Length);
+                    DeliverSingleFragment(data, length);
                     continue;
                 }
 
                 if (fragIndex >= totalFrags)
-                {
-                    // FEC parity packet — only add to EXISTING buffer.
-                    // If the message already completed and was removed, this is a late
-                    // parity packet — discard it. Using GetOrAdd here would create a
-                    // ghost buffer that never completes, inflating the loss metric.
-                    if (!_reassemblyBuffers.TryGetValue(msgId, out var fecBuffer))
-                        continue;
-
-                    if (length >= FragmentHeaderSize + FecMetaSize)
-                    {
-                        var fecIdx = fragIndex - totalFrags;
-                        var cols = data[FragmentHeaderSize];
-                        var rows = data[FragmentHeaderSize + 1];
-                        var totalMsgLen = (data[FragmentHeaderSize + 2] << 16)
-                            | (data[FragmentHeaderSize + 3] << 8)
-                            | data[FragmentHeaderSize + 4];
-                        var parityLen = length - FragmentHeaderSize - FecMetaSize;
-                        var parityData = new byte[parityLen];
-                        Buffer.BlockCopy(data, FragmentHeaderSize + FecMetaSize, parityData, 0, parityLen);
-
-                        if (cols > 0 && cols <= 30 && rows > 0 && rows <= 30 && (int)rows * cols >= totalFrags)
-                            fecBuffer.AddFecPacket(fecIdx, parityData, cols, rows, totalMsgLen);
-
-                        // Check if FEC enables recovery
-                        if (fecBuffer.TryRecover())
-                        {
-                            _reassemblyBuffers.TryRemove(msgId, out _);
-                            Interlocked.Increment(ref _messagesCompleted);
-                            var assembled = fecBuffer.Assemble();
-                            _logger.LogDebug("FEC recovered message {MsgId} ({Size}KB, {Frags} fragments)",
-                                msgId, assembled.Length / 1024, totalFrags);
-                            OnDataReceived?.Invoke(assembled, assembled.Length);
-                        }
-                    }
-                }
+                    HandleFecParityPacket(data, length, msgId, fragIndex, totalFrags);
                 else
-                {
-                    // Data fragment
-                    var buffer = _reassemblyBuffers.GetOrAdd(msgId, _ => new FragmentBuffer(totalFrags));
-                    var payload = new byte[length - FragmentHeaderSize];
-                    Buffer.BlockCopy(data, FragmentHeaderSize, payload, 0, payload.Length);
-                    buffer.AddFragment(fragIndex, payload);
-
-                    // Check if message is ready (direct completion or FEC recovery)
-                    if (buffer.IsComplete || buffer.TryRecover())
-                    {
-                        _reassemblyBuffers.TryRemove(msgId, out _);
-                        Interlocked.Increment(ref _messagesCompleted);
-                        var assembled = buffer.Assemble();
-                        if (buffer.WasRecovered)
-                            _logger.LogDebug("FEC recovered message {MsgId} ({Size}KB, {Frags} fragments)",
-                                msgId, assembled.Length / 1024, totalFrags);
-                        OnDataReceived?.Invoke(assembled, assembled.Length);
-                    }
-                }
+                    HandleDataFragment(data, length, msgId, fragIndex, totalFrags);
             }
         }
         catch (OperationCanceledException) { }
@@ -777,6 +703,95 @@ public sealed class UdpTransportBackend : ITransportBackend
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "UDP receive loop error");
+        }
+    }
+
+    // Single-byte control packet handler: probe echo, keepalive ping/pong.
+    // 0xFF=probe (echo with 0xFE), 0xFD=keepalive ping (pong with 0xFC),
+    // 0xFE/0xFC=responses (timestamp already updated by ReceiveLoopAsync).
+    private async Task HandleControlByteAsync(byte[] data, IPEndPoint src)
+    {
+        if (_udpClient == null) return;
+        switch (data[0])
+        {
+            case 0xFF: // Probe — echo back
+                LastProbeReceivedFrom = src;
+                _logger.LogDebug("[UDP-DIAG] ReceiveLoop echoing probe from {Source}", src);
+                try { await _udpClient.SendAsync(new byte[] { 0xFE }, 1, src); }
+                catch { }
+                break;
+            case 0xFD: // Keepalive ping — respond with pong
+                try { await _udpClient.SendAsync(new byte[] { 0xFC }, 1, src); }
+                catch { }
+                break;
+            case 0xFE: // Probe echo — handled
+            case 0xFC: // Keepalive pong — timestamp already updated by caller
+                break;
+        }
+    }
+
+    // Single-fragment message: no reassembly, no FEC possible. Copy payload + dispatch.
+    private void DeliverSingleFragment(byte[] data, int length)
+    {
+        Interlocked.Increment(ref _messagesCompleted);
+        var payload = new byte[length - FragmentHeaderSize];
+        Buffer.BlockCopy(data, FragmentHeaderSize, payload, 0, payload.Length);
+        OnDataReceived?.Invoke(payload, payload.Length);
+    }
+
+    // FEC parity packet handler. Only adds to an EXISTING reassembly buffer —
+    // if the message already completed and was removed, this is a late parity
+    // packet that we discard. GetOrAdd here would create a ghost buffer that
+    // never completes and inflates the loss metric.
+    private void HandleFecParityPacket(byte[] data, int length, ushort msgId, int fragIndex, int totalFrags)
+    {
+        if (!_reassemblyBuffers.TryGetValue(msgId, out var fecBuffer))
+            return;
+
+        if (length < FragmentHeaderSize + FecMetaSize) return;
+
+        var fecIdx = fragIndex - totalFrags;
+        var cols = data[FragmentHeaderSize];
+        var rows = data[FragmentHeaderSize + 1];
+        var totalMsgLen = (data[FragmentHeaderSize + 2] << 16)
+            | (data[FragmentHeaderSize + 3] << 8)
+            | data[FragmentHeaderSize + 4];
+        var parityLen = length - FragmentHeaderSize - FecMetaSize;
+        var parityData = new byte[parityLen];
+        Buffer.BlockCopy(data, FragmentHeaderSize + FecMetaSize, parityData, 0, parityLen);
+
+        if (cols > 0 && cols <= 30 && rows > 0 && rows <= 30 && (int)rows * cols >= totalFrags)
+            fecBuffer.AddFecPacket(fecIdx, parityData, cols, rows, totalMsgLen);
+
+        if (fecBuffer.TryRecover())
+        {
+            _reassemblyBuffers.TryRemove(msgId, out _);
+            Interlocked.Increment(ref _messagesCompleted);
+            var assembled = fecBuffer.Assemble();
+            _logger.LogDebug("FEC recovered message {MsgId} ({Size}KB, {Frags} fragments)",
+                msgId, assembled.Length / 1024, totalFrags);
+            OnDataReceived?.Invoke(assembled, assembled.Length);
+        }
+    }
+
+    // Data fragment handler. Adds to reassembly buffer (creating if missing).
+    // If the message becomes complete (direct or via FEC), dispatches it.
+    private void HandleDataFragment(byte[] data, int length, ushort msgId, int fragIndex, int totalFrags)
+    {
+        var buffer = _reassemblyBuffers.GetOrAdd(msgId, _ => new FragmentBuffer(totalFrags));
+        var payload = new byte[length - FragmentHeaderSize];
+        Buffer.BlockCopy(data, FragmentHeaderSize, payload, 0, payload.Length);
+        buffer.AddFragment(fragIndex, payload);
+
+        if (buffer.IsComplete || buffer.TryRecover())
+        {
+            _reassemblyBuffers.TryRemove(msgId, out _);
+            Interlocked.Increment(ref _messagesCompleted);
+            var assembled = buffer.Assemble();
+            if (buffer.WasRecovered)
+                _logger.LogDebug("FEC recovered message {MsgId} ({Size}KB, {Frags} fragments)",
+                    msgId, assembled.Length / 1024, totalFrags);
+            OnDataReceived?.Invoke(assembled, assembled.Length);
         }
     }
 
@@ -1037,8 +1052,8 @@ public sealed class UdpTransportBackend : ITransportBackend
         }
 
         /// <summary>
-        /// Attempt 2D XOR recovery. Iterates row then column recovery until
-        /// no more progress or all fragments recovered.
+        /// Attempt 2D XOR recovery. Runs row then column recovery in each pass,
+        /// repeating while either axis made progress and the message isn't complete.
         /// </summary>
         public bool TryRecover()
         {
@@ -1047,76 +1062,58 @@ public sealed class UdpTransportBackend : ITransportBackend
             bool progress;
             do
             {
-                progress = false;
-
-                // Row recovery
-                for (int r = 0; r < _matrixRows; r++)
-                {
-                    if (_rowParity?[r] == null) continue;
-                    int missingIdx = -1, missingCount = 0;
-                    for (int c = 0; c < _matrixCols; c++)
-                    {
-                        var idx = r * _matrixCols + c;
-                        if (idx >= _totalFragments) break;
-                        if (_fragments[idx] == null)
-                        {
-                            missingIdx = idx;
-                            if (++missingCount > 1) break;
-                        }
-                    }
-                    if (missingCount == 1 && missingIdx >= 0)
-                    {
-                        var recovered = (byte[])_rowParity[r]!.Clone();
-                        for (int c = 0; c < _matrixCols; c++)
-                        {
-                            var idx = r * _matrixCols + c;
-                            if (idx >= _totalFragments) break;
-                            if (idx == missingIdx) continue;
-                            XorInto(recovered, _fragments[idx]!);
-                        }
-                        TrimRecoveredFragment(ref recovered, missingIdx);
-                        _fragments[missingIdx] = recovered;
-                        Interlocked.Increment(ref _receivedCount);
-                        progress = true;
-                        WasRecovered = true;
-                    }
-                }
-
-                // Column recovery
-                for (int c = 0; c < _matrixCols; c++)
-                {
-                    if (_colParity?[c] == null) continue;
-                    int missingIdx = -1, missingCount = 0;
-                    for (int r = 0; r < _matrixRows; r++)
-                    {
-                        var idx = r * _matrixCols + c;
-                        if (idx >= _totalFragments) break;
-                        if (_fragments[idx] == null)
-                        {
-                            missingIdx = idx;
-                            if (++missingCount > 1) break;
-                        }
-                    }
-                    if (missingCount == 1 && missingIdx >= 0)
-                    {
-                        var recovered = (byte[])_colParity[c]!.Clone();
-                        for (int r = 0; r < _matrixRows; r++)
-                        {
-                            var idx = r * _matrixCols + c;
-                            if (idx >= _totalFragments) break;
-                            if (idx == missingIdx) continue;
-                            XorInto(recovered, _fragments[idx]!);
-                        }
-                        TrimRecoveredFragment(ref recovered, missingIdx);
-                        _fragments[missingIdx] = recovered;
-                        Interlocked.Increment(ref _receivedCount);
-                        progress = true;
-                        WasRecovered = true;
-                    }
-                }
+                // Both axes always run per iteration (logical OR after both evaluated).
+                bool rowProgress = TryRecoverAxis(_rowParity, _matrixRows, _matrixCols, isRowAxis: true);
+                bool colProgress = TryRecoverAxis(_colParity, _matrixCols, _matrixRows, isRowAxis: false);
+                progress = rowProgress || colProgress;
             } while (progress && !IsComplete);
 
             return IsComplete;
+        }
+
+        // Single-axis XOR recovery. For each outer index that has parity available,
+        // count missing fragments along the inner axis. If exactly one is missing,
+        // XOR-recover it from parity ^ remaining fragments. Row and column passes
+        // share this body — the only difference is which axis is outer (and thus
+        // how idx is computed: row-axis uses outer*cols+inner, col-axis uses
+        // inner*cols+outer, since fragments are row-major).
+        private bool TryRecoverAxis(byte[]?[]? parity, int outerDim, int innerDim, bool isRowAxis)
+        {
+            if (parity == null) return false;
+            bool progress = false;
+
+            for (int outer = 0; outer < outerDim; outer++)
+            {
+                if (parity[outer] == null) continue;
+                int missingIdx = -1, missingCount = 0;
+                for (int inner = 0; inner < innerDim; inner++)
+                {
+                    var idx = isRowAxis ? outer * _matrixCols + inner : inner * _matrixCols + outer;
+                    if (idx >= _totalFragments) break;
+                    if (_fragments[idx] == null)
+                    {
+                        missingIdx = idx;
+                        if (++missingCount > 1) break;
+                    }
+                }
+                if (missingCount == 1 && missingIdx >= 0)
+                {
+                    var recovered = (byte[])parity[outer]!.Clone();
+                    for (int inner = 0; inner < innerDim; inner++)
+                    {
+                        var idx = isRowAxis ? outer * _matrixCols + inner : inner * _matrixCols + outer;
+                        if (idx >= _totalFragments) break;
+                        if (idx == missingIdx) continue;
+                        XorInto(recovered, _fragments[idx]!);
+                    }
+                    TrimRecoveredFragment(ref recovered, missingIdx);
+                    _fragments[missingIdx] = recovered;
+                    Interlocked.Increment(ref _receivedCount);
+                    progress = true;
+                    WasRecovered = true;
+                }
+            }
+            return progress;
         }
 
         /// <summary>

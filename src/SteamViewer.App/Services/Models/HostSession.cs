@@ -12,6 +12,7 @@ using SteamViewer.Client.Core.Video;
 using SteamViewer.Common.Protocol;
 using System.Text.Json.Serialization;
 using SteamViewer.Platform.Windows.Clipboard;
+using SteamViewer.Platform.Windows.Input;
 using SteamViewer.Platform.Windows.ScreenCapture;
 
 namespace SteamViewer.App.Services.Models;
@@ -257,12 +258,7 @@ public sealed class HostSession : IAsyncDisposable
         {
             var elevated = _elevationService?.IsAdminConnected ?? false;
             var systemLevel = _elevationService?.IsSystemConnected ?? false;
-            await _transport!.SendControlAsync(JsonSerializer.Serialize(new
-            {
-                type = "hostStatus",
-                elevated,
-                systemLevel
-            }));
+            await SendAsync(new { type = "hostStatus", elevated, systemLevel }, "hostStatus");
             _logger.LogInformation("Sent elevation status: elevated={Elevated}, systemLevel={SystemLevel}", elevated, systemLevel);
         }
         catch (Exception ex)
@@ -398,123 +394,129 @@ public sealed class HostSession : IAsyncDisposable
         return await _transport.SendControlAsync(data);
     }
 
+    // Per-session wrappers binding _transport / _logger / SessionId to the shared helper.
+    // SendAsync<T>     - fire-and-forget; helper catches+warn-logs on failure.
+    // SendRawAsync<T>  - lets exceptions propagate; use when caller has its own try/catch
+    //                    that needs to see send failures (e.g., to send an error response).
+    private Task SendAsync<T>(T payload, string label)
+        => ControlMessageSender.SendAsync(_transport, _logger, SessionId, payload, label);
+
+    private Task SendRawAsync<T>(T payload)
+        => ControlMessageSender.SendRawAsync(_transport, payload);
+
+    // Dictionary-based dispatch replaces the previous switch-on-type. Handler table
+    // built lazily on first use; lambdas capture this-scoped state (logger, _videoPipeline,
+    // IsPeerSharingScreen, OnPeerSharingChanged, _pendingAcks, etc.). One entry per
+    // control message type; 21 entries matching the previous switch cases.
+    private Dictionary<string, Func<string, JsonElement, Task>>? _controlHandlers;
+    private Dictionary<string, Func<string, JsonElement, Task>> ControlHandlers
+        => _controlHandlers ??= BuildControlHandlers();
+
+    private Dictionary<string, Func<string, JsonElement, Task>> BuildControlHandlers() => new()
+    {
+        ["viewerReady"] = async (_, _) =>
+        {
+            _logger.LogInformation("Viewer relay connected — sending initial state");
+            await HandleTransportConnected();
+        },
+        ["rebootHost"] = async (_, _) =>
+        {
+            _logger.LogInformation("Received reboot request from viewer");
+            await HandleRebootAsync();
+        },
+        ["ctrlAltDel"] = async (_, _) =>
+        {
+            _logger.LogInformation("Received Ctrl+Alt+Del request from viewer");
+            await HandleCtrlAltDelAsync();
+        },
+        ["lockWorkstation"] = async (_, _) =>
+        {
+            _logger.LogInformation("Received lock workstation request from viewer");
+            await HandleLockWorkstationAsync();
+        },
+        ["requestElevation"] = (_, _) => HandleRequestElevationAsync(),
+        ["runElevated"] = (_, root) => HandleRunElevatedAsync(root),
+        ["requestSystemElevation"] = (_, _) => HandleRequestSystemElevationAsync(),
+        ["runAsSystem"] = (_, root) => HandleRunAsSystemAsync(root),
+        ["clipboard_request"] = (_, _) => HandleClipboardRequestAsync(),
+        ["clipboard_set"] = (_, root) => HandleClipboardSetAsync(root),
+        ["clipboard_paste"] = (_, root) => HandleClipboardPasteAsync(root),
+        ["switchDisplay"] = async (_, root) =>
+        {
+            var monitorId = JsonAccessors.GetInt(root, "monitorId", -1);
+            if (monitorId >= 0) await HandleSwitchDisplayAsync(monitorId);
+        },
+        ["toggleCursor"] = (_, _) => _videoPipeline.HandleToggleCursorAsync(),
+        ["inputLockChanged"] = (_, root) =>
+        {
+            var locked = JsonAccessors.GetBool(root, "locked");
+            _videoPipeline.SetCursorVisible(!locked);
+            _logger.LogInformation("Viewer input lock: {Locked} -> host cursor in video: {Visible}", locked, !locked);
+            return Task.CompletedTask;
+        },
+        ["screenShareStarted"] = (_, _) =>
+        {
+            _logger.LogInformation("Peer started sharing their screen");
+            IsPeerSharingScreen = true;
+            OnPeerSharingChanged?.Invoke(true);
+            return Task.CompletedTask;
+        },
+        ["screenShareStopped"] = (_, _) =>
+        {
+            _logger.LogInformation("Peer stopped sharing their screen");
+            IsPeerSharingScreen = false;
+            OnPeerSharingChanged?.Invoke(false);
+            return Task.CompletedTask;
+        },
+        ["setResolution"] = (_, root) =>
+        {
+            _videoPipeline.HandleSetResolution(root);
+            return Task.CompletedTask;
+        },
+        ["requestLosslessFrame"] = (_, root) =>
+        {
+            _videoPipeline.HandleRequestLosslessFrame(root);
+            return Task.CompletedTask;
+        },
+        ["qualityReport"] = (_, root) =>
+        {
+            _videoPipeline.HandleQualityReport(root);
+            return Task.CompletedTask;
+        },
+        ["ack"] = (_, root) =>
+        {
+            var ackType = JsonAccessors.GetString(root, "ackType");
+            if (ackType != null) _pendingAcks[ackType] = true;
+            return Task.CompletedTask;
+        },
+        ["keyboardLayout"] = (_, root) =>
+        {
+            HandleKeyboardLayoutMessage(root);
+            return Task.CompletedTask;
+        },
+    };
+
     private async Task HandleControlMessage(string json)
     {
         try
         {
-            using var doc = JsonDocument.Parse(json);
-            var root = doc.RootElement;
-
-            if (root.TryGetProperty("type", out var typeElement))
-            {
-                var type = typeElement.GetString();
-                switch (type)
+            await ControlMessageDispatcher.DispatchAsync(json, ControlHandlers,
+                onNoHandler: (type, _) =>
                 {
-                    case "viewerReady":
-                        _logger.LogInformation("Viewer relay connected — sending initial state");
-                        await HandleTransportConnected();
-                        return;
-
-                    case "rebootHost":
-                        _logger.LogInformation("Received reboot request from viewer");
-                        await HandleRebootAsync();
-                        return;
-
-                    case "ctrlAltDel":
-                        _logger.LogInformation("Received Ctrl+Alt+Del request from viewer");
-                        await HandleCtrlAltDelAsync();
-                        return;
-
-                    case "lockWorkstation":
-                        _logger.LogInformation("Received lock workstation request from viewer");
-                        await HandleLockWorkstationAsync();
-                        return;
-
-                    case "requestElevation":
-                        await HandleRequestElevationAsync();
-                        return;
-
-                    case "runElevated":
-                        await HandleRunElevatedAsync(root);
-                        return;
-
-                    case "requestSystemElevation":
-                        await HandleRequestSystemElevationAsync();
-                        return;
-
-                    case "runAsSystem":
-                        await HandleRunAsSystemAsync(root);
-                        return;
-
-                    case "clipboard_request":
-                        await HandleClipboardRequestAsync();
-                        return;
-
-                    case "clipboard_set":
-                        await HandleClipboardSetAsync(root);
-                        return;
-
-                    case "clipboard_paste":
-                        await HandleClipboardPasteAsync(root);
-                        return;
-
-                    case "switchDisplay":
-                        var monitorId = root.TryGetProperty("monitorId", out var midProp) ? midProp.GetInt32() : -1;
-                        if (monitorId >= 0)
-                            await HandleSwitchDisplayAsync(monitorId);
-                        return;
-
-                    case "toggleCursor":
-                        await _videoPipeline.HandleToggleCursorAsync();
-                        return;
-
-                    case "inputLockChanged":
-                        var locked = root.TryGetProperty("locked", out var lockedProp) && lockedProp.GetBoolean();
-                        _videoPipeline.SetCursorVisible(!locked);
-                        _logger.LogInformation("Viewer input lock: {Locked} -> host cursor in video: {Visible}", locked, !locked);
-                        return;
-
-                    case "screenShareStarted":
-                        _logger.LogInformation("Peer started sharing their screen");
-                        IsPeerSharingScreen = true;
-                        OnPeerSharingChanged?.Invoke(true);
-                        return;
-
-                    case "screenShareStopped":
-                        _logger.LogInformation("Peer stopped sharing their screen");
-                        IsPeerSharingScreen = false;
-                        OnPeerSharingChanged?.Invoke(false);
-                        return;
-
-                    case "setResolution":
-                        _videoPipeline.HandleSetResolution(root);
-                        return;
-
-                    case "requestLosslessFrame":
-                        _videoPipeline.HandleRequestLosslessFrame(root);
-                        return;
-
-                    case "qualityReport":
-                        _videoPipeline.HandleQualityReport(root);
-                        return;
-
-                    case "ack":
-                        var ackType = root.TryGetProperty("ackType", out var ackProp) ? ackProp.GetString() : null;
-                        if (ackType != null)
-                            _pendingAcks[ackType] = true;
-                        return;
-
-                    case "keyboardLayout":
-                        HandleKeyboardLayoutMessage(root);
-                        return;
-                }
-            }
-
-            // Not a control message — treat as input event
-            HandleInputMessage(json);
+                    // Type present but no handler matched. If it's a known input event type
+                    // (mouse_*, key_*), fall through silently to HandleInputMessage. Otherwise
+                    // warn-log; HandleInputMessage will silently drop it. Either way we still
+                    // route to HandleInputMessage to preserve the historical input-fallthrough
+                    // contract for type-less or non-control JSON.
+                    if (type != null && !Win32Input.IsKnownInputType(type))
+                        _logger.LogWarning("HostSession: Unknown control message type \"{Type}\" - dropped (no handler)", type);
+                    HandleInputMessage(json);
+                    return Task.CompletedTask;
+                });
         }
         catch (JsonException)
         {
+            // Non-JSON or malformed input - treat as raw input message (historical behavior).
             HandleInputMessage(json);
         }
         catch (Exception ex)
@@ -625,7 +627,7 @@ public sealed class HostSession : IAsyncDisposable
 
     private void HandleKeyboardLayoutMessage(JsonElement root)
     {
-        var klid = root.TryGetProperty("klid", out var klidProp) ? klidProp.GetString() : null;
+        var klid = JsonAccessors.GetString(root, "klid");
         if (string.IsNullOrEmpty(klid))
         {
             _logger.LogWarning("Received keyboardLayout message with empty KLID");
@@ -798,12 +800,12 @@ public sealed class HostSession : IAsyncDisposable
 
         try
         {
-            _ = _transport.SendControlAsync(JsonSerializer.Serialize(new
+            _ = SendAsync(new
             {
                 type = "hostStatus",
                 elevated = _elevationService?.IsAdminConnected ?? false,
                 systemLevel = connected
-            }));
+            }, "hostStatus");
             _logger.LogInformation("SYSTEM helper state changed: {Connected} - notified viewer", connected);
         }
         catch (Exception ex)
@@ -847,7 +849,7 @@ public sealed class HostSession : IAsyncDisposable
 
     private async Task HandleClipboardSetAsync(JsonElement root)
     {
-        var data = root.TryGetProperty("data", out var d) ? d.GetString() : null;
+        var data = JsonAccessors.GetString(root, "data");
         if (data == null) return;
 
         bool set = false;
@@ -871,7 +873,7 @@ public sealed class HostSession : IAsyncDisposable
 
     private async Task HandleClipboardPasteAsync(JsonElement root)
     {
-        var data = root.TryGetProperty("data", out var d) ? d.GetString() : null;
+        var data = JsonAccessors.GetString(root, "data");
         if (data == null) return;
 
         bool clipboardSet = false;
@@ -1198,10 +1200,7 @@ public sealed class HostSession : IAsyncDisposable
         if (_elevationService.IsAdminConnected)
         {
             _logger.LogInformation("Elevated helper already connected");
-            return _transport.SendControlAsync(JsonSerializer.Serialize(new
-            {
-                type = "elevationAlready"
-            })).AsTask();
+            return SendAsync(new { type = "elevationAlready" }, "elevationAlready");
         }
 
         _ = Task.Run(async () =>
@@ -1214,20 +1213,12 @@ public sealed class HostSession : IAsyncDisposable
                 if (success)
                 {
                     _logger.LogInformation("Admin elevation succeeded — admin features enabled");
-                    await _transport!.SendControlAsync(JsonSerializer.Serialize(new
-                    {
-                        type = "hostStatus",
-                        elevated = true
-                    }));
+                    await SendRawAsync(new { type = "hostStatus", elevated = true });
                 }
                 else
                 {
                     _logger.LogWarning("Admin elevation failed (UAC denied or error)");
-                    await _transport!.SendControlAsync(JsonSerializer.Serialize(new
-                    {
-                        type = "elevationDenied",
-                        message = "UAC prompt was denied or helper failed to start"
-                    }));
+                    await SendRawAsync(new { type = "elevationDenied", message = "UAC prompt was denied or helper failed to start" });
                 }
             }
             catch (Exception ex)
@@ -1235,11 +1226,7 @@ public sealed class HostSession : IAsyncDisposable
                 _logger.LogError(ex, "Failed to request admin elevation");
                 try
                 {
-                    await _transport!.SendControlAsync(JsonSerializer.Serialize(new
-                    {
-                        type = "elevationDenied",
-                        message = ex.Message
-                    }));
+                    await SendRawAsync(new { type = "elevationDenied", message = ex.Message });
                 }
                 catch { }
             }
@@ -1262,21 +1249,13 @@ public sealed class HostSession : IAsyncDisposable
             else
             {
                 _logger.LogWarning("Ctrl+Alt+Del failed via elevation service");
-                await _transport.SendControlAsync(JsonSerializer.Serialize(new
-                {
-                    type = "ctrlAltDelFailed",
-                    message = "SendSAS failed via elevated helper"
-                }));
+                await SendAsync(new { type = "ctrlAltDelFailed", message = "SendSAS failed via elevated helper" }, "ctrlAltDelFailed");
             }
         }
         else
         {
             _logger.LogWarning("Ctrl+Alt+Del requested but no elevated helper connected");
-            await _transport.SendControlAsync(JsonSerializer.Serialize(new
-            {
-                type = "ctrlAltDelFailed",
-                message = "Admin features not enabled — request elevation first"
-            }));
+            await SendAsync(new { type = "ctrlAltDelFailed", message = "Admin features not enabled — request elevation first" }, "ctrlAltDelFailed");
         }
     }
 
@@ -1330,12 +1309,7 @@ public sealed class HostSession : IAsyncDisposable
             else
             {
                 _logger.LogWarning("Reboot failed via elevation service");
-                if (_transport != null)
-                    await _transport.SendControlAsync(JsonSerializer.Serialize(new
-                    {
-                        type = "rebootFailed",
-                        message = "Reboot command failed"
-                    }));
+                await SendAsync(new { type = "rebootFailed", message = "Reboot command failed" }, "rebootFailed");
             }
         }
         else
@@ -1354,12 +1328,7 @@ public sealed class HostSession : IAsyncDisposable
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Failed to initiate reboot");
-                if (_transport != null)
-                    await _transport.SendControlAsync(JsonSerializer.Serialize(new
-                    {
-                        type = "rebootFailed",
-                        message = ex.Message
-                    }));
+                await SendAsync(new { type = "rebootFailed", message = ex.Message }, "rebootFailed");
             }
         }
     }
@@ -1367,13 +1336,12 @@ public sealed class HostSession : IAsyncDisposable
     private async Task HandleRunElevatedAsync(JsonElement root)
     {
         if (_transport == null) return;
-        var path = root.TryGetProperty("path", out var p) ? p.GetString() : null;
-        var args = root.TryGetProperty("args", out var a) ? a.GetString() : null;
+        var path = JsonAccessors.GetString(root, "path");
+        var args = JsonAccessors.GetString(root, "args");
 
         if (string.IsNullOrEmpty(path))
         {
-            await _transport.SendControlAsync(JsonSerializer.Serialize(new
-            { type = "runElevatedFailed", message = "No path specified" }));
+            await SendAsync(new { type = "runElevatedFailed", message = "No path specified" }, "runElevatedFailed");
             return;
         }
 
@@ -1381,13 +1349,11 @@ public sealed class HostSession : IAsyncDisposable
         {
             var success = await _elevationService.RunElevatedAsync(path, args);
             var responseType = success ? "runElevatedSuccess" : "runElevatedFailed";
-            await _transport.SendControlAsync(JsonSerializer.Serialize(new
-            { type = responseType, path, message = success ? (string?)null : $"Failed to launch: {path}" }));
+            await SendAsync(new { type = responseType, path, message = success ? (string?)null : $"Failed to launch: {path}" }, "runElevated response");
         }
         else
         {
-            await _transport.SendControlAsync(JsonSerializer.Serialize(new
-            { type = "runElevatedFailed", message = "Admin features not enabled — request elevation first" }));
+            await SendAsync(new { type = "runElevatedFailed", message = "Admin features not enabled — request elevation first" }, "runElevatedFailed");
         }
     }
 
@@ -1397,13 +1363,12 @@ public sealed class HostSession : IAsyncDisposable
 
         if (_elevationService.IsSystemConnected)
         {
-            return _transport.SendControlAsync(JsonSerializer.Serialize(new { type = "systemElevationAlready" })).AsTask();
+            return SendAsync(new { type = "systemElevationAlready" }, "systemElevationAlready");
         }
 
         if (!_elevationService.IsAdminConnected)
         {
-            return _transport.SendControlAsync(JsonSerializer.Serialize(new
-            { type = "systemElevationDenied", message = "Admin features must be enabled first" })).AsTask();
+            return SendAsync(new { type = "systemElevationDenied", message = "Admin features must be enabled first" }, "systemElevationDenied");
         }
 
         _ = Task.Run(async () =>
@@ -1414,13 +1379,11 @@ public sealed class HostSession : IAsyncDisposable
                 var success = await _elevationService.RequestSystemElevationAsync();
                 if (success)
                 {
-                    await _transport!.SendControlAsync(JsonSerializer.Serialize(new
-                    { type = "hostStatus", elevated = true, systemLevel = true }));
+                    await SendRawAsync(new { type = "hostStatus", elevated = true, systemLevel = true });
                 }
                 else
                 {
-                    await _transport!.SendControlAsync(JsonSerializer.Serialize(new
-                    { type = "systemElevationFailed", message = "Failed to create SYSTEM helper" }));
+                    await SendRawAsync(new { type = "systemElevationFailed", message = "Failed to create SYSTEM helper" });
                 }
             }
             catch (Exception ex)
@@ -1428,8 +1391,7 @@ public sealed class HostSession : IAsyncDisposable
                 _logger.LogError(ex, "Failed to request SYSTEM elevation");
                 try
                 {
-                    await _transport!.SendControlAsync(JsonSerializer.Serialize(new
-                    { type = "systemElevationFailed", message = ex.Message }));
+                    await SendRawAsync(new { type = "systemElevationFailed", message = ex.Message });
                 }
                 catch { }
             }
@@ -1441,13 +1403,12 @@ public sealed class HostSession : IAsyncDisposable
     private async Task HandleRunAsSystemAsync(JsonElement root)
     {
         if (_transport == null) return;
-        var path = root.TryGetProperty("path", out var p) ? p.GetString() : null;
-        var args = root.TryGetProperty("args", out var a) ? a.GetString() : null;
+        var path = JsonAccessors.GetString(root, "path");
+        var args = JsonAccessors.GetString(root, "args");
 
         if (string.IsNullOrEmpty(path))
         {
-            await _transport.SendControlAsync(JsonSerializer.Serialize(new
-            { type = "runAsSystemFailed", message = "No path specified" }));
+            await SendAsync(new { type = "runAsSystemFailed", message = "No path specified" }, "runAsSystemFailed");
             return;
         }
 
@@ -1455,13 +1416,11 @@ public sealed class HostSession : IAsyncDisposable
         {
             var success = await _elevationService.RunAsSystemAsync(path, args);
             var responseType = success ? "runAsSystemSuccess" : "runAsSystemFailed";
-            await _transport.SendControlAsync(JsonSerializer.Serialize(new
-            { type = responseType, path, message = success ? (string?)null : $"Failed to launch: {path}" }));
+            await SendAsync(new { type = responseType, path, message = success ? (string?)null : $"Failed to launch: {path}" }, "runAsSystem response");
         }
         else
         {
-            await _transport.SendControlAsync(JsonSerializer.Serialize(new
-            { type = "runAsSystemFailed", message = "SYSTEM features not enabled — request system elevation first" }));
+            await SendAsync(new { type = "runAsSystemFailed", message = "SYSTEM features not enabled — request system elevation first" }, "runAsSystemFailed");
         }
     }
 

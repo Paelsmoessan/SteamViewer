@@ -400,59 +400,28 @@ public sealed class ViewerSession : IAsyncDisposable
         }
     }
 
+    // Per-session wrapper binding _transport / _logger / SessionId to the shared helper.
+    // Call sites: 6 Send*Async methods on this class. See ControlMessageSender.cs.
+    private Task SendAsync<T>(T payload, string label)
+        => ControlMessageSender.SendAsync(_transport, _logger, SessionId, payload, label);
+
     /// <summary>
     /// Request the host's clipboard contents.
     /// </summary>
-    public async Task RequestClipboardAsync()
-    {
-        if (_transport == null || !_transport.IsConnected) return;
-
-        try
-        {
-            var json = JsonSerializer.Serialize<ClipboardMessage>(new ClipboardMessage.Request());
-            await _transport.SendControlAsync(json);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Failed to send clipboard request for session {SessionId}", SessionId);
-        }
-    }
+    public Task RequestClipboardAsync()
+        => SendAsync<ClipboardMessage>(new ClipboardMessage.Request(), "clipboard request");
 
     /// <summary>
     /// Send clipboard data to the host.
     /// </summary>
-    public async Task SendClipboardAsync(string format, string data)
-    {
-        if (_transport == null || !_transport.IsConnected) return;
-
-        try
-        {
-            var json = JsonSerializer.Serialize<ClipboardMessage>(new ClipboardMessage.Set(format, data));
-            await _transport.SendControlAsync(json);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Failed to send clipboard for session {SessionId}", SessionId);
-        }
-    }
+    public Task SendClipboardAsync(string format, string data)
+        => SendAsync<ClipboardMessage>(new ClipboardMessage.Set(format, data), "clipboard");
 
     /// <summary>
     /// Send clipboard data to the host and trigger paste.
     /// </summary>
-    public async Task SendClipboardPasteAsync(string format, string data)
-    {
-        if (_transport == null || !_transport.IsConnected) return;
-
-        try
-        {
-            var json = JsonSerializer.Serialize<ClipboardMessage>(new ClipboardMessage.Paste(format, data));
-            await _transport.SendControlAsync(json);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Failed to send clipboard paste for session {SessionId}", SessionId);
-        }
-    }
+    public Task SendClipboardPasteAsync(string format, string data)
+        => SendAsync<ClipboardMessage>(new ClipboardMessage.Paste(format, data), "clipboard paste");
 
     /// <summary>
     /// Start collecting and pushing stats every 1 second.
@@ -621,56 +590,20 @@ public sealed class ViewerSession : IAsyncDisposable
     /// <summary>
     /// Notify the host that viewer input lock state changed.
     /// </summary>
-    public async Task SendInputLockStateAsync(bool locked)
-    {
-        if (_transport == null || !_transport.IsConnected) return;
-
-        try
-        {
-            var json = JsonSerializer.Serialize(new { type = "inputLockChanged", locked });
-            await _transport.SendControlAsync(json);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Session {SessionId}: Failed to send inputLockChanged", SessionId);
-        }
-    }
+    public Task SendInputLockStateAsync(bool locked)
+        => SendAsync(new { type = "inputLockChanged", locked }, "inputLockChanged");
 
     /// <summary>
     /// Toggle host cursor visibility.
     /// </summary>
-    public async Task SendToggleCursorAsync()
-    {
-        if (_transport == null || !_transport.IsConnected) return;
-
-        try
-        {
-            var json = JsonSerializer.Serialize(new { type = "toggleCursor" });
-            await _transport.SendControlAsync(json);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Session {SessionId}: Failed to send toggleCursor", SessionId);
-        }
-    }
+    public Task SendToggleCursorAsync()
+        => SendAsync(new { type = "toggleCursor" }, "toggleCursor");
 
     /// <summary>
     /// Request the host to switch which display is being captured.
     /// </summary>
-    public async Task SendSwitchDisplayAsync(int monitorId)
-    {
-        if (_transport == null || !_transport.IsConnected) return;
-
-        try
-        {
-            var json = JsonSerializer.Serialize(new { type = "switchDisplay", monitorId });
-            await _transport.SendControlAsync(json);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Session {SessionId}: Failed to send switch display request", SessionId);
-        }
-    }
+    public Task SendSwitchDisplayAsync(int monitorId)
+        => SendAsync(new { type = "switchDisplay", monitorId }, "switch display request");
 
     /// <summary>
     /// Send desired encode resolution to host. Host will downscale using Lanczos
@@ -739,126 +672,160 @@ public sealed class ViewerSession : IAsyncDisposable
 
     #region Transport Event Handlers
 
+    // Dictionary-based dispatch replaces the previous switch-on-type. Handler table built
+    // lazily on first use; lambdas capture this-scoped state. 14 distinct handler bodies
+    // mapped to 20 keys (two case-groups share handler instances: failure-log trio +
+    // system-failure 5-tuple use shared handlers that read the matched `type` for logging).
+    private Dictionary<string, Func<string, JsonElement, Task>>? _controlHandlers;
+    private Dictionary<string, Func<string, JsonElement, Task>> ControlHandlers
+        => _controlHandlers ??= BuildControlHandlers();
+
+    private Dictionary<string, Func<string, JsonElement, Task>> BuildControlHandlers()
+    {
+        // Shared handler: ctrlAltDelFailed / rebootFailed / elevationDenied all log
+        // 'Session X: {type}: {message}' and invoke OnControlMessage with the message.
+        Func<string, JsonElement, Task> failureLogHandler = (type, root) =>
+        {
+            var message = JsonAccessors.GetString(root, "message");
+            _logger.LogWarning("Session {SessionId}: {Type}: {Message}", SessionId, type, message);
+            OnControlMessage?.Invoke(type, message);
+            return Task.CompletedTask;
+        };
+
+        // Shared handler: systemElevationAlready/Denied/Failed + runAsSystemSuccess/Failed
+        // all read 'message' and invoke OnControlMessage.
+        Func<string, JsonElement, Task> systemFailureHandler = (type, root) =>
+        {
+            var sysMessage = JsonAccessors.GetString(root, "message");
+            OnControlMessage?.Invoke(type, sysMessage);
+            return Task.CompletedTask;
+        };
+
+        return new Dictionary<string, Func<string, JsonElement, Task>>
+        {
+            ["screenShareStarted"] = (_, _) =>
+            {
+                _logger.LogInformation("Session {SessionId}: Peer started sharing", SessionId);
+                IsPeerSharing = true;
+                OnPeerSharingChanged?.Invoke(true);
+                return Task.CompletedTask;
+            },
+            ["screenShareStopped"] = (_, _) =>
+            {
+                _logger.LogInformation("Session {SessionId}: Peer stopped sharing", SessionId);
+                IsPeerSharing = false;
+                OnPeerSharingChanged?.Invoke(false);
+                return Task.CompletedTask;
+            },
+            ["hostStatus"] = (type, root) =>
+            {
+                var elevated = JsonAccessors.GetBool(root, "elevated");
+                var systemLevel = JsonAccessors.GetBool(root, "systemLevel");
+                IsHostElevated = elevated;
+                IsHostSystemLevel = systemLevel;
+                _logger.LogInformation("Session {SessionId}: Host elevated={Elevated}, systemLevel={SystemLevel}", SessionId, elevated, systemLevel);
+                OnControlMessage?.Invoke(type, null);
+                return Task.CompletedTask;
+            },
+            ["monitorLayout"] = (_, root) =>
+            {
+                HandleMonitorLayout(root);
+                return Task.CompletedTask;
+            },
+            ["ctrlAltDelFailed"] = failureLogHandler,
+            ["rebootFailed"] = failureLogHandler,
+            ["elevationDenied"] = failureLogHandler,
+            ["elevationAlready"] = (type, _) =>
+            {
+                OnControlMessage?.Invoke(type, null);
+                return Task.CompletedTask;
+            },
+            ["systemElevationAlready"] = systemFailureHandler,
+            ["systemElevationDenied"] = systemFailureHandler,
+            ["systemElevationFailed"] = systemFailureHandler,
+            ["runAsSystemSuccess"] = systemFailureHandler,
+            ["runAsSystemFailed"] = systemFailureHandler,
+            ["cursorVisibilityChanged"] = (type, root) =>
+            {
+                var visible = JsonAccessors.GetBool(root, "visible");
+                OnControlMessage?.Invoke(type, visible.ToString());
+                return Task.CompletedTask;
+            },
+            ["cursorShape"] = (type, root) =>
+            {
+                var cursor = JsonAccessors.GetString(root, "cursor");
+                if (cursor != null) OnControlMessage?.Invoke(type, cursor);
+                return Task.CompletedTask;
+            },
+            ["clipboard_data"] = (_, root) =>
+            {
+                var cbFormat = JsonAccessors.GetString(root, "format");
+                var cbData = JsonAccessors.GetString(root, "data");
+                if (cbFormat != null && cbData != null)
+                    OnClipboardReceived?.Invoke(cbFormat, cbData);
+                return Task.CompletedTask;
+            },
+            ["captureInfo"] = (_, root) =>
+            {
+                var capW = JsonAccessors.GetInt(root, "width");
+                var capH = JsonAccessors.GetInt(root, "height");
+                if (capW > 0 && capH > 0)
+                {
+                    CaptureWidth = capW;
+                    CaptureHeight = capH;
+                    _logger.LogInformation("Session {SessionId}: Host capture {W}x{H}", SessionId, capW, capH);
+                    OnCaptureInfoReceived?.Invoke(capW, capH);
+                }
+                return Task.CompletedTask;
+            },
+            // Lambda param named `type` (not `_`) because the body uses `_ = ...` discard
+            // for the InvokeVoidAsync ValueTask; a single-underscore lambda param would
+            // shadow the body's `_` discard and cause CS0029.
+            ["encodeInfo"] = (type, root) =>
+            {
+                var encW = JsonAccessors.GetInt(root, "width");
+                var encH = JsonAccessors.GetInt(root, "height");
+                if (encW > 0 && encH > 0)
+                {
+                    _logger.LogInformation("Session {SessionId}: Host encode resolution {W}x{H}", SessionId, encW, encH);
+                    try { _ = _jsRuntime.InvokeVoidAsync("SteamViewerVideo.setEncodeResolution", SessionId, encW, encH); }
+                    catch { /* JS not ready yet - next frame will use fallback path */ }
+                }
+                return Task.CompletedTask;
+            },
+            ["secureDesktopActive"] = (_, _) =>
+            {
+                IsSecureDesktopActive = true;
+                OnSecureDesktopStateChanged?.Invoke(true);
+                _ = _transport?.SendControlAsync(
+                    JsonSerializer.Serialize(new { type = "ack", ackType = "secureDesktopActive" }));
+                return Task.CompletedTask;
+            },
+            ["secureDesktopInactive"] = (_, _) =>
+            {
+                IsSecureDesktopActive = false;
+                OnSecureDesktopStateChanged?.Invoke(false);
+                _ = _transport?.SendControlAsync(
+                    JsonSerializer.Serialize(new { type = "ack", ackType = "secureDesktopInactive" }));
+                return Task.CompletedTask;
+            },
+            // secureDesktopFrame: removed - SD frames now arrive via H.264 on channel 1
+        };
+    }
+
     private async Task HandleControlMessage(string json)
     {
         try
         {
-            using var doc = JsonDocument.Parse(json);
-            var root = doc.RootElement;
-
-            if (root.TryGetProperty("type", out var typeElement))
-            {
-                var type = typeElement.GetString();
-                switch (type)
+            await ControlMessageDispatcher.DispatchAsync(json, ControlHandlers,
+                onNoHandler: (type, _) =>
                 {
-                    case "screenShareStarted":
-                        _logger.LogInformation("Session {SessionId}: Peer started sharing", SessionId);
-                        IsPeerSharing = true;
-                        OnPeerSharingChanged?.Invoke(true);
-                        break;
-
-                    case "screenShareStopped":
-                        _logger.LogInformation("Session {SessionId}: Peer stopped sharing", SessionId);
-                        IsPeerSharing = false;
-                        OnPeerSharingChanged?.Invoke(false);
-                        break;
-
-                    case "hostStatus":
-                        var elevated = root.TryGetProperty("elevated", out var elProp) && elProp.GetBoolean();
-                        var systemLevel = root.TryGetProperty("systemLevel", out var slProp) && slProp.GetBoolean();
-                        IsHostElevated = elevated;
-                        IsHostSystemLevel = systemLevel;
-                        _logger.LogInformation("Session {SessionId}: Host elevated={Elevated}, systemLevel={SystemLevel}", SessionId, elevated, systemLevel);
-                        OnControlMessage?.Invoke(type, null);
-                        break;
-
-                    case "monitorLayout":
-                        HandleMonitorLayout(root);
-                        break;
-
-                    case "ctrlAltDelFailed":
-                    case "rebootFailed":
-                    case "elevationDenied":
-                        var message = root.TryGetProperty("message", out var msgProp) ? msgProp.GetString() : null;
-                        _logger.LogWarning("Session {SessionId}: {Type}: {Message}", SessionId, type, message);
-                        OnControlMessage?.Invoke(type, message);
-                        break;
-
-                    case "elevationAlready":
-                        OnControlMessage?.Invoke(type, null);
-                        break;
-
-                    case "systemElevationAlready":
-                    case "systemElevationDenied":
-                    case "systemElevationFailed":
-                    case "runAsSystemSuccess":
-                    case "runAsSystemFailed":
-                        var sysMessage = root.TryGetProperty("message", out var sysMsgProp) ? sysMsgProp.GetString() : null;
-                        OnControlMessage?.Invoke(type, sysMessage);
-                        break;
-
-                    case "cursorVisibilityChanged":
-                        var visible = root.TryGetProperty("visible", out var visProp) && visProp.GetBoolean();
-                        OnControlMessage?.Invoke(type, visible.ToString());
-                        break;
-
-                    case "cursorShape":
-                        var cursor = root.TryGetProperty("cursor", out var cursorProp) ? cursorProp.GetString() : null;
-                        if (cursor != null)
-                            OnControlMessage?.Invoke(type, cursor);
-                        break;
-
-                    case "clipboard_data":
-                        var cbFormat = root.TryGetProperty("format", out var fProp) ? fProp.GetString() : null;
-                        var cbData = root.TryGetProperty("data", out var dProp) ? dProp.GetString() : null;
-                        if (cbFormat != null && cbData != null)
-                            OnClipboardReceived?.Invoke(cbFormat, cbData);
-                        break;
-
-                    case "captureInfo":
-                        var capW = root.TryGetProperty("width", out var cwProp) ? cwProp.GetInt32() : 0;
-                        var capH = root.TryGetProperty("height", out var chProp) ? chProp.GetInt32() : 0;
-                        if (capW > 0 && capH > 0)
-                        {
-                            CaptureWidth = capW;
-                            CaptureHeight = capH;
-                            _logger.LogInformation("Session {SessionId}: Host capture {W}x{H}", SessionId, capW, capH);
-                            OnCaptureInfoReceived?.Invoke(capW, capH);
-                        }
-                        break;
-
-                    case "encodeInfo":
-                        var encW = root.TryGetProperty("width", out var ewProp) ? ewProp.GetInt32() : 0;
-                        var encH = root.TryGetProperty("height", out var ehProp) ? ehProp.GetInt32() : 0;
-                        if (encW > 0 && encH > 0)
-                        {
-                            _logger.LogInformation("Session {SessionId}: Host encode resolution {W}x{H}", SessionId, encW, encH);
-                            try { _ = _jsRuntime.InvokeVoidAsync("SteamViewerVideo.setEncodeResolution", SessionId, encW, encH); }
-                            catch { /* JS not ready yet — next frame will use fallback path */ }
-                        }
-                        break;
-
-                    case "secureDesktopActive":
-                        IsSecureDesktopActive = true;
-                        OnSecureDesktopStateChanged?.Invoke(true);
-                        _ = _transport?.SendControlAsync(
-                            JsonSerializer.Serialize(new { type = "ack", ackType = "secureDesktopActive" }));
-                        break;
-
-                    case "secureDesktopInactive":
-                        IsSecureDesktopActive = false;
-                        OnSecureDesktopStateChanged?.Invoke(false);
-                        _ = _transport?.SendControlAsync(
-                            JsonSerializer.Serialize(new { type = "ack", ackType = "secureDesktopInactive" }));
-                        break;
-
-                    // secureDesktopFrame: removed - SD frames now arrive via H.264 on channel 1
-                }
-            }
+                    if (type != null)
+                        _logger.LogWarning("Session {SessionId}: Unknown control message type \"{Type}\" - dropped (no handler)", SessionId, type);
+                    return Task.CompletedTask;
+                });
         }
-        catch (JsonException) { }
-
-        await Task.CompletedTask;
+        catch (JsonException) { /* swallow - viewer has no input fallthrough */ }
     }
 
     private void HandleVideoData(byte[] data, int length)
@@ -990,18 +957,18 @@ public sealed class ViewerSession : IAsyncDisposable
             {
                 foreach (var m in monArr.EnumerateArray())
                 {
-                    var id = m.TryGetProperty("id", out var idP) ? (uint)idP.GetInt32() : 0u;
-                    var name = m.TryGetProperty("name", out var nP) ? nP.GetString() ?? "" : "";
-                    var width = m.TryGetProperty("width", out var wP) ? (uint)wP.GetInt32() : 0u;
-                    var height = m.TryGetProperty("height", out var hP) ? (uint)hP.GetInt32() : 0u;
-                    var x = m.TryGetProperty("x", out var xP) ? xP.GetInt32() : 0;
-                    var y = m.TryGetProperty("y", out var yP) ? yP.GetInt32() : 0;
-                    var isPrimary = m.TryGetProperty("isPrimary", out var pP) && pP.GetBoolean();
+                    var id = JsonAccessors.GetUInt(m, "id");
+                    var name = JsonAccessors.GetString(m, "name") ?? "";
+                    var width = JsonAccessors.GetUInt(m, "width");
+                    var height = JsonAccessors.GetUInt(m, "height");
+                    var x = JsonAccessors.GetInt(m, "x");
+                    var y = JsonAccessors.GetInt(m, "y");
+                    var isPrimary = JsonAccessors.GetBool(m, "isPrimary");
                     monitors.Add(new MonitorInfo(id, name, width, height, x, y, isPrimary));
                 }
             }
 
-            var activeId = root.TryGetProperty("activeMonitorId", out var aProp) ? aProp.GetInt32() : 0;
+            var activeId = JsonAccessors.GetInt(root, "activeMonitorId");
 
             HostMonitors = monitors;
             ActiveMonitorId = activeId;

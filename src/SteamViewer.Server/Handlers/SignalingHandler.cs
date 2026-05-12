@@ -379,45 +379,36 @@ public sealed class SignalingHandler
         return null;
     }
 
-    private SignalingMessage? HandleSdpOffer(SignalingMessage.SdpOffer offer, string? fromId)
+    // Generic forward-to-target helper. Eliminates the 9-site dedup pattern (8 CS-flagged
+    // + HandleRelayReady which shared the shape but logged at Information level).
+    // Each caller is one expression-bodied line. logLevel defaults to Debug; RelayReady
+    // overrides to Information to preserve its existing visibility in default-config logs.
+    private SignalingMessage? ForwardToTarget<TMessage>(
+        string? fromId,
+        string targetId,
+        Func<string, TMessage> messageFactory,
+        string logLabel,
+        LogLevel logLevel = LogLevel.Debug)
+        where TMessage : SignalingMessage
     {
-        if (fromId == null)
-        {
-            return new SignalingMessage.Error("Not registered");
-        }
-
-        _registry.TrySendToClient(offer.TargetId, new SignalingMessage.SdpOffer(fromId, offer.Sdp));
-        _logger.LogDebug("SDP offer forwarded from {FromId} to {TargetId}", fromId, offer.TargetId);
+        if (fromId == null) return new SignalingMessage.Error("Not registered");
+        _registry.TrySendToClient(targetId, messageFactory(fromId));
+        _logger.Log(logLevel, "{Label} forwarded from {FromId} to {TargetId}", logLabel, fromId, targetId);
         return null;
     }
+
+    private SignalingMessage? HandleSdpOffer(SignalingMessage.SdpOffer offer, string? fromId)
+        => ForwardToTarget(fromId, offer.TargetId,
+            from => new SignalingMessage.SdpOffer(from, offer.Sdp), "SDP offer");
 
     private SignalingMessage? HandleSdpAnswer(SignalingMessage.SdpAnswer answer, string? fromId)
-    {
-        if (fromId == null)
-        {
-            return new SignalingMessage.Error("Not registered");
-        }
-
-        _registry.TrySendToClient(answer.TargetId, new SignalingMessage.SdpAnswer(fromId, answer.Sdp));
-        _logger.LogDebug("SDP answer forwarded from {FromId} to {TargetId}", fromId, answer.TargetId);
-        return null;
-    }
+        => ForwardToTarget(fromId, answer.TargetId,
+            from => new SignalingMessage.SdpAnswer(from, answer.Sdp), "SDP answer");
 
     private SignalingMessage? HandleIceCandidate(SignalingMessage.IceCandidate candidate, string? fromId)
-    {
-        if (fromId == null)
-        {
-            return new SignalingMessage.Error("Not registered");
-        }
-
-        _registry.TrySendToClient(candidate.TargetId, new SignalingMessage.IceCandidate(
-            fromId,
-            candidate.Candidate,
-            candidate.SdpMid,
-            candidate.SdpMLineIndex));
-        _logger.LogDebug("ICE candidate forwarded from {FromId} to {TargetId}", fromId, candidate.TargetId);
-        return null;
-    }
+        => ForwardToTarget(fromId, candidate.TargetId,
+            from => new SignalingMessage.IceCandidate(from, candidate.Candidate, candidate.SdpMid, candidate.SdpMLineIndex),
+            "ICE candidate");
 
     private SignalingMessage? HandleDisconnect(SignalingMessage.Disconnect disconnect, string? fromId)
     {
@@ -436,41 +427,19 @@ public sealed class SignalingHandler
     }
 
     private SignalingMessage? HandleTransportEndpoint(SignalingMessage.TransportEndpoint endpoint, string? fromId)
-    {
-        if (fromId == null)
-        {
-            return new SignalingMessage.Error("Not registered");
-        }
-
-        _registry.TrySendToClient(endpoint.TargetId, new SignalingMessage.TransportEndpoint(fromId, endpoint.Candidates));
-        _logger.LogDebug("Transport endpoint forwarded from {FromId} to {TargetId} ({CandidateCount} candidates)", fromId, endpoint.TargetId, endpoint.Candidates.Length);
-        return null;
-    }
+        // Label embeds candidate count so the existing diagnostic detail isn't lost in the simpler helper log format.
+        => ForwardToTarget(fromId, endpoint.TargetId,
+            from => new SignalingMessage.TransportEndpoint(from, endpoint.Candidates),
+            $"Transport endpoint ({endpoint.Candidates.Length} candidates)");
 
     private SignalingMessage? HandleRelayReady(SignalingMessage.RelayReady relayReady, string? fromId)
-    {
-        if (fromId == null)
-        {
-            return new SignalingMessage.Error("Not registered");
-        }
-
-        // Forward relay-ready to peer (swap target_id → fromId so peer knows who it's from)
-        _registry.TrySendToClient(relayReady.TargetId, new SignalingMessage.RelayReady(fromId, relayReady.EncryptionNonce));
-        _logger.LogInformation("Relay ready from {FromId} to {TargetId}", fromId, relayReady.TargetId);
-        return null;
-    }
+        => ForwardToTarget(fromId, relayReady.TargetId,
+            from => new SignalingMessage.RelayReady(from, relayReady.EncryptionNonce),
+            "Relay ready", LogLevel.Information);
 
     private SignalingMessage? HandleTransportConfirmed(SignalingMessage.TransportConfirmed confirmed, string? fromId)
-    {
-        if (fromId == null)
-        {
-            return new SignalingMessage.Error("Not registered");
-        }
-
-        _registry.TrySendToClient(confirmed.TargetId, new SignalingMessage.TransportConfirmed(fromId));
-        _logger.LogDebug("Transport confirmed forwarded from {FromId} to {TargetId}", fromId, confirmed.TargetId);
-        return null;
-    }
+        => ForwardToTarget(fromId, confirmed.TargetId,
+            from => new SignalingMessage.TransportConfirmed(from), "Transport confirmed");
 
     // ==================== Collaboration Session Handlers ====================
 
@@ -561,47 +530,17 @@ public sealed class SignalingHandler
     }
 
     private SignalingMessage? HandleMeshSdpOffer(SignalingMessage.MeshSdpOffer offer, string? fromId)
-    {
-        if (fromId == null)
-        {
-            return new SignalingMessage.Error("Not registered");
-        }
-
-        // Forward to target with sender ID
-        _registry.TrySendToClient(offer.TargetId, new SignalingMessage.MeshSdpOffer(fromId, offer.Sdp));
-        _logger.LogDebug("Mesh SDP offer from {FromId} to {TargetId}", fromId, offer.TargetId);
-        return null;
-    }
+        => ForwardToTarget(fromId, offer.TargetId,
+            from => new SignalingMessage.MeshSdpOffer(from, offer.Sdp), "Mesh SDP offer");
 
     private SignalingMessage? HandleMeshSdpAnswer(SignalingMessage.MeshSdpAnswer answer, string? fromId)
-    {
-        if (fromId == null)
-        {
-            return new SignalingMessage.Error("Not registered");
-        }
-
-        // Forward to target with sender ID
-        _registry.TrySendToClient(answer.TargetId, new SignalingMessage.MeshSdpAnswer(fromId, answer.Sdp));
-        _logger.LogDebug("Mesh SDP answer from {FromId} to {TargetId}", fromId, answer.TargetId);
-        return null;
-    }
+        => ForwardToTarget(fromId, answer.TargetId,
+            from => new SignalingMessage.MeshSdpAnswer(from, answer.Sdp), "Mesh SDP answer");
 
     private SignalingMessage? HandleMeshIceCandidate(SignalingMessage.MeshIceCandidate candidate, string? fromId)
-    {
-        if (fromId == null)
-        {
-            return new SignalingMessage.Error("Not registered");
-        }
-
-        // Forward to target with sender ID
-        _registry.TrySendToClient(candidate.TargetId, new SignalingMessage.MeshIceCandidate(
-            fromId,
-            candidate.Candidate,
-            candidate.SdpMid,
-            candidate.SdpMLineIndex));
-        _logger.LogDebug("Mesh ICE candidate from {FromId} to {TargetId}", fromId, candidate.TargetId);
-        return null;
-    }
+        => ForwardToTarget(fromId, candidate.TargetId,
+            from => new SignalingMessage.MeshIceCandidate(from, candidate.Candidate, candidate.SdpMid, candidate.SdpMLineIndex),
+            "Mesh ICE candidate");
 
     private Task CleanupClientAsync(string? clientId, Guid connectionId)
     {

@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.2.6-alpha (2026-05-12)
+
+### Full Clean Delivery refactor cycle (8 sub-branches, all behavior-preserving)
+
+Codebase health overhaul driven by CodeScene Community Edition feedback. Eight
+sub-branches addressing duplication, low cohesion, and complex-method findings
+on the worst-Health files. Average Code Health trend turned positive.
+
+#### Dispatcher consolidation (Stages 1-5: C.1, A, B, C.2, C.3)
+- C.1: default-arm warnings on host/viewer control switches surface unknown
+  message types instead of dropping silently
+- A: ControlMessageSender static helper - 31+ JsonSerializer.Serialize + transport
+  send sites consolidated to one canonical path with logging
+- B: SignalingHandler ForwardToTarget helper - 9 protocol forwarding handlers
+  collapsed to expression-bodied one-liners
+- C.2: JsonAccessors value-returning helpers (GetString/Int/Bool/UInt) replace
+  TryGetProperty boilerplate
+- C.3: ControlMessageDispatcher generic handler-table - HandleControlMessage
+  twin (HostSession cc=32, ViewerSession cc=43) replaced with per-session
+  handler dictionaries
+
+#### Worst-Health residuals (Stage D)
+- D#1: video-interop.js sharedbufferreceived (cc 45 -> 10) decomposed into
+  paintLosslessFrame/paintRawFrame/paintJpegFrame painters + computeDisplayFit
+  geometry helper
+- D#2: Win32Input.cs (1078 LoC monolith, Low Cohesion) split into partial-class
+  files by concern: entry, Display, Mouse, Keyboard, Constants
+- D#3: UdpTransportBackend - ReceiveLoopAsync phase extract (cc 37 -> 20),
+  FragmentBuffer.TryRecover row/column twin collapse (cc 31 -> <10)
+
+#### Release artifact reliability
+- v0.2.5-alpha smoke-check CI step (zip-layout validation) + launcher
+  extraction hardening guard against future SDK output-path shifts
+
 ## v0.1 (2026-05-04)
 
 ### Native Keyboard Capture
