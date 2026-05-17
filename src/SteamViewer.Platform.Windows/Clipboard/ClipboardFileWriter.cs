@@ -325,7 +325,7 @@ public sealed class ClipboardFileWriter : IDisposable
                     return;
                 }
 
-                _logger.LogDebug("ClipboardFileWriter STA thread running with message pump");
+                _logger.LogDebug("ClipboardFileWriter STA thread running with message pump (class={ClassName})", _registeredClassName);
 
                 // Message pump — keeps COM apartment alive for Explorer's IDataObject/IStream calls
                 while (!_stopping && GetMessage(out var msg, IntPtr.Zero, 0, 0) > 0)
@@ -335,6 +335,21 @@ public sealed class ClipboardFileWriter : IDisposable
                 }
 
                 DestroyWindow(_hwnd);
+
+                // Unregister the per-instance window class to prevent accumulation across
+                // reconnects. Same Win32 class-collision pattern as ClipboardMonitor — a
+                // shared/const class name routes every future window's WM_* messages
+                // through the FIRST instance's WndProc, leaving the new writer's OLE
+                // clipboard operations stuck on the OLD disposed writer's state (host
+                // clipboard ends up empty despite "Setting clipboard..." log firing).
+                if (_registeredClassName != null)
+                {
+                    var hInstance = GetModuleHandle(null);
+                    if (UnregisterClass(_registeredClassName, hInstance))
+                        _logger.LogDebug("UnregisterClass succeeded for {ClassName}", _registeredClassName);
+                    else
+                        _logger.LogWarning("UnregisterClass failed for {ClassName} (error={Error})", _registeredClassName, Marshal.GetLastWin32Error());
+                }
             }
             finally
             {
@@ -349,7 +364,9 @@ public sealed class ClipboardFileWriter : IDisposable
 
     private IntPtr CreateWriterWindow()
     {
-        const string className = "SteamViewer_ClipboardFileWriter";
+        // Per-instance class name. Same fix as ClipboardMonitor — see that file's
+        // CreateClipboardWindow comment for the full Win32 class-collision rationale.
+        var className = $"SteamViewer_ClipboardFileWriter_{Guid.NewGuid():N}";
 
         _wndProc = WndProc; // prevent GC of delegate
         _wndProcHandle = GCHandle.Alloc(_wndProc); // explicit root - GC cannot collect this
@@ -362,7 +379,14 @@ public sealed class ClipboardFileWriter : IDisposable
             lpszClassName = className
         };
 
-        RegisterClassEx(ref wc);
+        var classAtom = RegisterClassEx(ref wc);
+        if (classAtom == 0)
+        {
+            _logger.LogError("RegisterClassEx failed for {ClassName} (error={Error})", className, Marshal.GetLastWin32Error());
+            return IntPtr.Zero;
+        }
+        _registeredClassName = className;
+        _logger.LogDebug("RegisterClassEx succeeded for {ClassName} (atom={Atom})", className, classAtom);
 
         return CreateWindowEx(
             0, className, "SteamViewer Clipboard Writer",
@@ -370,6 +394,8 @@ public sealed class ClipboardFileWriter : IDisposable
             HWND_MESSAGE, // message-only window
             IntPtr.Zero, wc.hInstance, IntPtr.Zero);
     }
+
+    private string? _registeredClassName; // set after RegisterClassEx so dispose can unregister
 
     private IntPtr WndProc(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam)
     {
@@ -395,27 +421,29 @@ public sealed class ClipboardFileWriter : IDisposable
                     files, _sendRequest, PendingRequests,
                     _sendStartStreaming, _sendStopStreaming);
 
-                // Tell our own clipboard monitor to ignore this change
-                _clipboardMonitor?.SetEchoFlag();
+                // Record self-write so the monitor's CheckClipboard suppresses the
+                // resulting WM_CLIPBOARDUPDATE if it surfaces as CF_HDROP. Replaces
+                // the previous SetEchoFlag/Thread.Sleep(100)/ClearEchoFlag pattern —
+                // hash-based echo prevention has no timing race and no blocking sleep.
+                // VirtualFileDataObject typically exposes only CFSTR_FILECONTENTS, not
+                // CF_HDROP, so the suppression is a defensive safety belt rather than
+                // a strictly-required guard for this code path.
+                var fileNames = new string[files.Length];
+                for (int i = 0; i < files.Length; i++) fileNames[i] = files[i].FileName;
+                _clipboardMonitor?.RecordSelfWriteFiles(fileNames);
 
                 int hr = OleSetClipboard(_currentDataObject);
                 if (hr < 0)
                 {
                     _logger.LogError("OleSetClipboard failed: 0x{HR:X8}", hr);
-                    _clipboardMonitor?.ClearEchoFlag();
                     continue;
                 }
 
                 _logger.LogDebug("OleSetClipboard succeeded — {Count} virtual files available", files.Length);
-
-                // Clear echo flag after a brief delay to let clipboard notification propagate
-                Thread.Sleep(100);
-                _clipboardMonitor?.ClearEchoFlag();
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Failed to set virtual file clipboard");
-                _clipboardMonitor?.ClearEchoFlag();
             }
         }
     }
@@ -469,6 +497,10 @@ public sealed class ClipboardFileWriter : IDisposable
 
     [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     private static extern ushort RegisterClassEx(ref WNDCLASSEX lpWndClass);
+
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool UnregisterClass(string lpClassName, IntPtr hInstance);
 
     [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     private static extern IntPtr CreateWindowEx(

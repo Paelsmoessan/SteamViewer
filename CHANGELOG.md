@@ -1,5 +1,67 @@
 # Changelog
 
+## v0.2.8-alpha (2026-05-17)
+
+### Clipboard reliability + viewer→host text auto-push
+
+Fixes post-reconnect clipboard loss (root cause: Win32 window-class
+name collision in both `ClipboardMonitor` and `ClipboardFileWriter`) and
+wires the previously missing viewer→host text auto-push.
+
+#### Bug fixes
+- **Post-reconnect clipboard silently lost.** Every `ClipboardMonitor` /
+  `ClipboardFileWriter` instance registered its Win32 window class under
+  the same hardcoded name. `RegisterClassEx` succeeds only for the first
+  caller; subsequent calls return `ERROR_CLASS_ALREADY_EXISTS=1410` and
+  are silently ignored. The class-level `lpfnWndProc` stays bound to the
+  FIRST instance, so post-reconnect `WM_CLIPBOARDUPDATE` and
+  `WM_SET_CLIPBOARD` messages dispatched through the disposed first
+  session's WndProc — events fired on dead sessions, virtual-file
+  clipboard writes operated on stale state, host clipboard ended up
+  empty even though `OleSetClipboard succeeded`. Fix: per-instance
+  GUID-suffixed class name + `UnregisterClass` on dispose.
+- **Hung `InvokeVoidAsync` swallowed paste post-reconnect.** WebView2's
+  JS context for `navigator.clipboard.writeText` could hang indefinitely
+  on the first call after a reconnect. The catch block never ran, Win32
+  fallback never ran, paste was silently lost. Fix: 500ms `WaitAsync`
+  timeout falls through to Win32 fallback on hang.
+
+#### New feature
+- **Viewer→host text clipboard auto-push.** Subscribing
+  `ViewerSession.OnClipboardTextDetected` was never wired (only
+  `ClipboardFilesDetected` was). Copying text on the viewer machine now
+  syncs to host's clipboard the same way the reverse direction already
+  worked. Sends `ClipboardMessage.Set("text", data)`; host's existing
+  `HandleClipboardSetAsync` handles the receive side.
+
+#### Internal refactor
+- **Replaced flag-based echo prevention with content-hash dedup** in
+  `ClipboardMonitor`. The previous `SetEchoFlag → Thread.Sleep(100) →
+  ClearEchoFlag` ceremony in `ClipboardFileWriter` had a 100ms blocking
+  sleep on every clipboard write, a timing race (relied on
+  `WM_CLIPBOARDUPDATE` arriving while the flag was set), and a
+  duplication-coordination anti-pattern (every writer had to remember
+  the ceremony — three of four sites had silently forgotten it). New
+  `RecordSelfWriteText` / `RecordSelfWriteFiles` API stores a content
+  hash on the monitor; `CheckClipboard` compares the hash of the
+  current clipboard against the last self-write and single-fire-
+  suppresses on match. All four write sites converge on one method
+  call. No blocking sleep, no timing race.
+
+#### Tooling + policy
+- **CLAUDE.md "Gate-logging rule (hard)"** under Code Change Discipline.
+  Any new guard, gate, or short-circuit return that can be hit at
+  runtime MUST log entry, guard-fail with reason, and success path.
+  Codifies what surfaced the class-name collision bug in one
+  reproduction cycle (vs ~90 minutes of static review pre-policy).
+- **Permanent verbose logging** at every clipboard send gate
+  (`OnClipboardFilesDetected`, `OnClipboardTextDetected`,
+  `SendFrameAsync`).
+- **Private Content Gate** workflow now correctly skips on the private
+  repo via `if: github.repository == 'Paelsmoessan/SteamViewer'`. Was
+  failing on every push to private since added (silently ignored, but
+  visible noise on PRs).
+
 ## v0.2.7-alpha (2026-05-12)
 
 ### Zero build warnings

@@ -1005,6 +1005,13 @@
             FileLogger.Log("INFO", "RemoteViewer", $"HandleClipboardReceived InvokeAsync: format={format}, len={data.Length}");
             if (format == "text")
             {
+                // Record self-write BEFORE TrySetClipboardNative so the viewer's
+                // ClipboardMonitor suppresses the resulting WM_CLIPBOARDUPDATE.
+                // Without this, viewer's OnClipboardTextDetected would fire and
+                // bounce the same text back to host as clipboard_set, creating
+                // an echo loop (now that viewer->host text auto-push is wired).
+                _activeSession?.RecordSelfWriteText(data);
+
                 bool written = false;
                 if (OperatingSystem.IsWindows())
                 {

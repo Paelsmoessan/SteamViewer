@@ -10,6 +10,10 @@ permissions:
 
 jobs:
   scan:
+    # Only enforce on the public repo, where these files MUST NOT exist.
+    # On the private repo (Paelsmoessan/SteamViewer.NET) the same files
+    # are tracked deliberately, so skip the scan there to keep CI green.
+    if: github.repository == 'Paelsmoessan/SteamViewer'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

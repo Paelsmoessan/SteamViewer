@@ -999,6 +999,7 @@ public sealed class ViewerSession : IAsyncDisposable
 
             _clipboardMonitor = new ClipboardMonitor(_loggerFactory.CreateLogger<ClipboardMonitor>());
             _clipboardMonitor.ClipboardFilesDetected += OnClipboardFilesDetected;
+            _clipboardMonitor.ClipboardTextDetected += OnClipboardTextDetected;
             _clipboardMonitor.Start();
 
             _clipboardFileWriter = new ClipboardFileWriter(
@@ -1032,7 +1033,16 @@ public sealed class ViewerSession : IAsyncDisposable
 
     private void OnClipboardFilesDetected(ClipboardFileInfo[] files, string[] localPaths)
     {
-        if (_transport == null || !_transport.IsConnected) return;
+        _logger.LogDebug("Session {SessionId}: OnClipboardFilesDetected entry: files={Count} transport={Transport} connected={Connected}",
+            SessionId, files.Length,
+            _transport != null ? "set" : "null",
+            _transport?.IsConnected);
+        if (_transport == null || !_transport.IsConnected)
+        {
+            _logger.LogWarning("Session {SessionId}: OnClipboardFilesDetected: dropping {Count} file(s) — transport not ready (transport={Transport}, connected={Connected})",
+                SessionId, files.Length, _transport != null ? "set" : "null", _transport?.IsConnected);
+            return;
+        }
 
         try
         {
@@ -1048,8 +1058,15 @@ public sealed class ViewerSession : IAsyncDisposable
                     // Send 3x with 500ms gaps for UDP reliability (idempotent on receiver)
                     for (int i = 0; i < 3; i++)
                     {
-                        if (_transport == null || !_transport.IsConnected) break;
-                        await _transport.SendFileSignalingAsync(json);
+                        if (_transport == null || !_transport.IsConnected)
+                        {
+                            _logger.LogWarning("Session {SessionId}: Clipboard format list send loop break at i={Iteration}: transport={Transport} connected={Connected}",
+                                SessionId, i, _transport != null ? "set" : "null", _transport?.IsConnected);
+                            break;
+                        }
+                        var sent = await _transport.SendFileSignalingAsync(json);
+                        if (i == 0) _logger.LogInformation("Session {SessionId}: Sent clipboard file format list: {Count} files (sent={Sent}, attempt={Attempt})", SessionId, files.Length, sent, i);
+                        else _logger.LogDebug("Session {SessionId}: Re-sent clipboard file format list (sent={Sent}, attempt={Attempt})", SessionId, sent, i);
                         if (i < 2) await Task.Delay(500);
                     }
                 }
@@ -1064,6 +1081,52 @@ public sealed class ViewerSession : IAsyncDisposable
             _logger.LogError(ex, "Session {SessionId}: Error handling clipboard files detected", SessionId);
         }
     }
+
+    /// <summary>
+    /// Auto-push viewer's local clipboard text to host on each WM_CLIPBOARDUPDATE
+    /// the monitor flags as text. Mirrors the host-side OnClipboardTextDetected
+    /// pattern but sends `clipboard_set` (which host's HandleClipboardSetAsync
+    /// already handles) instead of `clipboard_data`. Echo loop is prevented by
+    /// the monitor's hash-based suppression on both sides — viewer's own
+    /// HandleClipboardReceived calls RecordSelfWriteText before writing.
+    /// </summary>
+    private void OnClipboardTextDetected(string text)
+    {
+        _logger.LogDebug("Session {SessionId}: OnClipboardTextDetected entry: len={Length} transport={Transport} connected={Connected}",
+            SessionId, text.Length,
+            _transport != null ? "set" : "null",
+            _transport?.IsConnected);
+        if (_transport == null || !_transport.IsConnected)
+        {
+            _logger.LogWarning("Session {SessionId}: OnClipboardTextDetected: dropping {Length}-char text — transport not ready (transport={Transport}, connected={Connected})",
+                SessionId, text.Length, _transport != null ? "set" : "null", _transport?.IsConnected);
+            return;
+        }
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var msg = JsonSerializer.Serialize<ClipboardMessage>(new ClipboardMessage.Set("text", text));
+                var sent = await _transport.SendControlAsync(msg);
+                _logger.LogInformation("Session {SessionId}: Sent viewer clipboard text to host: {Length} chars (sent={Sent})",
+                    SessionId, text.Length, sent);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Session {SessionId}: Failed to send viewer clipboard text to host", SessionId);
+            }
+        });
+    }
+
+    /// <summary>
+    /// Record that the viewer just wrote text to its own local clipboard
+    /// (typically from a host->viewer clipboard_data sync). Forwards to the
+    /// monitor so its next WM_CLIPBOARDUPDATE is suppressed by hash match
+    /// instead of bouncing back to the host as a clipboard_set echo.
+    /// Public surface lets RemoteViewer.razor call it before TrySetClipboardNative.
+    /// </summary>
+    public void RecordSelfWriteText(string text) => _clipboardMonitor?.RecordSelfWriteText(text);
 
     private async Task HandleFileChannelMessage(string json)
     {

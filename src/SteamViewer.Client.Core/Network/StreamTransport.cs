@@ -157,7 +157,15 @@ public abstract class StreamTransport : IAsyncDisposable
 
     private async ValueTask<bool> SendFrameAsync(byte channel, byte[] payload, int offset, int length)
     {
-        if (!_connected || _disposed || _backend == null) return false;
+        if (!_connected || _disposed || _backend == null)
+        {
+            // Gate visibility per verbose-logging policy: surface which condition short-circuited,
+            // because callers (e.g., OnClipboardFilesDetected) ignore the false return and the
+            // silent drop is otherwise indistinguishable from a successful send.
+            _logger.LogDebug("SendFrameAsync ch={Channel} len={Length} short-circuit: connected={Connected} disposed={Disposed} backend={Backend}",
+                channel, length, _connected, _disposed, _backend != null ? "set" : "null");
+            return false;
+        }
 
         try
         {
@@ -177,6 +185,8 @@ public abstract class StreamTransport : IAsyncDisposable
             try
             {
                 await _backend.SendAsync(encrypted, 0, encrypted.Length);
+                _logger.LogDebug("SendFrameAsync ch={Channel} len={Length} sent via {Backend}",
+                    channel, length, _backend.GetType().Name);
                 return true;
             }
             finally { _sendLock.Release(); }

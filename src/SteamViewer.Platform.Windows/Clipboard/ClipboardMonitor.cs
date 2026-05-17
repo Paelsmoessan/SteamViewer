@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using Microsoft.Extensions.Logging;
 using SteamViewer.Common.Protocol;
@@ -15,7 +16,14 @@ public sealed class ClipboardMonitor : IDisposable
     private Thread? _thread;
     private IntPtr _hwnd;
     private volatile bool _stopping;
-    private volatile bool _isOurClipboard; // Echo prevention
+
+    // Echo prevention via content-hash. When a clipboard write originates locally
+    // (RecordSelfWriteText / RecordSelfWriteFiles), CheckClipboard compares the
+    // current clipboard's content hash against this field; on match it suppresses
+    // the event ONCE (then clears the hash so the next non-echo change fires
+    // normally). Replaces the previous SetEchoFlag/Thread.Sleep(100)/ClearEchoFlag
+    // ceremony, which had a timing race + 100ms blocking sleep on every write.
+    private volatile string? _lastSelfWriteContentHash;
 
     /// <summary>
     /// Fired when files are detected on the clipboard.
@@ -62,15 +70,38 @@ public sealed class ClipboardMonitor : IDisposable
     }
 
     /// <summary>
-    /// Mark that we just set the clipboard ourselves — prevents echo detection.
-    /// Call this before setting clipboard on this machine.
+    /// Record that we just wrote the given text to the clipboard ourselves.
+    /// The next CheckClipboard call whose content hashes identically will suppress
+    /// its event (and clear the recording). Call this BEFORE the write operation
+    /// so the recording is in place by the time WM_CLIPBOARDUPDATE arrives.
     /// </summary>
-    public void SetEchoFlag() => _isOurClipboard = true;
+    public void RecordSelfWriteText(string text)
+    {
+        var hash = "text:" + ComputeContentHash(text);
+        _lastSelfWriteContentHash = hash;
+        _logger.LogDebug("RecordSelfWriteText: {Length} chars (hash={HashPrefix})", text.Length, hash[..Math.Min(20, hash.Length)]);
+    }
 
     /// <summary>
-    /// Clear the echo flag after our clipboard operation completes.
+    /// Record that we just wrote the given file list to the clipboard ourselves.
+    /// Used by ClipboardFileWriter when our virtual-file IDataObject is set;
+    /// covers the case where a real CF_HDROP also ends up advertised (defensive
+    /// safety belt — VirtualFileDataObject typically exposes CFSTR_FILECONTENTS
+    /// only, but we want the same suppression contract regardless).
     /// </summary>
-    public void ClearEchoFlag() => _isOurClipboard = false;
+    public void RecordSelfWriteFiles(IReadOnlyList<string> fileIdentifiers)
+    {
+        var hash = "files:" + ComputeContentHash(string.Join("|", fileIdentifiers));
+        _lastSelfWriteContentHash = hash;
+        _logger.LogDebug("RecordSelfWriteFiles: {Count} files (hash={HashPrefix})", fileIdentifiers.Count, hash[..Math.Min(20, hash.Length)]);
+    }
+
+    private static string ComputeContentHash(string content)
+    {
+        var bytes = Encoding.UTF8.GetBytes(content);
+        var hash = SHA256.HashData(bytes);
+        return Convert.ToHexString(hash);
+    }
 
     private void ClipboardThreadProc()
     {
@@ -100,7 +131,7 @@ public sealed class ClipboardMonitor : IDisposable
                     return;
                 }
 
-                _logger.LogDebug("Clipboard monitor window created, listening for WM_CLIPBOARDUPDATE");
+                _logger.LogDebug("Clipboard monitor window created (class={ClassName}), listening for WM_CLIPBOARDUPDATE", _registeredClassName);
 
                 // Message pump — required for OLE clipboard and WM_CLIPBOARDUPDATE
                 while (!_stopping && GetMessage(out var msg, IntPtr.Zero, 0, 0) > 0)
@@ -111,6 +142,19 @@ public sealed class ClipboardMonitor : IDisposable
 
                 RemoveClipboardFormatListener(_hwnd);
                 DestroyWindow(_hwnd);
+
+                // Unregister the per-instance window class to prevent accumulation across
+                // reconnects. Each session uses a fresh GUID-suffixed class name so
+                // RegisterClassEx always succeeds and each window's WndProc is bound to
+                // its own instance (see CreateClipboardWindow comment).
+                if (_registeredClassName != null)
+                {
+                    var hInstance = GetModuleHandle(null);
+                    if (UnregisterClass(_registeredClassName, hInstance))
+                        _logger.LogDebug("UnregisterClass succeeded for {ClassName}", _registeredClassName);
+                    else
+                        _logger.LogWarning("UnregisterClass failed for {ClassName} (error={Error})", _registeredClassName, Marshal.GetLastWin32Error());
+                }
             }
             finally
             {
@@ -125,7 +169,13 @@ public sealed class ClipboardMonitor : IDisposable
 
     private IntPtr CreateClipboardWindow()
     {
-        const string className = "SteamViewer_ClipboardMonitor";
+        // Per-instance class name. The lpfnWndProc in WNDCLASSEX is class-scoped, so a
+        // shared/const class name would route every future window's WM_* messages
+        // through the FIRST monitor's WndProc (subsequent RegisterClassEx calls fail
+        // silently with ERROR_CLASS_ALREADY_EXISTS=1410). That bug caused post-reconnect
+        // clipboard events to fire on the OLD disposed session, never on the new one
+        // (see .claude/plans/clipboardmonitor-classname-fix-and-logging-policy.md).
+        var className = $"SteamViewer_ClipboardMonitor_{Guid.NewGuid():N}";
 
         _wndProc = WndProc; // prevent GC of delegate
         _wndProcHandle = GCHandle.Alloc(_wndProc); // explicit root - GC cannot collect this
@@ -138,7 +188,14 @@ public sealed class ClipboardMonitor : IDisposable
             lpszClassName = className
         };
 
-        RegisterClassEx(ref wc);
+        var classAtom = RegisterClassEx(ref wc);
+        if (classAtom == 0)
+        {
+            _logger.LogError("RegisterClassEx failed for {ClassName} (error={Error})", className, Marshal.GetLastWin32Error());
+            return IntPtr.Zero;
+        }
+        _registeredClassName = className;
+        _logger.LogDebug("RegisterClassEx succeeded for {ClassName} (atom={Atom})", className, classAtom);
 
         return CreateWindowEx(
             0, className, "SteamViewer Clipboard Monitor",
@@ -149,6 +206,7 @@ public sealed class ClipboardMonitor : IDisposable
 
     private WndProcDelegate? _wndProc; // prevent GC
     private GCHandle _wndProcHandle; // explicit GC root - prevents native callback crash
+    private string? _registeredClassName; // set after RegisterClassEx so dispose can unregister
 
     private IntPtr WndProc(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam)
     {
@@ -163,12 +221,10 @@ public sealed class ClipboardMonitor : IDisposable
 
     private void OnClipboardChanged()
     {
-        // Echo prevention — if we set the clipboard, ignore this notification
-        if (_isOurClipboard)
-        {
-            _logger.LogDebug("Ignoring clipboard change — echo from our own write");
-            return;
-        }
+        // Snapshot the self-write hash atomically — RecordSelfWriteText/Files writers
+        // may execute on any thread; the volatile read ensures we compare against a
+        // consistent value within this dispatch.
+        var lastSelfHash = _lastSelfWriteContentHash;
 
         try
         {
@@ -178,6 +234,18 @@ public sealed class ClipboardMonitor : IDisposable
                 var files = ReadFileDropList();
                 if (files != null && files.Count > 0)
                 {
+                    // Echo suppression for file paths — see RecordSelfWriteFiles XML doc
+                    if (lastSelfHash != null)
+                    {
+                        var currentFilesHash = "files:" + ComputeContentHash(string.Join("|", files));
+                        if (currentFilesHash == lastSelfHash)
+                        {
+                            _lastSelfWriteContentHash = null; // single-fire suppression
+                            _logger.LogDebug("Suppressed file-clipboard echo: {Count} files, hash matches last self-write", files.Count);
+                            return;
+                        }
+                    }
+
                     _logger.LogInformation("Clipboard has {Count} file(s)", files.Count);
 
                     var fileInfos = new ClipboardFileInfo[files.Count];
@@ -214,6 +282,18 @@ public sealed class ClipboardMonitor : IDisposable
                 var text = ReadClipboardText();
                 if (!string.IsNullOrEmpty(text))
                 {
+                    // Echo suppression for text — see RecordSelfWriteText XML doc
+                    if (lastSelfHash != null)
+                    {
+                        var currentTextHash = "text:" + ComputeContentHash(text);
+                        if (currentTextHash == lastSelfHash)
+                        {
+                            _lastSelfWriteContentHash = null; // single-fire suppression
+                            _logger.LogDebug("Suppressed text-clipboard echo: {Length} chars, hash matches last self-write", text.Length);
+                            return;
+                        }
+                    }
+
                     _logger.LogDebug("Clipboard has text: {Length} chars", text.Length);
                     ClipboardTextDetected?.Invoke(text);
                 }
@@ -382,6 +462,10 @@ public sealed class ClipboardMonitor : IDisposable
 
     [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     private static extern ushort RegisterClassEx(ref WNDCLASSEX lpWndClass);
+
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool UnregisterClass(string lpClassName, IntPtr hInstance);
 
     [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     private static extern IntPtr CreateWindowEx(
