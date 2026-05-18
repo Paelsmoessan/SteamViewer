@@ -1,4 +1,4 @@
-
+﻿
 Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
 VisualStudioVersion = 17.0.31903.59
@@ -22,6 +22,10 @@ EndProject
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{F1E2D3C4-0001-0001-0001-000000000001}"
 EndProject
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{F1E2D3C4-0002-0002-0002-000000000002}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "SteamViewer.App.Tests", "tests\SteamViewer.App.Tests\SteamViewer.App.Tests.csproj", "{D74B30DB-E892-40F3-86C0-59A7A0D99D4E}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "SteamViewer.Platform.Windows.Tests", "tests\SteamViewer.Platform.Windows.Tests\SteamViewer.Platform.Windows.Tests.csproj", "{28B30489-505F-4CBA-A7B2-B02A4F91BD7C}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -61,6 +65,14 @@ Global
 		{A1B2C3D4-8888-8888-8888-888888888888}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{A1B2C3D4-8888-8888-8888-888888888888}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{A1B2C3D4-8888-8888-8888-888888888888}.Release|Any CPU.Build.0 = Release|Any CPU
+		{D74B30DB-E892-40F3-86C0-59A7A0D99D4E}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{D74B30DB-E892-40F3-86C0-59A7A0D99D4E}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{D74B30DB-E892-40F3-86C0-59A7A0D99D4E}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{D74B30DB-E892-40F3-86C0-59A7A0D99D4E}.Release|Any CPU.Build.0 = Release|Any CPU
+		{28B30489-505F-4CBA-A7B2-B02A4F91BD7C}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{28B30489-505F-4CBA-A7B2-B02A4F91BD7C}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{28B30489-505F-4CBA-A7B2-B02A4F91BD7C}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{28B30489-505F-4CBA-A7B2-B02A4F91BD7C}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
@@ -74,5 +86,7 @@ Global
 		{A1B2C3D4-6666-6666-6666-666666666666} = {F1E2D3C4-0001-0001-0001-000000000001}
 		{A1B2C3D4-7777-7777-7777-777777777777} = {F1E2D3C4-0002-0002-0002-000000000002}
 		{A1B2C3D4-8888-8888-8888-888888888888} = {F1E2D3C4-0002-0002-0002-000000000002}
+		{D74B30DB-E892-40F3-86C0-59A7A0D99D4E} = {F1E2D3C4-0002-0002-0002-000000000002}
+		{28B30489-505F-4CBA-A7B2-B02A4F91BD7C} = {F1E2D3C4-0002-0002-0002-000000000002}
 	EndGlobalSection
 EndGlobal

@@ -20,10 +20,10 @@ public class ClientRegistryTests
         var connectionId = Guid.NewGuid();
 
         // Act
-        var result = registry.TryRegister("123456789", "password_hash", CreateMessageWriter(), connectionId);
+        var (result, _) = registry.Register("123456789", "password_hash", CreateMessageWriter(), connectionId);
 
         // Assert
-        Assert.True(result);
+        Assert.Equal(RegisterResult.Success, result);
         Assert.Equal(1, registry.ClientCount);
         Assert.True(registry.IsOnline("123456789"));
     }
@@ -36,13 +36,13 @@ public class ClientRegistryTests
         var connectionId1 = Guid.NewGuid();
         var connectionId2 = Guid.NewGuid();
 
-        registry.TryRegister("123456789", "hash1", CreateMessageWriter(), connectionId1);
+        registry.Register("123456789", "hash1", CreateMessageWriter(), connectionId1);
 
         // Act
-        var result = registry.TryRegister("123456789", "hash2", CreateMessageWriter(), connectionId2);
+        var (result, _) = registry.Register("123456789", "hash2", CreateMessageWriter(), connectionId2);
 
         // Assert
-        Assert.False(result);
+        Assert.Equal(RegisterResult.PasswordMismatch, result);
         Assert.Equal(1, registry.ClientCount);
     }
 
@@ -52,7 +52,7 @@ public class ClientRegistryTests
         // Arrange
         var registry = new ClientRegistry();
         var connectionId = Guid.NewGuid();
-        registry.TryRegister("123456789", "password_hash", CreateMessageWriter(), connectionId);
+        registry.Register("123456789", "password_hash", CreateMessageWriter(), connectionId);
 
         // Act
         var client = registry.GetClient("123456789");
@@ -83,7 +83,7 @@ public class ClientRegistryTests
         // Arrange
         var registry = new ClientRegistry();
         var connectionId = Guid.NewGuid();
-        registry.TryRegister("123456789", "hash", CreateMessageWriter(), connectionId);
+        registry.Register("123456789", "hash", CreateMessageWriter(), connectionId);
 
         // Act
         var clientId = registry.GetClientIdByConnection(connectionId);
@@ -110,7 +110,7 @@ public class ClientRegistryTests
     {
         // Arrange
         var registry = new ClientRegistry();
-        registry.TryRegister("123456789", "correct_hash", CreateMessageWriter(), Guid.NewGuid());
+        registry.Register("123456789", "correct_hash", CreateMessageWriter(), Guid.NewGuid());
 
         // Act
         var result = registry.VerifyPassword("123456789", "correct_hash");
@@ -124,7 +124,7 @@ public class ClientRegistryTests
     {
         // Arrange
         var registry = new ClientRegistry();
-        registry.TryRegister("123456789", "correct_hash", CreateMessageWriter(), Guid.NewGuid());
+        registry.Register("123456789", "correct_hash", CreateMessageWriter(), Guid.NewGuid());
 
         // Act
         var result = registry.VerifyPassword("123456789", "wrong_hash");
@@ -152,7 +152,7 @@ public class ClientRegistryTests
         // Arrange
         var registry = new ClientRegistry();
         var connectionId = Guid.NewGuid();
-        registry.TryRegister("123456789", "hash", CreateMessageWriter(), connectionId);
+        registry.Register("123456789", "hash", CreateMessageWriter(), connectionId);
 
         // Act
         var removedId = registry.UnregisterByConnection(connectionId);
@@ -181,7 +181,7 @@ public class ClientRegistryTests
     {
         // Arrange
         var registry = new ClientRegistry();
-        registry.TryRegister("123456789", "hash", CreateMessageWriter(), Guid.NewGuid());
+        registry.Register("123456789", "hash", CreateMessageWriter(), Guid.NewGuid());
 
         // Act
         registry.SetPeer("123456789", "987654321");
@@ -197,7 +197,7 @@ public class ClientRegistryTests
     {
         // Arrange
         var registry = new ClientRegistry();
-        registry.TryRegister("123456789", "hash", CreateMessageWriter(), Guid.NewGuid());
+        registry.Register("123456789", "hash", CreateMessageWriter(), Guid.NewGuid());
         registry.SetPeer("123456789", "987654321");
 
         // Act
@@ -215,7 +215,7 @@ public class ClientRegistryTests
         // Arrange
         var registry = new ClientRegistry();
         var channel = Channel.CreateUnbounded<SignalingMessage>();
-        registry.TryRegister("123456789", "hash", channel.Writer, Guid.NewGuid());
+        registry.Register("123456789", "hash", channel.Writer, Guid.NewGuid());
 
         // Act
         var result = registry.TrySendToClient("123456789", new SignalingMessage.Ping());
@@ -244,7 +244,7 @@ public class ClientRegistryTests
     {
         // Arrange
         var registry = new ClientRegistry();
-        registry.TryRegister("123456789", "hash", CreateMessageWriter(), Guid.NewGuid());
+        registry.Register("123456789", "hash", CreateMessageWriter(), Guid.NewGuid());
 
         // Act & Assert
         Assert.True(registry.IsOnline("123456789"));
@@ -269,13 +269,13 @@ public class ClientRegistryTests
         // Act & Assert
         Assert.Equal(0, registry.ClientCount);
 
-        registry.TryRegister("111111111", "hash", CreateMessageWriter(), Guid.NewGuid());
+        registry.Register("111111111", "hash", CreateMessageWriter(), Guid.NewGuid());
         Assert.Equal(1, registry.ClientCount);
 
-        registry.TryRegister("222222222", "hash", CreateMessageWriter(), Guid.NewGuid());
+        registry.Register("222222222", "hash", CreateMessageWriter(), Guid.NewGuid());
         Assert.Equal(2, registry.ClientCount);
 
-        registry.TryRegister("333333333", "hash", CreateMessageWriter(), Guid.NewGuid());
+        registry.Register("333333333", "hash", CreateMessageWriter(), Guid.NewGuid());
         Assert.Equal(3, registry.ClientCount);
     }
 }

@@ -1,0 +1,52 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <RootNamespace>SteamViewer.App.Tests</RootNamespace>
+    <SupportedOSPlatformVersion>10.0.17763.0</SupportedOSPlatformVersion>
+    <!-- Don't run MAUI's resource pipeline on the test project; we only need the
+         compiled types from SteamViewer.App, not the image/icon assets. -->
+    <UseMaui>false</UseMaui>
+    <EnableDefaultMauiItems>false</EnableDefaultMauiItems>
+    <SkipMauiResourceGeneration>true</SkipMauiResourceGeneration>
+  </PropertyGroup>
+
+  <!-- Strip any inherited MAUI resource items so Resizetizer doesn't see App's
+       icon/splash through the ProjectReference and trip the duplicate-name check. -->
+  <ItemGroup>
+    <MauiIcon Remove="@(MauiIcon)" />
+    <MauiImage Remove="@(MauiImage)" />
+    <MauiSplashScreen Remove="@(MauiSplashScreen)" />
+    <MauiFont Remove="@(MauiFont)" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="coverlet.collector" Version="6.0.0" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.8.0" />
+    <PackageReference Include="xunit" Version="2.6.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.5.4" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- PrivateAssets="all" + ExcludeAssets prevents MAUI's transitive build targets
+         (Resizetizer in particular) from running inside this test project. We still
+         get the compiled output assembly to reference at compile time. -->
+    <ProjectReference Include="..\..\src\SteamViewer.App\SteamViewer.App.csproj"
+                      PrivateAssets="all"
+                      ExcludeAssets="build;buildTransitive;analyzers" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="..\Shared\ApiSurface.cs" Link="Shared\ApiSurface.cs" />
+    <Compile Include="..\Shared\CharacterizationTestBase.cs" Link="Shared\CharacterizationTestBase.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+</Project>

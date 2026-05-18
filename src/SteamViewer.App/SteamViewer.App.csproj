@@ -35,6 +35,13 @@
     <SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'android'">24.0</SupportedOSPlatformVersion>
   </PropertyGroup>
 
+  <!-- Test access: expose internals (e.g. extracted helper methods like
+       ShouldRequestLosslessFrame) to the App.Tests project for characterization
+       tests of R2 refactor extracts. -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="SteamViewer.App.Tests" />
+  </ItemGroup>
+
   <!-- App Icon -->
   <ItemGroup>
     <MauiIcon Include="Resources\AppIcon\appicon.svg" ForegroundFile="Resources\AppIcon\appiconfg.svg" Color="#0A1929" />

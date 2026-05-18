@@ -266,67 +266,7 @@ public sealed class DxgiScreenCapture : IScreenCapture
                     ex.Message.Contains("access lost", StringComparison.OrdinalIgnoreCase) ||
                     ex.Message.Contains("Not capturing", StringComparison.OrdinalIgnoreCase))
                 {
-                    // DXGI_ERROR_ACCESS_LOST or resources released after failed reinitialize
-                    // Triggers: desktop switch (UAC Secure Desktop), hot-plug, lock screen, display mode change
-                    consecutiveErrors++;
-
-                    if (consecutiveErrors == 1)
-                        _logger.LogWarning("DXGI access lost: {Message}", ex.Message);
-
-                    // Phase 1: While Secure Desktop is active, don't waste time on DuplicateOutput.
-                    // Just poll until Default desktop is available (Microsoft/Sunshine pattern).
-                    if (!IsDefaultDesktopAvailable())
-                    {
-                        if (consecutiveErrors == 1 || consecutiveErrors % 20 == 0)
-                            _logger.LogInformation("DXGI waiting for Secure Desktop to exit (attempt {Count})", consecutiveErrors);
-                        // Wait up to 500ms, but wake immediately if NotifyDesktopAvailable() is called
-                        _desktopAvailableSignal.Wait(500);
-                        _desktopAvailableSignal.Reset();
-                        continue; // Don't attempt reinit, don't count against timeout
-                    }
-
-                    // Phase 2: Default desktop is back — reset clock and attempt reinit.
-                    // Start/reset the reinit clock on first attempt after desktop available
-                    if (reinitStartTicks == 0L)
-                    {
-                        reinitStartTicks = System.Diagnostics.Stopwatch.GetTimestamp();
-                        _logger.LogInformation("Default desktop available — starting DXGI reinit");
-                    }
-
-                    var reinitElapsedSec = (System.Diagnostics.Stopwatch.GetTimestamp() - reinitStartTicks)
-                        / (double)System.Diagnostics.Stopwatch.Frequency;
-
-                    // Progressive backoff: 250ms x20 (5s), then 2s x60 (2min), then 5s indefinitely
-                    // Never give up (Microsoft Desktop Duplication sample pattern)
-                    int sleepMs;
-                    if (consecutiveErrors <= 20) sleepMs = 250;
-                    else if (consecutiveErrors <= 80) sleepMs = 2000;
-                    else sleepMs = 5000;
-
-                    if (consecutiveErrors > 1)
-                        Thread.Sleep(sleepMs);
-
-                    try
-                    {
-                        // Try light reinit first (just DuplicateOutput, keep D3D device)
-                        // Falls back to full reinit if light reinit fails
-                        bool success = TryReinitDuplication();
-                        if (!success)
-                        {
-                            _logger.LogDebug("Light DXGI reinit failed, trying full reinitialize");
-                            Reinitialize();
-                        }
-                        // Success — reset for next desktop switch event
-                        consecutiveErrors = 0;
-                        reinitStartTicks = 0L;
-                        _logger.LogInformation("DXGI reinitialize succeeded after {Elapsed:F1}s ({Method})",
-                            reinitElapsedSec, success ? "light" : "full");
-                    }
-                    catch (Exception reinitEx)
-                    {
-                        if (consecutiveErrors <= 5 || consecutiveErrors % 20 == 0)
-                            _logger.LogWarning(reinitEx, "DXGI reinitialize failed (attempt {Count}, {Elapsed:F1}s)", consecutiveErrors, reinitElapsedSec);
-                    }
+                    HandleAccessLost(ex, ref consecutiveErrors, ref reinitStartTicks);
                 }
                 catch (Exception ex)
                 {
@@ -350,6 +290,82 @@ public sealed class DxgiScreenCapture : IScreenCapture
             jpegStream.Dispose();
             ReleaseResources();
             _logger.LogInformation("DXGI capture loop exited (frames: {Count})", frameCount);
+        }
+    }
+
+    /// <summary>
+    /// DXGI access-lost recovery state machine. Extracted from CaptureLoopInner.
+    /// Phase 1: while Secure Desktop is active, just poll until Default desktop is
+    /// available (don't waste time on DuplicateOutput).
+    /// Phase 2: Default desktop available - reset reinit clock, apply progressive
+    /// backoff (250ms x20 / 2s x60 / 5s indefinitely), then attempt light reinit
+    /// (DuplicateOutput only) falling back to full reinit (recreate D3D device).
+    /// Never gives up (Microsoft Desktop Duplication sample pattern).
+    /// State (consecutiveErrors / reinitStartTicks) is owned by the capture loop
+    /// and passed by ref so the helper can mutate it across iterations.
+    /// </summary>
+    private void HandleAccessLost(Exception ex, ref int consecutiveErrors, ref long reinitStartTicks)
+    {
+        // DXGI_ERROR_ACCESS_LOST or resources released after failed reinitialize
+        // Triggers: desktop switch (UAC Secure Desktop), hot-plug, lock screen, display mode change
+        consecutiveErrors++;
+
+        if (consecutiveErrors == 1)
+            _logger.LogWarning("DXGI access lost: {Message}", ex.Message);
+
+        // Phase 1: While Secure Desktop is active, don't waste time on DuplicateOutput.
+        // Just poll until Default desktop is available (Microsoft/Sunshine pattern).
+        if (!IsDefaultDesktopAvailable())
+        {
+            if (consecutiveErrors == 1 || consecutiveErrors % 20 == 0)
+                _logger.LogInformation("DXGI waiting for Secure Desktop to exit (attempt {Count})", consecutiveErrors);
+            // Wait up to 500ms, but wake immediately if NotifyDesktopAvailable() is called
+            _desktopAvailableSignal.Wait(500);
+            _desktopAvailableSignal.Reset();
+            return; // Don't attempt reinit, don't count against timeout (was `continue` inline)
+        }
+
+        // Phase 2: Default desktop is back — reset clock and attempt reinit.
+        // Start/reset the reinit clock on first attempt after desktop available
+        if (reinitStartTicks == 0L)
+        {
+            reinitStartTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+            _logger.LogInformation("Default desktop available — starting DXGI reinit");
+        }
+
+        var reinitElapsedSec = (System.Diagnostics.Stopwatch.GetTimestamp() - reinitStartTicks)
+            / (double)System.Diagnostics.Stopwatch.Frequency;
+
+        // Progressive backoff: 250ms x20 (5s), then 2s x60 (2min), then 5s indefinitely
+        // Never give up (Microsoft Desktop Duplication sample pattern)
+        int sleepMs;
+        if (consecutiveErrors <= 20) sleepMs = 250;
+        else if (consecutiveErrors <= 80) sleepMs = 2000;
+        else sleepMs = 5000;
+
+        if (consecutiveErrors > 1)
+            Thread.Sleep(sleepMs);
+
+        try
+        {
+            // Try light reinit first (just DuplicateOutput, keep D3D device)
+            // Falls back to full reinit if light reinit fails
+            bool success = TryReinitDuplication();
+            if (!success)
+            {
+                _logger.LogDebug("Light DXGI reinit failed, trying full reinitialize");
+                Reinitialize();
+            }
+            // Success — reset for next desktop switch event
+            consecutiveErrors = 0;
+            reinitStartTicks = 0L;
+            _logger.LogInformation("DXGI reinitialize succeeded after {Elapsed:F1}s ({Method})",
+                reinitElapsedSec, success ? "light" : "full");
+        }
+        catch (Exception reinitEx)
+        {
+            if (consecutiveErrors <= 5 || consecutiveErrors % 20 == 0)
+                _logger.LogWarning(reinitEx, "DXGI reinitialize failed (attempt {Count}, {Elapsed:F1}s)", consecutiveErrors, reinitElapsedSec);
         }
     }
 
@@ -779,24 +795,7 @@ public sealed class DxgiScreenCapture : IScreenCapture
                     if (_frameBuffer == null || _frameBuffer.Length < dataSize)
                         _frameBuffer = new byte[dataSize];
 
-                    // Copy pixel data — single block copy when stride matches, row-by-row otherwise
-                    unsafe
-                    {
-                        var srcPtr = (byte*)mappedResource.DataPointer;
-                        var expectedStride = _width * 4; // BGRA = 4 bytes per pixel
-                        if (stride == expectedStride)
-                        {
-                            // Stride matches width — single memcpy (fastest)
-                            Marshal.Copy((IntPtr)srcPtr, _frameBuffer, 0, dataSize);
-                        }
-                        else
-                        {
-                            for (var y = 0; y < _height; y++)
-                            {
-                                Marshal.Copy((IntPtr)(srcPtr + y * stride), _frameBuffer, y * stride, stride);
-                            }
-                        }
-                    }
+                    CopyPixelsToFrameBuffer(mappedResource, stride);
 
                     return new CapturedFrame
                     {
@@ -822,6 +821,31 @@ public sealed class DxgiScreenCapture : IScreenCapture
         {
             _logger.LogWarning("Desktop duplication access lost");
             throw new InvalidOperationException("Desktop duplication access lost", ex);
+        }
+    }
+
+    /// <summary>
+    /// Copy mapped DXGI pixel data into _frameBuffer. Single memcpy when stride
+    /// matches the expected BGRA stride (_width * 4); row-by-row copy when DXGI
+    /// hands back a stride with alignment padding. Caller must ensure
+    /// _frameBuffer has capacity for _height * stride bytes before calling.
+    /// </summary>
+    private unsafe void CopyPixelsToFrameBuffer(MappedSubresource mappedResource, int stride)
+    {
+        var srcPtr = (byte*)mappedResource.DataPointer;
+        var expectedStride = _width * 4; // BGRA = 4 bytes per pixel
+        var dataSize = _height * stride;
+        if (stride == expectedStride)
+        {
+            // Stride matches width — single memcpy (fastest)
+            Marshal.Copy((IntPtr)srcPtr, _frameBuffer!, 0, dataSize);
+        }
+        else
+        {
+            for (var y = 0; y < _height; y++)
+            {
+                Marshal.Copy((IntPtr)(srcPtr + y * stride), _frameBuffer!, y * stride, stride);
+            }
         }
     }
 

@@ -90,121 +90,117 @@ public sealed class InputMessageRouter : IDisposable
             using var doc = JsonDocument.Parse(json);
             var root = doc.RootElement;
 
-            if (!root.TryGetProperty("type", out var typeProp))
-                return;
-
+            if (!root.TryGetProperty("type", out var typeProp)) return;
             var messageType = typeProp.GetString();
 
-            // Handle resolution update from window resize
-            if (messageType == "resolution")
-            {
-                var w = root.TryGetProperty("width", out var wp) ? wp.GetInt32() : 0;
-                var h = root.TryGetProperty("height", out var hp) ? hp.GetInt32() : 0;
-                if (w > 0 && h > 0 && _activeSession != null)
-                {
-                    _ = _activeSession.SendDesiredResolutionAsync(w, h);
-                }
-                return;
-            }
+            if (messageType == "resolution") { HandleResolution(root); return; }
+            if (messageType != "input") return;
 
-            if (messageType != "input")
-                return;
-
-            if (!root.TryGetProperty("method", out var methodProp))
-                return;
-
+            if (!root.TryGetProperty("method", out var methodProp)) return;
             var method = methodProp.GetString();
             var session = _activeSession;
 
             switch (method)
             {
-                case "mouseMove":
-                    if (session == null) return;
-                    _ = session.SendInputAsync(new InputEvent.MouseMove(
-                        root.GetProperty("x").GetDouble(),
-                        root.GetProperty("y").GetDouble(),
-                        root.GetProperty("captureW").GetInt32(),
-                        root.GetProperty("captureH").GetInt32()));
-                    break;
-
-                case "mouseDown":
-                    if (session == null) return;
-                    _ = session.SendInputAsync(new InputEvent.MouseDown(
-                        ParseMouseButton(root.GetProperty("button").GetString()),
-                        root.GetProperty("x").GetDouble(),
-                        root.GetProperty("y").GetDouble(),
-                        root.GetProperty("captureW").GetInt32(),
-                        root.GetProperty("captureH").GetInt32()));
-                    break;
-
-                case "mouseUp":
-                    if (session == null) return;
-                    _ = session.SendInputAsync(new InputEvent.MouseUp(
-                        ParseMouseButton(root.GetProperty("button").GetString()),
-                        root.GetProperty("x").GetDouble(),
-                        root.GetProperty("y").GetDouble(),
-                        root.GetProperty("captureW").GetInt32(),
-                        root.GetProperty("captureH").GetInt32()));
-                    break;
-
-                case "mouseWheel":
-                    if (session == null) return;
-                    _ = session.SendInputAsync(new InputEvent.MouseWheel(
-                        root.GetProperty("deltaX").GetDouble(),
-                        root.GetProperty("deltaY").GetDouble()));
-                    break;
-
-                case "keyDown":
-                {
-                    if (session == null) return;
-                    var key = root.GetProperty("key").GetString() ?? "";
-                    var mods = ParseModifiers(root.GetProperty("modifiers"));
-                    var code = root.TryGetProperty("code", out var codeProp) ? codeProp.GetString() : null;
-                    var altGr = root.TryGetProperty("altGr", out var altGrProp) && altGrProp.GetBoolean();
-                    // Ctrl+Alt+End → Ctrl+Alt+Del (standard RDP convention)
-                    if (key == "End" && mods.Ctrl && mods.Alt)
-                    {
-                        OnCtrlAltDelRequested?.Invoke();
-                        return;
-                    }
-
-                    _ = session.SendInputAsync(new InputEvent.KeyDown(key, mods, code, altGr));
-                    break;
-                }
-
-                case "keyUp":
-                {
-                    if (session == null) return;
-                    var key = root.GetProperty("key").GetString() ?? "";
-                    var mods = ParseModifiers(root.GetProperty("modifiers"));
-                    var code = root.TryGetProperty("code", out var codeProp) ? codeProp.GetString() : null;
-                    var altGr = root.TryGetProperty("altGr", out var altGrProp) && altGrProp.GetBoolean();
-
-                    // Suppress the End key-up for Ctrl+Alt+End→Del
-                    if (key == "End" && mods.Ctrl && mods.Alt) return;
-
-                    _ = session.SendInputAsync(new InputEvent.KeyUp(key, mods, code, altGr));
-                    break;
-                }
-
-                case "clipboardPaste":
-                    _ = Task.Run(async () =>
-                    {
-                        try { if (OnClipboardPasteRequested != null) await OnClipboardPasteRequested.Invoke(); }
-                        catch (Exception ex) { _logger.LogWarning(ex, "Clipboard paste handler failed"); }
-                    });
-                    break;
-
-                case "lockChanged":
-                    if (root.TryGetProperty("locked", out var lockedProp))
-                        OnLockChanged?.Invoke(lockedProp.GetBoolean());
-                    break;
+                case "mouseMove":      if (session != null) HandleMouseMove(root, session); break;
+                case "mouseDown":      if (session != null) HandleMouseDown(root, session); break;
+                case "mouseUp":        if (session != null) HandleMouseUp(root, session); break;
+                case "mouseWheel":     if (session != null) HandleMouseWheel(root, session); break;
+                case "keyDown":        if (session != null) HandleKeyDown(root, session); break;
+                case "keyUp":          if (session != null) HandleKeyUp(root, session); break;
+                case "clipboardPaste": HandleClipboardPaste(); break;
+                case "lockChanged":    HandleLockChanged(root); break;
             }
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Failed to process input web message");
         }
+    }
+
+    private void HandleResolution(JsonElement root)
+    {
+        var w = root.TryGetProperty("width", out var wp) ? wp.GetInt32() : 0;
+        var h = root.TryGetProperty("height", out var hp) ? hp.GetInt32() : 0;
+        if (w > 0 && h > 0 && _activeSession != null)
+            _ = _activeSession.SendDesiredResolutionAsync(w, h);
+    }
+
+    private static void HandleMouseMove(JsonElement root, ViewerSession session)
+        => _ = session.SendInputAsync(new InputEvent.MouseMove(
+            root.GetProperty("x").GetDouble(),
+            root.GetProperty("y").GetDouble(),
+            root.GetProperty("captureW").GetInt32(),
+            root.GetProperty("captureH").GetInt32()));
+
+    private static void HandleMouseDown(JsonElement root, ViewerSession session)
+        => _ = session.SendInputAsync(new InputEvent.MouseDown(
+            ParseMouseButton(root.GetProperty("button").GetString()),
+            root.GetProperty("x").GetDouble(),
+            root.GetProperty("y").GetDouble(),
+            root.GetProperty("captureW").GetInt32(),
+            root.GetProperty("captureH").GetInt32()));
+
+    private static void HandleMouseUp(JsonElement root, ViewerSession session)
+        => _ = session.SendInputAsync(new InputEvent.MouseUp(
+            ParseMouseButton(root.GetProperty("button").GetString()),
+            root.GetProperty("x").GetDouble(),
+            root.GetProperty("y").GetDouble(),
+            root.GetProperty("captureW").GetInt32(),
+            root.GetProperty("captureH").GetInt32()));
+
+    private static void HandleMouseWheel(JsonElement root, ViewerSession session)
+        => _ = session.SendInputAsync(new InputEvent.MouseWheel(
+            root.GetProperty("deltaX").GetDouble(),
+            root.GetProperty("deltaY").GetDouble()));
+
+    private readonly record struct KeyEventInfo(string Key, KeyModifiers Mods, string? Code, bool AltGr);
+
+    private static KeyEventInfo ParseKeyEvent(JsonElement root)
+    {
+        var key = root.GetProperty("key").GetString() ?? "";
+        var mods = ParseModifiers(root.GetProperty("modifiers"));
+        var code = root.TryGetProperty("code", out var codeProp) ? codeProp.GetString() : null;
+        var altGr = root.TryGetProperty("altGr", out var altGrProp) && altGrProp.GetBoolean();
+        return new KeyEventInfo(key, mods, code, altGr);
+    }
+
+    // Ctrl+Alt+End → Ctrl+Alt+Del (standard RDP convention). Named so the dispatch
+    // logic reads as intent, not as a 3-conjunct check.
+    private static bool IsCtrlAltEnd(KeyEventInfo k)
+        => k.Key == "End" && k.Mods.Ctrl && k.Mods.Alt;
+
+    private void HandleKeyDown(JsonElement root, ViewerSession session)
+    {
+        var k = ParseKeyEvent(root);
+        if (IsCtrlAltEnd(k))
+        {
+            OnCtrlAltDelRequested?.Invoke();
+            return;
+        }
+        _ = session.SendInputAsync(new InputEvent.KeyDown(k.Key, k.Mods, k.Code, k.AltGr));
+    }
+
+    private static void HandleKeyUp(JsonElement root, ViewerSession session)
+    {
+        var k = ParseKeyEvent(root);
+        if (IsCtrlAltEnd(k)) return; // Suppress End key-up for Ctrl+Alt+End→Del
+        _ = session.SendInputAsync(new InputEvent.KeyUp(k.Key, k.Mods, k.Code, k.AltGr));
+    }
+
+    private void HandleClipboardPaste()
+    {
+        _ = Task.Run(async () =>
+        {
+            try { if (OnClipboardPasteRequested != null) await OnClipboardPasteRequested.Invoke(); }
+            catch (Exception ex) { _logger.LogWarning(ex, "Clipboard paste handler failed"); }
+        });
+    }
+
+    private void HandleLockChanged(JsonElement root)
+    {
+        if (root.TryGetProperty("locked", out var lockedProp))
+            OnLockChanged?.Invoke(lockedProp.GetBoolean());
     }
 
     private static MouseButton ParseMouseButton(string? button) => (button?.ToLowerInvariant()) switch

@@ -1,6 +1,14 @@
 // video-interop.js — FFmpeg transport video rendering + input capture
 // Replaces webrtc-interop.js (WebRTC removed)
 // Keeps: SharedBuffer rendering, mouse/keyboard capture, stats overlay, logger bridge
+//
+// CODE-HEALTH-EXEMPT (intrinsic-cap)
+// Realistic CH ceiling ~7.0-7.5. The sharedbufferreceived listener has three
+// codec-shape branches (lossless QOI / raw BGRA / JPEG) and the input capture
+// path carries cross-browser key/coord-mapping tables. Decomposition gains
+// readability little here and would require a JS build system this project
+// doesn't ship.
+// See: .claude/research/codescene-clean-delivery/intrinsic-caps.md
 
 // === Logger Bridge ===
 window.SteamViewerLogger = {

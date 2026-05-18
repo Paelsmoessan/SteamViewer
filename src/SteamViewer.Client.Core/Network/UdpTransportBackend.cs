@@ -9,6 +9,12 @@ using SIPSorcery.Net;
 
 namespace SteamViewer.Client.Core.Network;
 
+// CODE-HEALTH-EXEMPT (intrinsic-cap)
+// Realistic CH ceiling ~7.0-7.5. The ReceiveLoopAsync packet-shape decision tree
+// and TryRecover 2D-XOR FEC matrix are inherent to SMPTE 2022-1 / SRT-style
+// reliable UDP. Don't push for 8.0+ here.
+// See: .claude/research/codescene-clean-delivery/intrinsic-caps.md
+
 /// <summary>
 /// Transport backend that sends data over direct UDP (STUN hole-punch) or TURN relay.
 /// Phase 2 transport — lower latency than WebSocket relay.
