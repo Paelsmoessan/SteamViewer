@@ -4,8 +4,8 @@
 
 set -e
 
-REPO_OWNER="Jeyloh"  # TODO: Update to your GitHub username
-REPO_NAME="SteamViewer.NET"
+REPO_OWNER="Paelsmoessan"
+REPO_NAME="SteamViewer"
 
 # Colors for output
 RED='\033[0;31m'

@@ -337,6 +337,14 @@ else
             _canvasInitialized = false;
             StateHasChanged();
         });
+        // Mirror of OnPeerSharingChanged but for THIS host's screen-sharing state. Fires on
+        // every IsSharingScreen flip (including auto-share-on-reconnect which previously
+        // didn't fire any event). Closes TODO §5 P1 "Host UI doesn't reflect auto-share-on-reconnect state."
+        HostSessionManager.OnLocalSharingChanged += _ => InvokeAsync(StateHasChanged);
+
+        // Start the 30s signaling health-check loop. Cancellation handled in DisposeAsync.
+        _signalingHealthCts = new CancellationTokenSource();
+        _signalingHealthTask = SignalingHealthCheckLoopAsync(_signalingHealthCts.Token);
     }
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
@@ -830,6 +838,33 @@ else
         StateHasChanged();
     }
 
+    // Health-check timer: while an active session is suppressing signaling-disconnect
+    // errors, log every 30s whether signaling is back up so a silent WS death is no
+    // longer invisible. Cancelled in DisposeAsync.
+    private CancellationTokenSource? _signalingHealthCts;
+    private Task? _signalingHealthTask;
+
+    private async Task SignalingHealthCheckLoopAsync(CancellationToken ct)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(30));
+        try
+        {
+            while (await timer.WaitForNextTickAsync(ct))
+            {
+                // Only emit when an active P2P session is running - that is the
+                // case where suppression hides the signaling-WS state. When no
+                // session is active, normal connect/disconnect logging covers it.
+                if (!_isSharingScreen) continue;
+
+                if (SignalingClient.IsConnected)
+                    Logger.LogDebug("[SIG-HEALTH] active session + signaling WS connected (30s tick)");
+                else
+                    Logger.LogWarning("[SIG-HEALTH] active session BUT signaling WS dead - ReconnectAsync should be in flight (30s tick)");
+            }
+        }
+        catch (OperationCanceledException) { }
+    }
+
     private void HandleDisconnected(string? reason)
     {
         InvokeAsync(() =>
@@ -840,7 +875,12 @@ else
             // signaling WebSocket can drop without affecting the video/input stream.
             if (_isSharingScreen)
             {
-                Logger.LogInformation("Signaling disconnected but session still active — suppressing error");
+                Logger.LogInformation("Signaling disconnected but session still active — suppressing error, kicking ReconnectAsync");
+                // Belt-and-suspenders: SignalingClient already auto-kicks ReconnectAsync
+                // from its receive-loop exception catches (Commit 7), but the Close-message
+                // path (server sent a clean close) does NOT auto-kick. This call covers
+                // that case. ReconnectAsync's lock guard collapses concurrent calls.
+                _ = Task.Run(() => SignalingClient.ReconnectAsync(CancellationToken.None));
                 return;
             }
 
@@ -860,6 +900,12 @@ else
 
     public async ValueTask DisposeAsync()
     {
+        // Stop the signaling health-check loop before tearing down subscriptions
+        // so a 30s tick mid-disposal does not log against a half-disposed page.
+        _signalingHealthCts?.Cancel();
+        if (_signalingHealthTask != null) try { await _signalingHealthTask; } catch { }
+        _signalingHealthCts?.Dispose();
+
         SignalingClient.OnDisconnected -= HandleDisconnected;
         SignalingClient.OnError -= HandleError;
 

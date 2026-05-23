@@ -327,6 +327,10 @@ public sealed class SystemHelperClient : IAsyncDisposable
 
     /// <summary>
     /// Shut down the SYSTEM helper process and clean up pipes.
+    /// Each cleanup step is wrapped because the helper closes its end of the pipes in
+    /// response to "exit" — subsequent dispose operations can race with that close and
+    /// throw "Cannot access a closed pipe" or ObjectDisposedException. That race is
+    /// expected; demote to Debug to avoid noisy WARNs in normal shutdown.
     /// </summary>
     public async Task ShutdownAsync()
     {
@@ -336,9 +340,21 @@ public sealed class SystemHelperClient : IAsyncDisposable
         }
         catch { /* Helper may already be gone */ }
 
-        CleanupVideoPipe();
-        CleanupNotifyPipe();
-        await CleanupPipeAsync();
+        try { CleanupVideoPipe(); }
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException)
+        {
+            _logger.LogDebug(ex, "Video pipe cleanup raced with helper exit (expected)");
+        }
+        try { CleanupNotifyPipe(); }
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException)
+        {
+            _logger.LogDebug(ex, "Notify pipe cleanup raced with helper exit (expected)");
+        }
+        try { await CleanupPipeAsync(); }
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException)
+        {
+            _logger.LogDebug(ex, "Control pipe cleanup raced with helper exit (expected)");
+        }
     }
 
     /// <summary>

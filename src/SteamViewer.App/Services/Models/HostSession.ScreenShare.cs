@@ -37,6 +37,7 @@ public sealed partial class HostSession
             if (success)
             {
                 IsSharingScreen = true;
+                OnLocalSharingChanged?.Invoke(true);
                 await NotifyScreenShareStarted();
                 return true;
             }
@@ -61,6 +62,7 @@ public sealed partial class HostSession
             _dxgiAdapter = null;
 
             IsSharingScreen = false;
+            OnLocalSharingChanged?.Invoke(false);
             _inputInjector.ClearCapturedMonitor();
             await _transport.SendControlAsync(
                 JsonSerializer.Serialize(new { type = "screenShareStopped" }));

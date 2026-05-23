@@ -90,8 +90,24 @@ public sealed partial class HostSession : IAsyncDisposable
     /// <summary>Raised when the session disconnects.</summary>
     public event Action<string?>? OnDisconnected;
 
+    /// <summary>
+    /// Raised when the viewer sends an explicit `client_disconnecting` control message
+    /// via the data channel - signals a graceful user-initiated close, distinct from a
+    /// network-driven disconnect. Subscribers should fire cleanup with the
+    /// ExplicitClientDisconnect trigger so elevation is disposed (no auto-reconnect).
+    /// </summary>
+    public event Action<string>? OnClientDisconnecting;
+
     /// <summary>Raised when the peer starts/stops sharing their screen.</summary>
     public event Action<bool>? OnPeerSharingChanged;
+
+    /// <summary>
+    /// Raised when THIS host starts/stops sharing its own screen (IsSharingScreen flips).
+    /// Symmetric to OnPeerSharingChanged but for the local side. Allows Home.razor to
+    /// re-render after auto-share-on-reconnect (which sets IsSharingScreen=true with no
+    /// other event firing). Closes TODO §5 P1 "Host UI doesn't reflect auto-share-on-reconnect state."
+    /// </summary>
+    public event Action<bool>? OnLocalSharingChanged;
 
     #endregion
 
@@ -192,7 +208,11 @@ public sealed partial class HostSession : IAsyncDisposable
         {
             await _transport.DisposeAsync();
         }
-        IsSharingScreen = false;
+        if (IsSharingScreen)
+        {
+            IsSharingScreen = false;
+            OnLocalSharingChanged?.Invoke(false);
+        }
         IsPeerSharingScreen = false;
         SetState(HostSessionState.Disconnected);
     }
@@ -202,19 +222,36 @@ public sealed partial class HostSession : IAsyncDisposable
         if (_disposed) return;
         _disposed = true;
 
+        // Per-step timing logs to diagnose the "cleanup holds _cleanupLock for 10+ seconds"
+        // P1 in TODO §5. Each await/dispose step gets its own Stopwatch so we can identify
+        // which one is the slow path during transport-disconnect cleanup.
+        var totalSw = System.Diagnostics.Stopwatch.StartNew();
+
         if (_elevationService != null && !_elevationDetached)
         {
             _elevationService.OnSecureDesktopFrame -= HandleSecureDesktopFrame;
             _elevationService.OnSecureDesktopStateChanged -= HandleSecureDesktopStateChanged;
             _elevationService.OnSystemStateChanged -= HandleSystemStateChanged;
+            var elevSw = System.Diagnostics.Stopwatch.StartNew();
             await _elevationService.DisposeAsync();
+            elevSw.Stop();
+            _logger.LogInformation("HostSession.Dispose: elevation service disposed in {Elapsed}ms (inline, not detached)",
+                elevSw.ElapsedMilliseconds);
         }
 
+        var clipSw = System.Diagnostics.Stopwatch.StartNew();
         StopClipboardFileTransfer();
+        clipSw.Stop();
+        _logger.LogInformation("HostSession.Dispose: StopClipboardFileTransfer in {Elapsed}ms",
+            clipSw.ElapsedMilliseconds);
 
         // Dispose video pipeline (stops capture, disposes encoder, clears sleep prevention)
+        var vidSw = System.Diagnostics.Stopwatch.StartNew();
         _videoPipeline.Dispose();
         _dxgiAdapter = null;
+        vidSw.Stop();
+        _logger.LogInformation("HostSession.Dispose: video pipeline disposed in {Elapsed}ms",
+            vidSw.ElapsedMilliseconds);
 
         if (_transport != null)
         {
@@ -222,8 +259,16 @@ public sealed partial class HostSession : IAsyncDisposable
             _transport.OnFileData -= HandleFileDataBinary;
             _transport.OnFileSignalingMessage -= HandleFileChannelMessage;
             _transport.OnConnectionStateChanged -= HandleTransportStateChanged;
+            var txSw = System.Diagnostics.Stopwatch.StartNew();
             await _transport.DisposeAsync();
+            txSw.Stop();
+            _logger.LogInformation("HostSession.Dispose: transport disposed in {Elapsed}ms",
+                txSw.ElapsedMilliseconds);
             _transport = null;
         }
+
+        totalSw.Stop();
+        _logger.LogInformation("HostSession.Dispose: TOTAL {Elapsed}ms",
+            totalSw.ElapsedMilliseconds);
     }
 }

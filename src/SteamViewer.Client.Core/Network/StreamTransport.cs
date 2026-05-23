@@ -26,6 +26,10 @@ namespace SteamViewer.Client.Core.Network;
 public abstract class StreamTransport : IAsyncDisposable
 {
     protected readonly ILogger _logger;
+    // Per-instance short ID for log correlation. Generated at construction; constant for the
+    // lifetime of this transport. Lets log lines from the same instance be grouped under a
+    // single grep query and makes leaked-instance log streams identifiable.
+    protected readonly string _instanceId = Guid.NewGuid().ToString("N").Substring(0, 8);
     protected ITransportBackend? _backend;
     protected TransportEncryption? _encryption;
     protected CancellationTokenSource? _cts;
@@ -83,7 +87,7 @@ public abstract class StreamTransport : IAsyncDisposable
     /// <summary>Connection quality monitor - active only when on UDP transport.</summary>
     public ConnectionQualityMonitor? QualityMonitor => _qualityMonitor;
     protected ConnectionQualityMonitor? _qualityMonitor;
-    private Timer? _qualityUpdateTimer;
+    private Task? _qualityMonitorTask;
 
     protected StreamTransport(ILogger logger)
     {
@@ -435,35 +439,67 @@ public abstract class StreamTransport : IAsyncDisposable
     /// <summary>
     /// Start the connection quality monitor. Called after switching to UDP backend.
     /// Feeds loss rate from UdpTransportBackend every 10 seconds.
+    ///
+    /// Migrated from System.Threading.Timer to PeriodicTimer bound to _cts.Token
+    /// so cancellation is deterministic: when _cts cancels (DisposeAsync), the loop
+    /// exits via OperationCanceledException rather than relying on the BCL TimerQueue
+    /// holding a root to the captured backend closure (which could keep the transport
+    /// alive after disposal if a Dispose call was missed elsewhere).
     /// </summary>
     protected void StartQualityMonitor(UdpTransportBackend udpBackend, TimeSpan? probeRtt)
     {
-        _qualityMonitor = new ConnectionQualityMonitor(_logger);
+        _qualityMonitor = new ConnectionQualityMonitor(_logger, _instanceId);
         _qualityMonitor.OnQualityChanged += q => OnConnectionQualityChanged?.Invoke(q);
         if (probeRtt.HasValue)
             _qualityMonitor.RecordProbeRtt(probeRtt.Value);
 
-        _qualityUpdateTimer = new Timer(_ =>
-        {
-            if (_disposed || !_connected) return;
-            try
-            {
-                var (lossRate, messageCount) = udpBackend.GetAndResetLossStats();
-                _qualityMonitor.Update(lossRate, messageCount);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogDebug(ex, "Quality monitor update failed");
-            }
-        }, null, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(10));
+        var ct = _cts?.Token ?? CancellationToken.None;
+        _qualityMonitorTask = Task.Run(() => QualityMonitorLoopAsync(udpBackend, ct), ct);
 
-        _logger.LogInformation("[TRANSPORT] Connection quality monitor started (10s interval)");
+        _logger.LogInformation("[T:{InstanceId}] Connection quality monitor started (10s interval, PeriodicTimer bound to _cts)", _instanceId);
+    }
+
+    private async Task QualityMonitorLoopAsync(UdpTransportBackend udpBackend, CancellationToken ct)
+    {
+        _logger.LogDebug("[T:{InstanceId}] Quality monitor loop entered", _instanceId);
+        try
+        {
+            using var timer = new PeriodicTimer(TimeSpan.FromSeconds(10));
+            while (await timer.WaitForNextTickAsync(ct))
+            {
+                if (_disposed || !_connected)
+                {
+                    _logger.LogDebug("[T:{InstanceId}] Quality monitor tick guard fired: disposed={Disposed} connected={Connected} - exiting loop",
+                        _instanceId, _disposed, _connected);
+                    return;
+                }
+                try
+                {
+                    var (lossRate, messageCount) = udpBackend.GetAndResetLossStats();
+                    _qualityMonitor?.Update(lossRate, messageCount);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "[T:{InstanceId}] Quality monitor update failed", _instanceId);
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogDebug("[T:{InstanceId}] Quality monitor loop cancelled cleanly via _cts", _instanceId);
+        }
+        finally
+        {
+            _logger.LogDebug("[T:{InstanceId}] Quality monitor loop exited", _instanceId);
+        }
     }
 
     private void StopQualityMonitor()
     {
-        _qualityUpdateTimer?.Dispose();
-        _qualityUpdateTimer = null;
+        // Cancellation handled deterministically by _cts.Cancel() in DisposeAsync,
+        // which causes PeriodicTimer.WaitForNextTickAsync to throw OperationCanceledException
+        // and exit QualityMonitorLoopAsync. The task is awaited at the end of DisposeAsync.
+        // Here we just null out the monitor reference so any in-flight tick sees null and skips.
         _qualityMonitor = null;
     }
 
@@ -575,6 +611,9 @@ public abstract class StreamTransport : IAsyncDisposable
         _cts?.Cancel();
         _videoSendQueue.Writer.TryComplete();
 
+        // Wait for quality monitor loop to finish (cancelled via _cts)
+        if (_qualityMonitorTask != null) try { await _qualityMonitorTask; } catch { }
+
         // Wait for video send loop to finish
         if (_videoSendTask != null) try { await _videoSendTask; } catch { }
 
@@ -584,6 +623,6 @@ public abstract class StreamTransport : IAsyncDisposable
         _cts?.Dispose();
         _sendLock.Dispose();
 
-        _logger.LogInformation("StreamTransport disposed");
+        _logger.LogInformation("[T:{InstanceId}] StreamTransport disposed", _instanceId);
     }
 }

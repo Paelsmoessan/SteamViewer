@@ -237,6 +237,7 @@ public sealed class SignalingHandler
             SignalingMessage.SdpAnswer answer => HandleSdpAnswer(answer, currentClientId),
             SignalingMessage.IceCandidate candidate => HandleIceCandidate(candidate, currentClientId),
             SignalingMessage.Disconnect disconnect => HandleDisconnect(disconnect, currentClientId),
+            SignalingMessage.HostRecovered hostRecovered => HandleHostRecovered(hostRecovered, currentClientId),
             SignalingMessage.TransportEndpoint endpoint => HandleTransportEndpoint(endpoint, currentClientId),
             SignalingMessage.RelayReady relayReady => HandleRelayReady(relayReady, currentClientId),
             SignalingMessage.TransportConfirmed confirmed => HandleTransportConfirmed(confirmed, currentClientId),
@@ -425,6 +426,17 @@ public sealed class SignalingHandler
         _logger.LogInformation("Disconnect between {FromId} and {PeerId}", fromId, disconnect.PeerId);
         return null;
     }
+
+    /// <summary>
+    /// Host sends this after its SIG-RECONNECT succeeds so its previously-paired viewer can
+    /// cancel a grace timer started by the stale-WS prune-driven Disconnected. Pure forward;
+    /// server stamps FromId so the viewer knows which host recovered. No registry mutation -
+    /// the host re-registers separately, and the viewer's own peer mapping is intact.
+    /// </summary>
+    private SignalingMessage? HandleHostRecovered(SignalingMessage.HostRecovered hostRecovered, string? fromId)
+        => ForwardToTarget(fromId, hostRecovered.TargetId,
+            from => new SignalingMessage.HostRecovered(hostRecovered.TargetId, from),
+            "Host recovered");
 
     private SignalingMessage? HandleTransportEndpoint(SignalingMessage.TransportEndpoint endpoint, string? fromId)
         // Label embeds candidate count so the existing diagnostic detail isn't lost in the simpler helper log format.

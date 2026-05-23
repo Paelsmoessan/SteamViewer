@@ -179,167 +179,12 @@ public static partial class SystemHelperServer
 
             DebugLog("Authentication succeeded. Starting video pipe and Secure Desktop capture...");
 
-            // Create video pipe for binary BGRA frames (server -> client, outbound only)
-            var videoPipeName = $"{pipeName}_video";
-            var videoPipeSecurity = PipeAcl.ForUserSid(userSid);
+            StartVideoPipe(pipeName, userSid, expectedClientPid);
 
-            _videoPipeServer = NamedPipeServerStreamAcl.Create(
-                videoPipeName,
-                PipeDirection.Out,
-                1,
-                PipeTransmissionMode.Byte,
-                PipeOptions.None,
-                0, 0,
-                videoPipeSecurity);
-
-            DebugLog($"Video pipe created: {videoPipeName}. Waiting for client (non-blocking)...");
-
-            // Create Secure Desktop capture and subscribe events (before thread starts)
-            _capture = new SecureDesktopCapture();
-            _capture.OnSecureDesktopActive += OnCaptureSecureDesktopActive;
-            _capture.OnSecureDesktopInactive += OnCaptureSecureDesktopInactive;
-            _capture.OnFrameCaptured += OnCaptureFrameCaptured;
-
-            // Wait for video pipe connection on a background thread (non-blocking).
-            // The client connects AFTER control pipe auth+ping, so we must not block the main thread
-            // or the command loop won't be able to process the ping and the client will never
-            // reach ConnectVideoPipeAsync().
-            // Capture starts AFTER pipe connects to avoid dropping frames.
-            var videoConnectThread = new Thread(() =>
-            {
-                try
-                {
-                    _videoPipeServer.WaitForConnection();
-
-                    // Verify client PID matches the expected admin helper.
-                    if (!PipeAuth.TryGetClientProcessId(_videoPipeServer, out var videoClientPid)
-                        || videoClientPid != expectedClientPid)
-                    {
-                        DebugLog($"Video pipe: client PID {videoClientPid} != expected {expectedClientPid}. Refusing.");
-                        try { _videoPipeServer.Disconnect(); } catch { }
-                        return;
-                    }
-
-                    lock (_videoWriteLock)
-                    {
-                        _videoWriter = new BinaryWriter(_videoPipeServer);
-                        _videoConnected = true;
-                    }
-                    DebugLog($"Video pipe client connected (PID {videoClientPid})");
-
-                    // Start capture AFTER pipe is connected — frames go directly to pipe
-                    _capture.Start();
-                    DebugLog("Secure Desktop capture started");
-                }
-                catch (Exception ex)
-                {
-                    DebugLog($"Video pipe WaitForConnection error: {ex.Message}");
-                }
-            })
-            {
-                Name = "VideoPipeConnect",
-                IsBackground = true
-            };
-            videoConnectThread.Start();
-
-            // Create notify pipe for server-push notifications (server → client, outbound only)
-            var notifyPipeName = $"{pipeName}_notify";
-            var notifyPipeSecurity = PipeAcl.ForUserSid(userSid);
-
-            _notifyPipeServer = NamedPipeServerStreamAcl.Create(
-                notifyPipeName,
-                PipeDirection.Out,
-                1,
-                PipeTransmissionMode.Byte,
-                PipeOptions.None,
-                0, 0,
-                notifyPipeSecurity);
-
-            DebugLog($"Notify pipe created: {notifyPipeName}. Waiting for client (non-blocking)...");
-
-            var notifyConnectThread = new Thread(() =>
-            {
-                try
-                {
-                    _notifyPipeServer.WaitForConnection();
-
-                    // Verify client PID matches the expected admin helper.
-                    if (!PipeAuth.TryGetClientProcessId(_notifyPipeServer, out var notifyClientPid)
-                        || notifyClientPid != expectedClientPid)
-                    {
-                        DebugLog($"Notify pipe: client PID {notifyClientPid} != expected {expectedClientPid}. Refusing.");
-                        try { _notifyPipeServer.Disconnect(); } catch { }
-                        return;
-                    }
-
-                    lock (_notifyWriteLock)
-                    {
-                        _notifyWriter = new StreamWriter(_notifyPipeServer, PipeEncoding) { AutoFlush = true };
-                        _notifyConnected = true;
-                    }
-                    DebugLog($"Notify pipe client connected (PID {notifyClientPid})");
-                }
-                catch (Exception ex)
-                {
-                    DebugLog($"Notify pipe WaitForConnection error: {ex.Message}");
-                }
-            })
-            {
-                Name = "NotifyPipeConnect",
-                IsBackground = true
-            };
-            notifyConnectThread.Start();
+            StartNotifyPipe(pipeName, userSid, expectedClientPid);
 
             DebugLog("Processing commands...");
-
-            while (pipeServer.IsConnected)
-            {
-                string? line;
-                try
-                {
-                    line = reader.ReadLine();
-                }
-                catch (IOException ex)
-                {
-                    DebugLog($"Pipe read error (client disconnected?): {ex.Message}");
-                    break;
-                }
-                catch (Exception ex)
-                {
-                    DebugLog($"Unexpected read error: {ex}");
-                    break;
-                }
-
-                if (line == null)
-                {
-                    DebugLog("Client closed connection (null read).");
-                    break;
-                }
-
-                if (line.Length < 200) // Don't log full input events (noisy)
-                    DebugLog($"Received: {line}");
-
-                try
-                {
-                    var response = HandleCommand(line);
-                    if (response != null)
-                    {
-                        DebugLog($"Sending: {response}");
-                        writer.WriteLine(response);
-                    }
-                }
-                catch (IOException ex)
-                {
-                    DebugLog($"Pipe write error (broken pipe): {ex.Message}");
-                    break;
-                }
-                catch (Exception ex)
-                {
-                    DebugLog($"Command error: {ex.Message}");
-                    var errorResponse = JsonSerializer.Serialize(new HelperResponse(false, ex.Message));
-                    try { writer.WriteLine(errorResponse); } catch { break; }
-                }
-            }
+            RunCommandLoop(pipeServer, reader, writer);
 
             // Cleanup
             DebugLog("Client disconnected. Cleaning up...");
@@ -362,6 +207,62 @@ public static partial class SystemHelperServer
             CleanupVideoPipe();
             CleanupNotifyPipe();
         }
+    }
+
+    private static void RunCommandLoop(NamedPipeServerStream pipeServer, StreamReader reader, StreamWriter writer)
+    {
+        DebugLog($"RunCommandLoop entry: pipeServer.IsConnected={pipeServer.IsConnected}");
+        var commandCount = 0;
+        while (pipeServer.IsConnected)
+        {
+            string? line;
+            try
+            {
+                line = reader.ReadLine();
+            }
+            catch (IOException ex)
+            {
+                DebugLog($"Pipe read error (client disconnected?): {ex.Message}");
+                break;
+            }
+            catch (Exception ex)
+            {
+                DebugLog($"Unexpected read error: {ex}");
+                break;
+            }
+
+            if (line == null)
+            {
+                DebugLog("Client closed connection (null read).");
+                break;
+            }
+
+            if (line.Length < 200) // Don't log full input events (noisy)
+                DebugLog($"Received: {line}");
+            commandCount++;
+
+            try
+            {
+                var response = HandleCommand(line);
+                if (response != null)
+                {
+                    DebugLog($"Sending: {response}");
+                    writer.WriteLine(response);
+                }
+            }
+            catch (IOException ex)
+            {
+                DebugLog($"Pipe write error (broken pipe): {ex.Message}");
+                break;
+            }
+            catch (Exception ex)
+            {
+                DebugLog($"Command error: {ex.Message}");
+                var errorResponse = JsonSerializer.Serialize(new HelperResponse(false, ex.Message));
+                try { writer.WriteLine(errorResponse); } catch { break; }
+            }
+        }
+        DebugLog($"RunCommandLoop exit: processed {commandCount} command(s), pipeServer.IsConnected={pipeServer.IsConnected}");
     }
 
     private static string? HandleCommand(string json)

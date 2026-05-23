@@ -71,36 +71,8 @@ public sealed class ViewerStreamTransport : StreamTransport
             await _udpBackend.InitializeAsync(turnServerUri, turnUsername, turnCredential);
 
             // Gather candidates: local IPs (host) + reflexive (srflx) + TURN relay
-            var candidates = new List<TransportCandidate>();
-            var localPort = _udpBackend.LocalEndPoint?.Port ?? 0;
+            var candidates = BuildLocalCandidates();
 
-            // Local IPs — each uses the local socket port
-            try
-            {
-                var host = Dns.GetHostEntry(Dns.GetHostName());
-                foreach (var ip in host.AddressList)
-                {
-                    if (ip.AddressFamily == AddressFamily.InterNetwork && localPort > 0)
-                        candidates.Add(new TransportCandidate(ip.ToString(), localPort, "host"));
-                }
-            }
-            catch { }
-
-            // Reflexive endpoint from STUN — uses the NAT-mapped port
-            if (_udpBackend.ReflexiveEndPoint != null)
-                candidates.Add(new TransportCandidate(
-                    _udpBackend.ReflexiveEndPoint.Address.ToString(),
-                    _udpBackend.ReflexiveEndPoint.Port,
-                    "srflx"));
-
-            // TURN relay endpoint
-            if (_udpBackend.TurnRelayEndPoint != null)
-                candidates.Add(new TransportCandidate(
-                    _udpBackend.TurnRelayEndPoint.Address.ToString(),
-                    _udpBackend.TurnRelayEndPoint.Port,
-                    "relay"));
-
-            // Send our candidates to host
             if (candidates.Count > 0)
             {
                 await sendSignaling(new SignalingMessage.TransportEndpoint(peerId, candidates.ToArray()));
@@ -122,6 +94,45 @@ public sealed class ViewerStreamTransport : StreamTransport
                 _udpBackend = null;
             }
         }
+    }
+
+    /// <summary>
+    /// Collect this side's UDP candidates (local IPs at the bound port, reflexive
+    /// via STUN, TURN relay if configured) into the order the peer side expects.
+    /// Caller is responsible for non-null _udpBackend (assigned just before).
+    /// </summary>
+    private List<TransportCandidate> BuildLocalCandidates()
+    {
+        _logger.LogDebug("[T:{InstanceId}] BuildLocalCandidates entry: localPort={LocalPort}, reflexive={Reflexive}, turnRelay={TurnRelay}",
+            _instanceId, _udpBackend!.LocalEndPoint?.Port ?? 0, _udpBackend.ReflexiveEndPoint?.ToString() ?? "null", _udpBackend.TurnRelayEndPoint?.ToString() ?? "null");
+        var candidates = new List<TransportCandidate>();
+        var localPort = _udpBackend.LocalEndPoint?.Port ?? 0;
+
+        try
+        {
+            var host = Dns.GetHostEntry(Dns.GetHostName());
+            foreach (var ip in host.AddressList)
+            {
+                if (ip.AddressFamily == AddressFamily.InterNetwork && localPort > 0)
+                    candidates.Add(new TransportCandidate(ip.ToString(), localPort, "host"));
+            }
+        }
+        catch { }
+
+        if (_udpBackend.ReflexiveEndPoint != null)
+            candidates.Add(new TransportCandidate(
+                _udpBackend.ReflexiveEndPoint.Address.ToString(),
+                _udpBackend.ReflexiveEndPoint.Port,
+                "srflx"));
+
+        if (_udpBackend.TurnRelayEndPoint != null)
+            candidates.Add(new TransportCandidate(
+                _udpBackend.TurnRelayEndPoint.Address.ToString(),
+                _udpBackend.TurnRelayEndPoint.Port,
+                "relay"));
+
+        _logger.LogDebug("[T:{InstanceId}] BuildLocalCandidates exit: {Count} candidate(s) collected", _instanceId, candidates.Count);
+        return candidates;
     }
 
     /// <summary>
@@ -237,12 +248,25 @@ public sealed class ViewerStreamTransport : StreamTransport
                 }
             }
 
+            // After 5 retries (15s) without incoming TransportConfirmed: our OUTGOING send
+            // worked (we sent 6 copies of it) but the host's response never reached us.
+            // Smoke 2026-05-23 11:44 captured this: host upgraded to UDP, disposed its relay
+            // 10s later, viewer was stuck on relay with no incoming video. The OUTGOING-only
+            // retry loop did nothing for that case.
+            //
+            // Defense-in-depth: if our LOCAL UDP probe succeeded (_localUdpReady=true) and
+            // we've tried 6 times to coordinate, assume the host has switched (the missing
+            // confirmation is most likely a Railway routing drop during HostRecovered re-pair,
+            // not a true asymmetric NAT). Promote to UDP backend anyway. Symmetric to the
+            // host's behavior - if both sides ack'd UDP locally, the bilateral coordination is
+            // just an artifact.
+            // Risk mitigation: gated on _localUdpReady so we only promote if our own probe
+            // actually succeeded. If our probe didn't reach the host, we still tear down here.
             if (_localUdpReady && !_remoteUdpReady && _pendingUdpBackend != null)
             {
-                _logger.LogWarning("Viewer: peer did not confirm UDP within 15s — staying on relay");
-                _pendingUdpBackend.OnDataReceived -= HandleDataReceived;
-                _localUdpReady = false;
-                _pendingUdpBackend = null;
+                _logger.LogWarning("Viewer: peer did not confirm UDP within 15s but local probe succeeded - promoting to UDP backend anyway (defense-in-depth for HostRecovered re-pair signaling drop)");
+                _remoteUdpReady = true;
+                await TryCompleteSwitchAsync();
             }
         });
     }

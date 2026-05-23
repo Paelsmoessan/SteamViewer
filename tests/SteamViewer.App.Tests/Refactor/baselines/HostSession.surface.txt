@@ -6,8 +6,10 @@
 
 ctor:     .ctor(String peerId, IJSRuntime jsRuntime, ILoggerFactory loggerFactory, IInputInjector inputInjector, IConfiguration configuration, Func<SignalingMessage, Task> sendSignaling, SignalingClient signalingClient, IElevationService elevationService, IMonitorEnumerator monitorEnumerator, IScreenCapture screenCapture, NativeFrameBridge frameBridge, TurnConfigService turnConfigService, String hostClientId, String hostPasswordHash)
 event:    Action OnReady
+event:    Action<Boolean> OnLocalSharingChanged
 event:    Action<Boolean> OnPeerSharingChanged
 event:    Action<HostSessionState> OnStateChanged
+event:    Action<String> OnClientDisconnecting
 event:    Action<String> OnDisconnected
 method:   IElevationService DetachElevationService()
 method:   Task DisconnectAsync()

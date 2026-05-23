@@ -1,5 +1,87 @@
 # Changelog
 
+## v0.2.9-alpha (2026-05-23)
+
+### Reconnect quality sweep + host security cooldown
+
+A full pass through the reconnect-on-network-outage code path. Recovery is now
+deterministic up to ~2 minutes of wifi loss on either side; longer outages
+tear down cleanly and require fresh consent. Closes a security hole where
+preserved elevation could be auto-accepted indefinitely after a viewer
+disappeared.
+
+#### Reconnect recovery
+
+- **Host wifi cycles up to ~2 minutes now recover automatically.** Viewer
+  preserves the session through the outage; when host's signaling
+  reconnects, a `host_recovered` handshake re-pairs the session and video
+  resumes without manual intervention or window churn.
+- **SIG-RECONNECT backoff capped at 10s** (was 30s). Recovery latency on
+  long-tail attempts dropped from ~140s to ~50s for the typical
+  multi-minute outage case.
+- **Skip-grace logic discriminates by session state** so the 5-second
+  grace timer (intended for Railway's stale-WS prune false-positive) no
+  longer kills in-flight reconnects when transport is already dead.
+  Tracked per-epoch so atomic-swap reconnect attempts no longer fool the
+  guard.
+- **Viewer-side 120-second max-outage timer.** After 2 minutes of no
+  recovery the session tears down cleanly and the viewer window closes —
+  user can manually reconnect from Home with fresh state.
+- **Asymmetric UDP switch defense.** When a `TransportConfirmed` ack from
+  the peer is dropped during re-pair (rare but observed), the viewer now
+  promotes to the UDP backend after 15s of retries instead of staying
+  stuck on the relay that the host has already disposed.
+- **Encoder init defer (kills green blobs on auto-share-reconnect).** The
+  first encoder initialization waits up to 500ms for the viewer's desired
+  resolution before falling back to capture-native. Eliminates the
+  double-IDR-burst race that produced ~1 second of green corruption on
+  reconnect.
+
+#### Security cooldown (Bug G)
+
+- **Host-side 120-second preserved-elevation timeout.** Pre-fix, host
+  kept `_preservedElevationService` and `_isReconnect=true` indefinitely
+  after a viewer disappeared. Any subsequent IncomingConnection from the
+  same clientId would auto-accept with admin enabled and no password
+  prompt — an unbounded security window. Post-fix, after 2 minutes the
+  elevation is disposed and the flags are cleared. The next connection
+  requires fresh password + fresh elevation request, matching the
+  initial-consent flow.
+
+#### Internal
+
+- **Session-epoch versioning** for stale-callback guards. Atomic-swap
+  reconnect and remove-session both bump a per-session epoch; timer and
+  signal handlers capture the epoch and no-op if it has moved on.
+  Eliminates the race surface where stale callbacks were acting on a
+  replaced session.
+- **`HostRecovered` re-pair message** sent from host's SIG-RECONNECT
+  success to its previously-paired peer, so the viewer can suppress its
+  grace-timer-driven removal triggered by the Railway stale-WS prune.
+- **TryReconnect skip-if-Connected guard.** If the retry timer expires
+  on a session that has already reached Connected (typically via
+  `host_recovered` re-pair), the retry no-ops instead of triggering
+  another atomic-swap that would destroy the working transport.
+- **Reconnect overlay stays visible** with attempt counter and
+  countdown until the first frame actually arrives (previously hid on
+  dispatch, leaving the user without progress feedback).
+- **Helper shutdown noise removed.** Closed-pipe / ObjectDisposed race
+  during the SYSTEM/Admin helper exit handshake is expected and now
+  silently caught; "state may be inconsistent" warning gone in clean
+  shutdown.
+
+### Refactor
+
+- **`DxgiScreenCapture` split into 4 partial-class files**
+  (`Init` / `Frame` / `Cursor` / `Capture`). Original was 1100+ lines;
+  each partial is now under 300 LoC with a focused concern.
+- **`SystemHelperServer` split into 3 partial-class files**
+  (`Input` / `Capture` + core). Similar size reduction.
+- **MAUI window-close hook fires `HostSessionManager.DisposeAsync`**
+  before signaling teardown so the host's `host_disconnecting` control
+  message reaches the viewer through the data channel, allowing the
+  viewer to close cleanly instead of waiting for Railway's pruning.
+
 ## v0.2.8-alpha (2026-05-17)
 
 ### Clipboard reliability + viewer→host text auto-push

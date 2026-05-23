@@ -310,17 +310,25 @@ public sealed class WindowsElevationService : IElevationService
         if (_disposed) return;
         _disposed = true;
 
+        // Each helper dispose is wrapped so a throw on one doesn't skip the other.
+        // Pre-fix: if SystemHelper threw during ShutdownAsync's pipe-cleanup race, the
+        // AdminHelper disposal was skipped entirely (process leak risk). Post-fix: both
+        // get a clean dispose attempt regardless. The inner helpers already demote the
+        // expected closed-pipe race to Debug; this outer try/catch only fires on
+        // genuinely unexpected failures.
         if (_systemHelper != null)
         {
             UnsubscribeSystemHelper();
-            await _systemHelper.DisposeAsync();
+            try { await _systemHelper.DisposeAsync(); }
+            catch (Exception ex) { _logger.LogWarning(ex, "SystemHelper dispose threw - continuing to admin helper"); }
             _systemHelper = null;
             OnSystemStateChanged?.Invoke(false);
         }
 
         if (_adminHelper != null)
         {
-            await _adminHelper.DisposeAsync();
+            try { await _adminHelper.DisposeAsync(); }
+            catch (Exception ex) { _logger.LogWarning(ex, "AdminHelper dispose threw"); }
             _adminHelper = null;
             OnAdminStateChanged?.Invoke(false);
         }

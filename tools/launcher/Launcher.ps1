@@ -5,8 +5,8 @@ $ErrorActionPreference = "Stop"
 $appDir = "$env:APPDATA\SteamViewer"
 $serverExe = "$appDir\SteamViewer.Server.exe"
 $versionFile = "$appDir\version.txt"
-$repoOwner = "Jeyloh"  # TODO: Update to your GitHub username
-$repoName = "SteamViewer.NET"
+$repoOwner = "Paelsmoessan"
+$repoName = "SteamViewer"
 
 function Write-Status {
     param([string]$Message)

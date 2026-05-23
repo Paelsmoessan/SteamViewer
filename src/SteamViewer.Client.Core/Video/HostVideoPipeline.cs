@@ -65,6 +65,17 @@ public sealed class HostVideoPipeline : IDisposable
     // Deferred ForceKeyframe: set when SetTransport fires before encoder exists
     private bool _pendingForceKeyframe;
 
+    // Defer first encoder init for up to FirstFrameDeferMs waiting for viewer's setResolution.
+    // Closes the green-blob race on auto-share-on-reconnect: encoder used to init at
+    // capture-native (1920x1080), emit IDR, then re-init at viewer-desired (1264x712), emit
+    // second IDR with reference buffers that don't match the new resolution → ~0.5-1s of
+    // green corruption visible to the user. The deferral waits a short window for
+    // setResolution to land before init, eliminating the second IDR in the common case.
+    // First-connect path is unaffected because setResolution typically arrives within a
+    // single round-trip (<100ms LAN, <200ms WAN) — under the 500ms deadline.
+    private Stopwatch? _firstFrameDeferSw;
+    private const int FirstFrameDeferMs = 500;
+
     // Frame rate adaptation for constrained connections
     private long _dxgiFrameCounter;
     private ConnectionQuality _lastQuality = ConnectionQuality.Unknown;
@@ -384,6 +395,32 @@ public sealed class HostVideoPipeline : IDisposable
         }
     }
 
+    /// <summary>
+    /// True if the caller should SKIP this frame and wait for setResolution. False if either
+    /// the deferral window has elapsed (init at capture-native) OR a pending resolution has
+    /// already arrived (init at that resolution). SD bypasses the deferral entirely.
+    /// </summary>
+    private bool ShouldDeferEncoderInit(bool isSecureDesktop, int width, int height)
+    {
+        if (isSecureDesktop) return false;
+        if (_pendingResW > 0 || _pendingResH > 0) return false;
+
+        if (_firstFrameDeferSw == null)
+        {
+            _firstFrameDeferSw = Stopwatch.StartNew();
+            _logger.LogDebug("Encoder init deferred up to {Ms}ms waiting for viewer setResolution (first frame {W}x{H})",
+                FirstFrameDeferMs, width, height);
+            return true;
+        }
+        if (_firstFrameDeferSw.ElapsedMilliseconds < FirstFrameDeferMs)
+        {
+            return true;
+        }
+        _logger.LogInformation("Encoder init defer window ({Ms}ms) elapsed without setResolution - initializing at capture-native {W}x{H}",
+            FirstFrameDeferMs, width, height);
+        return false;
+    }
+
     /// <summary>Reset the encode-info tracking so the next frame re-sends dimensions to viewer.</summary>
     public void ResetEncodeInfo()
     {
@@ -401,9 +438,15 @@ public sealed class HostVideoPipeline : IDisposable
         {
             try
             {
-                // Lazy-init encoder on first frame (need real dimensions)
+                // Lazy-init encoder on first frame (need real dimensions). May defer briefly
+                // waiting for viewer's setResolution to skip the green-blob race.
                 if (_encoder == null)
                 {
+                    if (ShouldDeferEncoderInit(isSecureDesktop, width, height))
+                    {
+                        return;
+                    }
+
                     if (isSecureDesktop)
                         _logger.LogInformation("SD: encoder is null, initializing for {W}x{H}", width, height);
 

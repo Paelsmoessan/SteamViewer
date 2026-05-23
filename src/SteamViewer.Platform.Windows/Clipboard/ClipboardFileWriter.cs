@@ -102,10 +102,12 @@ public sealed class ClipboardFileWriter : IDisposable
         {
             PostMessage(_hwnd, WM_QUIT, IntPtr.Zero, IntPtr.Zero);
         }
-        _staThread?.Join(3000);
+        var joined = _staThread?.Join(3000) ?? true;
+        if (!joined)
+            _logger.LogWarning("ClipboardFileWriter: STA thread did not exit within 3000ms - window class / OLE uninit may be skipped");
         _staThread = null;
         _hwnd = IntPtr.Zero;
-        _logger.LogInformation("ClipboardFileWriter STA thread stopped");
+        _logger.LogInformation("ClipboardFileWriter STA thread stopped (joined={Joined})", joined);
     }
 
     /// <summary>

@@ -82,36 +82,8 @@ public sealed class HostStreamTransport : StreamTransport
             await _udpBackend.InitializeAsync(turnServerUri, turnUsername, turnCredential);
 
             // Gather candidates: local IPs (host) + reflexive (srflx) + TURN relay
-            var candidates = new List<TransportCandidate>();
-            var localPort = _udpBackend.LocalEndPoint?.Port ?? 0;
+            var candidates = BuildLocalCandidates();
 
-            // Local IPs — each uses the local socket port
-            try
-            {
-                var host = Dns.GetHostEntry(Dns.GetHostName());
-                foreach (var ip in host.AddressList)
-                {
-                    if (ip.AddressFamily == AddressFamily.InterNetwork && localPort > 0)
-                        candidates.Add(new TransportCandidate(ip.ToString(), localPort, "host"));
-                }
-            }
-            catch { }
-
-            // Reflexive endpoint from STUN — uses the NAT-mapped port
-            if (_udpBackend.ReflexiveEndPoint != null)
-                candidates.Add(new TransportCandidate(
-                    _udpBackend.ReflexiveEndPoint.Address.ToString(),
-                    _udpBackend.ReflexiveEndPoint.Port,
-                    "srflx"));
-
-            // TURN relay endpoint
-            if (_udpBackend.TurnRelayEndPoint != null)
-                candidates.Add(new TransportCandidate(
-                    _udpBackend.TurnRelayEndPoint.Address.ToString(),
-                    _udpBackend.TurnRelayEndPoint.Port,
-                    "relay"));
-
-            // Send TransportEndpoint to viewer with per-candidate (ip, port, type)
             if (candidates.Count > 0)
             {
                 await sendSignaling(new SignalingMessage.TransportEndpoint(peerId, candidates.ToArray()));
@@ -133,6 +105,45 @@ public sealed class HostStreamTransport : StreamTransport
                 _udpBackend = null;
             }
         }
+    }
+
+    /// <summary>
+    /// Collect this side's UDP candidates (local IPs at the bound port, reflexive
+    /// via STUN, TURN relay if configured) into the order the peer side expects.
+    /// Caller is responsible for non-null _udpBackend (assigned just before).
+    /// </summary>
+    private List<TransportCandidate> BuildLocalCandidates()
+    {
+        _logger.LogDebug("[T:{InstanceId}] BuildLocalCandidates entry: localPort={LocalPort}, reflexive={Reflexive}, turnRelay={TurnRelay}",
+            _instanceId, _udpBackend!.LocalEndPoint?.Port ?? 0, _udpBackend.ReflexiveEndPoint?.ToString() ?? "null", _udpBackend.TurnRelayEndPoint?.ToString() ?? "null");
+        var candidates = new List<TransportCandidate>();
+        var localPort = _udpBackend.LocalEndPoint?.Port ?? 0;
+
+        try
+        {
+            var host = Dns.GetHostEntry(Dns.GetHostName());
+            foreach (var ip in host.AddressList)
+            {
+                if (ip.AddressFamily == AddressFamily.InterNetwork && localPort > 0)
+                    candidates.Add(new TransportCandidate(ip.ToString(), localPort, "host"));
+            }
+        }
+        catch { }
+
+        if (_udpBackend.ReflexiveEndPoint != null)
+            candidates.Add(new TransportCandidate(
+                _udpBackend.ReflexiveEndPoint.Address.ToString(),
+                _udpBackend.ReflexiveEndPoint.Port,
+                "srflx"));
+
+        if (_udpBackend.TurnRelayEndPoint != null)
+            candidates.Add(new TransportCandidate(
+                _udpBackend.TurnRelayEndPoint.Address.ToString(),
+                _udpBackend.TurnRelayEndPoint.Port,
+                "relay"));
+
+        _logger.LogDebug("[T:{InstanceId}] BuildLocalCandidates exit: {Count} candidate(s) collected", _instanceId, candidates.Count);
+        return candidates;
     }
 
     /// <summary>

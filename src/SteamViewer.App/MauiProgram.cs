@@ -106,11 +106,19 @@ public static class MauiProgram
         // Store service provider for App to access
         ServiceProvider = app.Services;
 
-        // Ensure signaling disconnect on app exit (window close kills process before Blazor DisposeAsync completes)
+        // Ensure signaling disconnect on app exit (window close kills process before Blazor DisposeAsync completes).
+        // Order matters: HostSessionManager.DisposeAsync sends host_disconnecting via the data channel
+        // BEFORE the signaling Disconnect (so the viewer can identify the close as graceful and skip the
+        // reconnect overlay). It must run BEFORE SignalingClient.DisposeAsync tears down the WS - and
+        // viewer-side cleanup can run in parallel. Closes TODO §5 P1 "MAUI host window-close doesn't
+        // reach host_disconnecting send sites" (today's earlier fix-host-disconnect-handshake branch
+        // wired the send but the only paths to it were never reached on a normal window-X close).
         AppDomain.CurrentDomain.ProcessExit += (_, _) =>
         {
             try
             {
+                var hostSessionManager = ServiceProvider?.GetService<HostSessionManager>();
+                hostSessionManager?.DisposeAsync().AsTask().Wait(TimeSpan.FromSeconds(3));
                 var sessionManager = ServiceProvider?.GetService<ViewerSessionManager>();
                 sessionManager?.DisposeAsync().AsTask().Wait(TimeSpan.FromSeconds(3));
                 var signalingClient = ServiceProvider?.GetService<SignalingClient>();

@@ -279,6 +279,12 @@
     private int _reconnectCountdown;
     private System.Threading.Timer? _reconnectTimer;
     private int _reconnectAttempts;
+    // Set when the host sends a `host_disconnecting` control message (data-channel handshake
+    // mirror of viewer's `client_disconnecting`). When this is true and HandleSessionDisconnected
+    // fires from the subsequent transport-death, we SKIP ShowReconnectOverlay and let the
+    // natural OnSessionRemoved -> ViewerTabManager -> CloseWindow path close the viewer.
+    // Reset on every session-bind so a later legitimate transport-death case isn't suppressed.
+    private bool _peerGracefullyClosing;
     private bool _statsVisible;
     private bool _hostCursorVisible = false;
     private string? _statsText;
@@ -298,6 +304,12 @@
         // Subscribe to tab manager events
         TabManager.OnTabsChanged += HandleTabsChanged;
         TabManager.OnActiveTabChanged += HandleActiveTabChanged;
+
+        // ViewerSessionManager fires this when a session is rebuilt via ReconnectSessionAsync.
+        // The sessionId is unchanged but _activeSession now points at the OLD object - need
+        // to rebind to the new instance so stats / control messages keep flowing. Closes
+        // TODO §5 P1 "Stats overlay frozen after transport rebuild."
+        SessionManager.OnSessionReconnected += HandleSessionReconnected;
 
         RefreshTabs();
 
@@ -448,6 +460,7 @@
             var oldSessionId = _activeSession.SessionId;
             _activeSession.OnVideoStarted -= HandleVideoStarted;
             _activeSession.OnDisconnected -= HandleSessionDisconnected;
+            _activeSession.OnPeerDisconnecting -= HandlePeerDisconnecting;
             _activeSession.OnStatsUpdated -= HandleStatsUpdate;
             _activeSession.OnControlMessage -= HandleControlMessage;
             _activeSession.OnClipboardReceived -= HandleClipboardReceived;
@@ -464,6 +477,7 @@
         _showReconnectOverlay = false;
         _showSharingPaused = false;
         _secureDesktopActive = false;
+        _peerGracefullyClosing = false;
         _reconnectTimer?.Dispose();
         _reconnectTimer = null;
 
@@ -484,6 +498,7 @@
             {
                 _activeSession.OnVideoStarted += HandleVideoStarted;
                 _activeSession.OnDisconnected += HandleSessionDisconnected;
+                _activeSession.OnPeerDisconnecting += HandlePeerDisconnecting;
                 _activeSession.OnStatsUpdated += HandleStatsUpdate;
                 _activeSession.OnControlMessage += HandleControlMessage;
                 _activeSession.OnClipboardReceived += HandleClipboardReceived;
@@ -549,9 +564,104 @@
 
     private void HandleSessionDisconnected(string? reason)
     {
-        Logger.LogWarning("[RECONNECT-DIAG] HandleSessionDisconnected fired: reason={Reason}, activeSession={Session}, overlay={Overlay}",
-            reason, _activeSessionId, _showReconnectOverlay);
+        Logger.LogDebug("[RECONNECT-DIAG] HandleSessionDisconnected fired: reason={Reason}, activeSession={Session}, overlay={Overlay}, peerGraceful={Graceful}",
+            reason, _activeSessionId, _showReconnectOverlay, _peerGracefullyClosing);
+        // Skip the reconnect overlay if the host just told us via the data channel that it's
+        // gracefully closing (handshake from `host_disconnecting`). The natural OnSessionRemoved ->
+        // ViewerTabManager -> CloseWindow path will close this viewer cleanly. Without this check
+        // the overlay would flash and TryReconnect would chase a host that intentionally left.
+        if (_peerGracefullyClosing)
+        {
+            Logger.LogInformation("HandleSessionDisconnected: peerGracefullyClosing=true - suppressing reconnect overlay, letting OnSessionRemoved close the window");
+            return;
+        }
         ShowReconnectOverlay(reason);
+    }
+
+    private void HandlePeerDisconnecting(string reason)
+    {
+        Logger.LogInformation("HandlePeerDisconnecting fired: reason={Reason} - host sent host_disconnecting handshake; flagging session as graceful close so the subsequent OnDisconnected does NOT trigger the reconnect overlay",
+            reason);
+        _peerGracefullyClosing = true;
+    }
+
+    private void HandleSessionReconnected(string sessionId)
+    {
+        // Fires from ViewerSessionManager.ReconnectSessionAsync after the new ViewerSession
+        // is in place with the SAME sessionId. _activeSession (if it was this id) now points
+        // at the stale OLD object; rebind to the fresh one so events keep flowing AND the
+        // input router / JS bindings / canvas direct-render all repoint at the new session.
+        //
+        // First commit (Commit 3 in this batch) only rebound the event subscriptions and
+        // missed the input/JS/render plumbing. Smoke 2026-05-21 20:55 surfaced the regression:
+        // after adapter cycle the viewer kept the OLD JS state, OLD input router target, and
+        // OLD canvas binding -> all controls lost + stale frame on screen.
+        if (sessionId != _activeSessionId) return;
+
+        InvokeAsync(async () =>
+        {
+            Logger.LogInformation("HandleSessionReconnected: rebinding _activeSession + input router + JS bindings (sessionId={SessionId})", sessionId);
+
+            // Unsubscribe from the stale session reference (events on this object are now dangling).
+            if (_activeSession != null)
+            {
+                _activeSession.OnVideoStarted -= HandleVideoStarted;
+                _activeSession.OnDisconnected -= HandleSessionDisconnected;
+                _activeSession.OnPeerDisconnecting -= HandlePeerDisconnecting;
+                _activeSession.OnStatsUpdated -= HandleStatsUpdate;
+                _activeSession.OnControlMessage -= HandleControlMessage;
+                _activeSession.OnClipboardReceived -= HandleClipboardReceived;
+                _activeSession.OnSecureDesktopStateChanged -= HandleSecureDesktopStateChanged;
+                _activeSession.OnMonitorLayoutReceived -= HandleMonitorLayoutReceived;
+                _activeSession.OnCaptureInfoReceived -= HandleCaptureInfoReceived;
+                _activeSession.OnPeerSharingChanged -= HandlePeerSharingChanged;
+                if (_statsVisible) _ = _activeSession.DisableStatsRelayAsync();
+            }
+
+            // Tear down stale JS-side video state for this sessionId so BindAndEnableDirectRenderAsync
+            // below can re-initialize cleanly against the new ViewerSession's transport pipeline.
+            try { await JSRuntime.InvokeVoidAsync("SteamViewerVideo.dispose", sessionId); }
+            catch (Exception ex) { Logger.LogDebug(ex, "SteamViewerVideo.dispose during reconnect rebind failed (best effort)"); }
+
+            // Re-fetch from SessionManager and re-subscribe to the new instance.
+            _activeSession = SessionManager.GetSession(sessionId);
+#if WINDOWS
+            // Point Windows input router at the NEW session reference. Without this, mouse/keyboard
+            // events keep being routed at the disposed OLD session and silently drop.
+            _inputRouter?.SetActiveSession(_activeSession);
+#endif
+            // Tell JS-side input bridge about the active session id (no-op if already set, but
+            // mirrors HandleActiveTabChanged's behavior to be safe).
+            try { await JSRuntime.InvokeVoidAsync("SteamViewerInput.setActiveSession", sessionId); }
+            catch (Exception ex) { Logger.LogDebug(ex, "SteamViewerInput.setActiveSession during reconnect rebind failed (best effort)"); }
+
+            if (_activeSession != null)
+            {
+                _activeSession.OnVideoStarted += HandleVideoStarted;
+                _activeSession.OnDisconnected += HandleSessionDisconnected;
+                _activeSession.OnPeerDisconnecting += HandlePeerDisconnecting;
+                _activeSession.OnStatsUpdated += HandleStatsUpdate;
+                _activeSession.OnControlMessage += HandleControlMessage;
+                _activeSession.OnClipboardReceived += HandleClipboardReceived;
+                _activeSession.OnSecureDesktopStateChanged += HandleSecureDesktopStateChanged;
+                _activeSession.OnMonitorLayoutReceived += HandleMonitorLayoutReceived;
+                _activeSession.OnCaptureInfoReceived += HandleCaptureInfoReceived;
+                _activeSession.OnPeerSharingChanged += HandlePeerSharingChanged;
+
+                // Re-enable stats relay if the user had it toggled on.
+                if (_statsVisible) _ = _activeSession.EnableStatsRelayAsync();
+
+                // Re-bind canvas + direct-render path to the new session's video pipeline.
+                // Without this the viewer canvas keeps the OLD stale frame and no new frames render.
+                _hasReceivedFrame = false;
+                _ = BindAndEnableDirectRenderAsync(sessionId);
+            }
+
+            // Reset the graceful-close flag - this is a fresh session, not the prior one's death.
+            _peerGracefullyClosing = false;
+
+            StateHasChanged();
+        });
     }
 
     private void HandleControlMessage(string type, string? message)
@@ -612,9 +722,20 @@
     private void HandleVideoStarted()
     {
         // First video frame rendered via direct rendering — dismiss "Waiting for host screen"
+        // AND the reconnect overlay (this is the real success signal for a reconnect, not
+        // the TryReconnect dispatch which only means atomic-swap done). Reset attempts +
+        // dispose any pending retry-countdown timer so the loop stops once video is up.
         if (!_hasReceivedFrame)
         {
             _hasReceivedFrame = true;
+            if (_showReconnectOverlay)
+            {
+                Logger.LogInformation("[RECONNECT-DIAG] First frame after reconnect - hiding overlay, resetting attempts");
+                _showReconnectOverlay = false;
+                _reconnectAttempts = 0;
+                _reconnectTimer?.Dispose();
+                _reconnectTimer = null;
+            }
             _ = InvokeAsync(StateHasChanged);
         }
     }
@@ -1463,7 +1584,7 @@
 
     private void ShowReconnectOverlay(string? reason)
     {
-        Logger.LogWarning("[RECONNECT-DIAG] ShowReconnectOverlay: reason={Reason}, attempts={Attempts}, timerActive={Timer}",
+        Logger.LogDebug("[RECONNECT-DIAG] ShowReconnectOverlay: reason={Reason}, attempts={Attempts}, timerActive={Timer}",
             reason, _reconnectAttempts, _reconnectTimer != null);
         _showReconnectOverlay = true;
         _reconnectAttempts = 0;
@@ -1493,7 +1614,7 @@
 
         if (_reconnectCountdown <= 0)
         {
-            Logger.LogWarning("[RECONNECT-DIAG] Timer expired, calling TryReconnect");
+            Logger.LogDebug("[RECONNECT-DIAG] Timer expired, calling TryReconnect");
             _reconnectTimer?.Dispose();
             _reconnectTimer = null;
             // Marshal TryReconnect onto the dispatcher: the Timer callback is on a thread-pool
@@ -1511,8 +1632,27 @@
     {
         if (_activeSession == null || _activeSessionId == null) return;
 
+        // Skip-if-already-connected guard. The retry countdown is started on TryReconnect
+        // dispatch (EPOCH 7 Bug 2 fix - keep overlay+countdown visible during wait). If the
+        // dispatch's ConnectRequest succeeds OR HostRecovered arrives and re-pairs the session
+        // out-of-band, session.State goes Connected BEFORE the retry timer's next tick. Without
+        // this guard, the next tick fires ANOTHER TryReconnect on a session that's already up -
+        // ReconnectSessionAsync's atomic-swap then destroys the working transport, breaking
+        // recovery. Smoke 2026-05-23 12:45:25 captured exactly this: HostRecovered re-paired,
+        // state Connected, retry timer fired 0.5s later, swap killed the live session.
+        if (_activeSession.State == ViewerSessionState.Connected)
+        {
+            Logger.LogInformation("[RECONNECT-DIAG] TryReconnect skipped: session already Connected (likely HostRecovered re-paired or dispatch succeeded) - clearing overlay + timer");
+            _showReconnectOverlay = false;
+            _reconnectAttempts = 0;
+            _reconnectTimer?.Dispose();
+            _reconnectTimer = null;
+            StateHasChanged();
+            return;
+        }
+
         _reconnectAttempts++;
-        Logger.LogWarning("[RECONNECT-DIAG] TryReconnect: attempt={Attempt}, session={Session}", _reconnectAttempts, _activeSessionId);
+        Logger.LogDebug("[RECONNECT-DIAG] TryReconnect: attempt={Attempt}, session={Session}", _reconnectAttempts, _activeSessionId);
 
         try
         {
@@ -1522,6 +1662,7 @@
                 // Unsubscribe from old session events
                 _activeSession.OnVideoStarted -= HandleVideoStarted;
                 _activeSession.OnDisconnected -= HandleSessionDisconnected;
+                _activeSession.OnPeerDisconnecting -= HandlePeerDisconnecting;
                 _activeSession.OnStatsUpdated -= HandleStatsUpdate;
                 _activeSession.OnControlMessage -= HandleControlMessage;
                 _activeSession.OnClipboardReceived -= HandleClipboardReceived;
@@ -1537,6 +1678,7 @@
                 // Subscribe to new session events
                 _activeSession.OnVideoStarted += HandleVideoStarted;
                 _activeSession.OnDisconnected += HandleSessionDisconnected;
+                _activeSession.OnPeerDisconnecting += HandlePeerDisconnecting;
                 _activeSession.OnStatsUpdated += HandleStatsUpdate;
                 _activeSession.OnControlMessage += HandleControlMessage;
                 _activeSession.OnClipboardReceived += HandleClipboardReceived;
@@ -1558,17 +1700,24 @@
                 _hostMonitors = null;
                 _activeMonitorId = 0;
 
-                // Hide reconnect overlay, show "waiting for host screen"
-                _showReconnectOverlay = false;
-                _hasReceivedFrame = false;
-                _reconnectAttempts = 0;
-                Logger.LogWarning("[RECONNECT-DIAG] TryReconnect SUCCESS: new session bound, overlay hidden");
+                // KEEP reconnect overlay visible. ReconnectSessionAsync returning a session means
+                // the atomic-swap completed and ConnectRequest was dispatched - NOT that the host
+                // has responded or the transport came up. The actual success signal is the first
+                // video frame arriving (HandleVideoStarted), which sets _hasReceivedFrame=true and
+                // hides this overlay. Until then, keep showing the overlay with attempt counter
+                // so the user can see what's happening + retry/cancel.
+                // Don't reset _reconnectAttempts here - let it keep incrementing across retries.
+                Logger.LogDebug("[RECONNECT-DIAG] TryReconnect dispatched: atomic-swap done, ConnectRequest sent, awaiting host response (overlay STAYS visible until first frame)");
+                // Reschedule countdown for the next retry attempt. If host_recovered arrives
+                // first, HandleVideoStarted will hide the overlay + cancel the timer. If not,
+                // this keeps a visible countdown for the user.
+                StartReconnectCountdown();
                 StateHasChanged();
                 return;
             }
             else
             {
-                Logger.LogWarning("[RECONNECT-DIAG] TryReconnect returned null session");
+                Logger.LogDebug("[RECONNECT-DIAG] TryReconnect returned null session");
             }
         }
         catch (Exception ex)
@@ -1631,12 +1780,14 @@
 
         TabManager.OnTabsChanged -= HandleTabsChanged;
         TabManager.OnActiveTabChanged -= HandleActiveTabChanged;
+        SessionManager.OnSessionReconnected -= HandleSessionReconnected;
 
         // Unsubscribe from active session
         if (_activeSession != null)
         {
             _activeSession.OnVideoStarted -= HandleVideoStarted;
             _activeSession.OnDisconnected -= HandleSessionDisconnected;
+            _activeSession.OnPeerDisconnecting -= HandlePeerDisconnecting;
             _activeSession.OnStatsUpdated -= HandleStatsUpdate;
             _activeSession.OnControlMessage -= HandleControlMessage;
             _activeSession.OnClipboardReceived -= HandleClipboardReceived;

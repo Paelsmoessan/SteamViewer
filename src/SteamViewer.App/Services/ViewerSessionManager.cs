@@ -28,6 +28,41 @@ public sealed class ViewerSessionManager : IAsyncDisposable
     // opening the viewer window until we know the password was correct AND the host accepted -
     // otherwise a wrong-password attempt flashes a viewer window that opens and immediately closes.
     private readonly ConcurrentDictionary<string, Action<ViewerSession>> _onApprovedCallbacks = new();
+    // Grace timers started when a peer Disconnected signal arrives. Gives the host's SIG-RECONNECT
+    // a 5-second window to send `host_recovered` and cancel the timer; otherwise RemoveSessionAsync
+    // fires when the timer expires. Closes the Railway-prune race (TODO §5 P1 "Host-recovered handshake").
+    private readonly ConcurrentDictionary<string, System.Threading.Timer> _gracePeriodTimers = new();
+    private const int GracePeriodMs = 5000;
+
+    // Max-outage wall-clock cap. Per Chris's design (2026-05-22): persist sessions through
+    // transient outages (transport-dead, signaling errors, Railway "not online" during host
+    // recovery) but bound the persistence to 2 minutes. After that, give up + RemoveSession.
+    // Started on first state->Disconnected/Error for a session. Cancelled when state->Connected.
+    // Distinct from grace timer (5s, host_recovered-specific). With EPOCH 5's skip-grace logic,
+    // max-outage is the ONLY safety net for the fresh-reconnect path where transport never
+    // came up - without it, sessions hang indefinitely on "waiting for host."
+    private readonly ConcurrentDictionary<string, System.Threading.Timer> _maxOutageTimers = new();
+    private const int MaxOutageMs = 120_000;
+
+    // Session epoch versioning. Increments every time a sessionId's underlying ViewerSession
+    // is replaced (either via RemoveSessionAsync deletion OR ReconnectSessionAsync atomic-swap).
+    // Timer callbacks + late-arriving signal handlers capture the epoch at creation/dispatch
+    // and verify against the current value at fire time - stale callbacks (where the session
+    // they were created for has been replaced) no-op.
+    // Closes the race surface identified in rm chapter "Reconnect-logic FULL audit (round 2)"
+    // (2026-05-22) - smoke 18:49 / 19:13 showed grace timer killing in-flight TryReconnect
+    // because the timer fired with a stale view of the sessionId mapping.
+    private readonly ConcurrentDictionary<string, int> _sessionEpochs = new();
+
+    private int IncrementEpoch(string sessionId)
+    {
+        return _sessionEpochs.AddOrUpdate(sessionId, 1, (_, prev) => prev + 1);
+    }
+
+    private int CurrentEpoch(string sessionId)
+    {
+        return _sessionEpochs.TryGetValue(sessionId, out var v) ? v : 0;
+    }
     private bool _signalingSubscribed;
     private bool _disposed;
     private string _localClientId = "";
@@ -56,6 +91,16 @@ public sealed class ViewerSessionManager : IAsyncDisposable
     /// Raised when a session is removed.
     /// </summary>
     public event Action<string>? OnSessionRemoved;
+
+    /// <summary>
+    /// Raised when a session is reconnected via ReconnectSessionAsync - same sessionId,
+    /// new underlying ViewerSession object. Subscribers (e.g., RemoteViewer.razor) must
+    /// rebind their event subscriptions to the new session even though the id is unchanged.
+    /// Closes TODO §5 P1 "Stats overlay does not survive an adapter cycle" - BindToSessionAsync's
+    /// `if (sessionId != _activeSessionId)` early-return previously skipped rebinding when
+    /// the id was reused.
+    /// </summary>
+    public event Action<string>? OnSessionReconnected;
 
     /// <summary>
     /// Raised when a session's state changes.
@@ -202,9 +247,47 @@ public sealed class ViewerSessionManager : IAsyncDisposable
     /// </summary>
     public async Task RemoveSessionAsync(string sessionId)
     {
+        // Bump epoch FIRST. Any in-flight timer callback or signal handler that captured
+        // the previous epoch will see the bump and no-op. Guards against stale callbacks
+        // acting on a removed session.
+        var newEpoch = IncrementEpoch(sessionId);
+        _logger.LogDebug("Session {SessionId}: RemoveSessionAsync entered, epoch bumped to {Epoch}", sessionId, newEpoch);
+
+        // Dispose any pending grace timer for this session (no-op if no timer, e.g. user-initiated
+        // close path). Prevents the timer firing later and trying to remove an already-removed session.
+        if (_gracePeriodTimers.TryRemove(sessionId, out var graceTimer))
+        {
+            try { graceTimer.Dispose(); } catch { }
+        }
+        // Same for max-outage timer.
+        if (_maxOutageTimers.TryRemove(sessionId, out var outageTimer))
+        {
+            try { outageTimer.Dispose(); } catch { }
+        }
+
         if (_sessions.TryRemove(sessionId, out var session))
         {
             _peerToSession.TryRemove(session.PeerId, out _);
+
+            // Send graceful-close control message via DATA CHANNEL before signaling Disconnect.
+            // Lets the host distinguish a user-initiated close from a network-driven disconnect:
+            // - With this message + signaling Disconnect: host runs CleanupSessionAsync with
+            //   ExplicitClientDisconnect trigger -> elevation DISPOSED (no auto-reconnect).
+            // - Without (e.g., transport already dead, or this send fails): host's existing
+            //   SignalingPeerClaim + UDP-keepalive path eventually fires TransportDisconnect ->
+            //   elevation PRESERVED (assumes a reconnect may follow).
+            // Best-effort: if transport is gone we silently fall through to the signaling-only path.
+            try
+            {
+                var disconnectingJson = System.Text.Json.JsonSerializer.Serialize(new { type = "client_disconnecting" });
+                var sent = await session.SendDataAsync(disconnectingJson);
+                _logger.LogInformation("Sent client_disconnecting control for session {SessionId} peer {PeerId} (success={Success})",
+                    sessionId, session.PeerId, sent);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Failed to send client_disconnecting control (best effort)");
+            }
 
             // Notify host via signaling server before tearing down transport
             try
@@ -226,12 +309,25 @@ public sealed class ViewerSessionManager : IAsyncDisposable
     }
 
     /// <summary>
-    /// Reconnect an existing session (e.g., after elevation restart).
-    /// Disposes the old WebRTC connection and creates a new one with the same session ID and peer.
+    /// Reconnect an existing session (e.g., after elevation restart or adapter cycle).
+    /// Builds a NEW ViewerSession with the same sessionId + peerId, atomically swaps the
+    /// old one out, disposes the old in the background.
+    ///
+    /// Failure-safe: if the build fails before the swap, the OLD session stays in _sessions.
+    /// Pre-fix 2026-05-21 the method called TryRemove at the TOP unconditionally; if the
+    /// new connect attempt failed (e.g., during a long SIG-RECONNECT outage), the old
+    /// session was already gone and subsequent retries returned null. Closes TODO §5 P1
+    /// "TryReconnect attempt 1 destroys the session via TryRemove on failure."
+    ///
+    /// On success, fires OnSessionReconnected so subscribers can rebind to the new
+    /// ViewerSession instance (closes TODO §5 P1 "Stats overlay frozen after transport rebuild").
     /// </summary>
     public async Task<ViewerSession?> ReconnectSessionAsync(string sessionId, IJSRuntime jsRuntime)
     {
-        if (!_sessions.TryRemove(sessionId, out var oldSession))
+        // PEEK old session, do NOT remove yet. The swap happens atomically at the bottom
+        // when the new session is fully constructed. Any failure before that point leaves
+        // _sessions untouched so subsequent retries see the old session and can try again.
+        if (!_sessions.TryGetValue(sessionId, out var oldSession))
         {
             _logger.LogWarning("Cannot reconnect: session {SessionId} not found", sessionId);
             return null;
@@ -240,42 +336,48 @@ public sealed class ViewerSessionManager : IAsyncDisposable
         var peerId = oldSession.PeerId;
         var password = oldSession.StoredPassword;
 
-        // Clean up old session
-        _peerToSession.TryRemove(peerId, out _);
-        try { await oldSession.DisposeAsync(); }
-        catch (Exception ex) { _logger.LogWarning(ex, "Error disposing old session during reconnect"); }
-
         if (string.IsNullOrEmpty(password))
         {
             _logger.LogError("Cannot reconnect session {SessionId}: no stored password", sessionId);
             return null;
         }
 
-        _logger.LogInformation("Reconnecting session {SessionId} to peer {PeerId}", sessionId, peerId);
+        _logger.LogInformation("Reconnecting session {SessionId} to peer {PeerId} (old session preserved until swap)", sessionId, peerId);
 
         EnsureSignalingSubscribed();
 
         // Ensure signaling is connected
-        if (!_signalingClient.IsConnected)
+        try
         {
-            await _signalingClient.ConnectAsync();
+            if (!_signalingClient.IsConnected)
+            {
+                await _signalingClient.ConnectAsync();
 
 #if DEBUG
-            var joinerId = $"VIEWER{_debugViewerIdCounter++}";
+                var joinerId = $"VIEWER{_debugViewerIdCounter++}";
 #else
-            // Crypto RNG so attackers can't enumerate or predict joiner IDs.
-            var joinerId = System.Security.Cryptography.RandomNumberGenerator
-                .GetInt32(100_000_000, 1_000_000_000).ToString();
+                // Crypto RNG so attackers can't enumerate or predict joiner IDs.
+                var joinerId = System.Security.Cryptography.RandomNumberGenerator
+                    .GetInt32(100_000_000, 1_000_000_000).ToString();
 #endif
-            var joinerPasswordHash = Convert.ToHexString(
-                Hasher.Hash(Encoding.UTF8.GetBytes(Guid.NewGuid().ToString())).AsSpan()
-            ).ToLowerInvariant();
+                var joinerPasswordHash = Convert.ToHexString(
+                    Hasher.Hash(Encoding.UTF8.GetBytes(Guid.NewGuid().ToString())).AsSpan()
+                ).ToLowerInvariant();
 
-            await _signalingClient.RegisterAsync(joinerId, joinerPasswordHash);
-            _localClientId = joinerId;
+                await _signalingClient.RegisterAsync(joinerId, joinerPasswordHash);
+                _localClientId = joinerId;
+            }
+        }
+        catch (Exception ex)
+        {
+            // Signaling rebuild failed - oldSession stays in _sessions, caller's exponential
+            // backoff TryReconnect will retry. Pre-fix this path destroyed the session.
+            _logger.LogWarning(ex, "Reconnect signaling phase failed for session {SessionId} - leaving old session in place for retry",
+                sessionId);
+            return null;
         }
 
-        // Create new session with the SAME session ID (preserves tab tracking)
+        // Build NEW session AFTER signaling is confirmed up. Same sessionId preserves tab tracking.
         var session = new ViewerSession(
             sessionId,
             peerId,
@@ -292,15 +394,36 @@ public sealed class ViewerSessionManager : IAsyncDisposable
         session.OnStateChanged += state => HandleSessionStateChanged(sessionId, state);
         session.OnDisconnected += reason => HandleSessionDisconnected(sessionId, reason);
 
+        // ATOMIC SWAP: replace _sessions[sessionId] entry. ConcurrentDictionary handles this
+        // atomically. Old session reference captured into oldSessionToDispose for background
+        // teardown so the caller doesn't block on it.
+        // Bump epoch BEFORE the swap so any in-flight grace timer / signal handler that
+        // captured the previous epoch sees the bump and no-ops. Closes the smoke 18:49 race
+        // where grace timer killed the in-flight reconnect session.
+        var newReconnectEpoch = IncrementEpoch(sessionId);
+        _logger.LogDebug("Session {SessionId}: ReconnectSessionAsync atomic-swap, epoch bumped to {Epoch}", sessionId, newReconnectEpoch);
+        var oldSessionToDispose = oldSession;
         _sessions[sessionId] = session;
         _peerToSession[peerId] = sessionId;
 
-        // Transport initialization is DEFERRED — host sends TransportEndpoint via signaling
+        // Dispose old session in background (don't block the caller)
+        _ = Task.Run(async () =>
+        {
+            try { await oldSessionToDispose.DisposeAsync(); }
+            catch (Exception ex) { _logger.LogWarning(ex, "Error disposing old session during reconnect"); }
+        });
+
+        // Transport initialization is DEFERRED - host sends TransportEndpoint via signaling
 
         // Request connection via signaling
         await _signalingClient.RequestConnectionAsync(peerId, password);
 
         _logger.LogInformation("Reconnect session {SessionId} created, awaiting host response", sessionId);
+
+        // Notify subscribers (e.g., RemoteViewer.razor) to rebind to the new instance even
+        // though sessionId is unchanged. Without this, event subscriptions on the old object
+        // dangle and stats / control messages stop reaching the UI.
+        OnSessionReconnected?.Invoke(sessionId);
 
         return session;
     }
@@ -337,6 +460,10 @@ public sealed class ViewerSessionManager : IAsyncDisposable
 
             case SignalingMessage.Disconnected disconnected:
                 HandlePeerDisconnected(disconnected);
+                break;
+
+            case SignalingMessage.HostRecovered hostRecovered:
+                HandleHostRecovered(hostRecovered);
                 break;
 
             case SignalingMessage.Error error:
@@ -382,10 +509,150 @@ public sealed class ViewerSessionManager : IAsyncDisposable
         var session = GetSessionByPeerId(disconnected.PeerId);
         if (session == null) return;
 
-        _logger.LogInformation("Session {SessionId}: Peer {PeerId} disconnected",
-            session.SessionId, disconnected.PeerId);
+        var sessionId = session.SessionId;
 
-        _ = RemoveSessionAsync(session.SessionId);
+        // SKIP grace timer when transport is already dead. The grace timer's purpose is to
+        // wait 5 seconds for a host_recovered handshake after a Railway false-positive prune
+        // (signaling Disconnected arrives but UDP/relay is still flowing). When transport is
+        // ALREADY dead (UDP keepalive fired transport-dead), host's SIG-RECONNECT cannot
+        // possibly complete in 5s for a real wifi outage (typical 30-120s). Grace timer
+        // expires first, kills the in-flight TryReconnect that was actually about to succeed.
+        // Smoke 2026-05-22 20:32 captured this: transport-dead at 20:32:14, reconnect at
+        // 20:32:24, Railway prune at 20:32:27 started grace, 5s later session murdered.
+        // The user-visible reconnect overlay + retry timer handles recovery for the
+        // transport-dead case; grace timer is only meaningful when transport is alive.
+        if (session.State == ViewerSessionState.Disconnected)
+        {
+            _logger.LogInformation("Session {SessionId}: Peer {PeerId} disconnected (reason={Reason}) but session.State=Disconnected (transport already dead) - SKIPPING grace timer; user-visible reconnect overlay handles recovery",
+                sessionId, disconnected.PeerId, disconnected.Reason);
+            return;
+        }
+
+        // Also SKIP grace timer when this session-instance has never confirmed transport
+        // for its current epoch. Discriminator that survives ReconnectSessionAsync's atomic-swap:
+        // the new ViewerSession instance is in Initializing/WaitingForOffer (not Disconnected),
+        // but its HasTransportConfirmedThisEpoch is still false. A signaling Disconnected
+        // arriving in this window is the Railway-prune-of-old-session, not a live-session
+        // event - starting the grace timer would just murder the in-flight reconnect.
+        // Smoke 2026-05-23 10:45 captured this: transport-dead 10:45:21, atomic-swap 10:45:31
+        // (epoch=1, new session in Initializing), Railway prune 10:45:33 started grace,
+        // 5s later session murdered, HostRecovered arrived 10:45:47 to nothing.
+        // Let max-outage timer (or user-visible reconnect overlay) handle recovery.
+        if (!session.HasTransportConfirmedThisEpoch)
+        {
+            _logger.LogInformation("Session {SessionId}: Peer {PeerId} disconnected (reason={Reason}) but HasTransportConfirmedThisEpoch=false (fresh-reconnect, transport never came up this epoch) - SKIPPING grace timer; max-outage / overlay handles recovery",
+                sessionId, disconnected.PeerId, disconnected.Reason);
+            return;
+        }
+
+        // Capture the session's current epoch when starting the timer. When the timer fires,
+        // it verifies the epoch is still current - if the session has been replaced by
+        // RemoveSessionAsync or ReconnectSessionAsync's atomic-swap, the captured epoch is
+        // stale and the callback no-ops. Closes the smoke 18:49 / 19:13 race where grace timer
+        // killed in-flight TryReconnect.
+        var capturedEpoch = CurrentEpoch(sessionId);
+
+        _logger.LogInformation("Session {SessionId}: Peer {PeerId} disconnected (reason={Reason}) - starting {GraceMs}ms grace timer for possible host_recovered handshake (epoch={Epoch})",
+            sessionId, disconnected.PeerId, disconnected.Reason, GracePeriodMs, capturedEpoch);
+
+        var newTimer = new System.Threading.Timer(_ =>
+        {
+            // Stale-callback guard: if the session this timer was created for has been
+            // replaced (by ReconnectSessionAsync atomic-swap or earlier RemoveSessionAsync),
+            // the timer is operating on a sessionId mapping that no longer corresponds to
+            // the same ViewerSession object. NO-OP.
+            var nowEpoch = CurrentEpoch(sessionId);
+            if (nowEpoch != capturedEpoch)
+            {
+                _logger.LogInformation("Session {SessionId}: grace timer fired but is STALE (epoch was {Captured}, now {Now}) - no-op",
+                    sessionId, capturedEpoch, nowEpoch);
+                if (_gracePeriodTimers.TryRemove(sessionId, out var staleT))
+                {
+                    try { staleT.Dispose(); } catch { }
+                }
+                return;
+            }
+            if (_gracePeriodTimers.TryRemove(sessionId, out var t))
+            {
+                try { t.Dispose(); } catch { }
+            }
+            _logger.LogWarning("Session {SessionId}: grace timer expired (no host_recovered received, epoch={Epoch}) - running RemoveSessionAsync now",
+                sessionId, capturedEpoch);
+            _ = RemoveSessionAsync(sessionId);
+        }, null, GracePeriodMs, Timeout.Infinite);
+
+        // Cancel any previous grace timer for this session (duplicate Disconnected events possible).
+        if (_gracePeriodTimers.TryRemove(sessionId, out var existing))
+        {
+            try { existing.Dispose(); } catch { }
+            _logger.LogDebug("Session {SessionId}: cancelled previous grace timer in favor of fresh one", sessionId);
+        }
+        _gracePeriodTimers[sessionId] = newTimer;
+    }
+
+    /// <summary>
+    /// Server forwards this from a recovered host (after its SIG-RECONNECT succeeded). If a grace
+    /// timer is pending for the matching session, cancel it - the host is back, the session
+    /// should survive. If no grace timer (we already removed, or no Disconnected was received),
+    /// log informational and ignore.
+    /// </summary>
+    private void HandleHostRecovered(SignalingMessage.HostRecovered hostRecovered)
+    {
+        var fromPeer = hostRecovered.FromId;
+        if (string.IsNullOrEmpty(fromPeer))
+        {
+            _logger.LogWarning("HostRecovered received with empty FromId - server-side bug? Dropping.");
+            return;
+        }
+
+        var session = GetSessionByPeerId(fromPeer);
+        if (session == null)
+        {
+            _logger.LogInformation("HostRecovered for peer {Peer}: no active session - ignoring (already removed, or never paired)",
+                fromPeer);
+            return;
+        }
+
+        var sessionId = session.SessionId;
+        if (_gracePeriodTimers.TryRemove(sessionId, out var timer))
+        {
+            try { timer.Dispose(); } catch { }
+            _logger.LogInformation("Session {SessionId}: HostRecovered for peer {Peer} - grace timer CANCELLED, session preserved",
+                sessionId, fromPeer);
+        }
+        else
+        {
+            _logger.LogInformation("Session {SessionId}: HostRecovered for peer {Peer} arrived without a pending grace timer - re-pairing via fresh ConnectRequest",
+                sessionId, fromPeer);
+        }
+
+        // Re-pair: host is back at Registered state expecting an IncomingConnection. The
+        // viewer's session may have been "bound" earlier by TryReconnect but transport never
+        // came up because host was offline. Send fresh ConnectRequest so host's auto-accept
+        // re-establishes the pairing. Idempotent: if transport is somehow already live, the
+        // duplicate IncomingConnection is handled by host's SignalingPeerClaim SUPPRESS path.
+        // Closes the smoke 20:43:45 case where viewer sat idle for 54s after host SIG-RECONNECT
+        // because HostRecovered handler only logged.
+        var password = session.StoredPassword;
+        if (string.IsNullOrEmpty(password))
+        {
+            _logger.LogWarning("Session {SessionId}: HostRecovered but session has no StoredPassword - cannot re-pair",
+                sessionId);
+            return;
+        }
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await _signalingClient.RequestConnectionAsync(fromPeer, password);
+                _logger.LogInformation("Session {SessionId}: HostRecovered re-pair ConnectRequest sent to peer {Peer}",
+                    sessionId, fromPeer);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Session {SessionId}: HostRecovered re-pair ConnectRequest send failed", sessionId);
+            }
+        });
     }
 
     private void HandleError(SignalingMessage.Error error)
@@ -396,16 +663,47 @@ public sealed class ViewerSessionManager : IAsyncDisposable
         // or "Invalid password"). Clean up any sessions that haven't established transport yet -
         // they're the ones that failed. Their pending onApproved callbacks are dropped without
         // firing so no viewer window opens for a failed attempt.
+        //
+        // Grace window: only sweep sessions older than 5 seconds. Transient signaling errors
+        // during host's SIG-RECONNECT window (e.g., Railway returns "Target not online" for ~10s
+        // while host's WS is rebuilding) used to murder fresh in-flight reconnect sessions during
+        // their handshake (1-3s window where IsInitialized is still false). Smoke 2026-05-22 20:08
+        // captured this as a 16-click reconnect-churn loop. 5s gives the handshake time to
+        // complete; truly-stuck sessions are still cleaned up.
+        const int StaleSweepGraceSeconds = 5;
+        var now = DateTime.UtcNow;
         var staleSessionIds = _sessions
-            .Where(kvp => !kvp.Value.IsInitialized)
+            .Where(kvp => !kvp.Value.IsInitialized
+                       && (now - kvp.Value.CreatedAt).TotalSeconds > StaleSweepGraceSeconds)
             .Select(kvp => kvp.Key)
             .ToList();
 
-        foreach (var sessionId in staleSessionIds)
+        // Cleanup awaited inside a background Task.Run so the signaling handler returns
+        // promptly but disposal completes before the Task finishes. Each per-session result
+        // is logged so failures are no longer silent (was: bare `_ = RemoveSessionAsync(id)`,
+        // discarded exceptions, no signal that cleanup ran). Defensive fix for the leak
+        // pattern documented at .claude/research/post-tidy-hardening/transport-disposal-leak.md
+        // Option A bullet 3 even though the IsInitialized filter at L400 makes this
+        // specific path unlikely to leak a QualityMonitor today.
+        if (staleSessionIds.Count > 0)
         {
-            _logger.LogInformation("Cleaning up stale session {SessionId} after signaling error", sessionId);
-            _onApprovedCallbacks.TryRemove(sessionId, out _);
-            _ = RemoveSessionAsync(sessionId);
+            _logger.LogInformation("Cleaning up {Count} stale sessions after signaling error", staleSessionIds.Count);
+            _ = Task.Run(async () =>
+            {
+                foreach (var sessionId in staleSessionIds)
+                {
+                    _logger.LogInformation("Cleaning up stale session {SessionId} after signaling error", sessionId);
+                    _onApprovedCallbacks.TryRemove(sessionId, out _);
+                    try
+                    {
+                        await RemoveSessionAsync(sessionId);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to remove stale session {SessionId} after signaling error", sessionId);
+                    }
+                }
+            });
         }
 
         // Surface the error to UI. JoinSession's catch handler doesn't see this - the Error
@@ -417,6 +715,95 @@ public sealed class ViewerSessionManager : IAsyncDisposable
     {
         _logger.LogDebug("Session {SessionId} state changed to {State}", sessionId, state);
         OnSessionStateChanged?.Invoke(sessionId, state);
+        ManageMaxOutageTimerForState(sessionId, state);
+    }
+
+    /// <summary>
+    /// Max-outage timer management driven by session state transitions:
+    /// - State Connected: cancel any running max-outage timer (session is back).
+    /// - State Disconnected/Error: start the timer if not already running. Wall-clock
+    ///   from the FIRST outage - subsequent Disconnected events don't reset the budget.
+    /// - Other states (Connecting, WaitingForOffer): no-op.
+    /// With EPOCH 5's skip-grace logic, this is the ONLY teardown for the fresh-reconnect
+    /// path where transport never came up this epoch.
+    /// </summary>
+    private void ManageMaxOutageTimerForState(string sessionId, ViewerSessionState state)
+    {
+        // Guard: if the session has already been removed from _sessions (e.g., we're
+        // in the middle of RemoveSessionAsync and a Disconnected state event is firing
+        // during teardown), don't start a max-outage timer for a session that no longer
+        // exists. Otherwise the timer fires 120s later and tries to RemoveSessionAsync
+        // a session that's already gone - harmless but noisy. Smoke 2026-05-23 12:03:55
+        // captured this: max-outage timer STARTED log fired immediately after Removed
+        // session log.
+        if (!_sessions.ContainsKey(sessionId))
+        {
+            return;
+        }
+
+        if (state == ViewerSessionState.Connected)
+        {
+            CancelMaxOutageTimer(sessionId);
+            return;
+        }
+        if (IsOutageState(state) && !_maxOutageTimers.ContainsKey(sessionId))
+        {
+            StartMaxOutageTimer(sessionId);
+        }
+    }
+
+    private static bool IsOutageState(ViewerSessionState state)
+        => state == ViewerSessionState.Disconnected || state == ViewerSessionState.Error;
+
+    private void CancelMaxOutageTimer(string sessionId)
+    {
+        if (_maxOutageTimers.TryRemove(sessionId, out var t))
+        {
+            try { t.Dispose(); } catch { }
+            _logger.LogDebug("Session {SessionId}: state Connected - max-outage timer cancelled", sessionId);
+        }
+    }
+
+    private static void DisposeAllTimers(ConcurrentDictionary<string, System.Threading.Timer> timers)
+    {
+        foreach (var key in timers.Keys.ToList())
+        {
+            if (timers.TryRemove(key, out var t))
+            {
+                try { t.Dispose(); } catch { }
+            }
+        }
+    }
+
+    private void StartMaxOutageTimer(string sessionId)
+    {
+        // Max-outage timer is wall-clock from the FIRST outage. It must SURVIVE
+        // ReconnectSessionAsync's atomic-swap epoch bumps - the user is still in the same
+        // outage budget regardless of how many TryReconnect retries fire. Grace-timer-style
+        // epoch-stale guards are WRONG here (they'd invalidate the timer on every retry).
+        // The legitimate cancel paths are:
+        // - state Connected -> ManageMaxOutageTimerForState removes the timer
+        // - RemoveSessionAsync removes the timer (user closed window, etc.)
+        // - DisposeAsync (app shutdown) disposes all timers
+        var timer = new System.Threading.Timer(_ =>
+        {
+            if (_maxOutageTimers.TryRemove(sessionId, out var t))
+            {
+                try { t.Dispose(); } catch { }
+            }
+            _logger.LogWarning("Session {SessionId}: max-outage timer EXPIRED after {Ms}ms - giving up on recovery, running RemoveSessionAsync",
+                sessionId, MaxOutageMs);
+            _ = RemoveSessionAsync(sessionId);
+        }, null, MaxOutageMs, Timeout.Infinite);
+
+        if (!_maxOutageTimers.TryAdd(sessionId, timer))
+        {
+            // Lost the race - another thread added one. Dispose ours.
+            try { timer.Dispose(); } catch { }
+            return;
+        }
+        _logger.LogInformation("Session {SessionId}: max-outage timer STARTED ({Ms}ms wall-clock cap on persistence)",
+            sessionId, MaxOutageMs);
     }
 
     private void HandleRelayReady(SignalingMessage.RelayReady relayReady)
@@ -482,6 +869,11 @@ public sealed class ViewerSessionManager : IAsyncDisposable
         {
             _signalingClient.OnMessageReceived -= HandleSignalingMessage;
         }
+
+        // Cancel + dispose any outstanding grace + max-outage timers so they don't fire
+        // during/after teardown.
+        DisposeAllTimers(_gracePeriodTimers);
+        DisposeAllTimers(_maxOutageTimers);
 
         // Send Disconnect for each active session, then dispose
         foreach (var session in _sessions.Values)

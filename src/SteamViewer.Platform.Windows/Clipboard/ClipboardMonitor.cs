@@ -64,9 +64,11 @@ public sealed class ClipboardMonitor : IDisposable
         {
             PostMessage(_hwnd, WM_QUIT, IntPtr.Zero, IntPtr.Zero);
         }
-        _thread?.Join(3000);
+        var joined = _thread?.Join(3000) ?? true;
+        if (!joined)
+            _logger.LogWarning("ClipboardMonitor: message-pump thread did not exit within 3000ms - clipboard listener / window class cleanup skipped");
         _thread = null;
-        _logger.LogInformation("ClipboardMonitor stopped");
+        _logger.LogInformation("ClipboardMonitor stopped (joined={Joined})", joined);
     }
 
     /// <summary>

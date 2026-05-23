@@ -1,4 +1,5 @@
 using System.IO.Pipes;
+using System.Security.Principal;
 using System.Text.Json;
 
 namespace SteamViewer.Platform.Windows.Elevation;
@@ -25,6 +26,114 @@ public static partial class SystemHelperServer
     private static volatile bool _notifyConnected;
 
     private static int _frameCount;
+
+    private static void StartVideoPipe(string pipeName, SecurityIdentifier userSid, uint expectedClientPid)
+    {
+        DebugLog($"StartVideoPipe entry: pipeName={pipeName}, expectedClientPid={expectedClientPid}");
+        var videoPipeName = $"{pipeName}_video";
+        var videoPipeSecurity = PipeAcl.ForUserSid(userSid);
+
+        _videoPipeServer = NamedPipeServerStreamAcl.Create(
+            videoPipeName,
+            PipeDirection.Out,
+            1,
+            PipeTransmissionMode.Byte,
+            PipeOptions.None,
+            0, 0,
+            videoPipeSecurity);
+
+        DebugLog($"Video pipe created: {videoPipeName}. Waiting for client (non-blocking)...");
+
+        _capture = new SecureDesktopCapture();
+        _capture.OnSecureDesktopActive += OnCaptureSecureDesktopActive;
+        _capture.OnSecureDesktopInactive += OnCaptureSecureDesktopInactive;
+        _capture.OnFrameCaptured += OnCaptureFrameCaptured;
+
+        var videoConnectThread = new Thread(() =>
+        {
+            try
+            {
+                _videoPipeServer.WaitForConnection();
+
+                if (!PipeAuth.TryGetClientProcessId(_videoPipeServer, out var videoClientPid)
+                    || videoClientPid != expectedClientPid)
+                {
+                    DebugLog($"Video pipe: client PID {videoClientPid} != expected {expectedClientPid}. Refusing.");
+                    try { _videoPipeServer.Disconnect(); } catch { }
+                    return;
+                }
+
+                lock (_videoWriteLock)
+                {
+                    _videoWriter = new BinaryWriter(_videoPipeServer);
+                    _videoConnected = true;
+                }
+                DebugLog($"Video pipe client connected (PID {videoClientPid})");
+
+                _capture.Start();
+                DebugLog("Secure Desktop capture started");
+            }
+            catch (Exception ex)
+            {
+                DebugLog($"Video pipe WaitForConnection error: {ex.Message}");
+            }
+        })
+        {
+            Name = "VideoPipeConnect",
+            IsBackground = true
+        };
+        videoConnectThread.Start();
+    }
+
+    private static void StartNotifyPipe(string pipeName, SecurityIdentifier userSid, uint expectedClientPid)
+    {
+        DebugLog($"StartNotifyPipe entry: pipeName={pipeName}, expectedClientPid={expectedClientPid}");
+        var notifyPipeName = $"{pipeName}_notify";
+        var notifyPipeSecurity = PipeAcl.ForUserSid(userSid);
+
+        _notifyPipeServer = NamedPipeServerStreamAcl.Create(
+            notifyPipeName,
+            PipeDirection.Out,
+            1,
+            PipeTransmissionMode.Byte,
+            PipeOptions.None,
+            0, 0,
+            notifyPipeSecurity);
+
+        DebugLog($"Notify pipe created: {notifyPipeName}. Waiting for client (non-blocking)...");
+
+        var notifyConnectThread = new Thread(() =>
+        {
+            try
+            {
+                _notifyPipeServer.WaitForConnection();
+
+                if (!PipeAuth.TryGetClientProcessId(_notifyPipeServer, out var notifyClientPid)
+                    || notifyClientPid != expectedClientPid)
+                {
+                    DebugLog($"Notify pipe: client PID {notifyClientPid} != expected {expectedClientPid}. Refusing.");
+                    try { _notifyPipeServer.Disconnect(); } catch { }
+                    return;
+                }
+
+                lock (_notifyWriteLock)
+                {
+                    _notifyWriter = new StreamWriter(_notifyPipeServer, PipeEncoding) { AutoFlush = true };
+                    _notifyConnected = true;
+                }
+                DebugLog($"Notify pipe client connected (PID {notifyClientPid})");
+            }
+            catch (Exception ex)
+            {
+                DebugLog($"Notify pipe WaitForConnection error: {ex.Message}");
+            }
+        })
+        {
+            Name = "NotifyPipeConnect",
+            IsBackground = true
+        };
+        notifyConnectThread.Start();
+    }
 
     private static void CleanupCapture()
     {

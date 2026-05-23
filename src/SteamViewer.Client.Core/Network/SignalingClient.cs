@@ -22,6 +22,19 @@ public sealed class SignalingClient : IAsyncDisposable
     private Channel<SignalingMessage> _incomingMessages;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
 
+    // Stored credentials for ReconnectAsync. Set on successful RegisterAsync, cleared
+    // on DisconnectAsync. Without these, ReconnectAsync has no identity to re-register
+    // with, so it short-circuits.
+    private string? _lastClientId;
+    private string? _lastPasswordHash;
+    // Guards against concurrent ReconnectAsync invocations (receive-loop fires one and
+    // a subscriber might fire another). WaitAsync(0) short-circuits the second caller.
+    private readonly SemaphoreSlim _reconnectLock = new(1, 1);
+    // Gates whether receive-loop-triggered reconnect runs at all. Set true on first
+    // successful RegisterAsync, cleared on DisconnectAsync so a deliberate close does
+    // not immediately trigger a reconnect loop.
+    private bool _reconnectEnabled;
+
     /// <summary>
     /// Event raised when a text (JSON signaling) message is received from the server.
     /// </summary>
@@ -42,6 +55,14 @@ public sealed class SignalingClient : IAsyncDisposable
     /// Event raised when an error occurs.
     /// </summary>
     public event Action<Exception>? OnError;
+
+    /// <summary>
+    /// Raised after SIG-RECONNECT succeeds (RegisterAsync re-completed on a fresh WS).
+    /// HostSessionManager subscribes to send `host_recovered` to its previously-paired viewer
+    /// so the viewer can cancel its grace timer (closes TODO §5 P1 "Host-recovered handshake
+    /// to survive Railway prune race").
+    /// </summary>
+    public event Action? OnSignalingReconnected;
 
     /// <summary>
     /// Current connection state.
@@ -167,7 +188,107 @@ public sealed class SignalingClient : IAsyncDisposable
             TimeSpan.FromSeconds(10),
             cancellationToken);
 
-        return response is SignalingMessage.RegisterSuccess;
+        if (response is SignalingMessage.RegisterSuccess)
+        {
+            // Store credentials so ReconnectAsync can re-register transparently if the WS dies.
+            _lastClientId = clientId;
+            _lastPasswordHash = passwordHash;
+            _reconnectEnabled = true;
+            return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Reconnect to the signaling server and re-register with the stored credentials.
+    /// Exponential backoff: 250ms, 500ms, 1s, 2s, 5s, then 10s cap (was 30s). Returns
+    /// true on first successful registration, false if cancelled or stored credentials
+    /// are missing. Guarded by _reconnectLock so concurrent callers (receive-loop
+    /// auto-kick + a subscriber's defensive call) collapse to one in-flight attempt.
+    ///
+    /// Backoff cap lowered from 30s to 10s on 2026-05-23 after smoke showed the 30s
+    /// tail dominating recovery latency for host wifi cycles (~139s SIG-RECONNECT
+    /// completion when wifi returned during a 30s sleep). With 10s cap, recovery
+    /// drops to ~10s post-wifi-return, which (a) lets the medium-outage scenario
+    /// (30-100s wifi off) complete within viewer's 120s max-outage budget, and
+    /// (b) makes EPOCH 4 (HostRecovered re-pair) + EPOCH 7-Bug3 (asymmetric UDP
+    /// promote) actually reachable instead of always being preempted by max-outage.
+    ///
+    /// Closes the 2026-05-20 P0 "Signaling WS silent death never repaired": pre-fix,
+    /// the receive loop exited on WebSocketException, fired OnDisconnected, and the
+    /// session-still-active suppressing handler logged + returned without ever bringing
+    /// the WS back up. Railway then pruned the host from its registry, so reconnect
+    /// attempts from the viewer returned "Target client is not online."
+    /// </summary>
+    public async Task<bool> ReconnectAsync(CancellationToken cancellationToken = default)
+    {
+        if (!_reconnectEnabled || _lastClientId == null || _lastPasswordHash == null)
+        {
+            _logger.LogDebug("[SIG-RECONNECT] Skipped: enabled={Enabled} hasCredentials={HasCreds}",
+                _reconnectEnabled, _lastClientId != null);
+            return false;
+        }
+
+        if (!await _reconnectLock.WaitAsync(0, cancellationToken))
+        {
+            _logger.LogDebug("[SIG-RECONNECT] Skipped: another reconnect already in progress");
+            return false;
+        }
+
+        try
+        {
+            _logger.LogWarning("[SIG-RECONNECT] Starting reconnect (clientId={ClientId}) with exponential backoff",
+                _lastClientId);
+
+            var delaysMs = new[] { 250, 500, 1000, 2000, 5000, 10000 };
+            var attempt = 0;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                try
+                {
+                    await ConnectAsync(cancellationToken);
+                    var ok = await RegisterAsync(_lastClientId, _lastPasswordHash, cancellationToken);
+                    if (ok)
+                    {
+                        _logger.LogInformation("[SIG-RECONNECT] Reconnect succeeded after {Attempt} attempts in {Elapsed}ms",
+                            attempt + 1, sw.ElapsedMilliseconds);
+                        // Fire event so HostSessionManager can send host_recovered to its previously-paired
+                        // viewer (suppresses the viewer's grace-timer-driven RemoveSessionAsync that would
+                        // otherwise fire from the Railway stale-WS prune notification).
+                        try { OnSignalingReconnected?.Invoke(); }
+                        catch (Exception evtEx) { _logger.LogWarning(evtEx, "OnSignalingReconnected subscriber threw"); }
+                        return true;
+                    }
+                    _logger.LogWarning("[SIG-RECONNECT] Re-register failed on attempt {Attempt} (RegisterAsync returned false)",
+                        attempt + 1);
+                }
+                catch (OperationCanceledException)
+                {
+                    _logger.LogInformation("[SIG-RECONNECT] Cancelled mid-attempt after {Attempt} tries", attempt + 1);
+                    return false;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "[SIG-RECONNECT] Attempt {Attempt} threw", attempt + 1);
+                }
+
+                var delayMs = delaysMs[Math.Min(attempt, delaysMs.Length - 1)];
+                attempt++;
+                _logger.LogDebug("[SIG-RECONNECT] Sleeping {Delay}ms before attempt {Next}", delayMs, attempt + 1);
+                try { await Task.Delay(delayMs, cancellationToken); }
+                catch (OperationCanceledException) { break; }
+            }
+
+            _logger.LogWarning("[SIG-RECONNECT] Cancelled after {Attempt} attempts in {Elapsed}ms",
+                attempt, sw.ElapsedMilliseconds);
+            return false;
+        }
+        finally
+        {
+            _reconnectLock.Release();
+        }
     }
 
     /// <summary>
@@ -217,6 +338,17 @@ public sealed class SignalingClient : IAsyncDisposable
     public async Task DisconnectFromPeerAsync(string peerId, CancellationToken cancellationToken = default)
     {
         await SendAsync(new SignalingMessage.Disconnect(peerId), cancellationToken);
+    }
+
+    /// <summary>
+    /// Send a host_recovered notification to a previously-paired viewer. Used by
+    /// HostSessionManager after SIG-RECONNECT succeeds; lets the viewer cancel its grace
+    /// timer and preserve the existing session instead of running RemoveSessionAsync.
+    /// </summary>
+    public async Task SendHostRecoveredAsync(string targetPeerId, CancellationToken cancellationToken = default)
+    {
+        await SendAsync(new SignalingMessage.HostRecovered(targetPeerId), cancellationToken);
+        _logger.LogInformation("[HOST-RECOVERED] Sent host_recovered to peer {Peer}", targetPeerId);
     }
 
     /// <summary>
@@ -310,15 +442,38 @@ public sealed class SignalingClient : IAsyncDisposable
         }
         catch (WebSocketException ex)
         {
-            _logger.LogWarning(ex, "WebSocket error in receive loop");
+            // Enriched context per the gate-logging rule. The bare "WebSocket error in
+            // receive loop" line is invisible about cause and state; surface what we
+            // can detect locally to make Railway-vs-network-vs-deliberate diagnosable
+            // without correlating against server logs.
+            var wsState = _webSocket?.State.ToString() ?? "null";
+            var cancelled = cancellationToken.IsCancellationRequested;
+            _logger.LogWarning(ex, "WebSocket error in receive loop (wsState={WsState}, cancelled={Cancelled}, wsErrorCode={Code}, reconnectEnabled={Reconnect})",
+                wsState, cancelled, ex.WebSocketErrorCode, _reconnectEnabled);
             OnError?.Invoke(ex);
             OnDisconnected?.Invoke($"WebSocket error: {ex.Message}");
+
+            // Auto-reconnect kick: WS died unexpectedly (Railway proxy, network blip,
+            // server restart). Fire-and-forget so the receive loop can finish exiting;
+            // ReconnectAsync's lock guard prevents concurrent attempts if a subscriber
+            // (Home.razor) also kicks one off via OnDisconnected. _reconnectEnabled
+            // gates this against deliberate DisconnectAsync teardown.
+            if (_reconnectEnabled)
+            {
+                _ = Task.Run(() => ReconnectAsync(CancellationToken.None));
+            }
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Unexpected error in receive loop");
             OnError?.Invoke(ex);
             OnDisconnected?.Invoke($"Receive loop error: {ex.Message}");
+
+            // Same auto-reconnect rationale as the WebSocketException path above.
+            if (_reconnectEnabled)
+            {
+                _ = Task.Run(() => ReconnectAsync(CancellationToken.None));
+            }
         }
         finally
         {
@@ -332,6 +487,10 @@ public sealed class SignalingClient : IAsyncDisposable
     /// </summary>
     public async Task DisconnectAsync()
     {
+        // Disable auto-reconnect FIRST so the receive loop's WebSocketException catch
+        // (which may fire mid-disposal as the WS closes) does not kick off a reconnect
+        // loop on a deliberately-closed connection.
+        _reconnectEnabled = false;
         await DisposeInternalAsync();
     }
 
@@ -431,5 +590,6 @@ public sealed class SignalingClient : IAsyncDisposable
     {
         await DisconnectAsync();
         _writeLock.Dispose();
+        _reconnectLock.Dispose();
     }
 }

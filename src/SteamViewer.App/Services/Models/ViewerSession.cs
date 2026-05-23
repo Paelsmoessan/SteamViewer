@@ -59,6 +59,33 @@ public sealed partial class ViewerSession : IAsyncDisposable
     public bool IsInitialized => _transport?.IsConnected ?? false;
 
     /// <summary>
+    /// Wall-clock timestamp when this session was constructed. Used by
+    /// ViewerSessionManager.HandleError to give freshly-created sessions a grace window
+    /// (5 seconds) before the stale-session sweep can kill them. Without this, a transient
+    /// signaling error ("Target not online") during host's recovery window murders a session
+    /// that's still mid-handshake - the 16-click reconnect-churn observed 2026-05-22 20:08.
+    /// </summary>
+    public DateTime CreatedAt { get; } = DateTime.UtcNow;
+
+    /// <summary>
+    /// True once this session-instance has observed a successful transport handshake
+    /// (state == "connected" or "udp-upgraded"). Used by ViewerSessionManager.HandlePeerDisconnected
+    /// to discriminate "live-session prune" (start grace timer for host_recovered) from
+    /// "fresh-reconnect that never came up" (skip grace, let max-outage handle).
+    /// ReconnectSessionAsync's atomic-swap creates a NEW ViewerSession instance with this
+    /// flag back at false - the new instance hasn't confirmed transport yet for the new
+    /// epoch. Closes the smoke 2026-05-23 10:45 case where grace timer killed the post-swap
+    /// session before host's SIG-RECONNECT could complete.
+    /// </summary>
+    public bool HasTransportConfirmedThisEpoch { get; private set; }
+
+    /// <summary>
+    /// Set by HandleTransportStateChanged on the first transport-up signal. Cross-partial
+    /// internal write surface (same class, different file).
+    /// </summary>
+    internal void MarkTransportConfirmed() => HasTransportConfirmedThisEpoch = true;
+
+    /// <summary>
     /// Whether the remote peer is sharing their screen.
     /// </summary>
     public bool IsPeerSharing { get; private set; }
@@ -82,6 +109,14 @@ public sealed partial class ViewerSession : IAsyncDisposable
     /// Raised when the session disconnects or errors.
     /// </summary>
     public event Action<string?>? OnDisconnected;
+
+    /// <summary>
+    /// Raised when the host sends an explicit `host_disconnecting` control message via
+    /// the data channel - signals a graceful peer-initiated close, distinct from a
+    /// network-driven disconnect. Subscribers should close the session UI without
+    /// showing the reconnect overlay.
+    /// </summary>
+    public event Action<string>? OnPeerDisconnecting;
 
     /// <summary>
     /// Raised when a control message is received from the host.

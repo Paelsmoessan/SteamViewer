@@ -19,21 +19,33 @@ public sealed partial class HostSession
     {
         if (_transport == null) return;
 
-        string? text = null;
-        if (_jsRuntime != null)
+        // Win32-first on host (TODO §5 P1 "Host should use Win32 clipboard first" + P1
+        // "WebView2 clipboard READ permission prompt 0.0.0.0"):
+        // - The WebView2 readText prompt presents an ugly "0.0.0.0 wants to See text and
+        //   images copied to the clipboard" dialog because WebView2 base URL is unconfigured.
+        // - Win32 GetClipboardData has no prompt + no focus requirement; on host context
+        //   it's strictly better.
+        // - Browser API kept as a last-resort fallback in case Win32 fails on some
+        //   esoteric format. Wrapped in the same 500ms timeout defense the WRITE path uses.
+        string? text = TryGetClipboardNative();
+
+        if (string.IsNullOrEmpty(text) && _jsRuntime != null)
         {
             try
             {
-                text = await _jsRuntime.InvokeAsync<string>("navigator.clipboard.readText");
+                text = await _jsRuntime.InvokeAsync<string>("navigator.clipboard.readText")
+                    .AsTask()
+                    .WaitAsync(TimeSpan.FromMilliseconds(500));
+            }
+            catch (TimeoutException)
+            {
+                _logger.LogWarning("Clipboard read: browser API timed out after 500ms (Win32 already failed) - returning empty");
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "Browser clipboard.readText failed â€” trying native Win32");
+                _logger.LogDebug(ex, "Clipboard read: browser API failed after Win32 fallback miss - returning empty");
             }
         }
-
-        if (string.IsNullOrEmpty(text))
-            text = TryGetClipboardNative();
 
         if (!string.IsNullOrEmpty(text))
         {
@@ -56,38 +68,37 @@ public sealed partial class HostSession
         // once viewer->host text auto-push subscription is wired).
         _clipboardMonitor?.RecordSelfWriteText(data);
 
-        bool set = false;
+        // Win32-first on host (TODO §5 P1 "Host should use Win32 clipboard first").
+        // The browser-API path has been observed to fail under WebView2-not-warm
+        // conditions (post-reconnect) and produces avoidable permission prompts.
+        // Win32 SetClipboardData has no prompt + no focus requirement. Browser API
+        // kept only as a last-resort if Win32 fails.
+        bool set = TrySetClipboardNative(data);
+        if (set)
+        {
+            _logger.LogDebug("Set clipboard from viewer: {Length} chars (Win32, primary path)", data.Length);
+            return;
+        }
+
+        _logger.LogDebug("Clipboard set: Win32 failed, falling back to browser API ({Length} chars)", data.Length);
         if (_jsRuntime != null)
         {
-            _logger.LogDebug("Clipboard set: attempting browser API ({Length} chars)", data.Length);
             try
             {
-                // Timeout defends against hung InvokeVoidAsync — observed post-
-                // reconnect at 16:38:38 (2026-05-17) when WebView2's JS context
-                // isn't yet warm. Without the timeout the await hangs forever,
-                // the catch never fires, Win32 fallback never runs, paste is
-                // silently lost. 500ms is plenty for a healthy WebView2 write;
-                // beyond that we'd rather fall through than block the handler.
+                // 500ms timeout defends against hung InvokeVoidAsync (WebView2 not warm).
                 await _jsRuntime.InvokeVoidAsync("navigator.clipboard.writeText", data)
                     .AsTask()
                     .WaitAsync(TimeSpan.FromMilliseconds(500));
-                set = true;
-                _logger.LogDebug("Set clipboard from viewer: {Length} chars (browser API)", data.Length);
+                _logger.LogDebug("Set clipboard from viewer: {Length} chars (browser API fallback)", data.Length);
             }
             catch (TimeoutException)
             {
-                _logger.LogWarning("Clipboard set: browser API timed out after 500ms ({Length} chars) - falling back to Win32", data.Length);
+                _logger.LogWarning("Clipboard set: browser API fallback timed out after 500ms ({Length} chars) - clipboard write LOST", data.Length);
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "Clipboard set: browser API failed ({Length} chars) - falling back to Win32", data.Length);
+                _logger.LogDebug(ex, "Clipboard set: browser API fallback failed ({Length} chars) - clipboard write LOST", data.Length);
             }
-        }
-
-        if (!set)
-        {
-            var native = TrySetClipboardNative(data);
-            _logger.LogDebug("Set clipboard from viewer: {Length} chars (Win32, success={Success})", data.Length, native);
         }
     }
 
@@ -100,36 +111,36 @@ public sealed partial class HostSession
         // (same reasoning as HandleClipboardSetAsync above).
         _clipboardMonitor?.RecordSelfWriteText(data);
 
-        bool clipboardSet = false;
-        if (_jsRuntime != null)
+        // Win32-first on host (same rationale as HandleClipboardSetAsync).
+        bool clipboardSet = TrySetClipboardNative(data);
+        if (clipboardSet)
         {
-            _logger.LogDebug("Clipboard paste: attempting browser API ({Length} chars)", data.Length);
+            _logger.LogDebug("Clipboard paste: set via Win32 ({Length} chars, primary path)", data.Length);
+        }
+        else if (_jsRuntime != null)
+        {
+            _logger.LogDebug("Clipboard paste: Win32 failed, falling back to browser API ({Length} chars)", data.Length);
             try
             {
-                // Same hung-await defense as HandleClipboardSetAsync — see comment there.
                 await _jsRuntime.InvokeVoidAsync("navigator.clipboard.writeText", data)
                     .AsTask()
                     .WaitAsync(TimeSpan.FromMilliseconds(500));
                 clipboardSet = true;
-                _logger.LogDebug("Clipboard paste: set via browser API ({Length} chars)", data.Length);
+                _logger.LogDebug("Clipboard paste: set via browser API fallback ({Length} chars)", data.Length);
             }
             catch (TimeoutException)
             {
-                _logger.LogWarning("Clipboard paste: browser API timed out after 500ms ({Length} chars) - falling back to Win32", data.Length);
+                _logger.LogWarning("Clipboard paste: browser API fallback timed out after 500ms ({Length} chars) - paste WILL FAIL", data.Length);
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "Clipboard paste: browser API failed ({Length} chars) - falling back to Win32", data.Length);
+                _logger.LogDebug(ex, "Clipboard paste: browser API fallback failed ({Length} chars) - paste WILL FAIL", data.Length);
             }
         }
 
         if (!clipboardSet)
         {
-            clipboardSet = TrySetClipboardNative(data);
-            if (clipboardSet)
-                _logger.LogDebug("Clipboard paste: set via Win32 ({Length} chars)", data.Length);
-            else
-                _logger.LogWarning("Failed to set clipboard via both browser API and Win32");
+            _logger.LogWarning("Failed to set clipboard via both Win32 and browser API - paste aborted");
         }
 
         if (!clipboardSet) return;

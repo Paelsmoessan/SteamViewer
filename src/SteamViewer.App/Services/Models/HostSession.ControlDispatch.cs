@@ -116,6 +116,17 @@ public sealed partial class HostSession
             HandleKeyboardLayoutMessage(root);
             return Task.CompletedTask;
         },
+        // Graceful viewer-initiated close. The viewer sends this control message immediately
+        // before its signaling Disconnect + local teardown so the host has in-band proof of
+        // intent (vs a possibly-stale Railway notification). Fires OnClientDisconnecting so
+        // HostSessionManager can run CleanupSessionAsync with ExplicitClientDisconnect trigger
+        // (full cleanup + elevation disposed). See plans/fix-graceful-disconnect-handshake.md.
+        ["client_disconnecting"] = (_, _) =>
+        {
+            _logger.LogInformation("Received client_disconnecting control message from viewer");
+            OnClientDisconnecting?.Invoke("Client gracefully disconnecting");
+            return Task.CompletedTask;
+        },
     };
 
     private async Task HandleControlMessage(string json)

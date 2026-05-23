@@ -24,6 +24,7 @@ public enum ConnectionQuality { Unknown, Good, Fair, Poor }
 public sealed class ConnectionQualityMonitor
 {
     private readonly ILogger _logger;
+    private readonly string _instanceId;
     private readonly object _lock = new();
 
     // EMA state
@@ -69,9 +70,10 @@ public sealed class ConnectionQualityMonitor
 
     public event Action<ConnectionQuality>? OnQualityChanged;
 
-    public ConnectionQualityMonitor(ILogger logger)
+    public ConnectionQualityMonitor(ILogger logger, string instanceId)
     {
         _logger = logger;
+        _instanceId = instanceId;
     }
 
     /// <summary>
@@ -82,7 +84,7 @@ public sealed class ConnectionQualityMonitor
         lock (_lock)
         {
             _smoothedRtt = rtt.TotalMilliseconds;
-            _logger.LogInformation("[QualityMonitor] Initial probe RTT: {Rtt:F1}ms", _smoothedRtt);
+            _logger.LogInformation("[QualityMonitor:{Iid}] Initial probe RTT: {Rtt:F1}ms", _instanceId, _smoothedRtt);
         }
     }
 
@@ -110,8 +112,8 @@ public sealed class ConnectionQualityMonitor
             // Don't classify until we have enough data
             if (_totalMessagesRecorded < MinMessagesForClassification)
             {
-                _logger.LogDebug("[QualityMonitor] Update #{Count}: loss={Loss:P1} (smoothed={Smoothed:P1}), RTT={Rtt:F0}ms, msgs={MsgCount}/{MinMsgs} - waiting for data",
-                    _updateCount, lossRate, _smoothedLossRate, _smoothedRtt, _totalMessagesRecorded, MinMessagesForClassification);
+                _logger.LogDebug("[QualityMonitor:{Iid}] Update #{Count}: loss={Loss:P1} (smoothed={Smoothed:P1}), RTT={Rtt:F0}ms, msgs={MsgCount}/{MinMsgs} - waiting for data",
+                    _instanceId, _updateCount, lossRate, _smoothedLossRate, _smoothedRtt, _totalMessagesRecorded, MinMessagesForClassification);
                 return;
             }
 
@@ -141,13 +143,13 @@ public sealed class ConnectionQualityMonitor
                     _lastQualityChange = DateTime.UtcNow;
                     qualityChanged = true;
 
-                    _logger.LogInformation("[QualityMonitor] Quality changed: {Previous} -> {Current} (loss={Loss:P1}, RTT={Rtt:F0}ms, after {Count} consecutive readings)",
-                        previous, _currentQuality, _smoothedLossRate, _smoothedRtt, _consecutiveInRaw);
+                    _logger.LogInformation("[QualityMonitor:{Iid}] Quality changed: {Previous} -> {Current} (loss={Loss:P1}, RTT={Rtt:F0}ms, after {Count} consecutive readings)",
+                        _instanceId, previous, _currentQuality, _smoothedLossRate, _smoothedRtt, _consecutiveInRaw);
                 }
             }
 
-            _logger.LogDebug("[QualityMonitor] Update #{Count}: loss={Loss:P1} (smoothed={Smoothed:P1}), RTT={Rtt:F0}ms, quality={Quality} (raw={Raw}, consecutive={Consec})",
-                _updateCount, lossRate, _smoothedLossRate, _smoothedRtt, _currentQuality, rawNow, _consecutiveInRaw);
+            _logger.LogDebug("[QualityMonitor:{Iid}] Update #{Count}: loss={Loss:P1} (smoothed={Smoothed:P1}), RTT={Rtt:F0}ms, quality={Quality} (raw={Raw}, consecutive={Consec})",
+                _instanceId, _updateCount, lossRate, _smoothedLossRate, _smoothedRtt, _currentQuality, rawNow, _consecutiveInRaw);
 
             // Fire event outside lock
             if (qualityChanged)
@@ -157,7 +159,7 @@ public sealed class ConnectionQualityMonitor
                 _ = Task.Run(() =>
                 {
                     try { OnQualityChanged?.Invoke(quality); }
-                    catch (Exception ex) { _logger.LogWarning(ex, "[QualityMonitor] OnQualityChanged handler error"); }
+                    catch (Exception ex) { _logger.LogWarning(ex, "[QualityMonitor:{Iid}] OnQualityChanged handler error", _instanceId); }
                 });
             }
         }

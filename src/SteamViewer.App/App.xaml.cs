@@ -72,6 +72,8 @@ public partial class App : Application
             SaveWindowState();
             try
             {
+                var hostSessionManager = MauiProgram.ServiceProvider?.GetService<HostSessionManager>();
+                File.AppendAllText(debugPath, $"[{DateTime.Now:HH:mm:ss.fff}] HostSessionManager: {hostSessionManager != null}\n");
                 var sessionManager = MauiProgram.ServiceProvider?.GetService<ViewerSessionManager>();
                 File.AppendAllText(debugPath, $"[{DateTime.Now:HH:mm:ss.fff}] SessionManager: {sessionManager != null}\n");
                 var signalingClient = MauiProgram.ServiceProvider?.GetService<Client.Core.Network.SignalingClient>();
@@ -80,6 +82,13 @@ public partial class App : Application
                 var task = Task.Run(async () =>
                 {
                     try { File.AppendAllText(debugPath, $"[{DateTime.Now:HH:mm:ss.fff}] Task.Run started\n"); } catch { }
+                    // Dispose HostSessionManager BEFORE ViewerSessionManager + SignalingClient so the
+                    // host_disconnecting send (via data channel inside HostSessionManager.DisposeAsync)
+                    // and signaling DisconnectFromPeerAsync can both reach the wire. Closes TODO §5 P1
+                    // "MAUI window-close hook" - today's batch Commit 6 wired ProcessExit which
+                    // doesn't fire on window-X close; Window.Destroying (this handler) is the right hook.
+                    if (hostSessionManager != null) await hostSessionManager.DisposeAsync();
+                    try { File.AppendAllText(debugPath, $"[{DateTime.Now:HH:mm:ss.fff}] HostSessionManager disposed\n"); } catch { }
                     if (sessionManager != null) await sessionManager.DisposeAsync();
                     try { File.AppendAllText(debugPath, $"[{DateTime.Now:HH:mm:ss.fff}] SessionManager disposed\n"); } catch { }
                     if (signalingClient != null) await signalingClient.DisposeAsync();

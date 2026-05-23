@@ -233,7 +233,10 @@ public sealed class ElevatedHelperClient : IAsyncDisposable
     }
 
     /// <summary>
-    /// Shut down the elevated helper process.
+    /// Shut down the elevated helper process. CleanupAsync is wrapped because the helper
+    /// closes its pipe in response to "exit" — subsequent dispose operations can race
+    /// with that close and throw "Cannot access a closed pipe" or ObjectDisposedException.
+    /// That race is expected; demote to Debug to avoid noisy WARNs in normal shutdown.
     /// </summary>
     public async Task ShutdownHelperAsync()
     {
@@ -246,7 +249,11 @@ public sealed class ElevatedHelperClient : IAsyncDisposable
             // Ignore — helper may already be gone
         }
 
-        await CleanupAsync();
+        try { await CleanupAsync(); }
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException)
+        {
+            _logger.LogDebug(ex, "Admin helper cleanup raced with helper exit (expected)");
+        }
     }
 
     private async Task<HelperResponse?> SendCommandAsync(object command)

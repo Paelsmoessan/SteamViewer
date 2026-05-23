@@ -20,6 +20,7 @@ namespace SteamViewer.Common.Protocol;
 [JsonDerivedType(typeof(Connected), "connected")]
 [JsonDerivedType(typeof(Disconnect), "disconnect")]
 [JsonDerivedType(typeof(Disconnected), "disconnected")]
+[JsonDerivedType(typeof(HostRecovered), "host_recovered")]
 [JsonDerivedType(typeof(Error), "error")]
 [JsonDerivedType(typeof(Ping), "ping")]
 [JsonDerivedType(typeof(Pong), "pong")]
@@ -111,6 +112,16 @@ public abstract record SignalingMessage
     public sealed record Disconnected(
         [property: JsonPropertyName("peer_id")] string PeerId,
         [property: JsonPropertyName("reason")] string? Reason
+    ) : SignalingMessage;
+
+    /// <summary>
+    /// Host sends to its previously-paired viewer after SIG-RECONNECT succeeds, to suppress
+    /// the viewer's RemoveSessionAsync that Railway's stale-WS prune would otherwise trigger.
+    /// Server routes by TargetId. On wire FromId is filled by the server (server-known peer id).
+    /// </summary>
+    public sealed record HostRecovered(
+        [property: JsonPropertyName("target_id")] string TargetId,
+        [property: JsonPropertyName("from_id")] string? FromId = null
     ) : SignalingMessage;
 
     /// <summary>Error occurred</summary>

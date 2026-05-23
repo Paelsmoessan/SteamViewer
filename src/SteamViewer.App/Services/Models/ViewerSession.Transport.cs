@@ -148,16 +148,29 @@ public sealed partial class ViewerSession
             SetState(ViewerSessionState.Disconnected);
             OnDisconnected?.Invoke("Transport disconnected");
         }
-        else if (state == "udp-upgraded")
+        else if (state == "connected" || state == "udp-upgraded")
         {
-            // Re-send desired resolution on new UDP backend.
-            // The initial setResolution was sent on the WS relay which the host may
-            // have already unsubscribed from. Re-sending ensures the host gets it.
-            if (_lastDesiredWidth > 0 && _lastDesiredHeight > 0)
+            // Mark this session-instance as having confirmed transport for the current epoch.
+            // ViewerSessionManager.HandlePeerDisconnected uses this to decide whether a
+            // signaling Disconnected warrants the 5s grace timer (live-session prune) or
+            // should be ignored (fresh-reconnect that never came up - let max-outage handle).
+            if (!HasTransportConfirmedThisEpoch)
             {
-                _logger.LogInformation("Session {SessionId}: Re-sending resolution {W}x{H} after UDP upgrade",
-                    SessionId, _lastDesiredWidth, _lastDesiredHeight);
-                _ = SendDesiredResolutionAsync(_lastDesiredWidth, _lastDesiredHeight);
+                MarkTransportConfirmed();
+                _logger.LogDebug("Session {SessionId}: HasTransportConfirmedThisEpoch=true (state={State})", SessionId, state);
+            }
+
+            if (state == "udp-upgraded")
+            {
+                // Re-send desired resolution on new UDP backend.
+                // The initial setResolution was sent on the WS relay which the host may
+                // have already unsubscribed from. Re-sending ensures the host gets it.
+                if (_lastDesiredWidth > 0 && _lastDesiredHeight > 0)
+                {
+                    _logger.LogInformation("Session {SessionId}: Re-sending resolution {W}x{H} after UDP upgrade",
+                        SessionId, _lastDesiredWidth, _lastDesiredHeight);
+                    _ = SendDesiredResolutionAsync(_lastDesiredWidth, _lastDesiredHeight);
+                }
             }
         }
     }

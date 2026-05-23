@@ -154,6 +154,19 @@ public sealed partial class ViewerSession
                     JsonSerializer.Serialize(new { type = "ack", ackType = "secureDesktopInactive" }));
                 return Task.CompletedTask;
             },
+            // Graceful host-initiated close. The host sends this control message immediately
+            // before its signaling Disconnect + local teardown so the viewer has in-band proof
+            // of intent (vs assuming any disconnect is a transport problem and showing the
+            // reconnect overlay). Fires OnPeerDisconnecting so RemoteViewer.razor can suppress
+            // the overlay and let OnSessionRemoved drive a clean window-close. Symmetric to
+            // the viewer's client_disconnecting (commit 73bc168). See
+            // plans/fix-host-disconnect-handshake.md.
+            ["host_disconnecting"] = (_, _) =>
+            {
+                _logger.LogInformation("Session {SessionId}: Received host_disconnecting control - host gracefully closing", SessionId);
+                OnPeerDisconnecting?.Invoke("Host gracefully disconnecting");
+                return Task.CompletedTask;
+            },
             // secureDesktopFrame: removed - SD frames now arrive via H.264 on channel 1
         };
     }
