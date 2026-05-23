@@ -44,13 +44,14 @@ public sealed class SignalingHandler
         {
             // Run send and receive concurrently
             var sendTask = SendLoopAsync(webSocket, channel.Reader, connectionId, cancellationToken);
-            var receiveTask = ReceiveLoopAsync(webSocket, channel.Writer, connectionId, id =>
+            var ctx = new DispatchContext(connectionId, channel.Writer, id =>
             {
                 clientId = id;
                 // Store WebSocket reference for binary relay
                 var client = _registry.GetClient(id);
                 if (client != null) client.WebSocket = webSocket;
-            }, cancellationToken);
+            });
+            var receiveTask = ReceiveLoopAsync(webSocket, ctx, cancellationToken);
 
             // Wait for either to complete
             await Task.WhenAny(sendTask, receiveTask);
@@ -122,11 +123,18 @@ public sealed class SignalingHandler
     /// </summary>
     private static readonly TimeSpan ReceiveTimeout = TimeSpan.FromSeconds(35);
 
+    /// <summary>Raw bytes of one incoming WebSocket frame.</summary>
+    private readonly record struct WsFrameChunk(byte[] Buffer, int Count, bool EndOfMessage);
+
+    /// <summary>Per-connection routing state passed through the receive + dispatch chain.</summary>
+    private readonly record struct DispatchContext(
+        Guid ConnectionId,
+        ChannelWriter<SignalingMessage> Writer,
+        Action<string> SetClientId);
+
     private async Task ReceiveLoopAsync(
         WebSocket webSocket,
-        ChannelWriter<SignalingMessage> writer,
-        Guid connectionId,
-        Action<string> setClientId,
+        DispatchContext ctx,
         CancellationToken cancellationToken)
     {
         var buffer = new byte[65536]; // 64KB for video frame relay
@@ -148,68 +156,28 @@ public sealed class SignalingHandler
                 }
 
                 // Any incoming data (text, binary, ping) counts as liveness for the takeover gate (F1).
-                _registry.TouchActivity(connectionId);
+                _registry.TouchActivity(ctx.ConnectionId);
 
+                var frame = new WsFrameChunk(buffer, result.Count, result.EndOfMessage);
                 if (result.MessageType == WebSocketMessageType.Binary)
                 {
-                    // Binary relay: forward to peer's WebSocket (streaming, chunk by chunk)
-                    var clientId = _registry.GetClientIdByConnection(connectionId);
-                    if (clientId != null)
-                    {
-                        var peer = _registry.GetPeerWebSocket(clientId);
-                        if (peer.HasValue)
-                        {
-                            await peer.Value.writeLock.WaitAsync(cancellationToken);
-                            try
-                            {
-                                await peer.Value.ws.SendAsync(
-                                    new ArraySegment<byte>(buffer, 0, result.Count),
-                                    WebSocketMessageType.Binary,
-                                    result.EndOfMessage,
-                                    cancellationToken);
-                            }
-                            finally { peer.Value.writeLock.Release(); }
-                        }
-                    }
+                    await TryRelayBinaryFrameAsync(frame, ctx.ConnectionId, cancellationToken);
                 }
                 else if (result.MessageType == WebSocketMessageType.Text)
                 {
-                    messageBuilder.Append(Encoding.UTF8.GetString(buffer, 0, result.Count));
-
-                    if (result.EndOfMessage)
-                    {
-                        var json = messageBuilder.ToString();
-                        messageBuilder.Clear();
-
-                        var message = SignalingSerializer.Deserialize(json);
-                        if (message != null)
-                        {
-                            _logger.LogDebug("Received message: {MessageType}", message.GetType().Name);
-
-                            var response = await HandleMessageAsync(message, connectionId, writer, setClientId);
-                            if (response != null)
-                            {
-                                await writer.WriteAsync(response, cancellationToken);
-                            }
-                        }
-                        else
-                        {
-                            _logger.LogWarning("Failed to deserialize message: {Json}", json);
-                            await writer.WriteAsync(new SignalingMessage.Error("Invalid message format"), cancellationToken);
-                        }
-                    }
+                    await ProcessTextChunkAsync(frame, messageBuilder, ctx, cancellationToken);
                 }
             }
             catch (WebSocketException ex)
             {
-                _logger.LogWarning(ex, "WebSocket error for connection {ConnectionId}", connectionId);
+                _logger.LogWarning(ex, "WebSocket error for connection {ConnectionId}", ctx.ConnectionId);
                 break;
             }
             catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
             {
                 // Receive timeout - no data for 90s, connection is dead
                 _logger.LogWarning("Connection {ConnectionId} timed out (no data for {Timeout}s)",
-                    connectionId, ReceiveTimeout.TotalSeconds);
+                    ctx.ConnectionId, ReceiveTimeout.TotalSeconds);
                 break;
             }
             catch (OperationCanceledException)
@@ -217,6 +185,66 @@ public sealed class SignalingHandler
                 // Server shutdown
                 break;
             }
+        }
+    }
+
+    /// <summary>
+    /// Forward a single incoming binary frame to the sender's paired peer. Silent no-op
+    /// if the sender is not registered, has no paired peer, or the peer's WebSocket is
+    /// not in an Open state. Per-peer SemaphoreSlim prevents interleaving binary frames
+    /// from multiple senders to the same peer.
+    /// </summary>
+    private async Task TryRelayBinaryFrameAsync(
+        WsFrameChunk frame, Guid connectionId, CancellationToken cancellationToken)
+    {
+        var clientId = _registry.GetClientIdByConnection(connectionId);
+        if (clientId == null) return;
+
+        var peer = _registry.GetPeerWebSocket(clientId);
+        if (!peer.HasValue) return;
+
+        await peer.Value.writeLock.WaitAsync(cancellationToken);
+        try
+        {
+            await peer.Value.ws.SendAsync(
+                new ArraySegment<byte>(frame.Buffer, 0, frame.Count),
+                WebSocketMessageType.Binary,
+                frame.EndOfMessage,
+                cancellationToken);
+        }
+        finally { peer.Value.writeLock.Release(); }
+    }
+
+    /// <summary>
+    /// Accumulate one incoming text chunk into <paramref name="messageBuilder"/> (which
+    /// persists across iterations for multi-frame messages). On <c>frame.EndOfMessage</c>:
+    /// deserialize, dispatch to <see cref="HandleMessageAsync"/>, and write any response
+    /// to the outgoing channel. Sends an `Error("Invalid message format")` response if
+    /// deserialization fails.
+    /// </summary>
+    private async Task ProcessTextChunkAsync(
+        WsFrameChunk frame, StringBuilder messageBuilder,
+        DispatchContext ctx, CancellationToken cancellationToken)
+    {
+        messageBuilder.Append(Encoding.UTF8.GetString(frame.Buffer, 0, frame.Count));
+        if (!frame.EndOfMessage) return;
+
+        var json = messageBuilder.ToString();
+        messageBuilder.Clear();
+
+        var message = SignalingSerializer.Deserialize(json);
+        if (message == null)
+        {
+            _logger.LogWarning("Failed to deserialize message: {Json}", json);
+            await ctx.Writer.WriteAsync(new SignalingMessage.Error("Invalid message format"), cancellationToken);
+            return;
+        }
+
+        _logger.LogDebug("Received message: {MessageType}", message.GetType().Name);
+        var response = await HandleMessageAsync(message, ctx.ConnectionId, ctx.Writer, ctx.SetClientId);
+        if (response != null)
+        {
+            await ctx.Writer.WriteAsync(response, cancellationToken);
         }
     }
 

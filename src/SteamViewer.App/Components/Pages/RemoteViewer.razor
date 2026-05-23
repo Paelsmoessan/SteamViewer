@@ -452,6 +452,11 @@
         {
             oldTab.StatsVisible = _statsVisible;
             oldTab.InputLocked = _inputLocked;
+            // Snapshot reconnect overlay state so switching away + back preserves it.
+            // Retry timer stays global and keeps updating; we capture the displayed values.
+            oldTab.ShowReconnectOverlay = _showReconnectOverlay;
+            oldTab.ReconnectAttempts = _reconnectAttempts;
+            oldTab.ReconnectCountdown = _reconnectCountdown;
         }
 
         // Clean up and unsubscribe from previous session
@@ -536,6 +541,17 @@
         var newTab = _tabs.FirstOrDefault(t => t.SessionId == sessionId);
         _statsVisible = newTab?.StatsVisible ?? false;
         _inputLocked = newTab?.InputLocked ?? false;
+        // Restore reconnect overlay state. Overrides the unconditional false-reset earlier
+        // in this method. Line 521's "session is Disconnected → ShowReconnectOverlay" fired
+        // earlier in this method too — if both fired, the explicit ShowReconnectOverlay call
+        // already set the global field; we don't want to clobber it back to a stale tabstate
+        // value of false. So restore ONLY if the snapshot was true.
+        if (newTab?.ShowReconnectOverlay == true)
+        {
+            _showReconnectOverlay = true;
+            _reconnectAttempts = newTab.ReconnectAttempts;
+            _reconnectCountdown = newTab.ReconnectCountdown;
+        }
         _hostElevated = _activeSession?.IsHostElevated;
         if (!_statsVisible) _statsText = null;
 
@@ -1317,9 +1333,22 @@
 
     private void HandlePeerSharingChanged(bool isSharing)
     {
+        // Diagnostic per project CLAUDE.md gate-logging rule: log all inputs + the resulting
+        // overlay state. Surfaced as P1 2026-05-23: viewer log shows ViewerSession's
+        // "Peer stopped sharing" line firing but the .reconnect-overlay (sharing-paused
+        // variant) never appears. This handler is the wire-up between session event and
+        // razor state - if this log doesn't fire, the subscription dropped. If it fires
+        // but _showSharingPaused stays false, _hasReceivedFrame got reset or the conditional
+        // logic is wrong. If both are correct, the razor template's `&& !_showReconnectOverlay`
+        // gate is blocking (_showReconnectOverlay stuck true from earlier transient).
+        Logger.LogInformation("[SHARE-DIAG] HandlePeerSharingChanged fired: isSharing={IsSharing}, hasReceivedFrame={HasFrame}, showReconnectOverlay={Reconnect}, activeSession={Session}",
+            isSharing, _hasReceivedFrame, _showReconnectOverlay, _activeSessionId);
         InvokeAsync(() =>
         {
-            _showSharingPaused = !isSharing && _hasReceivedFrame;
+            var newValue = !isSharing && _hasReceivedFrame;
+            Logger.LogInformation("[SHARE-DIAG] Setting _showSharingPaused {Old} -> {New} (overlay visible = newValue && !_showReconnectOverlay = {Visible})",
+                _showSharingPaused, newValue, newValue && !_showReconnectOverlay);
+            _showSharingPaused = newValue;
             StateHasChanged();
         });
     }
@@ -2012,12 +2041,16 @@
         min-height: 0;
     }
 
-    /* Floating tab bar - overlays canvas, connects to toolbar */
+    /* Floating tab bar - overlays canvas, connects to toolbar.
+       z-index 200 sits ABOVE .reconnect-overlay's z-index 100 so tabs remain
+       clickable while a session shows the reconnect overlay. Empty bar area
+       keeps pointer-events: none so canvas clicks pass through; tab elements
+       (.tabs, .tab, .tab-add) restore pointer-events: auto. */
     .tab-bar {
         position: absolute;
         top: 0;
         left: 0;
-        z-index: 10;
+        z-index: 200;
         display: flex;
         align-items: flex-start;
         height: 36px;

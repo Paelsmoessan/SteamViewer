@@ -55,6 +55,25 @@ public sealed class TabState
     /// Whether input lock is enabled for this tab.
     /// </summary>
     public bool InputLocked { get; set; }
+
+    /// <summary>
+    /// Whether the reconnect overlay is shown for this tab. Snapshotted on tab-switch-away
+    /// so the overlay persists per-tab instead of being cleared globally. Restored on
+    /// switch-to. The underlying retry timer remains global - only the displayed UI state
+    /// is per-tab.
+    /// </summary>
+    public bool ShowReconnectOverlay { get; set; }
+
+    /// <summary>
+    /// Reconnect attempt counter, snapshotted per-tab (mirrors ShowReconnectOverlay).
+    /// </summary>
+    public int ReconnectAttempts { get; set; }
+
+    /// <summary>
+    /// Reconnect countdown to next retry, snapshotted per-tab. Display may be 1 tick stale
+    /// after switch-back since the timer updates the global field while another tab is active.
+    /// </summary>
+    public int ReconnectCountdown { get; set; }
 }
 
 /// <summary>

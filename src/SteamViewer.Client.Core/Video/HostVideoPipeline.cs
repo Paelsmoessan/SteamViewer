@@ -334,65 +334,76 @@ public sealed class HostVideoPipeline : IDisposable
     /// </param>
     public void HandleSecureDesktopStateChanged(bool active, Func<uint?, Task>? restartCaptureAsync = null)
     {
-        _logger.LogInformation("SD state handler: active={Active}, transport={Transport}, ready={Ready}",
-            active, _transport != null, _transport?.IsConnected ?? false);
-
+        LogSdStateTransition(active);
         _isSecureDesktopActive = active;
+
         if (active)
         {
             _sdFrameIndex = 0;
             _logger.LogInformation("SD pipeline: active, sdFrameIndex reset, encoder={HasEncoder}, encoderDims={W}x{H}",
                 _encoder != null, _encoder?.Width ?? 0, _encoder?.Height ?? 0);
-        }
-        else
-        {
-            _logger.LogInformation("SD pipeline: inactive, sdFrameIndex was {Idx}", _sdFrameIndex);
+            return;
         }
 
-        // When leaving Secure Desktop, force re-send encodeInfo so viewer canvas re-syncs CSS.
-        if (!active)
+        // SD-exit path: reset encode-info so viewer canvas re-syncs CSS, wake DXGI retry, restart capture if dead.
+        _logger.LogInformation("SD pipeline: inactive, sdFrameIndex was {Idx}", _sdFrameIndex);
+        ResetEncodeInfoOnSdExit();
+        _activeDxgi?.NotifyDesktopAvailable();
+        RestartDxgiAfterSdIfDead(restartCaptureAsync);
+    }
+
+    /// <summary>Entry log capturing SD transition + transport state at the moment of handoff.</summary>
+    private void LogSdStateTransition(bool active)
+    {
+        _logger.LogInformation("SD state handler: active={Active}, transport={Transport}, ready={Ready}",
+            active, _transport != null, _transport?.IsConnected ?? false);
+    }
+
+    /// <summary>
+    /// Force re-send of encodeInfo on the next encoded frame after SD exit so the viewer
+    /// canvas re-syncs its CSS. Called from SD-exit path only.
+    /// </summary>
+    private void ResetEncodeInfoOnSdExit()
+    {
+        _lastSentEncodeW = 0;
+        _lastSentEncodeH = 0;
+    }
+
+    /// <summary>
+    /// On SD exit, DXGI desktop duplication may have been invalidated. If capture was
+    /// active before SD and is now dead, tear down stale state and request a restart
+    /// via the caller-provided callback. Silent no-op if capture is still healthy or
+    /// no callback was provided.
+    /// </summary>
+    private void RestartDxgiAfterSdIfDead(Func<uint?, Task>? restartCaptureAsync)
+    {
+        if (!IsCapturing || _activeDxgi == null) return;
+        if (_activeDxgi.IsCapturing)
         {
-            _lastSentEncodeW = 0;
-            _lastSentEncodeH = 0;
+            _logger.LogInformation("DXGI capture still running after SD - no restart needed");
+            return;
         }
 
-        // Wake DXGI retry loop immediately
-        if (!active)
-            _activeDxgi?.NotifyDesktopAvailable();
+        _logger.LogInformation("DXGI capture died during SD - restarting capture");
+        _activeDxgi.StopCaptureLoop();
+        DetachCapture();
 
-        // When leaving SD, DXGI capture may have died. Restart if needed.
-        if (!active && IsCapturing && _activeDxgi != null)
+        if (restartCaptureAsync == null) return;
+
+        _ = Task.Run(async () =>
         {
-            if (_activeDxgi.IsCapturing)
+            await Task.Delay(500);
+            try
             {
-                _logger.LogInformation("DXGI capture still running after SD - no restart needed");
+                await restartCaptureAsync(0);
+                _logger.LogInformation("DXGI capture restarted after SD");
             }
-            else
+            catch (Exception restartEx)
             {
-                _logger.LogInformation("DXGI capture died during SD - restarting capture");
-                // Clean up dead state
-                _activeDxgi.StopCaptureLoop();
-                DetachCapture();
-
-                if (restartCaptureAsync != null)
-                {
-                    _ = Task.Run(async () =>
-                    {
-                        await Task.Delay(500);
-                        try
-                        {
-                            await restartCaptureAsync(0);
-                            _logger.LogInformation("DXGI capture restarted after SD");
-                        }
-                        catch (Exception restartEx)
-                        {
-                            _logger.LogWarning(restartEx, "Failed to restart DXGI capture after SD");
-                            OnScreenShareRestartFailed?.Invoke();
-                        }
-                    });
-                }
+                _logger.LogWarning(restartEx, "Failed to restart DXGI capture after SD");
+                OnScreenShareRestartFailed?.Invoke();
             }
-        }
+        });
     }
 
     /// <summary>
@@ -438,59 +449,14 @@ public sealed class HostVideoPipeline : IDisposable
         {
             try
             {
-                // Lazy-init encoder on first frame (need real dimensions). May defer briefly
-                // waiting for viewer's setResolution to skip the green-blob race.
-                if (_encoder == null)
-                {
-                    if (ShouldDeferEncoderInit(isSecureDesktop, width, height))
-                    {
-                        return;
-                    }
-
-                    if (isSecureDesktop)
-                        _logger.LogInformation("SD: encoder is null, initializing for {W}x{H}", width, height);
-
-                    FFmpegInit.EnsureInitialized();
-                    var encoder = new FFmpegEncoder(_loggerFactory.CreateLogger<FFmpegEncoder>());
-                    // Apply pending resolution so first frame encodes at correct size
-                    if (_pendingResW > 0 && _pendingResH > 0)
-                    {
-                        encoder.SetRequestedResolution(_pendingResW, _pendingResH);
-                        // Initialize at pending resolution directly - avoids wasted 1920x1080 keyframe
-                        var initW = Math.Min(_pendingResW, width);
-                        var initH = Math.Min(_pendingResH, height);
-                        encoder.Initialize(initW, initH, 30, 20_000_000, crf: 14);
-                        _logger.LogInformation("Encoder initialized at pending resolution {W}x{H} (capture: {CW}x{CH})",
-                            initW, initH, width, height);
-                    }
-                    else
-                    {
-                        encoder.Initialize(width, height, 30, 20_000_000, crf: 14);
-                        _logger.LogInformation("Encoder initialized at capture resolution {W}x{H}", width, height);
-                    }
-                    _encoder = encoder;
-                    SendCaptureInfoIfChanged(width, height);
-
-                    // Apply deferred ForceKeyframe from SetTransport (encoder didn't exist yet)
-                    if (_pendingForceKeyframe)
-                    {
-                        _pendingForceKeyframe = false;
-                        _encoder.ForceKeyframe(3);
-                        _logger.LogInformation("Deferred ForceKeyframe burst applied after encoder init");
-                    }
-                }
-                else if (isSecureDesktop && frameIndex == 0)
-                {
-                    _logger.LogInformation("SD: encoder exists ({EW}x{EH}), SD frame is {W}x{H} - {Action}",
-                        _encoder.Width, _encoder.Height, width, height,
-                        (_encoder.Width != width || _encoder.Height != height) ? "REINIT expected" : "same resolution");
-                }
+                if (!EnsureEncoderInitialized(width, height, isSecureDesktop)) return;
+                LogSdResolutionMismatchIfRelevant(isSecureDesktop, frameIndex, width, height);
 
                 // Notify viewer if capture dims changed
                 SendCaptureInfoIfChanged(width, height);
 
                 _encodeSw.Restart();
-                var result = _encoder.EncodeFrame(bgraData, stride, width, height);
+                var result = _encoder!.EncodeFrame(bgraData, stride, width, height);
                 _encodeSw.Stop();
 
                 // Notify viewer of actual encode resolution
@@ -499,38 +465,121 @@ public sealed class HostVideoPipeline : IDisposable
                 if (result is var (naluData, naluLength))
                 {
                     _transport!.EnqueueVideoFrame(naluData, naluLength);
-
                     _encodeFrameCount++;
-                    if (isSecureDesktop)
-                    {
-                        if (frameIndex < 3 || _encodeFrameCount % 300 == 0)
-                            _logger.LogInformation("SD H.264 frame #{Idx}: {Ms:F1}ms, {Size}KB",
-                                frameIndex, _encodeSw.Elapsed.TotalMilliseconds, naluLength / 1024);
-                    }
-                    else
-                    {
-                        if (_encodeFrameCount % 300 == 0)
-                            _logger.LogInformation("Encode #{Count}: {Ms:F1}ms, {Size}KB",
-                                _encodeFrameCount, _encodeSw.Elapsed.TotalMilliseconds, naluLength / 1024);
-                    }
+                    LogEncodedFrame(naluLength, _encodeSw.Elapsed.TotalMilliseconds, isSecureDesktop, frameIndex);
                 }
 
-                // Heartbeat: prove the encode pipeline is alive (every 60s)
-                if (_heartbeatSw.ElapsedMilliseconds >= 60_000)
-                {
-                    _logger.LogInformation("Encode heartbeat: #{Count} frames, encoder {W}x{H}",
-                        _encodeFrameCount, _encoder?.Width ?? 0, _encoder?.Height ?? 0);
-                    _heartbeatSw.Restart();
-                }
+                EmitEncodeHeartbeatIfDue();
             }
             catch (Exception ex)
             {
-                if (_encoderErrorCount == 0 || _encoderErrorCount % 300 == 0)
-                    _logger.LogError(ex, "{Prefix}encode error #{Count}",
-                        isSecureDesktop ? "SD " : "FFmpeg ", _encoderErrorCount);
-                _encoderErrorCount++;
+                LogEncodeError(ex, isSecureDesktop);
             }
         }
+    }
+
+    /// <summary>
+    /// Ensure the encoder is constructed + initialized. Returns false if the caller should
+    /// SKIP this frame (defer window not elapsed yet, waiting for viewer setResolution).
+    /// Returns true if the encoder is ready (either pre-existing or just-constructed).
+    /// Caller holds _encoderLock.
+    /// </summary>
+    private bool EnsureEncoderInitialized(int width, int height, bool isSecureDesktop)
+    {
+        if (_encoder != null) return true;
+
+        if (ShouldDeferEncoderInit(isSecureDesktop, width, height))
+        {
+            return false;
+        }
+
+        if (isSecureDesktop)
+            _logger.LogInformation("SD: encoder is null, initializing for {W}x{H}", width, height);
+
+        FFmpegInit.EnsureInitialized();
+        var encoder = new FFmpegEncoder(_loggerFactory.CreateLogger<FFmpegEncoder>());
+        if (_pendingResW > 0 && _pendingResH > 0)
+        {
+            encoder.SetRequestedResolution(_pendingResW, _pendingResH);
+            // Initialize at pending resolution directly - avoids wasted 1920x1080 keyframe
+            var initW = Math.Min(_pendingResW, width);
+            var initH = Math.Min(_pendingResH, height);
+            encoder.Initialize(initW, initH, 30, 20_000_000, crf: 14);
+            _logger.LogInformation("Encoder initialized at pending resolution {W}x{H} (capture: {CW}x{CH})",
+                initW, initH, width, height);
+        }
+        else
+        {
+            encoder.Initialize(width, height, 30, 20_000_000, crf: 14);
+            _logger.LogInformation("Encoder initialized at capture resolution {W}x{H}", width, height);
+        }
+        _encoder = encoder;
+        SendCaptureInfoIfChanged(width, height);
+
+        // Apply deferred ForceKeyframe from SetTransport (encoder didn't exist yet)
+        if (_pendingForceKeyframe)
+        {
+            _pendingForceKeyframe = false;
+            _encoder.ForceKeyframe(3);
+            _logger.LogInformation("Deferred ForceKeyframe burst applied after encoder init");
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// Log a one-shot warning on the first SD frame if the existing encoder's resolution
+    /// doesn't match the incoming SD frame. Silent no-op for non-SD frames or non-first-frame.
+    /// </summary>
+    private void LogSdResolutionMismatchIfRelevant(bool isSecureDesktop, int frameIndex, int width, int height)
+    {
+        if (!isSecureDesktop) return;
+        if (frameIndex != 0) return;
+        if (_encoder == null) return;
+        var resolutionMatches = _encoder.Width == width && _encoder.Height == height;
+        _logger.LogInformation("SD: encoder exists ({EW}x{EH}), SD frame is {W}x{H} - {Action}",
+            _encoder.Width, _encoder.Height, width, height,
+            resolutionMatches ? "same resolution" : "REINIT expected");
+    }
+
+    /// <summary>
+    /// Verbose per-frame log. SD path: first 3 frames + every 300th. Normal path: every 300th.
+    /// </summary>
+    private void LogEncodedFrame(int naluLength, double elapsedMs, bool isSecureDesktop, int frameIndex)
+    {
+        if (isSecureDesktop)
+        {
+            if (frameIndex < 3 || _encodeFrameCount % 300 == 0)
+                _logger.LogInformation("SD H.264 frame #{Idx}: {Ms:F1}ms, {Size}KB",
+                    frameIndex, elapsedMs, naluLength / 1024);
+        }
+        else if (_encodeFrameCount % 300 == 0)
+        {
+            _logger.LogInformation("Encode #{Count}: {Ms:F1}ms, {Size}KB",
+                _encodeFrameCount, elapsedMs, naluLength / 1024);
+        }
+    }
+
+    /// <summary>
+    /// Heartbeat log every 60s to prove the encode pipeline is alive.
+    /// </summary>
+    private void EmitEncodeHeartbeatIfDue()
+    {
+        if (_heartbeatSw.ElapsedMilliseconds < 60_000) return;
+        _logger.LogInformation("Encode heartbeat: #{Count} frames, encoder {W}x{H}",
+            _encodeFrameCount, _encoder?.Width ?? 0, _encoder?.Height ?? 0);
+        _heartbeatSw.Restart();
+    }
+
+    /// <summary>
+    /// Throttled encode-error log: fires on the first error and every 300th error after that.
+    /// Increments _encoderErrorCount on every call.
+    /// </summary>
+    private void LogEncodeError(Exception ex, bool isSecureDesktop)
+    {
+        if (_encoderErrorCount == 0 || _encoderErrorCount % 300 == 0)
+            _logger.LogError(ex, "{Prefix}encode error #{Count}",
+                isSecureDesktop ? "SD " : "FFmpeg ", _encoderErrorCount);
+        _encoderErrorCount++;
     }
 
     // ------------------------------------------------------------------
@@ -635,46 +684,46 @@ public sealed class HostVideoPipeline : IDisposable
         ApplyQualityAdaptation(quality);
     }
 
+    /// <summary>Per-quality adaptation settings: encoder bitrate cap + UDP FEC tuning + log label.</summary>
+    private readonly record struct QualityProfile(long MaxBitrate, double FecScaleFactor, string FecLabel);
+
+    private static QualityProfile GetQualityProfile(ConnectionQuality quality) => quality switch
+    {
+        ConnectionQuality.Poor => new QualityProfile(5_000_000L, 1.6, "35%"),
+        ConnectionQuality.Fair => new QualityProfile(12_000_000L, 1.3, "25%"),
+        ConnectionQuality.Good => new QualityProfile(20_000_000L, 0, "off"),
+        // Default keeps the historical asymmetric values: Good's bitrate cap + Fair's FEC.
+        _ => new QualityProfile(20_000_000L, 1.3, "25%"),
+    };
+
     private void ApplyQualityAdaptation(ConnectionQuality quality)
     {
         if (quality == _lastQuality) return;
         _lastQuality = quality;
 
-        var maxBitrate = quality switch
-        {
-            ConnectionQuality.Poor => 5_000_000L,
-            ConnectionQuality.Fair => 12_000_000L,
-            _ => 20_000_000L
-        };
+        var profile = GetQualityProfile(quality);
 
         lock (_encoderLock)
         {
-            _encoder?.SetMaxBitrate(maxBitrate);
+            _encoder?.SetMaxBitrate(profile.MaxBitrate);
         }
 
-        if (_transport?.IsDirectUdp == true)
-        {
-            var udp = _transport.GetUdpBackend();
-            if (udp != null)
-            {
-                udp.FecScaleFactor = quality switch
-                {
-                    ConnectionQuality.Good => 0,
-                    ConnectionQuality.Fair => 1.3,
-                    ConnectionQuality.Poor => 1.6,
-                    _ => 1.3
-                };
-            }
-        }
+        ApplyFecScaleIfDirectUdp(profile.FecScaleFactor);
 
         _logger.LogInformation("[QualityAdapt] {Quality}: bitrate cap={Mbps}Mbps, FEC={Fec}",
-            quality, maxBitrate / 1_000_000, quality switch
-            {
-                ConnectionQuality.Good => "off",
-                ConnectionQuality.Fair => "25%",
-                ConnectionQuality.Poor => "35%",
-                _ => "25%"
-            });
+            quality, profile.MaxBitrate / 1_000_000, profile.FecLabel);
+    }
+
+    /// <summary>
+    /// Push the FEC scale factor onto the UDP backend if direct UDP is active. Silent no-op
+    /// on relay or when the UDP backend is not yet bound.
+    /// </summary>
+    private void ApplyFecScaleIfDirectUdp(double fecScale)
+    {
+        if (_transport?.IsDirectUdp != true) return;
+        var udp = _transport.GetUdpBackend();
+        if (udp == null) return;
+        udp.FecScaleFactor = fecScale;
     }
 
     // ------------------------------------------------------------------
@@ -735,52 +784,75 @@ public sealed class HostVideoPipeline : IDisposable
         FulfillLosslessRequest();
     }
 
+    /// <summary>Captured raw frame snapshot used for a lossless send.</summary>
+    private readonly record struct LosslessFrameSource(byte[] Frame, int Width, int Height, int Stride);
+
     private void FulfillLosslessRequest()
     {
-        if (_activeDxgi == null || _transport == null || !_transport.IsConnected) return;
+        if (_activeDxgi == null) return;
+        if (_transport == null) return;
+        if (!_transport.IsConnected) return;
 
-        var rawFrame = _activeDxgi.LastRawFrame;
-        var rawW = _activeDxgi.LastRawWidth;
-        var rawH = _activeDxgi.LastRawHeight;
-        var rawStride = _activeDxgi.LastRawStride;
-
-        if (rawFrame == null || rawW <= 0 || rawH <= 0) return;
+        var source = SnapshotLosslessSource();
+        if (source == null) return;
 
         _losslessSent = true;
         _losslessRequested = false;
 
+        _ = Task.Run(() => EncodeAndSendLosslessAsync(source.Value));
+    }
+
+    /// <summary>
+    /// Snapshot the current raw DXGI frame for lossless encoding. Returns null if the
+    /// DXGI capture has no frame yet or the frame is in an invalid state.
+    /// </summary>
+    private LosslessFrameSource? SnapshotLosslessSource()
+    {
+        var rawFrame = _activeDxgi?.LastRawFrame;
+        if (rawFrame == null) return null;
+        var rawW = _activeDxgi!.LastRawWidth;
+        if (rawW <= 0) return null;
+        var rawH = _activeDxgi.LastRawHeight;
+        if (rawH <= 0) return null;
+        var rawStride = _activeDxgi.LastRawStride;
+
         var frameCopy = new byte[rawFrame.Length];
         Buffer.BlockCopy(rawFrame, 0, frameCopy, 0, rawFrame.Length);
+        return new LosslessFrameSource(frameCopy, rawW, rawH, rawStride);
+    }
 
-        _ = Task.Run(async () =>
+    /// <summary>
+    /// Background task: downscale if the requested resolution differs from the capture
+    /// resolution, encode to QOI, send via the transport's lossless channel, log result.
+    /// </summary>
+    private async Task EncodeAndSendLosslessAsync(LosslessFrameSource source)
+    {
+        try
         {
-            try
+            byte[] bgraToEncode = source.Frame;
+            int encodeW = source.Width, encodeH = source.Height, encodeStride = source.Stride;
+
+            if (_losslessRequestW != source.Width || _losslessRequestH != source.Height)
             {
-                byte[] bgraToEncode = frameCopy;
-                int encodeW = rawW, encodeH = rawH, encodeStride = rawStride;
-
-                if (_losslessRequestW != rawW || _losslessRequestH != rawH)
-                {
-                    bgraToEncode = DownscaleBgra(frameCopy, rawW, rawH, rawStride,
-                        _losslessRequestW, _losslessRequestH);
-                    encodeW = _losslessRequestW;
-                    encodeH = _losslessRequestH;
-                    encodeStride = encodeW * 4;
-                }
-
-                var sw = Stopwatch.StartNew();
-                var qoiData = QoiCodec.Encode(bgraToEncode, encodeW, encodeH, encodeStride);
-                sw.Stop();
-
-                var sent = await _transport!.SendLosslessFrameAsync(qoiData, 0, qoiData.Length);
-                _logger.LogInformation("Lossless QOI frame: {W}x{H}, {Size}KB, encode={Ms:F1}ms, sent={Sent}",
-                    encodeW, encodeH, qoiData.Length / 1024, sw.Elapsed.TotalMilliseconds, sent);
+                bgraToEncode = DownscaleBgra(source.Frame, source.Width, source.Height, source.Stride,
+                    _losslessRequestW, _losslessRequestH);
+                encodeW = _losslessRequestW;
+                encodeH = _losslessRequestH;
+                encodeStride = encodeW * 4;
             }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Failed to encode/send lossless frame");
-            }
-        });
+
+            var sw = Stopwatch.StartNew();
+            var qoiData = QoiCodec.Encode(bgraToEncode, encodeW, encodeH, encodeStride);
+            sw.Stop();
+
+            var sent = await _transport!.SendLosslessFrameAsync(qoiData, 0, qoiData.Length);
+            _logger.LogInformation("Lossless QOI frame: {W}x{H}, {Size}KB, encode={Ms:F1}ms, sent={Sent}",
+                encodeW, encodeH, qoiData.Length / 1024, sw.Elapsed.TotalMilliseconds, sent);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to encode/send lossless frame");
+        }
     }
 
     private byte[] DownscaleBgra(byte[] srcBgra, int srcW, int srcH, int srcStride, int dstW, int dstH)

@@ -1,5 +1,70 @@
 # Changelog
 
+## v0.2.10-alpha (2026-05-23)
+
+### Reconnect overlay UX + internal code-health lifts
+
+Small user-facing UX fix plus two big internal refactors that bring
+two long-standing "Risky"-band files into the "Healthy" CodeScene band.
+
+#### User-facing
+
+- **Reconnect overlay no longer traps you on a disconnected tab.** Tab
+  strip now sits above the overlay z-index, so you can switch to a
+  healthy tab while one is in reconnect-overlay state. Overlay state is
+  snapshotted per-tab so switching back to the disconnected tab restores
+  the overlay (and its attempt counter / countdown) instead of resetting
+  it. Surfaced during today's smoke; multi-tab verification is partial
+  until the duplicate-connect-to-same-host bug (filed as P1 TODO) is
+  fixed.
+
+#### Internal — CodeScene lifts
+
+- **SignalingHandler.cs (server) lifted 6.63 → 8.44.** Cleared the
+  CodeScene "Brain Method" finding on `ReceiveLoopAsync` by extracting
+  binary-relay and text-dispatch into focused private helpers. Excess
+  Args follow-up cleanup wrapped the helper signatures into two private
+  records (`WsFrameChunk`, `DispatchContext`), bringing arg counts back
+  under the threshold.
+- **HostVideoPipeline.cs (host) lifted 6.81 → 9.09.** Four incremental
+  decompositions: extracted 5 helpers from the 30fps hot-path
+  `EncodeAndSend`; extracted 3 helpers from `HandleSecureDesktopStateChanged`;
+  consolidated 3 ConnectionQuality switch-expressions into one
+  `QualityProfile` record; extracted lossless-encode background task
+  into `EncodeAndSendLosslessAsync` + `SnapshotLosslessSource`. All
+  extractions stay inside the existing `_encoderLock`; no semantic
+  change to the hot path.
+
+#### Internal — write-time discipline
+
+- **New "Code Change Discipline" sections in project CLAUDE.md** for
+  fresh code creation (not just edits). "Write-it-once-right gate"
+  enumerates five rules to apply BEFORE typing (one responsibility,
+  decompose before >50 LoC, 3-nesting stop, switch-from-day-1, no
+  copy-paste-with-edits). "Brain Method warning signs" lists four
+  stop-conditions to catch at write-time instead of at CodeScene audit.
+  Aims to reduce the future lift-cycle workload.
+
+#### Internal — diagnostics
+
+- **Permanent `[SHARE-DIAG]` gate-logging on `HandlePeerSharingChanged`**
+  per project gate-logging rule. Originally added as a diagnostic for a
+  suspected SharingPaused regression that turned out to be a false alarm
+  (rapid-click test where the overlay flashed too briefly to notice).
+  Kept as permanent — rare event, low log volume, easy to grep for
+  future investigations.
+
+#### Internal — robustness
+
+- **Helper-shutdown closed-pipe race demoted** to Debug. The
+  SystemHelper / AdminHelper acknowledge an `exit` command then close
+  their end of the pipe; subsequent cleanup operations can race with
+  that close and throw `Cannot access a closed pipe`. Now caught
+  specifically (IOException + ObjectDisposedException) and logged at
+  Debug. WindowsElevationService.DisposeAsync also wraps each helper
+  disposal so a throw on one doesn't skip the other (process-leak
+  guard).
+
 ## v0.2.9-alpha (2026-05-23)
 
 ### Reconnect quality sweep + host security cooldown
