@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.2.11-alpha (2026-05-24)
+
+### Security: orphan-proof elevated/SYSTEM helpers
+
+A regression from the elevation-preservation feature (which keeps the elevated helper warm for a
+seamless reconnect) could leave a privileged named-pipe helper process running after the host
+exited unexpectedly. Fixed:
+
+- Parent-death watchdog: each helper self-terminates when the host process exits (crash,
+  taskkill, window-close), regardless of network state.
+- The exit command now actually terminates the helper; the SYSTEM helper also self-terminates
+  if the admin helper dies.
+- Startup orphan reap + force-kill on cleanup, as defense-in-depth.
+
+#### Also
+
+- Dedup viewer input-lock control send (duplicate sends were killing the transport).
+- Skip the mouse-move log flood in helper logs; stretch the Secure Desktop idle heartbeat.
+
 ## v0.2.10-alpha (2026-05-23)
 
 ### Reconnect overlay UX + internal code-health lifts
