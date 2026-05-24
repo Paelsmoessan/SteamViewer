@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.Text;
 using System.Threading.Channels;
 using Microsoft.Extensions.Logging;
@@ -19,7 +20,9 @@ namespace SteamViewer.Client.Core.Network;
 /// Channel 2 = Binary file data
 /// Channel 3 = JSON file signaling
 /// Channel 4 = Lossless QOI frame (host → viewer, one-shot on screen settle)
-/// Channel 5 = Binary Secure Desktop JPEG frame (host → viewer)
+///
+/// (Secure Desktop JPEG frames do NOT ride this mux - they use the SYSTEM helper's
+///  separate video pipe. There is no channel 5 here.)
 ///
 /// Each frame is AES-256-GCM encrypted before sending through the backend.
 /// </summary>
@@ -159,9 +162,15 @@ public abstract class StreamTransport : IAsyncDisposable
         }
     }
 
+    /// <summary>True when the transport can send a frame: connected, not disposed, backend present.
+    /// Shared guard for the control-send and video-send paths. MemberNotNullWhen preserves the
+    /// compiler's null-flow on _backend through the extracted check.</summary>
+    [MemberNotNullWhen(true, nameof(_backend))]
+    private bool CanSend() => _connected && !_disposed && _backend != null;
+
     private async ValueTask<bool> SendFrameAsync(byte channel, byte[] payload, int offset, int length)
     {
-        if (!_connected || _disposed || _backend == null)
+        if (!CanSend())
         {
             // Gate visibility per verbose-logging policy: surface which condition short-circuited,
             // because callers (e.g., OnClipboardFilesDetected) ignore the false return and the
@@ -227,119 +236,141 @@ public abstract class StreamTransport : IAsyncDisposable
 
         try
         {
-            // Decrypt (returns null if session tag mismatches = stale data from old session)
-            byte[]? plaintext;
-            if (_encryption != null)
-            {
-                plaintext = _encryption.Decrypt(data, 0, length);
-                if (plaintext == null)
-                {
-                    // Session tag mismatch: stale data from old session, fast-rejected without crypto cost
-                    var staleCount = Interlocked.Increment(ref _decryptionFailures);
-                    if (staleCount <= 3 || staleCount % 100 == 0)
-                        _logger.LogDebug("Stale session data dropped (tag mismatch, count={Count})", staleCount);
-                    return;
-                }
-            }
-            else
-            {
-                plaintext = new byte[length];
-                Buffer.BlockCopy(data, 0, plaintext, 0, length);
-            }
-
-            if (plaintext.Length < 1) return;
-
-            var channel = plaintext[0];
-
-            switch (channel)
-            {
-                case ChannelControl:
-                {
-                    var json = Encoding.UTF8.GetString(plaintext, 1, plaintext.Length - 1);
-                    if (OnControlMessage != null)
-                        _ = Task.Run(async () =>
-                        {
-                            try { await OnControlMessage.Invoke(json); }
-                            catch (Exception ex) { _logger.LogWarning(ex, "Control handler error"); }
-                        });
-                    break;
-                }
-                case ChannelVideo:
-                {
-                    var videoLen = plaintext.Length - 1;
-                    var videoData = new byte[videoLen];
-                    Buffer.BlockCopy(plaintext, 1, videoData, 0, videoLen);
-                    OnVideoData?.Invoke(videoData, videoLen);
-                    break;
-                }
-                case ChannelLossless:
-                {
-                    var losslessLen = plaintext.Length - 1;
-                    var losslessData = new byte[losslessLen];
-                    Buffer.BlockCopy(plaintext, 1, losslessData, 0, losslessLen);
-                    // Lossless frames are infrequent one-shots — Task.Run is fine
-                    if (OnLosslessFrame != null)
-                    {
-                        var handler = OnLosslessFrame;
-                        _ = Task.Run(() =>
-                        {
-                            try { handler.Invoke(losslessData, losslessLen); }
-                            catch (Exception ex) { _logger.LogWarning(ex, "Lossless frame handler error"); }
-                        });
-                    }
-                    break;
-                }
-                case ChannelFileData:
-                {
-                    var fileData = new byte[plaintext.Length - 1];
-                    Buffer.BlockCopy(plaintext, 1, fileData, 0, fileData.Length);
-                    if (OnFileData != null)
-                        _ = Task.Run(async () =>
-                        {
-                            try { await OnFileData.Invoke(fileData); }
-                            catch (Exception ex) { _logger.LogWarning(ex, "File data handler error"); }
-                        });
-                    break;
-                }
-                case ChannelFileSignaling:
-                {
-                    var json = Encoding.UTF8.GetString(plaintext, 1, plaintext.Length - 1);
-                    if (OnFileSignalingMessage != null)
-                        _ = Task.Run(async () =>
-                        {
-                            try { await OnFileSignalingMessage.Invoke(json); }
-                            catch (Exception ex) { _logger.LogWarning(ex, "File signaling handler error"); }
-                        });
-                    break;
-                }
-                default:
-                    _logger.LogWarning("Unknown channel byte: {Channel}", channel);
-                    break;
-            }
+            var plaintext = DecryptFrame(data, length);
+            if (plaintext == null || plaintext.Length < 1) return;
+            DispatchFrame(plaintext);
         }
         catch (System.Security.Cryptography.CryptographicException)
         {
-            // RFC 9147 (DTLS 1.3) pattern: silently drop invalid records, count failures.
-            // Stale data from old sessions is expected during reconnect and fails decryption
-            // because each session derives a unique key via HKDF with session nonce.
-            var count = Interlocked.Increment(ref _decryptionFailures);
-            var elapsed = _transportStartTime.Elapsed;
-
-            if (elapsed.TotalSeconds < 5)
-            {
-                // Grace window: reconnect transient, log sparingly
-                if (count == 1 || count % 50 == 0)
-                    _logger.LogDebug("Decryption failed during grace window (count={Count}, elapsed={Elapsed:F1}s)", count, elapsed.TotalSeconds);
-            }
-            else if (count <= 5 || count % 100 == 0)
-            {
-                // Steady state: log periodically
-                _logger.LogWarning("Decryption failed in steady state (count={Count})", count);
-            }
+            CountHardDecryptionFailure();
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Data receive handler error");
+        }
+    }
+
+    /// <summary>
+    /// Decrypt a received frame. Returns the plaintext, or null when the AES-GCM session tag does not
+    /// match (stale data from a prior session - fast-rejected without crypto cost, counted + logged).
+    /// A hard CryptographicException propagates to the caller's catch (see CountHardDecryptionFailure).
+    /// </summary>
+    private byte[]? DecryptFrame(byte[] data, int length)
+    {
+        if (_encryption == null)
+        {
+            var copy = new byte[length];
+            Buffer.BlockCopy(data, 0, copy, 0, length);
+            return copy;
+        }
+
+        var plaintext = _encryption.Decrypt(data, 0, length);
+        if (plaintext == null)
+        {
+            // Session tag mismatch: stale data from old session, fast-rejected without crypto cost
+            var staleCount = Interlocked.Increment(ref _decryptionFailures);
+            if (staleCount <= 3 || staleCount % 100 == 0)
+                _logger.LogDebug("Stale session data dropped (tag mismatch, count={Count})", staleCount);
+        }
+        return plaintext;
+    }
+
+    /// <summary>Route a decrypted frame to the handler for the channel in its first byte.</summary>
+    private void DispatchFrame(byte[] plaintext)
+    {
+        var channel = plaintext[0];
+        switch (channel)
+        {
+            case ChannelControl:
+                RaiseControlMessage(Encoding.UTF8.GetString(plaintext, 1, plaintext.Length - 1));
+                break;
+            case ChannelVideo:
+                OnVideoData?.Invoke(ExtractPayload(plaintext), plaintext.Length - 1);
+                break;
+            case ChannelLossless:
+                RaiseLosslessFrame(ExtractPayload(plaintext), plaintext.Length - 1);
+                break;
+            case ChannelFileData:
+                RaiseFileData(ExtractPayload(plaintext));
+                break;
+            case ChannelFileSignaling:
+                RaiseFileSignaling(Encoding.UTF8.GetString(plaintext, 1, plaintext.Length - 1));
+                break;
+            default:
+                _logger.LogWarning("Unknown channel byte: {Channel}", channel);
+                break;
+        }
+    }
+
+    /// <summary>Copy the payload that follows the 1-byte channel header.</summary>
+    private static byte[] ExtractPayload(byte[] plaintext)
+    {
+        var payload = new byte[plaintext.Length - 1];
+        Buffer.BlockCopy(plaintext, 1, payload, 0, payload.Length);
+        return payload;
+    }
+
+    private void RaiseControlMessage(string json)
+    {
+        if (OnControlMessage is not { } handler) return;
+        _ = Task.Run(async () =>
+        {
+            try { await handler.Invoke(json); }
+            catch (Exception ex) { _logger.LogWarning(ex, "Control handler error"); }
+        });
+    }
+
+    private void RaiseLosslessFrame(byte[] data, int length)
+    {
+        // Lossless frames are infrequent one-shots - Task.Run is fine.
+        if (OnLosslessFrame is not { } handler) return;
+        _ = Task.Run(() =>
+        {
+            try { handler.Invoke(data, length); }
+            catch (Exception ex) { _logger.LogWarning(ex, "Lossless frame handler error"); }
+        });
+    }
+
+    private void RaiseFileData(byte[] fileData)
+    {
+        if (OnFileData is not { } handler) return;
+        _ = Task.Run(async () =>
+        {
+            try { await handler.Invoke(fileData); }
+            catch (Exception ex) { _logger.LogWarning(ex, "File data handler error"); }
+        });
+    }
+
+    private void RaiseFileSignaling(string json)
+    {
+        if (OnFileSignalingMessage is not { } handler) return;
+        _ = Task.Run(async () =>
+        {
+            try { await handler.Invoke(json); }
+            catch (Exception ex) { _logger.LogWarning(ex, "File signaling handler error"); }
+        });
+    }
+
+    /// <summary>
+    /// Handle a hard decryption failure (CryptographicException). RFC 9147 (DTLS 1.3) pattern:
+    /// silently drop invalid records, count failures. Stale data from old sessions is expected during
+    /// reconnect and fails decryption because each session derives a unique key via HKDF + session nonce.
+    /// </summary>
+    private void CountHardDecryptionFailure()
+    {
+        var count = Interlocked.Increment(ref _decryptionFailures);
+        var elapsed = _transportStartTime.Elapsed;
+
+        if (elapsed.TotalSeconds < 5)
+        {
+            // Grace window: reconnect transient, log sparingly
+            if (count == 1 || count % 50 == 0)
+                _logger.LogDebug("Decryption failed during grace window (count={Count}, elapsed={Elapsed:F1}s)", count, elapsed.TotalSeconds);
+        }
+        else if (count <= 5 || count % 100 == 0)
+        {
+            // Steady state: log periodically
+            _logger.LogWarning("Decryption failed in steady state (count={Count})", count);
         }
     }
 
@@ -422,19 +453,68 @@ public abstract class StreamTransport : IAsyncDisposable
     /// </summary>
     protected async Task TryCompleteSwitchAsync()
     {
-        if (_localUdpReady && _remoteUdpReady && _pendingUdpBackend != null)
-        {
-            var pending = _pendingUdpBackend;
-            _pendingUdpBackend = null;
-            await SwitchBackendAsync(pending);
-            _logger.LogInformation("Both sides confirmed UDP - backend switched to direct");
-            OnConnectionStateChanged?.Invoke("udp-upgraded");
+        if (!BothSidesUdpReady()) return;
 
-            // Start quality monitoring on the new UDP backend
-            if (pending is UdpTransportBackend udp)
-                StartQualityMonitor(udp, udp.ProbeRtt);
-        }
+        var pending = _pendingUdpBackend;
+        _pendingUdpBackend = null;
+        await SwitchBackendAsync(pending);
+        _logger.LogInformation("Both sides confirmed UDP - backend switched to direct");
+        OnConnectionStateChanged?.Invoke("udp-upgraded");
+
+        // Start quality monitoring on the new UDP backend
+        if (pending is UdpTransportBackend udp)
+            StartQualityMonitor(udp, udp.ProbeRtt);
     }
+
+    /// <summary>True when both sides have signalled UDP-ready and a pending backend is staged for switch.</summary>
+    [MemberNotNullWhen(true, nameof(_pendingUdpBackend))]
+    private bool BothSidesUdpReady() => _localUdpReady && _remoteUdpReady && _pendingUdpBackend != null;
+
+    #region UDP-upgrade coordinator API
+
+    // These members are driven by UdpUpgradeCoordinator (composition, not inheritance). Switch-state
+    // (_pendingUdpBackend / _localUdpReady / _remoteUdpReady) stays owned here because the actual
+    // backend swap (SwitchBackendAsync / TryCompleteSwitchAsync) lives here. The coordinator owns the
+    // probe/accept logic and calls these to mutate switch-state.
+
+    /// <summary>The coordinator's probe succeeded: subscribe our data handler to the (already-connected)
+    /// UDP backend, stage it as the pending switch target, and mark our side ready.</summary>
+    internal void RegisterPendingUdpBackend(UdpTransportBackend backend)
+    {
+        backend.OnDataReceived += HandleDataReceived; // Receive peer data before switch completes
+        _pendingUdpBackend = backend;
+        _localUdpReady = true;
+    }
+
+    /// <summary>Mark the remote side ready and complete the switch if both sides are now ready.</summary>
+    internal async Task MarkRemoteUdpReadyAsync()
+    {
+        _remoteUdpReady = true;
+        await TryCompleteSwitchAsync();
+    }
+
+    /// <summary>Complete the switch if both sides have already signalled ready (no-op otherwise).</summary>
+    internal Task TryCompleteUdpSwitchAsync() => TryCompleteSwitchAsync();
+
+    /// <summary>Abandon a pending UDP path (peer never confirmed): unsubscribe and drop it, staying on relay.</summary>
+    internal void AbandonPendingUdpBackend()
+    {
+        if (_pendingUdpBackend != null)
+            _pendingUdpBackend.OnDataReceived -= HandleDataReceived;
+        _localUdpReady = false;
+        _pendingUdpBackend = null;
+    }
+
+    internal bool LocalUdpReady => _localUdpReady;
+    internal bool RemoteUdpReady => _remoteUdpReady;
+    internal bool HasPendingUdp => _pendingUdpBackend != null;
+
+    /// <summary>Logging context for collaborators (e.g. UdpUpgradeCoordinator) that reuse this
+    /// transport's logger + correlation id instead of taking them as separate constructor args.</summary>
+    internal ILogger Logger => _logger;
+    internal string InstanceId => _instanceId;
+
+    #endregion
 
     /// <summary>
     /// Start the connection quality monitor. Called after switching to UDP backend.
@@ -529,28 +609,11 @@ public abstract class StreamTransport : IAsyncDisposable
         {
             await foreach (var (data, length) in _videoSendQueue.Reader.ReadAllAsync(ct))
             {
-                if (!_connected || _disposed || _backend == null) break;
+                if (!CanSend()) break;
 
                 try
                 {
-                    // Build frame: [1 byte channel=video][video data]
-                    var frame = new byte[1 + length];
-                    frame[0] = ChannelVideo;
-                    Buffer.BlockCopy(data, 0, frame, 1, length);
-
-                    // Encrypt
-                    byte[] encrypted;
-                    if (_encryption != null)
-                        encrypted = _encryption.Encrypt(frame, 0, frame.Length);
-                    else
-                        encrypted = frame;
-
-                    await _sendLock.WaitAsync(ct);
-                    try
-                    {
-                        await _backend.SendAsync(encrypted, 0, encrypted.Length, ct);
-                    }
-                    finally { _sendLock.Release(); }
+                    await SendEncryptedVideoFrameAsync(data, length, ct);
 
                     if (!firstFrameSent)
                     {
@@ -584,6 +647,24 @@ public abstract class StreamTransport : IAsyncDisposable
         _logger.LogInformation("Video send loop exited (firstFrameSent={FirstFrame})", firstFrameSent);
     }
 
+    /// <summary>Build [channel=video][data], encrypt, and send one frame under the send lock.
+    /// Extracted from the send loop; the loop retains failure counting + the disconnect threshold.</summary>
+    private async Task SendEncryptedVideoFrameAsync(byte[] data, int length, CancellationToken ct)
+    {
+        var frame = new byte[1 + length];
+        frame[0] = ChannelVideo;
+        Buffer.BlockCopy(data, 0, frame, 1, length);
+
+        var encrypted = _encryption != null ? _encryption.Encrypt(frame, 0, frame.Length) : frame;
+
+        await _sendLock.WaitAsync(ct);
+        try
+        {
+            await _backend!.SendAsync(encrypted, 0, encrypted.Length, ct);
+        }
+        finally { _sendLock.Release(); }
+    }
+
     #endregion
 
     public virtual async ValueTask DisposeAsync()
@@ -594,9 +675,11 @@ public abstract class StreamTransport : IAsyncDisposable
 
         StopQualityMonitor();
 
-        // Dispose pending UDP backend if switch never completed
+        // Dispose pending UDP backend if switch never completed.
+        // (Unsubscribe first — folded in from the former subclass DisposeAsync override.)
         if (_pendingUdpBackend != null)
         {
+            _pendingUdpBackend.OnDataReceived -= HandleDataReceived;
             await _pendingUdpBackend.DisposeAsync();
             _pendingUdpBackend = null;
         }

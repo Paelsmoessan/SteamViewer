@@ -158,6 +158,12 @@ We also studied proprietary protocols (Parsec BUD, Citrix HDX, Microsoft RDP/Rem
 
 This project was developed with [Claude Code](https://claude.ai/code) by Anthropic.
 
+Honorable mentions to the code-quality and security tools that kept the codebase healthy:
+- [CodeScene](https://codescene.com/) - per-function code-health analysis that turned "this feels messy" into located, measurable refactor targets.
+- [GitHub Copilot code review](https://github.com/features/copilot) - automated diff auditing that surfaced real structural issues.
+- [CodeQL](https://codeql.github.com/) - semantic security analysis / code-scanning in CI.
+- [SonarCloud](https://sonarcloud.io/) - continuous code-quality and security analysis (bugs, code smells, security hotspots).
+
 ## License
 
 MIT
