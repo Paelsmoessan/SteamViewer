@@ -212,9 +212,10 @@ internal static class ProcessLauncher
 
     /// <summary>
     /// Enable SeDebugPrivilege on the current process token.
-    /// Required to open winlogon.exe's process handle.
+    /// Required to open winlogon.exe's process handle, and to terminate SYSTEM-level orphan helpers
+    /// during startup reap (HelperRegistry.ReapOrphans). Admins hold it but it's disabled by default.
     /// </summary>
-    private static bool EnableDebugPrivilege()
+    internal static bool EnableDebugPrivilege()
     {
         if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, out var token))
             return false;

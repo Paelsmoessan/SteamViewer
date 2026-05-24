@@ -185,8 +185,10 @@ public sealed class SecureDesktopCapture : IDisposable
                     var desktopName = GetDesktopName(hDesk);
                     pollCount++;
 
-                    // Log desktop name on first poll, on change, and every ~5s (33 polls at 150ms)
-                    if (desktopName != lastLoggedDesktopName || pollCount % 33 == 1)
+                    // Log desktop name immediately on first poll + any change, plus an idle heartbeat
+                    // every ~60s (400 polls at 150ms). Was ~5s (33 polls), which grew the debug log to
+                    // MBs over the helper's continuous runtime even when nothing changed.
+                    if (desktopName != lastLoggedDesktopName || pollCount % 400 == 1)
                     {
                         DebugLog($"Desktop: \"{desktopName}\" (poll #{pollCount}, hDesk=0x{hDesk:X})");
                         lastLoggedDesktopName = desktopName;

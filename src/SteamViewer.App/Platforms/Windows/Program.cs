@@ -71,6 +71,10 @@ public static class Program
                 return; // Invalid args - refuse to run
             }
             var allowedUserSid = args[systemIdx + 4];
+            // Optional 5th arg: the admin helper's PID, so the SYSTEM helper can watch it too (B3).
+            uint sysAdminPid = 0;
+            if (systemIdx + 5 < args.Length)
+                uint.TryParse(args[systemIdx + 5], out sysAdminPid);
             var sysDebugPath = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                 "SteamViewer", "system-helper-debug.txt");
@@ -79,15 +83,15 @@ public static class Program
                 Directory.CreateDirectory(Path.GetDirectoryName(sysDebugPath)!);
                 File.AppendAllText(sysDebugPath,
                     $"[{DateTime.Now:HH:mm:ss}] System helper intercepted. PID: {Environment.ProcessId}\n" +
-                    $"[{DateTime.Now:HH:mm:ss}] PipeName: {sysPipeName}, User: {Environment.UserName}, ExpectedClientPid: {sysExpectedClientPid}, AllowedUserSid: {allowedUserSid}\n");
+                    $"[{DateTime.Now:HH:mm:ss}] PipeName: {sysPipeName}, User: {Environment.UserName}, ExpectedClientPid: {sysExpectedClientPid}, AllowedUserSid: {allowedUserSid}, AdminPid: {sysAdminPid}\n");
             }
             catch { /* best-effort debug log */ }
 
-            // DPI awareness already set at top of Main() — all modes get PMv2.
+            // DPI awareness already set at top of Main() - all modes get PMv2.
 
             try
             {
-                SteamViewer.Platform.Windows.Elevation.SystemHelperServer.Run(sysPipeName, nonce, sysExpectedClientPid, allowedUserSid);
+                SteamViewer.Platform.Windows.Elevation.SystemHelperServer.Run(sysPipeName, nonce, sysExpectedClientPid, allowedUserSid, sysAdminPid);
             }
             catch (Exception ex)
             {

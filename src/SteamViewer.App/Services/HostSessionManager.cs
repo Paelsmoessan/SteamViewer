@@ -588,7 +588,10 @@ public sealed class HostSessionManager : IAsyncDisposable
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "Host max-outage: elevation service disposal threw - state may be inconsistent");
+                // The helper force-kill now runs in ElevatedHelperClient.CleanupAsync's finally (B5),
+                // and the parent-death watchdog reaps any survivor on host exit - so a throw here no
+                // longer means a lingering privileged helper, only that graceful teardown was partial.
+                _logger.LogWarning(ex, "Host max-outage: elevation service disposal threw - force-kill/watchdog backstops still apply");
             }
         }
 

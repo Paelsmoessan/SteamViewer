@@ -41,6 +41,18 @@ public sealed class ElevatedHelperClient : IAsyncDisposable
     {
         if (IsConnected) return true;
 
+        // B5 concurrent guard: if a prior helper process is still around (e.g. a previous connect
+        // attempt spawned it but failed before connecting), reap it before spawning another so we
+        // never accumulate live admin helpers.
+        if (_helperProcess != null && !_helperProcess.HasExited)
+        {
+            var stalePid = _helperProcess.Id;
+            _logger.LogWarning("LaunchAndConnect found a stale helper process (PID {PID}) - killing it before spawning a new one", stalePid);
+            try { _helperProcess.Kill(); } catch (Exception ex) { _logger.LogWarning(ex, "Failed to kill stale helper PID {PID}", stalePid); }
+            _helperProcess.Dispose();
+            _helperProcess = null;
+        }
+
         // Random pipe name (was PID-based, but PID is observable; random Guid is harder to race)
         _pipeName = $"SteamViewer-Elevated-{Guid.NewGuid():N}";
 
@@ -302,24 +314,43 @@ public sealed class ElevatedHelperClient : IAsyncDisposable
 
     private async Task CleanupAsync()
     {
-        _reader?.Dispose();
-        _reader = null;
-
-        _writer?.Dispose();
-        _writer = null;
-
-        if (_pipeClient != null)
+        try
         {
-            await _pipeClient.DisposeAsync();
-            _pipeClient = null;
-        }
+            _reader?.Dispose();
+            _reader = null;
 
-        if (_helperProcess != null && !_helperProcess.HasExited)
-        {
-            try { _helperProcess.Kill(); } catch { }
+            _writer?.Dispose();
+            _writer = null;
+
+            if (_pipeClient != null)
+            {
+                await _pipeClient.DisposeAsync();
+                _pipeClient = null;
+            }
         }
-        _helperProcess?.Dispose();
-        _helperProcess = null;
+        finally
+        {
+            // B5: force-kill the helper in a finally so a stream/pipe dispose throw above can never
+            // skip it (that path left orphaned admin helpers while the host stayed alive). The creator
+            // handle carries PROCESS_TERMINATE even though the helper is elevated. If this is somehow
+            // missed the helper still self-terminates via its parent-death watchdog; killing here
+            // reaps it immediately during a live session.
+            if (_helperProcess != null && !_helperProcess.HasExited)
+            {
+                var pid = _helperProcess.Id;
+                try
+                {
+                    _helperProcess.Kill();
+                    _logger.LogDebug("Elevated helper killed in cleanup (PID {PID})", pid);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Elevated helper Kill failed in cleanup (PID {PID}) - relying on parent-death watchdog", pid);
+                }
+            }
+            _helperProcess?.Dispose();
+            _helperProcess = null;
+        }
     }
 
     /// <summary>

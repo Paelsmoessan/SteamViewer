@@ -35,6 +35,9 @@ public static partial class SystemHelperServer
     private static string? _debugPath;
     private static string? _debugPathLocal;
 
+    // Set by HandleExit so RunCommandLoop breaks after acknowledging, then the process terminates.
+    private static bool _exitRequested;
+
     private static void DebugLog(string message)
     {
         var line = $"[{DateTime.Now:HH:mm:ss.fff}] {message}";
@@ -49,7 +52,7 @@ public static partial class SystemHelperServer
     /// expectedClientPid + allowedUserSid restrict pipe access to one specific process running
     /// as the launching user; without this, any local user could connect (LPE).
     /// </summary>
-    public static void Run(string pipeName, string expectedNonce, uint expectedClientPid, string allowedUserSid)
+    public static void Run(string pipeName, string expectedNonce, uint expectedClientPid, string allowedUserSid, uint adminPid = 0)
     {
         // Use CommonApplicationData (C:\ProgramData) — SYSTEM user's %LOCALAPPDATA% is different
         _debugPath = Path.Combine(
@@ -67,6 +70,18 @@ public static partial class SystemHelperServer
 
         DebugLog($"Starting SYSTEM pipe server: {pipeName} (PID {Environment.ProcessId})");
         DebugLog($"Running as: {Environment.UserName} (SYSTEM expected)");
+
+        // Orphan-proofing: self-terminate if the host dies by any path (crash / taskkill / window-X).
+        // expectedClientPid is the host PID (passed through by the admin helper). Armed before the
+        // connect-wait. See .claude/research/elevated-helper-lifecycle.
+        ParentDeathWatchdog.Arm(expectedClientPid, DebugLog, "host");
+        // B3: also watch the admin helper that launched us. If it dies (e.g. the host disposes the
+        // elevation service and kills the admin helper) we self-terminate even if the host lives.
+        ParentDeathWatchdog.Arm(adminPid, DebugLog, "admin helper");
+
+        // B4: register so the next admin helper can reap us if we ever orphan. (The admin helper does
+        // the reaping with SeDebug; the SYSTEM helper only registers/deregisters.)
+        HelperRegistry.Register(expectedClientPid, "system", DebugLog);
 
         // Attach to interactive window station — SYSTEM process may be in Service-0x0-3e7$
         var hWinSta = OpenWindowStation("WinSta0", false, WINSTA_ALL_ACCESS);
@@ -207,6 +222,12 @@ public static partial class SystemHelperServer
             CleanupVideoPipe();
             CleanupNotifyPipe();
         }
+
+        // Guarantee process termination after cleanup. The SYSTEM helper holds background threads
+        // (input/video/notify) that could otherwise keep the orphaned privileged process alive.
+        DebugLog("Run() complete - terminating SYSTEM helper process (Environment.Exit(0)).");
+        HelperRegistry.Deregister(DebugLog);
+        Environment.Exit(0);
     }
 
     private static void RunCommandLoop(NamedPipeServerStream pipeServer, StreamReader reader, StreamWriter writer)
@@ -237,7 +258,10 @@ public static partial class SystemHelperServer
                 break;
             }
 
-            if (line.Length < 200) // Don't log full input events (noisy)
+            // Don't log full input events (noisy), and skip the ~60Hz mouse_move injectInput flood
+            // (mouse_move is ~110 chars so it slips under the length cap; coordinates are captured in
+            // the input-debug log instead). Key/click events and other commands stay visible.
+            if (line.Length < 200 && !line.Contains("mouse_move"))
                 DebugLog($"Received: {line}");
             commandCount++;
 
@@ -248,6 +272,11 @@ public static partial class SystemHelperServer
                 {
                     DebugLog($"Sending: {response}");
                     writer.WriteLine(response);
+                }
+                if (_exitRequested)
+                {
+                    DebugLog("Exit acknowledged - breaking command loop to terminate helper.");
+                    break;
                 }
             }
             catch (IOException ex)
@@ -293,7 +322,8 @@ public static partial class SystemHelperServer
 
     private static string HandleExit()
     {
-        DebugLog("Exit command received");
+        DebugLog("Exit command received - will terminate after sending acknowledgement.");
+        _exitRequested = true;
         return JsonSerializer.Serialize(new HelperResponse(true, null));
     }
 

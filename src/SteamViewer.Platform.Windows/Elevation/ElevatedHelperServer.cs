@@ -31,6 +31,9 @@ public static class ElevatedHelperServer
     // Host app PID — the SYSTEM helper's pipe gate must check this, not Environment.ProcessId.
     private static uint _hostClientPid;
 
+    // Set by HandleExit so the command loop breaks after acknowledging, then the process terminates.
+    private static bool _exitRequested;
+
     private static void DebugLog(string message)
     {
         var line = $"[{DateTime.Now:HH:mm:ss.fff}] {message}";
@@ -61,6 +64,18 @@ public static class ElevatedHelperServer
 
         DebugLog($"Starting pipe server: {pipeName} (PID {Environment.ProcessId}, expecting client PID {expectedClientPid})");
         _hostClientPid = expectedClientPid;
+
+        // Orphan-proofing: self-terminate if the host dies by any path (crash / taskkill / window-X),
+        // not just the graceful exit-command. Armed before the connect-wait so a host that dies during
+        // the 30s connection window also tears us down. See .claude/research/elevated-helper-lifecycle.
+        ParentDeathWatchdog.Arm(expectedClientPid, DebugLog, "host");
+
+        // B4: reap orphan helpers left by a prior dead session, then register ourselves so a future
+        // admin helper can reap us if we ever orphan. SeDebug (best-effort) lets us kill SYSTEM orphans.
+        var seDebug = ProcessLauncher.EnableDebugPrivilege();
+        DebugLog($"SeDebugPrivilege enabled for orphan reap: {seDebug}");
+        HelperRegistry.ReapOrphans(DebugLog);
+        HelperRegistry.Register(expectedClientPid, "admin", DebugLog);
 
         try
         {
@@ -149,7 +164,10 @@ public static class ElevatedHelperServer
                     break;
                 }
 
-                DebugLog($"Received: {line}");
+                // Skip the ~60Hz mouse_move injectInput flood (coordinates are captured in the
+                // input-debug log); everything else stays visible.
+                if (!line.Contains("mouse_move"))
+                    DebugLog($"Received: {line}");
 
                 try
                 {
@@ -158,6 +176,11 @@ public static class ElevatedHelperServer
                     {
                         DebugLog($"Sending: {response}");
                         writer.WriteLine(response);
+                    }
+                    if (_exitRequested)
+                    {
+                        DebugLog("Exit acknowledged - breaking command loop to terminate helper.");
+                        break;
                     }
                 }
                 catch (IOException ex)
@@ -179,6 +202,12 @@ public static class ElevatedHelperServer
         {
             DebugLog($"FATAL: {ex}");
         }
+
+        // Guarantee process termination on every Run() exit (normal disconnect, exit-command, FATAL).
+        // Without this the privileged pipe endpoint could linger if any non-background thread survives.
+        DebugLog("Run() complete - terminating helper process (Environment.Exit(0)).");
+        HelperRegistry.Deregister(DebugLog);
+        Environment.Exit(0);
     }
 
     private static string? HandleCommand(string json)
@@ -406,7 +435,9 @@ public static class ElevatedHelperServer
 
             DebugLog($"LaunchSystemHelper: pipe={pipeName}, exe={exePath}, hostClientPid={expectedClientPid}, adminHelperPid={Environment.ProcessId}, userSid={allowedUserSid}");
 
-            var arguments = $"--system-helper {pipeName} {nonce} {expectedClientPid} {allowedUserSid}";
+            // Pass our own PID so the SYSTEM helper can watch the admin helper too (B3): if the admin
+            // helper dies (e.g. host disposes the elevation service), the SYSTEM helper self-terminates.
+            var arguments = $"--system-helper {pipeName} {nonce} {expectedClientPid} {allowedUserSid} {Environment.ProcessId}";
             if (ProcessLauncher.LaunchAsSystemFromAdmin(exePath, arguments, out var pid, out var launchError))
             {
                 DebugLog($"SYSTEM helper launched via token duplication: PID {pid}");
@@ -425,7 +456,8 @@ public static class ElevatedHelperServer
 
     private static string HandleExit()
     {
-        DebugLog("Exit command received");
+        DebugLog("Exit command received - will terminate after sending acknowledgement.");
+        _exitRequested = true;
         return JsonSerializer.Serialize(new HelperResponse(true, null));
     }
 

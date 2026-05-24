@@ -47,9 +47,22 @@ public sealed partial class ViewerSession
         }
     }
 
+    private bool? _lastSentInputLock;
+
     /// <summary>
-    /// Notify the host that viewer input lock state changed.
+    /// Notify the host that viewer input lock state changed. Deduped: one user toggle fires this from
+    /// two paths (the button handler + the JS InputMessageRouter callback). Sending the same lock state
+    /// twice churns the AES-GCM nonce enough to trip steady-state decryption failures and kill the
+    /// transport, so only send on an actual state change.
     /// </summary>
     public Task SendInputLockStateAsync(bool locked)
-        => SendAsync(new { type = "inputLockChanged", locked }, "inputLockChanged");
+    {
+        if (_lastSentInputLock == locked)
+        {
+            _logger.LogDebug("Session {SessionId}: inputLockChanged={Locked} dedup - already sent, skipping redundant resend", SessionId, locked);
+            return Task.CompletedTask;
+        }
+        _lastSentInputLock = locked;
+        return SendAsync(new { type = "inputLockChanged", locked }, "inputLockChanged");
+    }
 }
