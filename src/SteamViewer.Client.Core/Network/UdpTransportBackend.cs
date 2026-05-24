@@ -9,12 +9,6 @@ using SIPSorcery.Net;
 
 namespace SteamViewer.Client.Core.Network;
 
-// CODE-HEALTH-EXEMPT (intrinsic-cap)
-// Realistic CH ceiling ~7.0-7.5. The ReceiveLoopAsync packet-shape decision tree
-// and TryRecover 2D-XOR FEC matrix are inherent to SMPTE 2022-1 / SRT-style
-// reliable UDP. Don't push for 8.0+ here.
-// See: .claude/research/codescene-clean-delivery/intrinsic-caps.md
-
 /// <summary>
 /// Transport backend that sends data over direct UDP (STUN hole-punch) or TURN relay.
 /// Phase 2 transport — lower latency than WebSocket relay.
@@ -138,44 +132,7 @@ public sealed class UdpTransportBackend : ITransportBackend
         var localPort = ((IPEndPoint)_udpClient.Client.LocalEndPoint!).Port;
         _logger.LogInformation("UDP transport bound to local port {Port}", localPort);
 
-        // STUN binding to discover reflexive address
-        try
-        {
-            var stunServer = new IPEndPoint(
-                (await Dns.GetHostAddressesAsync("stun.l.google.com")).First(a => a.AddressFamily == AddressFamily.InterNetwork),
-                19302);
-
-            var stunRequest = new STUNMessage(STUNMessageTypesEnum.BindingRequest);
-            var stunBytes = stunRequest.ToByteBuffer(null, false);
-            await _udpClient.SendAsync(stunBytes, stunBytes.Length, stunServer);
-
-            // Wait for STUN response (2s timeout, cancellable — no abandoned tasks)
-            using var stunCts = new CancellationTokenSource(2000);
-            try
-            {
-                var result = await _udpClient.ReceiveAsync(stunCts.Token);
-                var response = STUNMessage.ParseSTUNMessage(result.Buffer, result.Buffer.Length);
-                if (response != null)
-                {
-                    var mapped = response.Attributes
-                        .FirstOrDefault(a => a.AttributeType == STUNAttributeTypesEnum.XORMappedAddress)
-                        as STUNXORAddressAttribute;
-                    if (mapped != null)
-                    {
-                        ReflexiveEndPoint = new IPEndPoint(mapped.Address, mapped.Port);
-                        _logger.LogInformation("STUN reflexive endpoint: {Endpoint}", ReflexiveEndPoint);
-                    }
-                }
-            }
-            catch (OperationCanceledException)
-            {
-                _logger.LogWarning("STUN binding timed out");
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "STUN binding failed");
-        }
+        await DiscoverReflexiveEndpointAsync();
 
         // TURN allocation (if configured)
         if (!string.IsNullOrEmpty(turnServerUri) && !string.IsNullOrEmpty(username))
@@ -200,6 +157,50 @@ public sealed class UdpTransportBackend : ITransportBackend
         StartEchoLoop();
     }
 
+    // STUN binding to discover the reflexive (public) endpoint. Best-effort — failures
+    // are logged and swallowed; reflexive endpoint stays null if STUN doesn't respond.
+    private async Task DiscoverReflexiveEndpointAsync()
+    {
+        try
+        {
+            var stunServer = new IPEndPoint(
+                (await Dns.GetHostAddressesAsync("stun.l.google.com")).First(a => a.AddressFamily == AddressFamily.InterNetwork),
+                19302);
+
+            var stunRequest = new STUNMessage(STUNMessageTypesEnum.BindingRequest);
+            var stunBytes = stunRequest.ToByteBuffer(null, false);
+            await _udpClient!.SendAsync(stunBytes, stunBytes.Length, stunServer);
+
+            // Wait for STUN response (2s timeout, cancellable — no abandoned tasks)
+            using var stunCts = new CancellationTokenSource(2000);
+            try
+            {
+                var result = await _udpClient.ReceiveAsync(stunCts.Token);
+                ParseStunBindingResponse(result.Buffer);
+            }
+            catch (OperationCanceledException)
+            {
+                _logger.LogWarning("STUN binding timed out");
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "STUN binding failed");
+        }
+    }
+
+    private void ParseStunBindingResponse(byte[] buffer)
+    {
+        var response = STUNMessage.ParseSTUNMessage(buffer, buffer.Length);
+        if (response == null) return;
+        var mapped = response.Attributes
+            .FirstOrDefault(a => a.AttributeType == STUNAttributeTypesEnum.XORMappedAddress)
+            as STUNXORAddressAttribute;
+        if (mapped == null) return;
+        ReflexiveEndPoint = new IPEndPoint(mapped.Address, mapped.Port);
+        _logger.LogInformation("STUN reflexive endpoint: {Endpoint}", ReflexiveEndPoint);
+    }
+
     /// <summary>
     /// Receive a UDP packet from the TURN server only (filters by source endpoint).
     /// Discards stale STUN packets from other sources that may sit in the kernel buffer.
@@ -219,6 +220,15 @@ public sealed class UdpTransportBackend : ITransportBackend
 
     private async Task AllocateTurnAsync(string turnUri, string username, string credential)
     {
+        await ResolveTurnEndpointAsync(turnUri);
+        var challenge = await ReceiveTurnAuthChallengeAsync();
+        if (challenge == null) return;
+        var (nonce, realm) = challenge.Value;
+        await SendAuthenticatedAllocateAsync(username, credential, nonce, realm);
+    }
+
+    private async Task ResolveTurnEndpointAsync(string turnUri)
+    {
         // Parse turn URI: "turn:host:port"
         var uri = turnUri.Replace("turn:", "").Replace("turns:", "");
         var parts = uri.Split(':');
@@ -230,13 +240,16 @@ public sealed class UdpTransportBackend : ITransportBackend
         _turnServerEndPoint = new IPEndPoint(turnAddr, port);
 
         _logger.LogInformation("Attempting TURN allocation to {Server}", _turnServerEndPoint);
+    }
 
+    private async Task<(string nonce, string realm)?> ReceiveTurnAuthChallengeAsync()
+    {
         // Send Allocate request (will get 401 first, then retry with auth)
         var allocateReq = new STUNMessage(STUNMessageTypesEnum.Allocate);
         allocateReq.Attributes.Add(new STUNAttribute(STUNAttributeTypesEnum.RequestedTransport, new byte[] { 17, 0, 0, 0 })); // UDP = 17
 
         var allocateBytes = allocateReq.ToByteBuffer(null, false);
-        await _udpClient!.SendAsync(allocateBytes, allocateBytes.Length, _turnServerEndPoint);
+        await _udpClient!.SendAsync(allocateBytes, allocateBytes.Length, _turnServerEndPoint!);
 
         // Wait for 401 response with nonce/realm — filter by TURN server source
         UdpReceiveResult resp401;
@@ -249,7 +262,7 @@ public sealed class UdpTransportBackend : ITransportBackend
             catch (OperationCanceledException)
             {
                 _logger.LogWarning("TURN Allocate timed out waiting for 401");
-                return;
+                return null;
             }
         }
 
@@ -257,7 +270,7 @@ public sealed class UdpTransportBackend : ITransportBackend
         if (msg401 == null)
         {
             _logger.LogWarning("TURN: Could not parse 401 response");
-            return;
+            return null;
         }
 
         var nonceAttr = msg401.Attributes.FirstOrDefault(a => a.AttributeType == STUNAttributeTypesEnum.Nonce);
@@ -266,14 +279,18 @@ public sealed class UdpTransportBackend : ITransportBackend
         if (nonceAttr == null || realmAttr == null)
         {
             _logger.LogWarning("TURN: 401 response missing nonce or realm");
-            return;
+            return null;
         }
 
         var nonce = Encoding.UTF8.GetString(nonceAttr.Value);
         var realm = Encoding.UTF8.GetString(realmAttr.Value);
 
         _logger.LogDebug("TURN: Got 401 with realm={Realm}, nonce={Nonce}", realm, nonce[..Math.Min(8, nonce.Length)] + "...");
+        return (nonce, realm);
+    }
 
+    private async Task SendAuthenticatedAllocateAsync(string username, string credential, string nonce, string realm)
+    {
         // Retry Allocate with auth credentials
         var allocateAuth = new STUNMessage(STUNMessageTypesEnum.Allocate);
         allocateAuth.Attributes.Add(new STUNAttribute(STUNAttributeTypesEnum.RequestedTransport, new byte[] { 17, 0, 0, 0 }));
@@ -288,7 +305,7 @@ public sealed class UdpTransportBackend : ITransportBackend
         _turnRealm = realm;
         _turnUsername = username;
         var authBytes = allocateAuth.ToByteBuffer(hmacKey, false);
-        await _udpClient.SendAsync(authBytes, authBytes.Length, _turnServerEndPoint);
+        await _udpClient!.SendAsync(authBytes, authBytes.Length, _turnServerEndPoint!);
 
         // Wait for Allocate success — filter by TURN server source
         UdpReceiveResult respAlloc;
@@ -316,27 +333,26 @@ public sealed class UdpTransportBackend : ITransportBackend
                 _turnRelayEndPoint = new IPEndPoint(relayAddr.Address, relayAddr.Port);
                 _logger.LogInformation("TURN allocation successful. Relay: {Relay}", _turnRelayEndPoint);
             }
+            return;
+        }
+
+        // Extract error code for diagnostics
+        var errorAttr = msgAlloc?.Attributes
+            .FirstOrDefault(a => a.AttributeType == STUNAttributeTypesEnum.ErrorCode);
+        if (errorAttr != null)
+        {
+            // ErrorCode attribute: first 4 bytes = reserved(2) + class(1) + number(1)
+            var errorCode = errorAttr.Value.Length >= 4
+                ? (errorAttr.Value[2] * 100 + errorAttr.Value[3])
+                : 0;
+            var reason = errorAttr.Value.Length > 4
+                ? Encoding.UTF8.GetString(errorAttr.Value, 4, errorAttr.Value.Length - 4)
+                : "unknown";
+            _logger.LogWarning("TURN Allocate error {Code}: {Reason}", errorCode, reason);
         }
         else
         {
-            // Extract error code for diagnostics
-            var errorAttr = msgAlloc?.Attributes
-                .FirstOrDefault(a => a.AttributeType == STUNAttributeTypesEnum.ErrorCode);
-            if (errorAttr != null)
-            {
-                // ErrorCode attribute: first 4 bytes = reserved(2) + class(1) + number(1)
-                var errorCode = errorAttr.Value.Length >= 4
-                    ? (errorAttr.Value[2] * 100 + errorAttr.Value[3])
-                    : 0;
-                var reason = errorAttr.Value.Length > 4
-                    ? Encoding.UTF8.GetString(errorAttr.Value, 4, errorAttr.Value.Length - 4)
-                    : "unknown";
-                _logger.LogWarning("TURN Allocate error {Code}: {Reason}", errorCode, reason);
-            }
-            else
-            {
-                _logger.LogWarning("TURN Allocate failed: {Type}", msgAlloc?.Header.MessageType);
-            }
+            _logger.LogWarning("TURN Allocate failed: {Type}", msgAlloc?.Header.MessageType);
         }
     }
 
@@ -361,31 +377,11 @@ public sealed class UdpTransportBackend : ITransportBackend
             {
                 var result = await _udpClient.ReceiveAsync(ct);
                 if (result.Buffer.Length == 1)
-                {
-                    switch (result.Buffer[0])
-                    {
-                        case 0xFF: // Probe
-                            LastProbeReceivedFrom = result.RemoteEndPoint;
-                            _logger.LogDebug("[UDP-DIAG] EchoLoop: echoing probe from {Source}", result.RemoteEndPoint);
-                            try { await _udpClient.SendAsync(new byte[] { 0xFE }, 1, result.RemoteEndPoint); }
-                            catch { }
-                            break;
-                        case 0xFD: // Keepalive ping — respond with pong
-                            try { await _udpClient.SendAsync(new byte[] { 0xFC }, 1, result.RemoteEndPoint); }
-                            catch { }
-                            break;
-                        default: // 0xFE echo, 0xFC pong, other — ignore
-                            break;
-                    }
-                }
-                else if (result.Buffer.Length <= 2)
-                {
-                    // Small packet — ignore in echo loop
-                }
-                else
-                {
-                    _logger.LogDebug("[UDP-DIAG] EchoLoop: ignoring {Len}byte packet from {Source}", result.Buffer.Length, result.RemoteEndPoint);
-                }
+                    await HandleEchoControlByteAsync(result.Buffer[0], result.RemoteEndPoint);
+                else if (result.Buffer.Length > 2)
+                    _logger.LogDebug("[UDP-DIAG] EchoLoop: ignoring {Len}byte packet from {Source}",
+                        result.Buffer.Length, result.RemoteEndPoint);
+                // else: 2-byte packet — ignore silently in echo loop
             }
         }
         catch (OperationCanceledException) { }
@@ -393,6 +389,26 @@ public sealed class UdpTransportBackend : ITransportBackend
         catch (Exception ex)
         {
             _logger.LogDebug(ex, "[UDP-DIAG] Echo loop ended");
+        }
+    }
+
+    // Dispatch a single-byte control packet in the echo loop. 0xFF=probe (echo with 0xFE),
+    // 0xFD=keepalive ping (respond with pong). 0xFE/0xFC and other bytes are ignored.
+    private async Task HandleEchoControlByteAsync(byte controlByte, IPEndPoint src)
+    {
+        if (_udpClient == null) return;
+        switch (controlByte)
+        {
+            case 0xFF: // Probe
+                LastProbeReceivedFrom = src;
+                _logger.LogDebug("[UDP-DIAG] EchoLoop: echoing probe from {Source}", src);
+                try { await _udpClient.SendAsync(new byte[] { 0xFE }, 1, src); }
+                catch { }
+                break;
+            case 0xFD: // Keepalive ping
+                try { await _udpClient.SendAsync(new byte[] { 0xFC }, 1, src); }
+                catch { }
+                break;
         }
     }
 
@@ -442,77 +458,95 @@ public sealed class UdpTransportBackend : ITransportBackend
             localEp, endpoint, timeout.TotalMilliseconds, _udpClient.Available);
 
         using var probeCts = new CancellationTokenSource(timeout);
-        var attempt = 0;
         var probeStopwatch = Stopwatch.StartNew();
+        var totalAttempts = 0;
         try
         {
-            // Burst phase: send 3 probes at ~0ms, ~15ms, ~30ms with jitter
-            // Jitter prevents correlated timing where both sides' probes arrive before NAT bindings form
-            for (int burst = 0; burst < 3; burst++)
+            var (burstSuccess, burstAttempts) = await ProbeBurstPhaseAsync(endpoint, probeStopwatch, probeCts.Token);
+            totalAttempts = burstAttempts;
+            if (burstSuccess) { StartEchoLoop(); return true; }
+
+            if (await ProbeSlowRetryPhaseAsync(endpoint, probeStopwatch, totalAttempts, probeCts.Token))
             {
-                attempt++;
-                if (burst == 0) probeStopwatch.Restart(); // Start RTT measurement from first send
-                await _udpClient.SendAsync(new byte[] { 0xFF }, 1, endpoint);
-                _logger.LogDebug("[UDP-DIAG] Probe #{Attempt} (burst) sent 0xFF to {Target}", attempt, endpoint);
-
-                // Check for immediate response between burst probes
-                using var burstCts = CancellationTokenSource.CreateLinkedTokenSource(probeCts.Token);
-                // 10-20ms jitter between bursts; crypto RNG to satisfy static analysis (jitter window is non-security-critical).
-                burstCts.CancelAfter(10 + System.Security.Cryptography.RandomNumberGenerator.GetInt32(10));
-                try
-                {
-                    var result = await _udpClient.ReceiveAsync(burstCts.Token);
-                    if (result.Buffer.Length <= 2)
-                    {
-                        ProbeRtt = probeStopwatch.Elapsed;
-                        _logger.LogInformation("UDP probe to {Endpoint} succeeded (burst #{Attempt}, RTT={Rtt}ms)", endpoint, attempt, ProbeRtt.Value.TotalMilliseconds);
-                        StartEchoLoop(); // Restart echo loop for other candidates
-                        return true;
-                    }
-                }
-                catch (OperationCanceledException) when (!probeCts.Token.IsCancellationRequested) { }
-            }
-
-            // Slow retry phase: re-send every 150ms until overall timeout
-            while (!probeCts.Token.IsCancellationRequested)
-            {
-                using var subCts = CancellationTokenSource.CreateLinkedTokenSource(probeCts.Token);
-                subCts.CancelAfter(150);
-                try
-                {
-                    var result = await _udpClient.ReceiveAsync(subCts.Token);
-                    _logger.LogDebug("[UDP-DIAG] Probe received {Len}bytes from {Source} (first byte=0x{First:X2})",
-                        result.Buffer.Length, result.RemoteEndPoint, result.Buffer.Length > 0 ? result.Buffer[0] : 0);
-
-                    if (result.Buffer.Length <= 2)
-                    {
-                        ProbeRtt = probeStopwatch.Elapsed;
-                        _logger.LogInformation("UDP probe to {Endpoint} succeeded (attempt #{Attempt}, RTT={Rtt}ms)", endpoint, attempt, ProbeRtt.Value.TotalMilliseconds);
-                        StartEchoLoop();
-                        return true;
-                    }
-                    _logger.LogDebug("[UDP-DIAG] Ignoring large packet ({Len}bytes) — likely stale STUN/TURN", result.Buffer.Length);
-                }
-                catch (OperationCanceledException) when (!probeCts.Token.IsCancellationRequested)
-                {
-                    attempt++;
-                    _logger.LogDebug("[UDP-DIAG] Probe #{Attempt} — no response after 150ms, resending to {Target}", attempt, endpoint);
-                    probeStopwatch.Restart(); // Reset RTT measurement for each resend
-                    try { await _udpClient.SendAsync(new byte[] { 0xFF }, 1, endpoint); }
-                    catch (Exception sendEx) { _logger.LogDebug("[UDP-DIAG] Resend failed: {Error}", sendEx.Message); }
-                }
+                StartEchoLoop();
+                return true;
             }
         }
         catch (OperationCanceledException)
         {
-            _logger.LogDebug("[UDP-DIAG] ProbeAsync TIMEOUT after {Attempts} attempts to {Target}", attempt, endpoint);
+            _logger.LogDebug("[UDP-DIAG] ProbeAsync TIMEOUT (at least {Attempts} attempts) to {Target}", totalAttempts, endpoint);
         }
         catch (Exception ex)
         {
-            _logger.LogDebug(ex, "[UDP-DIAG] ProbeAsync EXCEPTION to {Target} after {Attempts} attempts", endpoint, attempt);
+            _logger.LogDebug(ex, "[UDP-DIAG] ProbeAsync EXCEPTION to {Target} after at least {Attempts} attempts", endpoint, totalAttempts);
         }
 
         StartEchoLoop(); // Restart echo loop for other candidates
+        return false;
+    }
+
+    // Burst phase: send 3 probes at ~0ms, ~15ms, ~30ms with jitter.
+    // Jitter prevents correlated timing where both sides' probes arrive before NAT bindings form.
+    private async Task<(bool success, int attempts)> ProbeBurstPhaseAsync(IPEndPoint endpoint, Stopwatch probeStopwatch, CancellationToken outerCt)
+    {
+        var attempt = 0;
+        for (int burst = 0; burst < 3; burst++)
+        {
+            attempt++;
+            if (burst == 0) probeStopwatch.Restart(); // Start RTT measurement from first send
+            await _udpClient!.SendAsync(new byte[] { 0xFF }, 1, endpoint);
+            _logger.LogDebug("[UDP-DIAG] Probe #{Attempt} (burst) sent 0xFF to {Target}", attempt, endpoint);
+
+            // Check for immediate response between burst probes
+            using var burstCts = CancellationTokenSource.CreateLinkedTokenSource(outerCt);
+            // 10-20ms jitter between bursts; crypto RNG to satisfy static analysis (jitter window is non-security-critical).
+            burstCts.CancelAfter(10 + System.Security.Cryptography.RandomNumberGenerator.GetInt32(10));
+            try
+            {
+                var result = await _udpClient.ReceiveAsync(burstCts.Token);
+                if (result.Buffer.Length <= 2)
+                {
+                    ProbeRtt = probeStopwatch.Elapsed;
+                    _logger.LogInformation("UDP probe to {Endpoint} succeeded (burst #{Attempt}, RTT={Rtt}ms)", endpoint, attempt, ProbeRtt.Value.TotalMilliseconds);
+                    return (true, attempt);
+                }
+            }
+            catch (OperationCanceledException) when (!outerCt.IsCancellationRequested) { }
+        }
+        return (false, attempt);
+    }
+
+    // Slow retry phase: re-send every 150ms until overall timeout.
+    private async Task<bool> ProbeSlowRetryPhaseAsync(IPEndPoint endpoint, Stopwatch probeStopwatch, int startingAttempt, CancellationToken outerCt)
+    {
+        var attempt = startingAttempt;
+        while (!outerCt.IsCancellationRequested)
+        {
+            using var subCts = CancellationTokenSource.CreateLinkedTokenSource(outerCt);
+            subCts.CancelAfter(150);
+            try
+            {
+                var result = await _udpClient!.ReceiveAsync(subCts.Token);
+                _logger.LogDebug("[UDP-DIAG] Probe received {Len}bytes from {Source} (first byte=0x{First:X2})",
+                    result.Buffer.Length, result.RemoteEndPoint, result.Buffer.Length > 0 ? result.Buffer[0] : 0);
+
+                if (result.Buffer.Length <= 2)
+                {
+                    ProbeRtt = probeStopwatch.Elapsed;
+                    _logger.LogInformation("UDP probe to {Endpoint} succeeded (attempt #{Attempt}, RTT={Rtt}ms)", endpoint, attempt, ProbeRtt.Value.TotalMilliseconds);
+                    return true;
+                }
+                _logger.LogDebug("[UDP-DIAG] Ignoring large packet ({Len}bytes) — likely stale STUN/TURN", result.Buffer.Length);
+            }
+            catch (OperationCanceledException) when (!outerCt.IsCancellationRequested)
+            {
+                attempt++;
+                _logger.LogDebug("[UDP-DIAG] Probe #{Attempt} — no response after 150ms, resending to {Target}", attempt, endpoint);
+                probeStopwatch.Restart(); // Reset RTT measurement for each resend
+                try { await _udpClient!.SendAsync(new byte[] { 0xFF }, 1, endpoint); }
+                catch (Exception sendEx) { _logger.LogDebug("[UDP-DIAG] Resend failed: {Error}", sendEx.Message); }
+            }
+        }
         return false;
     }
 
@@ -534,7 +568,15 @@ public sealed class UdpTransportBackend : ITransportBackend
             _logger.LogTrace("UDP sending {Size}KB message in {Fragments} fragments (msgId={MsgId})",
                 length / 1024, totalFragments, msgId);
 
-        // Send data fragments
+        await SendDataFragmentsAsync(data, offset, length, msgId, totalFragments);
+
+        var fecScale = FecScaleFactor;
+        if (totalFragments >= FecMinFragments && fecScale > 0)
+            await GenerateAndSendFecAsync(data, offset, length, msgId, totalFragments, fecScale);
+    }
+
+    private async Task SendDataFragmentsAsync(byte[] data, int offset, int length, ushort msgId, int totalFragments)
+    {
         for (int i = 0; i < totalFragments; i++)
         {
             var fragOffset = i * MaxFragmentPayload;
@@ -547,58 +589,72 @@ public sealed class UdpTransportBackend : ITransportBackend
 
             await SendRawPacketAsync(packet);
         }
+    }
 
-        // Generate and send FEC parity (2D XOR matrix)
-        var fecScale = FecScaleFactor;
-        if (totalFragments >= FecMinFragments && fecScale > 0)
+    // Generate and send 2D XOR FEC parity (SMPTE 2022-1 / SRT-style).
+    private async Task GenerateAndSendFecAsync(byte[] data, int offset, int length, ushort msgId, int totalFragments, double fecScale)
+    {
+        var (rows, cols) = ChooseFecMatrix(totalFragments, fecScale);
+        _logger.LogTrace("FEC: {Rows}x{Cols} matrix for {Frags} fragments (+{Extra} parity)",
+            rows, cols, totalFragments, rows + cols);
+
+        var rowParities = ComputeRowParities(data, offset, length, rows, cols, totalFragments);
+        var colParities = ComputeColParities(data, offset, length, rows, cols, totalFragments);
+
+        await SendInterleavedFecAsync(msgId, totalFragments, length, (byte)rows, (byte)cols, rowParities, colParities);
+    }
+
+    private static byte[][] ComputeRowParities(byte[] data, int offset, int length, int rows, int cols, int totalFragments)
+    {
+        var rowParities = new byte[rows][];
+        for (int r = 0; r < rows; r++)
         {
-            var (rows, cols) = ChooseFecMatrix(totalFragments, fecScale);
-            _logger.LogTrace("FEC: {Rows}x{Cols} matrix for {Frags} fragments (+{Extra} parity)",
-                rows, cols, totalFragments, rows + cols);
-
-            // Row parity — interleaved with column parity for burst protection
-            var rowParities = new byte[rows][];
-            for (int r = 0; r < rows; r++)
-            {
-                var parity = new byte[MaxFragmentPayload];
-                for (int c = 0; c < cols; c++)
-                {
-                    var idx = r * cols + c;
-                    if (idx >= totalFragments) break;
-                    XorFragmentFromSource(parity, data, offset, length, idx);
-                }
-                rowParities[r] = parity;
-            }
-
-            var colParities = new byte[cols][];
+            var parity = new byte[MaxFragmentPayload];
             for (int c = 0; c < cols; c++)
             {
-                var parity = new byte[MaxFragmentPayload];
-                for (int r = 0; r < rows; r++)
-                {
-                    var idx = r * cols + c;
-                    if (idx >= totalFragments) break;
-                    XorFragmentFromSource(parity, data, offset, length, idx);
-                }
-                colParities[c] = parity;
+                var idx = r * cols + c;
+                if (idx >= totalFragments) break;
+                XorFragmentFromSource(parity, data, offset, length, idx);
             }
+            rowParities[r] = parity;
+        }
+        return rowParities;
+    }
 
-            // Send interleaved: RF0, CF0, RF1, CF1, ... (remaining RF/CF after shorter list ends)
-            var maxPairs = Math.Max(rows, cols);
-            for (int i = 0; i < maxPairs; i++)
+    private static byte[][] ComputeColParities(byte[] data, int offset, int length, int rows, int cols, int totalFragments)
+    {
+        var colParities = new byte[cols][];
+        for (int c = 0; c < cols; c++)
+        {
+            var parity = new byte[MaxFragmentPayload];
+            for (int r = 0; r < rows; r++)
             {
-                if (i < rows)
-                {
-                    var fecPkt = BuildFecPacket(msgId, totalFragments + i, totalFragments,
-                        (byte)cols, (byte)rows, length, rowParities[i]);
-                    await SendRawPacketAsync(fecPkt);
-                }
-                if (i < cols)
-                {
-                    var fecPkt = BuildFecPacket(msgId, totalFragments + rows + i, totalFragments,
-                        (byte)cols, (byte)rows, length, colParities[i]);
-                    await SendRawPacketAsync(fecPkt);
-                }
+                var idx = r * cols + c;
+                if (idx >= totalFragments) break;
+                XorFragmentFromSource(parity, data, offset, length, idx);
+            }
+            colParities[c] = parity;
+        }
+        return colParities;
+    }
+
+    // Send interleaved: RF0, CF0, RF1, CF1, ... (remaining RF/CF after shorter list ends).
+    // Interleaving spreads parity across the burst so a localised packet-loss event
+    // doesn't wipe out the same axis twice.
+    private async Task SendInterleavedFecAsync(ushort msgId, int totalFragments, int totalMsgLen, byte rows, byte cols, byte[][] rowParities, byte[][] colParities)
+    {
+        var maxPairs = Math.Max(rows, cols);
+        for (int i = 0; i < maxPairs; i++)
+        {
+            if (i < rows)
+            {
+                var fecPkt = BuildFecPacket(msgId, totalFragments + i, totalFragments, cols, rows, totalMsgLen, rowParities[i]);
+                await SendRawPacketAsync(fecPkt);
+            }
+            if (i < cols)
+            {
+                var fecPkt = BuildFecPacket(msgId, totalFragments + rows + i, totalFragments, cols, rows, totalMsgLen, colParities[i]);
+                await SendRawPacketAsync(fecPkt);
             }
         }
     }
@@ -658,6 +714,11 @@ public sealed class UdpTransportBackend : ITransportBackend
         return (rows, cols);
     }
 
+    // FEC matrix shape validation: cols/rows must be positive, bounded at 30 (matches
+    // ChooseFecMatrix clamp), and the matrix must cover all data fragments.
+    private static bool IsValidFecMatrix(byte cols, byte rows, int totalFrags)
+        => cols > 0 && cols <= 30 && rows > 0 && rows <= 30 && (int)rows * cols >= totalFrags;
+
     private async Task ReceiveLoopAsync(CancellationToken ct)
     {
         try
@@ -665,47 +726,9 @@ public sealed class UdpTransportBackend : ITransportBackend
             while (!ct.IsCancellationRequested && _udpClient != null)
             {
                 var result = await _udpClient.ReceiveAsync(ct);
-                var data = result.Buffer;
-                var length = data.Length;
-
                 // Update keepalive timestamp on any received data
                 _lastReceivedTick = Environment.TickCount64;
-
-                // Single-byte probe/echo/keepalive packets handled by dedicated path
-                if (length <= 2)
-                {
-                    if (length == 1) await HandleControlByteAsync(data, result.RemoteEndPoint);
-                    continue;
-                }
-
-                // Check if this is a TURN DataIndication (unwrap it).
-                // `data!` asserts non-null - `data` was just initialized from
-                // result.Buffer (non-null) and not reassigned before this call;
-                // the analyzer can't track that across the tuple-deconstruction
-                // reassignment that follows.
-                if (length > 20 && IsTurnDataIndication(data))
-                {
-                    (data, length) = UnwrapDataIndication(data!, length);
-                    if (data == null || length < FragmentHeaderSize) continue;
-                }
-
-                if (length < FragmentHeaderSize) continue;
-
-                // Parse fragment header: [2 msgId][2 fragIdx][2 totalFrags]
-                var msgId = (ushort)((data[0] << 8) | data[1]);
-                var fragIndex = (data[2] << 8) | data[3];
-                var totalFrags = (data[4] << 8) | data[5];
-
-                if (fragIndex == 0 && totalFrags == 1)
-                {
-                    DeliverSingleFragment(data, length);
-                    continue;
-                }
-
-                if (fragIndex >= totalFrags)
-                    HandleFecParityPacket(data, length, msgId, fragIndex, totalFrags);
-                else
-                    HandleDataFragment(data, length, msgId, fragIndex, totalFrags);
+                await DispatchReceivedPacketAsync(result.Buffer, result.Buffer.Length, result.RemoteEndPoint);
             }
         }
         catch (OperationCanceledException) { }
@@ -714,6 +737,53 @@ public sealed class UdpTransportBackend : ITransportBackend
         {
             _logger.LogWarning(ex, "UDP receive loop error");
         }
+    }
+
+    // Dispatch a single received packet by shape: control byte, TURN-wrapped, single-fragment,
+    // FEC parity, or data fragment. Caller has already updated the keepalive timestamp.
+    private async Task DispatchReceivedPacketAsync(byte[] inputData, int inputLength, IPEndPoint src)
+    {
+        // Single-byte probe/echo/keepalive packets handled by dedicated path
+        if (inputLength <= 2)
+        {
+            if (inputLength == 1) await HandleControlByteAsync(inputData, src);
+            return;
+        }
+
+        var (data, length) = UnwrapTurnIfNeeded(inputData, inputLength);
+        if (data == null || length < FragmentHeaderSize) return;
+
+        DispatchFragmentPacket(data, length);
+    }
+
+    // Detect and strip a TURN DataIndication wrapper if present. Returns the original
+    // bytes unchanged if not a TURN wrapper, or the unwrapped payload if it was.
+    private static (byte[]? data, int length) UnwrapTurnIfNeeded(byte[] data, int length)
+    {
+        if (length > 20 && IsTurnDataIndication(data))
+            return UnwrapDataIndication(data, length);
+        return (data, length);
+    }
+
+    // Parse the 6-byte fragment header and route to single-fragment, FEC, or
+    // data-fragment handlers. Caller has already verified length >= FragmentHeaderSize.
+    private void DispatchFragmentPacket(byte[] data, int length)
+    {
+        // Parse fragment header: [2 msgId][2 fragIdx][2 totalFrags]
+        var msgId = (ushort)((data[0] << 8) | data[1]);
+        var fragIndex = (data[2] << 8) | data[3];
+        var totalFrags = (data[4] << 8) | data[5];
+
+        if (fragIndex == 0 && totalFrags == 1)
+        {
+            DeliverSingleFragment(data, length);
+            return;
+        }
+
+        if (fragIndex >= totalFrags)
+            HandleFecParityPacket(data, length, msgId, fragIndex, totalFrags);
+        else
+            HandleDataFragment(data, length, msgId, fragIndex, totalFrags);
     }
 
     // Single-byte control packet handler: probe echo, keepalive ping/pong.
@@ -770,7 +840,7 @@ public sealed class UdpTransportBackend : ITransportBackend
         var parityData = new byte[parityLen];
         Buffer.BlockCopy(data, FragmentHeaderSize + FecMetaSize, parityData, 0, parityLen);
 
-        if (cols > 0 && cols <= 30 && rows > 0 && rows <= 30 && (int)rows * cols >= totalFrags)
+        if (IsValidFecMatrix(cols, rows, totalFrags))
             fecBuffer.AddFecPacket(fecIdx, parityData, cols, rows, totalMsgLen);
 
         if (fecBuffer.TryRecover())
@@ -815,6 +885,16 @@ public sealed class UdpTransportBackend : ITransportBackend
 
         _logger.LogDebug("[UDP-DIAG] TURN relay probe: creating permission for {Peer}", peerRelayEndPoint);
 
+        if (!await CreateTurnPermissionAsync(peerRelayEndPoint)) return false;
+
+        _echoCts?.Cancel();
+        var success = await ProbeViaTurnWithRetryAsync(peerRelayEndPoint, timeout);
+        StartEchoLoop();
+        return success;
+    }
+
+    private async Task<bool> CreateTurnPermissionAsync(IPEndPoint peerRelayEndPoint)
+    {
         // Send CreatePermission for peer's relay address.
         // The (type, port, IPAddress) STUNXORAddressAttribute constructor is marked
         // obsolete by SIPSorcery ("Provided for backward compatibility with RFC3489
@@ -834,9 +914,8 @@ public sealed class UdpTransportBackend : ITransportBackend
             permReq.Attributes.Add(new STUNAttribute(STUNAttributeTypesEnum.Realm, Encoding.UTF8.GetBytes(_turnRealm)));
 
         var permBytes = permReq.ToByteBuffer(_turnHmacKey, false);
-        await _udpClient.SendAsync(permBytes, permBytes.Length, _turnServerEndPoint);
+        await _udpClient!.SendAsync(permBytes, permBytes.Length, _turnServerEndPoint!);
 
-        // Wait for CreatePermission response
         using var permCts = new CancellationTokenSource(2000);
         try
         {
@@ -848,15 +927,17 @@ public sealed class UdpTransportBackend : ITransportBackend
                 return false;
             }
             _logger.LogDebug("[UDP-DIAG] TURN CreatePermission succeeded for {Peer}", peerRelayEndPoint);
+            return true;
         }
         catch (OperationCanceledException)
         {
             _logger.LogWarning("TURN CreatePermission timed out");
             return false;
         }
+    }
 
-        // Now probe via SendIndication
-        _echoCts?.Cancel();
+    private async Task<bool> ProbeViaTurnWithRetryAsync(IPEndPoint peerRelayEndPoint, TimeSpan timeout)
+    {
         using var probeCts = new CancellationTokenSource(timeout);
         var attempt = 0;
         try
@@ -866,7 +947,7 @@ public sealed class UdpTransportBackend : ITransportBackend
             {
                 attempt++;
                 var probeInd = BuildSendIndication(peerRelayEndPoint, new byte[] { 0xFF });
-                await _udpClient.SendAsync(probeInd, probeInd.Length, _turnServerEndPoint);
+                await _udpClient!.SendAsync(probeInd, probeInd.Length, _turnServerEndPoint!);
                 _logger.LogDebug("[UDP-DIAG] TURN probe #{Attempt} sent to {Peer} via {Turn}", attempt, peerRelayEndPoint, _turnServerEndPoint);
 
                 using var burstCts = CancellationTokenSource.CreateLinkedTokenSource(probeCts.Token);
@@ -874,12 +955,9 @@ public sealed class UdpTransportBackend : ITransportBackend
                 try
                 {
                     var result = await _udpClient.ReceiveAsync(burstCts.Token);
-                    // Could be a DataIndication containing the echo, or a direct echo
-                    if (result.Buffer.Length <= 2 ||
-                        (IsTurnDataIndication(result.Buffer) && result.Buffer.Length < 40))
+                    if (IsTurnProbeEchoResponse(result.Buffer))
                     {
                         _logger.LogInformation("TURN relay probe to {Peer} succeeded", peerRelayEndPoint);
-                        StartEchoLoop();
                         return true;
                     }
                 }
@@ -893,12 +971,10 @@ public sealed class UdpTransportBackend : ITransportBackend
                 subCts.CancelAfter(300);
                 try
                 {
-                    var result = await _udpClient.ReceiveAsync(subCts.Token);
-                    if (result.Buffer.Length <= 2 ||
-                        (IsTurnDataIndication(result.Buffer) && result.Buffer.Length < 40))
+                    var result = await _udpClient!.ReceiveAsync(subCts.Token);
+                    if (IsTurnProbeEchoResponse(result.Buffer))
                     {
                         _logger.LogInformation("TURN relay probe to {Peer} succeeded (attempt #{Attempt})", peerRelayEndPoint, attempt);
-                        StartEchoLoop();
                         return true;
                     }
                 }
@@ -906,7 +982,7 @@ public sealed class UdpTransportBackend : ITransportBackend
                 {
                     attempt++;
                     var probeInd = BuildSendIndication(peerRelayEndPoint, new byte[] { 0xFF });
-                    try { await _udpClient.SendAsync(probeInd, probeInd.Length, _turnServerEndPoint); }
+                    try { await _udpClient!.SendAsync(probeInd, probeInd.Length, _turnServerEndPoint!); }
                     catch { }
                 }
             }
@@ -916,9 +992,13 @@ public sealed class UdpTransportBackend : ITransportBackend
             _logger.LogDebug("[UDP-DIAG] TURN probe TIMEOUT after {Attempts} attempts to {Peer}", attempt, peerRelayEndPoint);
         }
 
-        StartEchoLoop();
         return false;
     }
+
+    // Probe-echo response shape: either a direct ≤2-byte echo (0xFE), or a TURN
+    // DataIndication wrapping a small echo payload (size < 40 bytes).
+    private static bool IsTurnProbeEchoResponse(byte[] buffer)
+        => buffer.Length <= 2 || (IsTurnDataIndication(buffer) && buffer.Length < 40);
 
     private static byte[] BuildSendIndication(IPEndPoint peer, byte[] data)
     {
@@ -1156,23 +1236,30 @@ public sealed class UdpTransportBackend : ITransportBackend
         }
 
         public byte[] Assemble()
-        {
-            // Use totalMsgLen if available (FEC recovery may have padded fragments)
-            if (WasRecovered && _totalMsgLen > 0)
-            {
-                var result = new byte[_totalMsgLen];
-                var offset = 0;
-                foreach (var frag in _fragments)
-                {
-                    if (frag == null) continue;
-                    var copyLen = Math.Min(frag.Length, _totalMsgLen - offset);
-                    if (copyLen <= 0) break;
-                    Buffer.BlockCopy(frag, 0, result, offset, copyLen);
-                    offset += copyLen;
-                }
-                return result;
-            }
+            => WasRecovered && _totalMsgLen > 0
+                ? AssembleFromFecRecovered()
+                : AssembleFromCompleteFragments();
 
+        // FEC-recovered path: copy up to _totalMsgLen bytes total, since recovered
+        // fragments are padded to MaxFragmentPayload but the original message was shorter.
+        private byte[] AssembleFromFecRecovered()
+        {
+            var result = new byte[_totalMsgLen];
+            var offset = 0;
+            foreach (var frag in _fragments)
+            {
+                if (frag == null) continue;
+                var copyLen = Math.Min(frag.Length, _totalMsgLen - offset);
+                if (copyLen <= 0) break;
+                Buffer.BlockCopy(frag, 0, result, offset, copyLen);
+                offset += copyLen;
+            }
+            return result;
+        }
+
+        // Normal-completion path: every fragment present with exact length.
+        private byte[] AssembleFromCompleteFragments()
+        {
             var totalLen = _fragments.Where(f => f != null).Sum(f => f!.Length);
             var buf = new byte[totalLen];
             var off = 0;

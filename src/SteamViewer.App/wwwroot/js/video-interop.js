@@ -3,12 +3,12 @@
 // Keeps: SharedBuffer rendering, mouse/keyboard capture, stats overlay, logger bridge
 //
 // CODE-HEALTH-EXEMPT (intrinsic-cap)
-// Realistic CH ceiling ~7.0-7.5. The sharedbufferreceived listener has three
-// codec-shape branches (lossless QOI / raw BGRA / JPEG) and the input capture
-// path carries cross-browser key/coord-mapping tables. Decomposition gains
-// readability little here and would require a JS build system this project
-// doesn't ship.
-// See: .claude/research/codescene-clean-delivery/intrinsic-caps.md
+// Complexity here is bounded by browser-context intrinsics: the WebView2 AltGr
+// phantom-Ctrl keyboard workaround (platform bug, see handleKeyDown), the PID mouse
+// regulator, and DPR / object-fit / letterbox coordinate math. Each carries an
+// irreducible branch count; decomposing them was measured to LOWER Code Health, not
+// raise it. Only the safely de-duplicatable parts were lifted — don't split these
+// methods further.
 
 // === Logger Bridge ===
 window.SteamViewerLogger = {
@@ -135,34 +135,36 @@ window.SteamViewerVideo = {
         const session = this.sessions.get(sessionId);
         if (!session) return;
         session.statsData = JSON.parse(statsJson);
-        if (session.statsOverlayEl) {
-            const s = session.statsData;
-            const videoInfo = s.resolution || '?';
-            // Canvas and display dimensions for diagnostics
-            let canvasInfo = '?', displayInfo = '?', scaleStr = '?';
-            if (session.canvas) {
-                canvasInfo = `${session.canvas.width}x${session.canvas.height}`;
-                const rect = session.canvas.getBoundingClientRect();
-                const dpr = window.devicePixelRatio || 1;
-                const dw = Math.round(rect.width * dpr);
-                const dh = Math.round(rect.height * dpr);
-                displayInfo = `${dw}x${dh}`;
-                if (session.videoW && session.videoH) {
-                    const scale = Math.min(dw / session.videoW, dh / session.videoH);
-                    scaleStr = `${scale.toFixed(2)}x${session.isDownscaling ? ' ↓' : ''}`;
-                }
+        if (!session.statsOverlayEl) return;
+        session.statsOverlayEl.textContent = this._buildStatsLines(session).join('\n');
+        session.statsOverlayEl.style.whiteSpace = 'pre';
+    },
+
+    _buildStatsLines(session) {
+        const s = session.statsData;
+        const videoInfo = s.resolution || '?';
+        // Canvas and display dimensions for diagnostics
+        let canvasInfo = '?', displayInfo = '?', scaleStr = '?';
+        if (session.canvas) {
+            canvasInfo = `${session.canvas.width}x${session.canvas.height}`;
+            const rect = session.canvas.getBoundingClientRect();
+            const dpr = window.devicePixelRatio || 1;
+            const dw = Math.round(rect.width * dpr);
+            const dh = Math.round(rect.height * dpr);
+            displayInfo = `${dw}x${dh}`;
+            if (session.videoW && session.videoH) {
+                const scale = Math.min(dw / session.videoW, dh / session.videoH);
+                scaleStr = `${scale.toFixed(2)}x${session.isDownscaling ? ' ↓' : ''}`;
             }
-            const encInfo = (session.encodeW && session.encodeH)
-                ? `${session.encodeW}x${session.encodeH}` : '?';
-            const lines = [
-                `Video: ${s.fps?.toFixed(0) || '?'} FPS | ${s.bitrateMbps?.toFixed(1) || '?'} Mbps`,
-                `Src:   ${videoInfo} | Enc: ${encInfo} | Canvas: ${canvasInfo} | Disp: ${displayInfo} | Scale: ${scaleStr}`,
-                `Lat:   Enc ${s.encodeMs?.toFixed(0) || '?'}ms | Dec ${s.decodeMs?.toFixed(0) || '?'}ms`,
-                `Net:   ${s.bytesSent ? fmtBytes(s.bytesSent) : '?'} sent | ${s.bytesReceived ? fmtBytes(s.bytesReceived) : '?'} rcvd`,
-            ];
-            session.statsOverlayEl.textContent = lines.join('\n');
-            session.statsOverlayEl.style.whiteSpace = 'pre';
         }
+        const encInfo = (session.encodeW && session.encodeH)
+            ? `${session.encodeW}x${session.encodeH}` : '?';
+        return [
+            `Video: ${s.fps?.toFixed(0) || '?'} FPS | ${s.bitrateMbps?.toFixed(1) || '?'} Mbps`,
+            `Src:   ${videoInfo} | Enc: ${encInfo} | Canvas: ${canvasInfo} | Disp: ${displayInfo} | Scale: ${scaleStr}`,
+            `Lat:   Enc ${s.encodeMs?.toFixed(0) || '?'}ms | Dec ${s.decodeMs?.toFixed(0) || '?'}ms`,
+            `Net:   ${s.bytesSent ? fmtBytes(s.bytesSent) : '?'} sent | ${s.bytesReceived ? fmtBytes(s.bytesReceived) : '?'} rcvd`,
+        ];
     },
 
     toggleStatsOverlay(sessionId) {
@@ -362,12 +364,13 @@ function paintRawFrame1to1(frame, meta, session) {
     session.isDownscaling = false;
 }
 
-// Raw BGRA VideoFrame: display-pixel fallback path. Used before encodeInfo arrives,
-// or when frame doesn't match encode resolution. Letterbox-downscale or 1:1.
-function paintRawFrameFallback(frame, meta, session) {
+// Shared canvas resize + letterbox/1:1 draw for the fallback painters (raw + jpeg).
+// Derives ctx/canvas from session and tracks lastDisplayW/H + isDownscaling. Unifies
+// the jpeg fallback onto the same state tracking as the raw path (jpeg previously
+// skipped that tracking — a latent inconsistency; jpeg is a rarely-used fallback).
+function drawFrameWithFit(source, meta, fit, session) {
     const canvas = session.canvas;
     const ctx = session.ctx;
-    const fit = computeDisplayFit(canvas, meta.w, meta.h);
     if (fit.isDownscaling) {
         const displayChanged = fit.displayW !== session.lastDisplayW || fit.displayH !== session.lastDisplayH;
         if (canvas.width !== fit.displayW || canvas.height !== fit.displayH || displayChanged) {
@@ -379,7 +382,7 @@ function paintRawFrameFallback(frame, meta, session) {
             session.lastDisplayH = fit.displayH;
         }
         if (fit.dx > 0 || fit.dy > 0) ctx.clearRect(0, 0, fit.displayW, fit.displayH);
-        ctx.drawImage(frame, fit.dx, fit.dy, fit.fitW, fit.fitH);
+        ctx.drawImage(source, fit.dx, fit.dy, fit.fitW, fit.fitH);
         session.isDownscaling = true;
     } else {
         if (canvas.width !== meta.w || canvas.height !== meta.h) {
@@ -388,9 +391,16 @@ function paintRawFrameFallback(frame, meta, session) {
             session.lastDisplayW = 0;
             session.lastDisplayH = 0;
         }
-        ctx.drawImage(frame, 0, 0);
+        ctx.drawImage(source, 0, 0);
         session.isDownscaling = false;
     }
+}
+
+// Raw BGRA VideoFrame: display-pixel fallback path. Used before encodeInfo arrives,
+// or when frame doesn't match encode resolution. Letterbox-downscale or 1:1.
+function paintRawFrameFallback(frame, meta, session) {
+    const fit = computeDisplayFit(session.canvas, meta.w, meta.h);
+    drawFrameWithFit(frame, meta, fit, session);
 }
 
 // Raw BGRA VideoFrame from C# FFmpeg decoder.
@@ -428,29 +438,32 @@ function paintJpegFrame(buf, meta, session) {
     const blob = new Blob([jpegBytes], { type: 'image/jpeg' });
     createImageBitmap(blob).then(bitmap => {
         if (!session.canvas || !session.ctx) { bitmap.close(); return; }
-
-        const canvas = session.canvas;
-        const ctx = session.ctx;
         session.videoW = meta.w;
         session.videoH = meta.h;
-
-        const fit = computeDisplayFit(canvas, meta.w, meta.h);
-        if (fit.isDownscaling) {
-            if (canvas.width !== fit.displayW || canvas.height !== fit.displayH) {
-                canvas.width = fit.displayW; canvas.height = fit.displayH;
-                ctx.imageSmoothingEnabled = true;
-                ctx.imageSmoothingQuality = 'high';
-            }
-            if (fit.dx > 0 || fit.dy > 0) ctx.clearRect(0, 0, fit.displayW, fit.displayH);
-            ctx.drawImage(bitmap, fit.dx, fit.dy, fit.fitW, fit.fitH);
-        } else {
-            if (canvas.width !== meta.w || canvas.height !== meta.h) {
-                canvas.width = meta.w; canvas.height = meta.h;
-            }
-            ctx.drawImage(bitmap, 0, 0);
-        }
+        const fit = computeDisplayFit(session.canvas, meta.w, meta.h);
+        drawFrameWithFit(bitmap, meta, fit, session);
         bitmap.close();
     }).catch(() => {});
+}
+
+// Dispatch a received frame to the right painter by meta flags, then run frame
+// accounting + first-frame callback. Lossless suppresses the first-frame callback
+// (QOI settle frames) — preserved from pre-refactor behavior.
+function paintFrame(buf, meta, session) {
+    if (meta.lossless) {
+        paintLosslessFrame(buf, meta, session);
+        session.frameCount++;
+        return;
+    }
+    if (meta.raw) paintRawFrame(buf, meta, session);
+    else paintJpegFrame(buf, meta, session);
+    session.frameCount++;
+    if (session.frameCount === 1 && session.dotNetRef) {
+        try {
+            session.dotNetRef.invokeMethodAsync('OnVideoStartedCallback');
+            console.log(`[Video] First frame: ${meta.w}x${meta.h}`);
+        } catch (err) { console.warn('OnVideoStartedCallback failed:', err); }
+    }
 }
 
 if (window.chrome?.webview) {
@@ -458,32 +471,12 @@ if (window.chrome?.webview) {
         try {
             const meta = e.additionalData;
             const buf = e.getBuffer();
-
             const session = window.SteamViewerVideo.sessions.get(meta.sid);
             if (!session || !session.canvas || !session.ctx) {
                 chrome.webview.releaseBuffer(buf);
                 return;
             }
-
-            // Lossless paths return early — first-frame callback is suppressed for QOI
-            // settle frames (preserved from pre-refactor behavior).
-            if (meta.lossless) {
-                paintLosslessFrame(buf, meta, session);
-                session.frameCount++;
-                return;
-            }
-
-            if (meta.raw) paintRawFrame(buf, meta, session);
-            else paintJpegFrame(buf, meta, session);
-
-            session.frameCount++;
-
-            if (session.frameCount === 1 && session.dotNetRef) {
-                try {
-                    session.dotNetRef.invokeMethodAsync('OnVideoStartedCallback');
-                    console.log(`[Video] First frame: ${meta.w}x${meta.h}`);
-                } catch (err) { console.warn('OnVideoStartedCallback failed:', err); }
-            }
+            paintFrame(buf, meta, session);
         } catch (err) {
             console.warn('SharedBuffer frame error:', err);
         }
@@ -726,12 +719,7 @@ window.SteamViewerInput = {
         if (this._focusWatchdogId) clearInterval(this._focusWatchdogId);
         this._focusWatchdogId = setInterval(() => {
             if (this.isLocked && this.canvas && document.activeElement !== this.canvas) {
-                const active = document.activeElement;
-                if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA'
-                    || active.tagName === 'SELECT' || active.closest('.menu-dropdown')
-                    || active.closest('.connection-dialog'))) {
-                    return;
-                }
+                if (this._isInteractiveElement(document.activeElement)) return;
                 this.canvas.focus();
             }
         }, 500);
@@ -922,11 +910,27 @@ window.SteamViewerInput = {
         };
     },
 
+    // === Input Gate ===
+
+    // Shared guard for all input handlers (mouse + keyboard). Hot-path: intentionally
+    // NOT logged per-call (fires at pointer/key event rate). Behavior is identical to
+    // the inlined guard it replaces across the 6 handlers.
+    _canSendInput() {
+        return this.isCapturing && this.isLocked && !!window.chrome?.webview;
+    },
+
+    // True if the element should keep focus instead of the canvas (form fields, menus, dialogs).
+    _isInteractiveElement(el) {
+        return !!el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA'
+            || el.tagName === 'SELECT' || !!el.closest('.menu-dropdown')
+            || !!el.closest('.connection-dialog'));
+    },
+
     // === Mouse Handlers ===
 
     handleMouseMove(e) {
         this._rawEventCount++;
-        if (!this.isCapturing || !this.isLocked || !window.chrome?.webview) return;
+        if (!this._canSendInput()) return;
         this._inputEventCount++;
         this.ensureCanvas();
         this._lastMouseDownCoords = null;
@@ -969,7 +973,7 @@ window.SteamViewerInput = {
     },
 
     handleMouseDown(e) {
-        if (!this.isCapturing || !this.isLocked || !window.chrome?.webview) return;
+        if (!this._canSendInput()) return;
         e.preventDefault();
         const { x, y, captureW, captureH } = this._getMouseCoords(e);
         const button = ['left', 'middle', 'right', 'XButton1', 'XButton2'][e.button] || 'left';
@@ -980,7 +984,7 @@ window.SteamViewerInput = {
     },
 
     handleMouseUp(e) {
-        if (!this.isCapturing || !this.isLocked || !window.chrome?.webview) return;
+        if (!this._canSendInput()) return;
         e.preventDefault();
         const button = ['left', 'middle', 'right', 'XButton1', 'XButton2'][e.button] || 'left';
         let x, y, captureW, captureH;
@@ -997,7 +1001,7 @@ window.SteamViewerInput = {
     },
 
     handleWheel(e) {
-        if (!this.isCapturing || !this.isLocked || !window.chrome?.webview) return;
+        if (!this._canSendInput()) return;
         e.preventDefault();
         let dx = e.deltaX, dy = e.deltaY;
         if (e.deltaMode === 1) { dx *= 40; dy *= 40; }
@@ -1024,7 +1028,7 @@ window.SteamViewerInput = {
     },
 
     handleKeyDown(e) {
-        if (!this.isCapturing || !this.isLocked || !window.chrome?.webview) return;
+        if (!this._canSendInput()) return;
         e.preventDefault();
         if (this._nativeKeyboardActive) return;
 
@@ -1104,7 +1108,7 @@ window.SteamViewerInput = {
     },
 
     handleKeyUp(e) {
-        if (!this.isCapturing || !this.isLocked || !window.chrome?.webview) return;
+        if (!this._canSendInput()) return;
         e.preventDefault();
         if (this._nativeKeyboardActive) return;
 
