@@ -7,9 +7,7 @@ namespace SteamViewer.App;
 
 public partial class App : Application
 {
-    private CollaborationViewerService? _collabViewerService;
     private ViewerTabManager? _tabManager;
-    private Window? _collabViewerWindow;
     private Window? _mainWindow;
     private readonly ConcurrentDictionary<string, Window> _viewerWindows = new();
     private readonly ConcurrentDictionary<string, byte> _pendingWindowCloses = new();
@@ -172,13 +170,6 @@ public partial class App : Application
 
     private void InitializeViewerServices()
     {
-        // Collaboration viewer service (multi-user mode)
-        _collabViewerService = MauiProgram.ServiceProvider?.GetService<CollaborationViewerService>();
-        if (_collabViewerService != null)
-        {
-            _collabViewerService.OnViewerOpenRequested += OpenCollabViewerWindow;
-        }
-
         // Tab manager for multi-tab viewer windows
         _tabManager = MauiProgram.ServiceProvider?.GetService<ViewerTabManager>();
         if (_tabManager != null)
@@ -255,34 +246,4 @@ public partial class App : Application
         });
     }
 
-    private void OpenCollabViewerWindow(string peerId)
-    {
-        if (_collabViewerWindow != null)
-        {
-            // Window already open - just switch tab
-            _collabViewerService?.SwitchTab(peerId);
-            return;
-        }
-
-        MainThread.BeginInvokeOnMainThread(() =>
-        {
-            _collabViewerWindow = new Window(new CollaborationViewerPage())
-            {
-                Title = "Collaboration Viewer",
-                Width = 1280,
-                Height = 800
-            };
-
-            _collabViewerWindow.Destroying += OnCollabViewerWindowDestroying;
-            _collabViewerService?.RegisterViewerWindow(_collabViewerWindow);
-
-            Application.Current?.OpenWindow(_collabViewerWindow);
-        });
-    }
-
-    private void OnCollabViewerWindowDestroying(object? sender, EventArgs e)
-    {
-        _collabViewerWindow = null;
-        _collabViewerService?.NotifyViewerClosed();
-    }
 }

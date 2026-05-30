@@ -446,6 +446,18 @@
     {
         if (windowId != _windowId) return;
 
+        // Re-activating the SAME session instance that is already bound (e.g. duplicate-connect
+        // focus, or SetActiveTab on the current tab) must NOT dispose + rebind the live video -
+        // that tears down a working render for no reason and leaves the canvas black. Reconnect
+        // is a different path (OnSessionReconnected) and swaps in a NEW ViewerSession instance,
+        // so the identity check (not just sessionId) keeps reconnect-rebind working.
+        if (sessionId != null && _activeSession != null
+            && ReferenceEquals(_activeSession, SessionManager.GetSession(sessionId)))
+        {
+            Logger.LogDebug("[Viewer] HandleActiveTabChanged: session {SessionId} already bound (same instance) - skipping rebind to avoid disposing live video", sessionId);
+            return;
+        }
+
         // Save current tab's per-tab state before switching
         var oldTab = _tabs.FirstOrDefault(t => t.SessionId == _activeSessionId);
         if (oldTab != null)
@@ -518,8 +530,8 @@
                 _hostMonitors = _activeSession.HostMonitors;
                 _activeMonitorId = _activeSession.ActiveMonitorId;
 
-                // Bind WebRTC to this viewer window's JS context and enable direct rendering.
-                // PeerConnection is created in OUR window → video renders directly to canvas.
+                // Bind the video pipeline to this viewer window's JS context and enable direct rendering.
+                // The decoded frames render directly to OUR window's canvas.
                 _ = BindAndEnableDirectRenderAsync(sessionId);
 
                 // Show reconnect overlay if session is already disconnected
@@ -785,8 +797,7 @@
             // Send resolution EARLY — host needs this before encoding first frames
             await SendDisplayResolutionAsync(session);
 
-            // Bind WebRTC to this viewer window's JS context
-            // (creates PeerConnection here, processes queued SDP/ICE)
+            // Bind the video pipeline to this viewer window's JS context.
             await session.BindToViewerAsync(JSRuntime);
 
             // Enable direct rendering — PeerConnection is now in our window
@@ -851,12 +862,14 @@
     {
         try
         {
-            // Multiple refocus attempts with increasing delays to combat Blazor re-render stealing focus.
-            // StateHasChanged() triggers an async re-render that can complete at varying times.
+            // Do not steal focus from a local modal (ConnectionDialog) - bail early if it is open,
+            // and route the refocus through the guarded JS helper that skips when an interactive
+            // element is focused. Multiple attempts combat Blazor's async re-render timing.
+            if (_showConnectionDialog) return;
             await Task.Delay(200);
-            await JSRuntime.InvokeVoidAsync("eval", "document.getElementById('viewerCanvas')?.focus()");
+            await JSRuntime.InvokeVoidAsync("SteamViewerInput._focusCanvasSafe");
             await Task.Delay(300);
-            await JSRuntime.InvokeVoidAsync("eval", "document.getElementById('viewerCanvas')?.focus()");
+            await JSRuntime.InvokeVoidAsync("SteamViewerInput._focusCanvasSafe");
         }
         catch { }
     }
@@ -888,23 +901,61 @@
         return AppIcon.Link;
     }
 
+    private bool _keyboardCaptureSuspendedForDialog;
+
     private void OpenConnectionDialog()
     {
+        SuspendKeyboardCaptureForDialog();
         _showConnectionDialog = true;
         StateHasChanged();
     }
 
     private void CloseConnectionDialog()
     {
+        RestoreKeyboardCaptureAfterDialog();
         _showConnectionDialog = false;
         StateHasChanged();
     }
 
     private void HandleConnected(string sessionId)
     {
+        RestoreKeyboardCaptureAfterDialog();
         _showConnectionDialog = false;
         RefreshTabs();
         StateHasChanged();
+    }
+
+    // While a local modal (ConnectionDialog) is open, the OS-level keyboard hook must NOT
+    // swallow keystrokes - otherwise they are captured and injected to the HOST instead of
+    // reaching the dialog's text box (confirmed via helper-debug.txt 2026-05-25: typed
+    // "TRAV..." went to the host). Suspend Active -> LogOnly (NOT Disabled): LogOnly passes
+    // keys through to the WebView2 while PRESERVING the AltGr/modifier state machine, whereas
+    // Disabled calls ResetModifierState() and would corrupt AltGr/Ctrl on restore.
+    private void SuspendKeyboardCaptureForDialog()
+    {
+        if (SystemKeyInterceptor is SteamViewer.Platform.Windows.Input.WindowsSystemKeyInterceptor winInterceptor
+            && winInterceptor.Mode == SteamViewer.Platform.Windows.Input.CaptureMode.Active)
+        {
+            winInterceptor.Mode = SteamViewer.Platform.Windows.Input.CaptureMode.LogOnly;
+            _keyboardCaptureSuspendedForDialog = true;
+            Logger.LogInformation("[Viewer] Keyboard capture suspended (Active -> LogOnly) for ConnectionDialog");
+        }
+        else
+        {
+            Logger.LogDebug("[Viewer] ConnectionDialog opened, keyboard capture not Active (mode={Mode}) - nothing to suspend",
+                (SystemKeyInterceptor as SteamViewer.Platform.Windows.Input.WindowsSystemKeyInterceptor)?.Mode);
+        }
+    }
+
+    private void RestoreKeyboardCaptureAfterDialog()
+    {
+        if (_keyboardCaptureSuspendedForDialog
+            && SystemKeyInterceptor is SteamViewer.Platform.Windows.Input.WindowsSystemKeyInterceptor winInterceptor)
+        {
+            winInterceptor.Mode = SteamViewer.Platform.Windows.Input.CaptureMode.Active;
+            _keyboardCaptureSuspendedForDialog = false;
+            Logger.LogInformation("[Viewer] Keyboard capture restored (LogOnly -> Active) after ConnectionDialog");
+        }
     }
 
     private async Task ToggleHostCursor()
@@ -1433,7 +1484,7 @@
                      + $"Mode: [{transport}]";
             }
 
-            // Legacy WebRTC stats
+            // Video pipeline stats
             var wFps = r.GetProperty("videoFps").GetDouble();
             var wMbps = r.GetProperty("bitrateMbps").GetDouble();
             var wRes = r.GetProperty("resolution").GetString() ?? "?";
@@ -1722,7 +1773,7 @@
                 _inputRouter?.SetActiveSession(_activeSession);
 #endif
 
-                // Bind new session's WebRTC to this viewer window and enable direct rendering
+                // Bind new session's video pipeline to this viewer window and enable direct rendering
                 _ = BindAndEnableDirectRenderAsync(newSession.SessionId);
 
                 // Reset monitor layout (host will resend on new capture)

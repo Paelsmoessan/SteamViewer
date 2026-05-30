@@ -172,6 +172,12 @@ public sealed class WindowsSystemKeyInterceptor : ISystemKeyInterceptor
 
     public void Dispose() => Uninstall();
 
+    // CODE-HEALTH-EXEMPT (see .claude/research/codescene-clean-delivery/intrinsic-caps.md):
+    // HookCallback is the LL keyboard hook state machine. Structurally identical to
+    // video-interop.js.handleKeyDown which was empirically measured 2026-05-24 (Pass 4 -0.08
+    // CH, reverted). AltGr phantom-LCtrl drop + modifier snapshot + unicode-resolution +
+    // legacy system-key interception all share state (_activeUnicodeKeys, _lCtrlDown, etc.).
+    // Extraction relocates the conditionals onto helpers AND adds the function-count penalty.
     private IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
     {
         if (nCode >= 0)

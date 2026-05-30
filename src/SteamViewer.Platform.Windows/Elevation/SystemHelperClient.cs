@@ -3,6 +3,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
+using SteamViewer.Common.Logging;
 
 namespace SteamViewer.Platform.Windows.Elevation;
 
@@ -164,34 +165,54 @@ public sealed class SystemHelperClient : IAsyncDisposable
     /// </summary>
     private async Task ConnectVideoPipeAsync()
     {
-        if (_pipeName == null) return;
+        _videoPipe = await ConnectAuxiliaryPipeAsync("video", "Video");
+        if (_videoPipe == null) { CleanupVideoPipe(); return; }
 
-        var videoPipeName = $"{_pipeName}_video";
+        _videoReader = new BinaryReader(_videoPipe);
+        _videoStopRequested = false;
+        _videoReaderThread = new Thread(VideoReaderLoop)
+        {
+            Name = "SecureDesktopVideoReader",
+            IsBackground = true
+        };
+        _videoReaderThread.Start();
+    }
+
+    /// <summary>
+    /// Shared open-and-log path for the auxiliary pipes ({_pipeName}_video / _notify). Returns the
+    /// connected pipe on success, null on TimeoutException / generic failure (logged in-helper);
+    /// always disposes the half-constructed pipe on the failure path so the caller does not need to.
+    /// Caller wires up the reader, the read-loop thread, and the stop flag because those differ
+    /// per pipe (BinaryReader vs StreamReader; VideoReaderLoop vs NotifyReaderLoop).
+    /// </summary>
+    private async Task<NamedPipeClientStream?> ConnectAuxiliaryPipeAsync(string suffix, string logLabel)
+    {
+        if (_pipeName == null) return null;
+        var fullPipeName = $"{_pipeName}_{suffix}";
+
+        NamedPipeClientStream? pipe = null;
         try
         {
-            _videoPipe = new NamedPipeClientStream(".", videoPipeName, PipeDirection.In, PipeOptions.None);
-            await _videoPipe.ConnectAsync(10_000); // 10s timeout
-            _videoReader = new BinaryReader(_videoPipe);
-            _logger.LogInformation("Video pipe connected: {PipeName}", videoPipeName);
-
-            // Start background thread to read video frames
-            _videoStopRequested = false;
-            _videoReaderThread = new Thread(VideoReaderLoop)
-            {
-                Name = "SecureDesktopVideoReader",
-                IsBackground = true
-            };
-            _videoReaderThread.Start();
+            pipe = new NamedPipeClientStream(".", fullPipeName, PipeDirection.In, PipeOptions.None);
+            await pipe.ConnectAsync(10_000); // 10s timeout
+            _logger.LogInformation("{Label} pipe connected: {PipeName}", logLabel, fullPipeName);
+            var result = pipe;
+            pipe = null; // success: prevent finally-dispose
+            return result;
         }
         catch (TimeoutException)
         {
-            _logger.LogWarning("Video pipe connection timed out (10s) — secure desktop capture unavailable");
-            CleanupVideoPipe();
+            _logger.LogWarning("{Label} pipe connection timed out (10s)", logLabel);
+            return null;
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Failed to connect video pipe — secure desktop capture unavailable");
-            CleanupVideoPipe();
+            _logger.LogWarning(ex, "Failed to connect {Label} pipe", logLabel);
+            return null;
+        }
+        finally
+        {
+            pipe?.Dispose();
         }
     }
 
@@ -359,39 +380,21 @@ public sealed class SystemHelperClient : IAsyncDisposable
 
     /// <summary>
     /// Connect to the notify pipe ({pipeName}_notify) for receiving server-push notifications.
-    /// Non-critical — if it fails, secure desktop state tracking just won't work.
+    /// Non-critical - if it fails, secure desktop state tracking just won't work.
     /// </summary>
     private async Task ConnectNotifyPipeAsync()
     {
-        if (_pipeName == null) return;
+        _notifyPipe = await ConnectAuxiliaryPipeAsync("notify", "Notify");
+        if (_notifyPipe == null) { CleanupNotifyPipe(); return; }
 
-        var notifyPipeName = $"{_pipeName}_notify";
-        try
+        _notifyReader = new StreamReader(_notifyPipe, PipeEncoding);
+        _notifyStopRequested = false;
+        _notifyReaderThread = new Thread(NotifyReaderLoop)
         {
-            _notifyPipe = new NamedPipeClientStream(".", notifyPipeName, PipeDirection.In, PipeOptions.None);
-            await _notifyPipe.ConnectAsync(10_000);
-            _notifyReader = new StreamReader(_notifyPipe, PipeEncoding);
-            _logger.LogInformation("Notify pipe connected: {PipeName}", notifyPipeName);
-
-            // Start background thread to read notifications
-            _notifyStopRequested = false;
-            _notifyReaderThread = new Thread(NotifyReaderLoop)
-            {
-                Name = "SystemPipeNotifyReader",
-                IsBackground = true
-            };
-            _notifyReaderThread.Start();
-        }
-        catch (TimeoutException)
-        {
-            _logger.LogWarning("Notify pipe connection timed out (10s)");
-            CleanupNotifyPipe();
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Failed to connect notify pipe");
-            CleanupNotifyPipe();
-        }
+            Name = "SystemPipeNotifyReader",
+            IsBackground = true
+        };
+        _notifyReaderThread.Start();
     }
 
     /// <summary>
@@ -413,7 +416,7 @@ public sealed class SystemHelperClient : IAsyncDisposable
                     break;
                 }
 
-                _logger.LogInformation("Notify pipe recv: {Line}", line);
+                _logger.LogInformation("Notify pipe recv: {Line}", LogSanitizer.MaskJsonSecrets(line));
                 TryHandleNotification(line);
             }
         }
@@ -433,7 +436,7 @@ public sealed class SystemHelperClient : IAsyncDisposable
         _logger.LogInformation("Notify reader loop exited");
     }
 
-    private async Task<ElevatedHelperClient.HelperResponse?> SendCommandAsync(object command)
+    private async Task<HelperResponse?> SendCommandAsync(object command)
     {
         if (_writer == null || !IsConnected)
         {
@@ -445,7 +448,7 @@ public sealed class SystemHelperClient : IAsyncDisposable
         try
         {
             var json = JsonSerializer.Serialize(command);
-            _logger.LogInformation("System pipe send: {Json}", json);
+            _logger.LogInformation("System pipe send: {Json}", LogSanitizer.MaskJsonSecrets(json));
             await _writer.WriteLineAsync(json);
             await _writer.FlushAsync();
 
@@ -459,10 +462,10 @@ public sealed class SystemHelperClient : IAsyncDisposable
             }
 
             var responseLine = await readTask;
-            _logger.LogInformation("System pipe recv: {Response}", responseLine ?? "(null)");
+            _logger.LogInformation("System pipe recv: {Response}", LogSanitizer.MaskJsonSecrets(responseLine ?? "(null)"));
             if (responseLine == null) return null;
 
-            return JsonSerializer.Deserialize<ElevatedHelperClient.HelperResponse>(responseLine,
+            return JsonSerializer.Deserialize<HelperResponse>(responseLine,
                 new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
         }
         catch (Exception ex)

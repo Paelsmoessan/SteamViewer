@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.IO.Pipes;
 using System.Text;
 using System.Text.Json;
+using SteamViewer.Common.Logging;
 
 namespace SteamViewer.Platform.Windows.Elevation;
 
@@ -34,6 +35,23 @@ public sealed class ElevatedHelperClient : IAsyncDisposable
     }
 
     /// <summary>
+    /// B5 concurrent guard: if a prior connect attempt left a helper process behind without a live
+    /// pipe (e.g. spawned but failed before ping), reap it before spawning another so we never
+    /// accumulate live admin helpers across retries.
+    /// </summary>
+    private void ReapStaleHelperProcess()
+    {
+        if (_helperProcess == null || _helperProcess.HasExited) return;
+
+        var stalePid = _helperProcess.Id;
+        _logger.LogWarning("LaunchAndConnect found a stale helper process (PID {PID}) - killing it before spawning a new one", stalePid);
+        try { _helperProcess.Kill(); }
+        catch (Exception ex) { _logger.LogWarning(ex, "Failed to kill stale helper PID {PID}", stalePid); }
+        _helperProcess.Dispose();
+        _helperProcess = null;
+    }
+
+    /// <summary>
     /// Launch the elevated helper process (triggers UAC) and connect via named pipe.
     /// Returns true if helper is running and pipe is connected.
     /// </summary>
@@ -41,17 +59,7 @@ public sealed class ElevatedHelperClient : IAsyncDisposable
     {
         if (IsConnected) return true;
 
-        // B5 concurrent guard: if a prior helper process is still around (e.g. a previous connect
-        // attempt spawned it but failed before connecting), reap it before spawning another so we
-        // never accumulate live admin helpers.
-        if (_helperProcess != null && !_helperProcess.HasExited)
-        {
-            var stalePid = _helperProcess.Id;
-            _logger.LogWarning("LaunchAndConnect found a stale helper process (PID {PID}) - killing it before spawning a new one", stalePid);
-            try { _helperProcess.Kill(); } catch (Exception ex) { _logger.LogWarning(ex, "Failed to kill stale helper PID {PID}", stalePid); }
-            _helperProcess.Dispose();
-            _helperProcess = null;
-        }
+        ReapStaleHelperProcess();
 
         // Random pipe name (was PID-based, but PID is observable; random Guid is harder to race)
         _pipeName = $"SteamViewer-Elevated-{Guid.NewGuid():N}";
@@ -142,43 +150,24 @@ public sealed class ElevatedHelperClient : IAsyncDisposable
     /// <summary>
     /// Send Ctrl+Alt+Del (SAS) via the elevated helper.
     /// </summary>
-    public async Task<bool> SendSASAsync()
-    {
-        var response = await SendCommandAsync(new { command = "sendSAS" });
-        if (response?.Success == true)
-        {
-            _logger.LogInformation("SendSAS succeeded via elevated helper");
-            return true;
-        }
-
-        _logger.LogWarning("SendSAS failed: {Error}", response?.Error ?? "no response");
-        return false;
-    }
+    public Task<bool> SendSASAsync() =>
+        SendBoolCommandAsync(new { command = "sendSAS" },
+            "SendSAS succeeded via elevated helper", "SendSAS");
 
     /// <summary>
     /// Run a process elevated via the helper (no additional UAC prompt).
     /// </summary>
-    public async Task<bool> RunElevatedAsync(string path, string? args = null)
-    {
-        var response = await SendCommandAsync(new { command = "runElevated", path, args });
-        if (response?.Success == true)
-        {
-            _logger.LogInformation("RunElevated succeeded: {Path}", path);
-            return true;
-        }
-
-        _logger.LogWarning("RunElevated failed: {Error}", response?.Error ?? "no response");
-        return false;
-    }
+    public Task<bool> RunElevatedAsync(string path, string? args = null) =>
+        SendBoolCommandAsync(new { command = "runElevated", path, args },
+            "RunElevated succeeded: {Path}", "RunElevated", path);
 
     /// <summary>
     /// Reboot with auto-restart via the elevated helper (writes RunOnceEx + shutdown).
     /// </summary>
-    public async Task<bool> RebootAsync(string? clientId = null, string? passwordHash = null, string? viewerPeerId = null,
+    public Task<bool> RebootAsync(string? clientId = null, string? passwordHash = null, string? viewerPeerId = null,
         string? serverUrl = null, string[]? stunUrls = null,
-        string[]? turnUrls = null, string? turnUsername = null, string? turnCredential = null)
-    {
-        var response = await SendCommandAsync(new
+        string[]? turnUrls = null, string? turnUsername = null, string? turnCredential = null) =>
+        SendBoolCommandAsync(new
         {
             command = "reboot",
             clientId,
@@ -189,17 +178,7 @@ public sealed class ElevatedHelperClient : IAsyncDisposable
             turnUrls,
             turnUsername,
             turnCredential
-        });
-
-        if (response?.Success == true)
-        {
-            _logger.LogInformation("Reboot initiated via elevated helper");
-            return true;
-        }
-
-        _logger.LogWarning("Reboot failed: {Error}", response?.Error ?? "no response");
-        return false;
-    }
+        }, "Reboot initiated via elevated helper", "Reboot");
 
     /// <summary>
     /// Send an input event to the elevated helper for injection (fire-and-forget, no response).
@@ -268,6 +247,20 @@ public sealed class ElevatedHelperClient : IAsyncDisposable
         }
     }
 
+    private async Task<bool> SendBoolCommandAsync(object command, string successLog, string failureLabel,
+        params object?[] successArgs)
+    {
+        var response = await SendCommandAsync(command);
+        if (response?.Success == true)
+        {
+            _logger.LogInformation(successLog, successArgs);
+            return true;
+        }
+
+        _logger.LogWarning("{Label} failed: {Error}", failureLabel, response?.Error ?? "no response");
+        return false;
+    }
+
     private async Task<HelperResponse?> SendCommandAsync(object command)
     {
         if (_writer == null || _reader == null || !IsConnected)
@@ -280,7 +273,7 @@ public sealed class ElevatedHelperClient : IAsyncDisposable
         try
         {
             var json = JsonSerializer.Serialize(command);
-            _logger.LogInformation("Pipe send: {Json}", json);
+            _logger.LogInformation("Pipe send: {Json}", LogSanitizer.MaskJsonSecrets(json));
             await _writer.WriteLineAsync(json);
             await _writer.FlushAsync();
 
@@ -294,7 +287,7 @@ public sealed class ElevatedHelperClient : IAsyncDisposable
             }
 
             var responseLine = await readTask;
-            _logger.LogInformation("Pipe recv: {Response}", responseLine ?? "(null)");
+            _logger.LogInformation("Pipe recv: {Response}", LogSanitizer.MaskJsonSecrets(responseLine ?? "(null)"));
 
             if (responseLine == null) return null;
 
@@ -373,6 +366,4 @@ public sealed class ElevatedHelperClient : IAsyncDisposable
 
         await ShutdownHelperAsync();
     }
-
-    internal record HelperResponse(bool Success, string? Error);
 }

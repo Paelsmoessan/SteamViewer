@@ -6,7 +6,7 @@ using SteamViewer.Common.Protocol;
 namespace SteamViewer.Client.Core.FileTransfer;
 
 /// <summary>
-/// Manages file transfers over WebRTC data channel.
+/// Manages file transfers over the custom UDP transport's file channel.
 /// </summary>
 public sealed class FileTransferManager : IAsyncDisposable
 {

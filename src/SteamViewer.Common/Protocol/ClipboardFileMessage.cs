@@ -3,7 +3,7 @@ using System.Text.Json.Serialization;
 namespace SteamViewer.Common.Protocol;
 
 /// <summary>
-/// Clipboard file transfer messages sent over the dedicated file WebRTC data channel.
+/// Clipboard file transfer messages sent over the dedicated file channel on the custom UDP transport.
 /// Follows the RDP CLIPRDR virtual channel pattern: metadata first, then on-demand streaming.
 /// </summary>
 [JsonPolymorphic(TypeDiscriminatorPropertyName = "type")]

@@ -98,83 +98,6 @@ public class SignalingMessageTests
     }
 
     [Fact]
-    public void SdpOffer_SerializesCorrectly()
-    {
-        // Arrange
-        var sdp = "v=0\r\no=- 12345 1 IN IP4 127.0.0.1\r\n...";
-        var message = new SignalingMessage.SdpOffer("987654321", sdp);
-
-        // Act
-        var json = SignalingSerializer.Serialize(message);
-        var deserialized = SignalingSerializer.Deserialize(json);
-
-        // Assert
-        var offer = Assert.IsType<SignalingMessage.SdpOffer>(deserialized);
-        Assert.Equal("987654321", offer.TargetId);
-        Assert.Equal(sdp, offer.Sdp);
-    }
-
-    [Fact]
-    public void SdpAnswer_SerializesCorrectly()
-    {
-        // Arrange
-        var sdp = "v=0\r\no=- 67890 1 IN IP4 127.0.0.1\r\n...";
-        var message = new SignalingMessage.SdpAnswer("123456789", sdp);
-
-        // Act
-        var json = SignalingSerializer.Serialize(message);
-        var deserialized = SignalingSerializer.Deserialize(json);
-
-        // Assert
-        var answer = Assert.IsType<SignalingMessage.SdpAnswer>(deserialized);
-        Assert.Equal("123456789", answer.TargetId);
-        Assert.Equal(sdp, answer.Sdp);
-    }
-
-    [Fact]
-    public void IceCandidate_SerializesCorrectly_WithAllFields()
-    {
-        // Arrange
-        var message = new SignalingMessage.IceCandidate(
-            "987654321",
-            "candidate:0 1 UDP 2122252543 192.168.1.100 54321 typ host",
-            "audio",
-            0);
-
-        // Act
-        var json = SignalingSerializer.Serialize(message);
-        var deserialized = SignalingSerializer.Deserialize(json);
-
-        // Assert
-        var candidate = Assert.IsType<SignalingMessage.IceCandidate>(deserialized);
-        Assert.Equal("987654321", candidate.TargetId);
-        Assert.Equal("candidate:0 1 UDP 2122252543 192.168.1.100 54321 typ host", candidate.Candidate);
-        Assert.Equal("audio", candidate.SdpMid);
-        Assert.Equal((ushort)0, candidate.SdpMLineIndex);
-    }
-
-    [Fact]
-    public void IceCandidate_SerializesCorrectly_WithNullOptionalFields()
-    {
-        // Arrange
-        var message = new SignalingMessage.IceCandidate(
-            "987654321",
-            "candidate:0 1 UDP 2122252543 192.168.1.100 54321 typ host",
-            null,
-            null);
-
-        // Act
-        var json = SignalingSerializer.Serialize(message);
-        var deserialized = SignalingSerializer.Deserialize(json);
-
-        // Assert
-        var candidate = Assert.IsType<SignalingMessage.IceCandidate>(deserialized);
-        Assert.Equal("987654321", candidate.TargetId);
-        Assert.Null(candidate.SdpMid);
-        Assert.Null(candidate.SdpMLineIndex);
-    }
-
-    [Fact]
     public void Connected_SerializesCorrectly()
     {
         // Arrange
@@ -312,5 +235,59 @@ public class SignalingMessageTests
         Assert.Contains("\"type\":\"register\"", json);
         Assert.Contains("\"client_id\":\"123456789\"", json);
         Assert.Contains("\"password_hash\":\"password_hash\"", json);
+    }
+
+    [Fact]
+    public void SanitizeForLog_Register_MasksPasswordHash()
+    {
+        var message = new SignalingMessage.Register("client1", "deadbeefcafebabe");
+
+        var sanitized = (SignalingMessage.Register)SignalingSerializer.SanitizeForLog(message);
+
+        Assert.Equal("***", sanitized.PasswordHash);
+        Assert.Equal("client1", sanitized.ClientId);
+    }
+
+    [Fact]
+    public void SanitizeForLog_ConnectRequest_MasksPasswordHash()
+    {
+        var message = new SignalingMessage.ConnectRequest("target1", "deadbeefcafebabe");
+
+        var sanitized = (SignalingMessage.ConnectRequest)SignalingSerializer.SanitizeForLog(message);
+
+        Assert.Equal("***", sanitized.PasswordHash);
+        Assert.Equal("target1", sanitized.TargetId);
+    }
+
+    [Fact]
+    public void SanitizeForLog_RelayReady_MasksEncryptionNonce()
+    {
+        var message = new SignalingMessage.RelayReady("target1", "abcdef0123456789");
+
+        var sanitized = (SignalingMessage.RelayReady)SignalingSerializer.SanitizeForLog(message);
+
+        Assert.Equal("***", sanitized.EncryptionNonce);
+        Assert.Equal("target1", sanitized.TargetId);
+    }
+
+    [Fact]
+    public void SanitizeForLog_NonSecretType_ReturnsSameInstance()
+    {
+        SignalingMessage message = new SignalingMessage.Ping();
+
+        var sanitized = SignalingSerializer.SanitizeForLog(message);
+
+        Assert.Same(message, sanitized);
+    }
+
+    [Fact]
+    public void SanitizeForLog_SerializedOutput_DoesNotContainOriginalSecret()
+    {
+        var message = new SignalingMessage.Register("client1", "actual_hash_value_xyz");
+
+        var json = SignalingSerializer.Serialize(SignalingSerializer.SanitizeForLog(message));
+
+        Assert.DoesNotContain("actual_hash_value_xyz", json);
+        Assert.Contains("\"password_hash\":\"***\"", json);
     }
 }

@@ -191,5 +191,20 @@ public sealed unsafe class FFmpegDecoder : IDisposable
         if (_disposed) return;
         _disposed = true;
         Cleanup();
+        GC.SuppressFinalize(this);
+    }
+
+    /// <summary>
+    /// Safety net for missed Dispose() (closes audit unverified-MED finding
+    /// `.claude/research/fresh-audit-2026-05-29` "FFmpegEncoder/FFmpegDecoder have no
+    /// finalizer/SafeHandle - missed Dispose permanently leaks native FFmpeg memory across
+    /// reconnect/resolution cycles"). Cleanup is pointer-only (no managed state read), so it
+    /// is safe to call from the finalizer thread. Normal-path Dispose calls
+    /// GC.SuppressFinalize so this only runs when the object went out of scope without
+    /// explicit disposal.
+    /// </summary>
+    ~FFmpegDecoder()
+    {
+        Cleanup();
     }
 }

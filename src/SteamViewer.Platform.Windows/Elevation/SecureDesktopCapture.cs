@@ -151,6 +151,14 @@ public sealed class SecureDesktopCapture : IDisposable
         }
     }
 
+    // CODE-HEALTH-EXEMPT (see .claude/research/codescene-clean-delivery/intrinsic-caps.md):
+    // CaptureLoopInner is the SD poll loop's state machine. The Winlogon <-> Default desktop
+    // transition + GDI lifecycle + BitBlt+GetDIBits capture phases share mutable state
+    // (hDesktopDC, hMemDC, hBitmap, hOldBitmap, cachedWidth, cachedHeight, _winlogonDesktop,
+    // _frameCount, wasActive). Extraction was measured 2026-05-30: 7.35 -> 7.15 with full
+    // extracts, 7.17 with partial revert. Reverted. Audit's "Brain Method" finding is
+    // acknowledged as maintainability-not-correctness; the measured cap converts it into a
+    // documented exemption, not an open follow-up.
     private void CaptureLoopInner()
     {
         DebugLog("Capture loop starting");
@@ -281,8 +289,7 @@ public sealed class SecureDesktopCapture : IDisposable
                         if (!bitBltOk && _frameCount < 3)
                             DebugLog($"BitBlt failed (error {Marshal.GetLastWin32Error()})");
 
-                        // Read raw BGRA pixels via GetDIBits
-                        // CRITICAL: Deselect bitmap from DC before GetDIBits (Phase 4 lesson - API contract)
+                        // CRITICAL: Deselect bitmap from DC before GetDIBits (Phase 4 lesson - API contract).
                         // GetDIBits requires the bitmap NOT selected into any DC.
                         var deselected = SelectObject(hMemDC, hOldBitmap);
                         if (_frameCount < 3)
@@ -371,7 +378,11 @@ public sealed class SecureDesktopCapture : IDisposable
                         cachedHeight = 0;
                         _bgraBuffer = null;
 
-                        SetThreadDesktop(originalDesktop);
+                        // Audit LOW (.claude/research/fresh-audit-2026-05-29 "SecureDesktopCapture ignores
+                        // SetThreadDesktop return on SD-exit") - capture + log the bool, asymmetric with
+                        // the activation call at line 202 which IS checked.
+                        if (!SetThreadDesktop(originalDesktop))
+                            DebugLog($"SetThreadDesktop(originalDesktop) failed on SD exit: Win32 error {Marshal.GetLastWin32Error()}");
                         CloseDesktop(_winlogonDesktop);
                         _winlogonDesktop = IntPtr.Zero;
 
@@ -407,7 +418,9 @@ public sealed class SecureDesktopCapture : IDisposable
 
             if (wasActive)
             {
-                SetThreadDesktop(originalDesktop);
+                // Same audit-LOW fix as the SD-exit path above.
+                if (!SetThreadDesktop(originalDesktop))
+                    DebugLog($"SetThreadDesktop(originalDesktop) failed in finally: Win32 error {Marshal.GetLastWin32Error()}");
                 if (_winlogonDesktop != IntPtr.Zero)
                 {
                     CloseDesktop(_winlogonDesktop);
@@ -419,6 +432,7 @@ public sealed class SecureDesktopCapture : IDisposable
             DebugLog("Capture loop exited");
         }
     }
+
 
     private static void CleanupGdiResources(ref IntPtr hDesktopDC, ref IntPtr hMemDC,
         ref IntPtr hBitmap, ref IntPtr hOldBitmap)

@@ -11,6 +11,28 @@ using System.Text;
 namespace SteamViewer.App.Services;
 
 /// <summary>
+/// Outcome of a <see cref="ViewerSessionManager.CreateSessionAsync"/> call. Distinguishes a
+/// brand-new session from a refused duplicate-connect (a live/reconnecting session to the same
+/// host already exists) so callers do not render a refusal as a failure. See reason-notes
+/// "duplicate-connect silently replaces live session" (2026-05-25).
+/// </summary>
+public enum CreateSessionOutcome
+{
+    /// <summary>A new session was created and a connection request was sent.</summary>
+    Created,
+    /// <summary>A session to this peer already exists; no new session was created. Focus the existing tab.</summary>
+    AlreadyConnected,
+    /// <summary>Session creation failed (max sessions, etc). OnConnectionFailed has fired.</summary>
+    Failed
+}
+
+/// <summary>
+/// Result of <see cref="ViewerSessionManager.CreateSessionAsync"/>. On AlreadyConnected,
+/// <see cref="Session"/> is the pre-existing session to focus; on Failed it is null.
+/// </summary>
+public readonly record struct CreateSessionResult(CreateSessionOutcome Outcome, ViewerSession? Session);
+
+/// <summary>
 /// Manages multiple viewer sessions for the multi-tab viewer feature.
 /// Routes signaling messages (including TransportEndpoint) to the correct session.
 /// </summary>
@@ -93,6 +115,13 @@ public sealed class ViewerSessionManager : IAsyncDisposable
     public event Action<string>? OnSessionRemoved;
 
     /// <summary>
+    /// Raised when a duplicate connect to an already-present peer is refused. The single
+    /// subscriber (ViewerTabManager) focuses the existing session's tab - connect entry points
+    /// (Home, ConnectionDialog) must NOT duplicate that focus logic.
+    /// </summary>
+    public event Action<ViewerSession>? OnDuplicateConnectRefused;
+
+    /// <summary>
     /// Raised when a session is reconnected via ReconnectSessionAsync - same sessionId,
     /// new underlying ViewerSession object. Subscribers (e.g., RemoteViewer.razor) must
     /// rebind their event subscriptions to the new session even though the id is unchanged.
@@ -139,22 +168,31 @@ public sealed class ViewerSessionManager : IAsyncDisposable
     /// host never causes a viewer window to flash open and closed.
     /// </param>
     /// <returns>The created session, or null if max sessions reached or connection failed.</returns>
-    public async Task<ViewerSession?> CreateSessionAsync(string peerId, string password, IJSRuntime jsRuntime,
+    public async Task<CreateSessionResult> CreateSessionAsync(string peerId, string password, IJSRuntime jsRuntime,
         Action<ViewerSession>? onApproved = null)
     {
         if (_sessions.Count >= MaxSessions)
         {
             _logger.LogWarning("Cannot create session: max sessions ({Max}) reached", MaxSessions);
             OnConnectionFailed?.Invoke(peerId, $"Maximum {MaxSessions} sessions allowed");
-            return null;
+            return new CreateSessionResult(CreateSessionOutcome.Failed, null);
         }
 
-        // If a stale session exists for this peer, clean it up first
-        if (_peerToSession.TryGetValue(peerId, out var existingSessionId))
+        // Deny-by-default on duplicate connect. If a session for this peer already exists it is, by
+        // construction, live or reconnecting-within-120s: dead sessions self-clean their _peerToSession
+        // entry via RemoveSessionAsync (max-outage/grace/peer-disconnect timers all funnel there). So a
+        // present mapping means "there is already a tab for this host" - refuse the second connect and
+        // let the caller focus the existing tab. Silently tearing it down (the pre-2026-05-25 behavior
+        // from 979f9fe) killed live sessions, auto-closed their window, and orphaned the replacement.
+        // Reconnect proper uses ReconnectSessionAsync, NOT this path, so it is unaffected.
+        if (_peerToSession.TryGetValue(peerId, out var existingSessionId)
+            && _sessions.TryGetValue(existingSessionId, out var existingSession))
         {
-            _logger.LogWarning("Stale session {SessionId} for peer {PeerId} — cleaning up before reconnect",
-                existingSessionId, peerId);
-            await RemoveSessionAsync(existingSessionId);
+            _logger.LogWarning(
+                "Duplicate connect to peer {PeerId} REFUSED: session {SessionId} already present (state={State}); focusing existing tab.",
+                peerId, existingSessionId, existingSession.State);
+            OnDuplicateConnectRefused?.Invoke(existingSession);
+            return new CreateSessionResult(CreateSessionOutcome.AlreadyConnected, existingSession);
         }
 
         EnsureSignalingSubscribed();
@@ -219,7 +257,7 @@ public sealed class ViewerSessionManager : IAsyncDisposable
 
         OnSessionCreated?.Invoke(session);
 
-        return session;
+        return new CreateSessionResult(CreateSessionOutcome.Created, session);
     }
 
     /// <summary>
@@ -576,9 +614,25 @@ public sealed class ViewerSessionManager : IAsyncDisposable
             {
                 try { t.Dispose(); } catch { }
             }
-            _logger.LogWarning("Session {SessionId}: grace timer expired (no host_recovered received, epoch={Epoch}) - running RemoveSessionAsync now",
+            // Test 5 fix (TODO §5 P1 abrupt-kill bug): pre-fix, grace expiry called
+            // RemoveSessionAsync directly, which tore down the viewer window before the host's
+            // restart (taskkill /f / crash / BSOD) could complete (~10-20s typical). With the
+            // tear-down removed, the session stays alive and one of two paths recovers it:
+            // (a) UDP keepalive detects transport-dead (~9s after grace expires for a fully-dead
+            //     host) -> session.OnDisconnected fires -> ShowReconnectOverlay + TryReconnect
+            //     loop kicks in via RemoteViewer.razor.
+            // (b) Host actually comes back -> ConnectRequest succeeds via reconnect, session
+            //     never needed to be removed at all.
+            // (c) Worst case (host gone forever, transport somehow still appears alive):
+            //     max-outage timer (120s) is the final tear-down gate.
+            // Grace timer's job is to wait for the host_recovered handshake; on miss, hand off
+            // to the keepalive/retry/max-outage chain, not to make the tear-down decision.
+            _logger.LogInformation("Session {SessionId}: grace timer expired (no host_recovered received, epoch={Epoch}) - keeping session alive; transport-keepalive + TryReconnect loop will handle recovery (max-outage 120s is final tear-down gate)",
                 sessionId, capturedEpoch);
-            _ = RemoveSessionAsync(sessionId);
+            if (_gracePeriodTimers.TryRemove(sessionId, out var expiredTimer))
+            {
+                try { expiredTimer.Dispose(); } catch { }
+            }
         }, null, GracePeriodMs, Timeout.Infinite);
 
         // Cancel any previous grace timer for this session (duplicate Disconnected events possible).

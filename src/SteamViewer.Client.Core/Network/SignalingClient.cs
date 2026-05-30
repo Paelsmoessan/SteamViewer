@@ -149,7 +149,7 @@ public sealed class SignalingClient : IAsyncDisposable
         finally { _writeLock.Release(); }
 
         _logger.LogDebug("[SIG] Sent {MessageType}: {Json}", message.GetType().Name,
-            System.Text.Json.JsonSerializer.Serialize(message, message.GetType()));
+            SignalingSerializer.Serialize(SignalingSerializer.SanitizeForLog(message)));
     }
 
     /// <summary>
@@ -309,30 +309,6 @@ public sealed class SignalingClient : IAsyncDisposable
     }
 
     /// <summary>
-    /// Send SDP offer to a peer.
-    /// </summary>
-    public async Task SendSdpOfferAsync(string targetId, string sdp, CancellationToken cancellationToken = default)
-    {
-        await SendAsync(new SignalingMessage.SdpOffer(targetId, sdp), cancellationToken);
-    }
-
-    /// <summary>
-    /// Send SDP answer to a peer.
-    /// </summary>
-    public async Task SendSdpAnswerAsync(string targetId, string sdp, CancellationToken cancellationToken = default)
-    {
-        await SendAsync(new SignalingMessage.SdpAnswer(targetId, sdp), cancellationToken);
-    }
-
-    /// <summary>
-    /// Send ICE candidate to a peer.
-    /// </summary>
-    public async Task SendIceCandidateAsync(string targetId, string candidate, string? sdpMid, ushort? sdpMLineIndex, CancellationToken cancellationToken = default)
-    {
-        await SendAsync(new SignalingMessage.IceCandidate(targetId, candidate, sdpMid, sdpMLineIndex), cancellationToken);
-    }
-
-    /// <summary>
     /// Disconnect from a peer.
     /// </summary>
     public async Task DisconnectFromPeerAsync(string peerId, CancellationToken cancellationToken = default)
@@ -400,40 +376,9 @@ public sealed class SignalingClient : IAsyncDisposable
                 }
 
                 if (result.MessageType == WebSocketMessageType.Binary)
-                {
-                    // Accumulate binary chunks
-                    binaryBuffer.Write(buffer, 0, result.Count);
-
-                    if (result.EndOfMessage)
-                    {
-                        var data = binaryBuffer.GetBuffer();
-                        var length = (int)binaryBuffer.Length;
-                        OnBinaryReceived?.Invoke(data, length);
-                        binaryBuffer.SetLength(0); // Reset for next message
-                    }
-                }
+                    HandleBinaryFrame(buffer, result.Count, result.EndOfMessage, binaryBuffer);
                 else if (result.MessageType == WebSocketMessageType.Text)
-                {
-                    messageBuilder.Append(Encoding.UTF8.GetString(buffer, 0, result.Count));
-
-                    if (result.EndOfMessage)
-                    {
-                        var json = messageBuilder.ToString();
-                        messageBuilder.Clear();
-
-                        var message = SignalingSerializer.Deserialize(json);
-                        if (message != null)
-                        {
-                            _logger.LogDebug("[SIG] Received {MessageType}: {Json}", message.GetType().Name, json);
-                            await _incomingMessages.Writer.WriteAsync(message, cancellationToken);
-                            OnMessageReceived?.Invoke(message);
-                        }
-                        else
-                        {
-                            _logger.LogWarning("Failed to deserialize message: {Json}", json);
-                        }
-                    }
-                }
+                    await HandleTextFrameAsync(buffer, result.Count, result.EndOfMessage, messageBuilder, cancellationToken);
             }
         }
         catch (OperationCanceledException)
@@ -442,43 +387,95 @@ public sealed class SignalingClient : IAsyncDisposable
         }
         catch (WebSocketException ex)
         {
-            // Enriched context per the gate-logging rule. The bare "WebSocket error in
-            // receive loop" line is invisible about cause and state; surface what we
-            // can detect locally to make Railway-vs-network-vs-deliberate diagnosable
-            // without correlating against server logs.
-            var wsState = _webSocket?.State.ToString() ?? "null";
-            var cancelled = cancellationToken.IsCancellationRequested;
-            _logger.LogWarning(ex, "WebSocket error in receive loop (wsState={WsState}, cancelled={Cancelled}, wsErrorCode={Code}, reconnectEnabled={Reconnect})",
-                wsState, cancelled, ex.WebSocketErrorCode, _reconnectEnabled);
-            OnError?.Invoke(ex);
-            OnDisconnected?.Invoke($"WebSocket error: {ex.Message}");
-
-            // Auto-reconnect kick: WS died unexpectedly (Railway proxy, network blip,
-            // server restart). Fire-and-forget so the receive loop can finish exiting;
-            // ReconnectAsync's lock guard prevents concurrent attempts if a subscriber
-            // (Home.razor) also kicks one off via OnDisconnected. _reconnectEnabled
-            // gates this against deliberate DisconnectAsync teardown.
-            if (_reconnectEnabled)
-            {
-                _ = Task.Run(() => ReconnectAsync(CancellationToken.None));
-            }
+            HandleWebSocketException(ex, cancellationToken);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Unexpected error in receive loop");
-            OnError?.Invoke(ex);
-            OnDisconnected?.Invoke($"Receive loop error: {ex.Message}");
-
-            // Same auto-reconnect rationale as the WebSocketException path above.
-            if (_reconnectEnabled)
-            {
-                _ = Task.Run(() => ReconnectAsync(CancellationToken.None));
-            }
+            HandleUnexpectedReceiveError(ex);
         }
         finally
         {
             _incomingMessages.Writer.Complete();
             binaryBuffer.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Accumulate a binary frame chunk; on EndOfMessage, raise OnBinaryReceived with the full
+    /// buffer and reset for the next message. Binary frames carry transport relay payloads.
+    /// </summary>
+    private void HandleBinaryFrame(byte[] buffer, int count, bool endOfMessage, MemoryStream binaryBuffer)
+    {
+        binaryBuffer.Write(buffer, 0, count);
+        if (!endOfMessage) return;
+
+        var data = binaryBuffer.GetBuffer();
+        var length = (int)binaryBuffer.Length;
+        OnBinaryReceived?.Invoke(data, length);
+        binaryBuffer.SetLength(0); // Reset for next message
+    }
+
+    /// <summary>
+    /// Accumulate a text frame chunk; on EndOfMessage, deserialize the JSON, log the sanitized
+    /// shape, push to the incoming-messages channel, and raise OnMessageReceived. Failed
+    /// deserialization is logged at Warning and the message is dropped.
+    /// </summary>
+    private async Task HandleTextFrameAsync(byte[] buffer, int count, bool endOfMessage, StringBuilder messageBuilder, CancellationToken cancellationToken)
+    {
+        messageBuilder.Append(Encoding.UTF8.GetString(buffer, 0, count));
+        if (!endOfMessage) return;
+
+        var json = messageBuilder.ToString();
+        messageBuilder.Clear();
+
+        var message = SignalingSerializer.Deserialize(json);
+        if (message == null)
+        {
+            _logger.LogWarning("Failed to deserialize message: {Json}", json);
+            return;
+        }
+
+        _logger.LogDebug("[SIG] Received {MessageType}: {Json}", message.GetType().Name,
+            SignalingSerializer.Serialize(SignalingSerializer.SanitizeForLog(message)));
+        await _incomingMessages.Writer.WriteAsync(message, cancellationToken);
+        OnMessageReceived?.Invoke(message);
+    }
+
+    /// <summary>
+    /// Enriched context per the gate-logging rule. The bare "WebSocket error in receive loop"
+    /// line is invisible about cause and state; surface what we can detect locally to make
+    /// Railway-vs-network-vs-deliberate diagnosable without correlating against server logs.
+    /// </summary>
+    private void HandleWebSocketException(WebSocketException ex, CancellationToken cancellationToken)
+    {
+        var wsState = _webSocket?.State.ToString() ?? "null";
+        var cancelled = cancellationToken.IsCancellationRequested;
+        _logger.LogWarning(ex, "WebSocket error in receive loop (wsState={WsState}, cancelled={Cancelled}, wsErrorCode={Code}, reconnectEnabled={Reconnect})",
+            wsState, cancelled, ex.WebSocketErrorCode, _reconnectEnabled);
+        OnError?.Invoke(ex);
+        OnDisconnected?.Invoke($"WebSocket error: {ex.Message}");
+        TryAutoReconnect();
+    }
+
+    private void HandleUnexpectedReceiveError(Exception ex)
+    {
+        _logger.LogError(ex, "Unexpected error in receive loop");
+        OnError?.Invoke(ex);
+        OnDisconnected?.Invoke($"Receive loop error: {ex.Message}");
+        TryAutoReconnect();
+    }
+
+    /// <summary>
+    /// Fire-and-forget reconnect kick used by both receive-loop error paths. The receive loop
+    /// can finish exiting while ReconnectAsync runs; ReconnectAsync's lock guard prevents
+    /// concurrent attempts if a subscriber (Home.razor) also kicks one off via OnDisconnected.
+    /// _reconnectEnabled gates this against deliberate DisconnectAsync teardown.
+    /// </summary>
+    private void TryAutoReconnect()
+    {
+        if (_reconnectEnabled)
+        {
+            _ = Task.Run(() => ReconnectAsync(CancellationToken.None));
         }
     }
 

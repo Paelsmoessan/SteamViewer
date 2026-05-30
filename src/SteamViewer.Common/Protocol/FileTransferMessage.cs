@@ -3,7 +3,7 @@ using System.Text.Json.Serialization;
 namespace SteamViewer.Common.Protocol;
 
 /// <summary>
-/// File transfer messages sent over WebRTC data channel.
+/// File transfer messages sent over the custom UDP transport's file channel.
 /// </summary>
 [JsonPolymorphic(TypeDiscriminatorPropertyName = "type")]
 [JsonDerivedType(typeof(Request), "request")]

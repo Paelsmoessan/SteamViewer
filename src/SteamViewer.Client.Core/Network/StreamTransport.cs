@@ -7,8 +7,7 @@ using Microsoft.Extensions.Logging;
 namespace SteamViewer.Client.Core.Network;
 
 /// <summary>
-/// Transport layer replacing WebRTC PeerConnection + data channels.
-/// Sends encrypted, multiplexed frames through an ITransportBackend.
+/// Transport layer: AES-256-GCM encrypted, multiplexed frames through an ITransportBackend.
 /// Phase 1: WebSocketRelayBackend (via signaling server)
 /// Phase 2: UdpTransportBackend (direct P2P or TURN relay)
 ///

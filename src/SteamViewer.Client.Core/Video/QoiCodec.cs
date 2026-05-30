@@ -24,6 +24,12 @@ public static class QoiCodec
     private static int ColorHash(byte r, byte g, byte b, byte a)
         => (r * 3 + g * 5 + b * 7 + a * 11) % 64;
 
+    // CODE-HEALTH-EXEMPT (see .claude/research/codescene-clean-delivery/intrinsic-caps.md):
+    // Encode + Decode are the QOI-spec per-pixel decision trees, run on a ~2M-iteration hot path
+    // per 1080p frame. The 5-level nesting + 29-arm decision tree IS the spec hierarchy
+    // (run / index / diff / luma / RGB / RGBA). Per-arm extraction adds allocation +
+    // virtual-dispatch overhead on the hottest path; CS gain would be cancelled by a measurable
+    // runtime perf regression on lossless settle.
     /// <summary>
     /// Encode BGRA pixel data to QOI format.
     /// Input is DXGI BGRA layout: [B, G, R, A] per pixel.

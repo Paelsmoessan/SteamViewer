@@ -73,62 +73,81 @@ internal static class HelperRegistry
             return;
         }
 
-        var self = Environment.ProcessId;
+        var selfPid = Environment.ProcessId;
         int reaped = 0, stale = 0;
 
         foreach (var marker in markers)
         {
-            try
+            switch (TryReapMarker(marker, selfPid, log))
             {
-                if (!int.TryParse(Path.GetFileNameWithoutExtension(marker), out var helperPid) || helperPid == self)
-                {
-                    if (helperPid != self) TryDelete(marker); // unparseable name
-                    continue;
-                }
-
-                Process helper;
-                try { helper = Process.GetProcessById(helperPid); }
-                catch { TryDelete(marker); stale++; continue; } // not running -> stale marker
-
-                using (helper)
-                {
-                    if (helper.HasExited) { TryDelete(marker); stale++; continue; }
-
-                    // PID-reuse guard: the live process at this PID must still be our exe.
-                    if (!helper.ProcessName.Equals(OurProcessName, StringComparison.OrdinalIgnoreCase))
-                    {
-                        log($"HelperRegistry: marker PID {helperPid} is now '{helper.ProcessName}' (PID reused) - dropping stale marker, NOT killing.");
-                        TryDelete(marker);
-                        stale++;
-                        continue;
-                    }
-
-                    var parts = File.ReadAllText(marker).Split('|');
-                    var role = parts.Length > 1 ? parts[1] : "?";
-                    if (!uint.TryParse(parts.Length > 0 ? parts[0] : "", out var hostPid))
-                    {
-                        log($"HelperRegistry: marker PID {helperPid} unparseable host - dropping marker, NOT killing live helper.");
-                        TryDelete(marker);
-                        continue;
-                    }
-
-                    if (IsAlive((int)hostPid))
-                        continue; // host parent alive => live session => leave it
-
-                    // Orphan confirmed: our helper, alive, with a dead host parent.
-                    log($"HelperRegistry: ORPHAN - {role} helper PID {helperPid} (dead host {hostPid}); killing.");
-                    try { helper.Kill(); reaped++; }
-                    catch (Exception ex) { log($"HelperRegistry: failed to kill orphan PID {helperPid}: {ex.Message}"); }
-                    TryDelete(marker);
-                }
-            }
-            catch (Exception ex)
-            {
-                log($"HelperRegistry: error on marker {Path.GetFileName(marker)}: {ex.Message}");
+                case MarkerOutcome.Reaped: reaped++; break;
+                case MarkerOutcome.Stale: stale++; break;
+                // Skipped (self / live legitimate session) and Error (logged in-helper): not tallied.
             }
         }
 
         log($"HelperRegistry: reap complete - {reaped} orphan(s) killed, {stale} stale marker(s) cleaned, {markers.Length} scanned.");
+    }
+
+    private enum MarkerOutcome { Reaped, Stale, Skipped, Error }
+
+    /// <summary>
+    /// Inspect a single marker and decide its fate (kill / clean / leave). Behavior matches the
+    /// pre-extract inline body: self-skip, unparseable-name cleanup, dead/PID-reused cleanup,
+    /// live-host skip, dead-host kill. Caller tallies Reaped/Stale; Skipped is the "legitimate
+    /// session, leave alone" case; Error is logged in-place so the caller stays cc-flat.
+    /// </summary>
+    private static MarkerOutcome TryReapMarker(string marker, int selfPid, Action<string> log)
+    {
+        try
+        {
+            if (!int.TryParse(Path.GetFileNameWithoutExtension(marker), out var helperPid))
+            {
+                TryDelete(marker); // unparseable name - drop
+                return MarkerOutcome.Stale;
+            }
+            if (helperPid == selfPid) return MarkerOutcome.Skipped;
+
+            Process helper;
+            try { helper = Process.GetProcessById(helperPid); }
+            catch { TryDelete(marker); return MarkerOutcome.Stale; } // not running
+
+            using (helper)
+            {
+                if (helper.HasExited) { TryDelete(marker); return MarkerOutcome.Stale; }
+
+                // PID-reuse guard: the live process at this PID must still be our exe.
+                if (!helper.ProcessName.Equals(OurProcessName, StringComparison.OrdinalIgnoreCase))
+                {
+                    log($"HelperRegistry: marker PID {helperPid} is now '{helper.ProcessName}' (PID reused) - dropping stale marker, NOT killing.");
+                    TryDelete(marker);
+                    return MarkerOutcome.Stale;
+                }
+
+                var parts = File.ReadAllText(marker).Split('|');
+                var role = parts.Length > 1 ? parts[1] : "?";
+                if (!uint.TryParse(parts.Length > 0 ? parts[0] : "", out var hostPid))
+                {
+                    log($"HelperRegistry: marker PID {helperPid} unparseable host - dropping marker, NOT killing live helper.");
+                    TryDelete(marker);
+                    return MarkerOutcome.Stale;
+                }
+
+                if (IsAlive((int)hostPid)) return MarkerOutcome.Skipped; // live legitimate session
+
+                // Orphan confirmed: our helper, alive, with a dead host parent.
+                log($"HelperRegistry: ORPHAN - {role} helper PID {helperPid} (dead host {hostPid}); killing.");
+                try { helper.Kill(); }
+                catch (Exception ex) { log($"HelperRegistry: failed to kill orphan PID {helperPid}: {ex.Message}"); }
+                TryDelete(marker);
+                return MarkerOutcome.Reaped;
+            }
+        }
+        catch (Exception ex)
+        {
+            log($"HelperRegistry: error on marker {Path.GetFileName(marker)}: {ex.Message}");
+            return MarkerOutcome.Error;
+        }
     }
 
     private static bool IsAlive(int pid)

@@ -165,6 +165,11 @@ public static partial class Win32Input
         });
     }
 
+    // CODE-HEALTH-EXEMPT (see .claude/research/codescene-clean-delivery/intrinsic-caps.md):
+    // KeyToVirtualKey + CodeToVirtualKey + InjectKey form the intrinsic keyboard dispatch table
+    // and per-event dispatcher. The 84-case switch expression compiles to a perfect-hash jump
+    // table on the input hot path; Dictionary<,> lookup would be slower and any per-category
+    // sub-switch extraction adds a function-count penalty exceeding the cc reduction.
     public static ushort KeyToVirtualKey(string key)
     {
         return key.ToLowerInvariant() switch

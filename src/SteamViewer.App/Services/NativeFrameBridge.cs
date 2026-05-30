@@ -8,7 +8,7 @@ using Windows.Storage.Streams;
 namespace SteamViewer.App.Services;
 
 /// <summary>
-/// Zero-copy frame transfer bridge from C# DXGI capture to JS WebRTC pipeline.
+/// Zero-copy frame transfer bridge from C# DXGI capture to JS render pipeline (custom UDP transport).
 /// Uses WebView2 SharedBuffer to bypass base64+JSInterop bottleneck.
 ///
 /// Flow: C# writes JPEG bytes to shared memory → PostSharedBufferToScript →

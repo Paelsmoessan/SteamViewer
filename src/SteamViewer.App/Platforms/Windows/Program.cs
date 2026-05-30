@@ -60,21 +60,27 @@ public static class Program
             return;
         }
 
-        // --system-helper <pipeName> <nonce> <expectedClientPid> <allowedUserSid>: SYSTEM-level pipe server
+        // --system-helper <pipeName> <expectedClientPid> <allowedUserSid> <adminPid>: SYSTEM-level pipe server.
+        // The auth nonce is delivered out-of-cmdline via NonceFile (F6 LPE close-out 2026-05-30): admin helper
+        // wrote it to %ProgramData%\SteamViewer\.system-helper-nonce-{adminPid}.bin with SYSTEM+user-only ACL.
         var systemIdx = Array.IndexOf(args, "--system-helper");
         if (systemIdx >= 0 && systemIdx + 4 < args.Length)
         {
             var sysPipeName = args[systemIdx + 1];
-            var nonce = args[systemIdx + 2];
-            if (!uint.TryParse(args[systemIdx + 3], out var sysExpectedClientPid))
+            if (!uint.TryParse(args[systemIdx + 2], out var sysExpectedClientPid))
             {
                 return; // Invalid args - refuse to run
             }
-            var allowedUserSid = args[systemIdx + 4];
-            // Optional 5th arg: the admin helper's PID, so the SYSTEM helper can watch it too (B3).
-            uint sysAdminPid = 0;
-            if (systemIdx + 5 < args.Length)
-                uint.TryParse(args[systemIdx + 5], out sysAdminPid);
+            var allowedUserSid = args[systemIdx + 3];
+            if (!uint.TryParse(args[systemIdx + 4], out var sysAdminPid))
+            {
+                return; // Admin PID required - it derives the off-cmdline nonce file path
+            }
+            var nonce = SteamViewer.Platform.Windows.Elevation.NonceFile.ReadAndDelete(sysAdminPid);
+            if (string.IsNullOrEmpty(nonce))
+            {
+                return; // Nonce file missing/unreadable - refuse to run (auth handshake would fail anyway)
+            }
             var sysDebugPath = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                 "SteamViewer", "system-helper-debug.txt");
@@ -83,7 +89,7 @@ public static class Program
                 Directory.CreateDirectory(Path.GetDirectoryName(sysDebugPath)!);
                 File.AppendAllText(sysDebugPath,
                     $"[{DateTime.Now:HH:mm:ss}] System helper intercepted. PID: {Environment.ProcessId}\n" +
-                    $"[{DateTime.Now:HH:mm:ss}] PipeName: {sysPipeName}, User: {Environment.UserName}, ExpectedClientPid: {sysExpectedClientPid}, AllowedUserSid: {allowedUserSid}, AdminPid: {sysAdminPid}\n");
+                    $"[{DateTime.Now:HH:mm:ss}] PipeName: {sysPipeName}, User: {Environment.UserName}, ExpectedClientPid: {sysExpectedClientPid}, AllowedUserSid: {allowedUserSid}, AdminPid: {sysAdminPid}, NonceRead=true\n");
             }
             catch { /* best-effort debug log */ }
 
@@ -91,7 +97,9 @@ public static class Program
 
             try
             {
-                SteamViewer.Platform.Windows.Elevation.SystemHelperServer.Run(sysPipeName, nonce, sysExpectedClientPid, allowedUserSid, sysAdminPid);
+                SteamViewer.Platform.Windows.Elevation.SystemHelperServer.Run(
+                    new SteamViewer.Platform.Windows.Elevation.SystemHelperArgs(
+                        sysPipeName, nonce, sysExpectedClientPid, allowedUserSid, sysAdminPid));
             }
             catch (Exception ex)
             {

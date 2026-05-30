@@ -14,9 +14,6 @@ namespace SteamViewer.Common.Protocol;
 [JsonDerivedType(typeof(ConnectRequest), "connect_request")]
 [JsonDerivedType(typeof(IncomingConnection), "incoming_connection")]
 [JsonDerivedType(typeof(ConnectionResponse), "connection_response")]
-[JsonDerivedType(typeof(SdpOffer), "sdp_offer")]
-[JsonDerivedType(typeof(SdpAnswer), "sdp_answer")]
-[JsonDerivedType(typeof(IceCandidate), "ice_candidate")]
 [JsonDerivedType(typeof(Connected), "connected")]
 [JsonDerivedType(typeof(Disconnect), "disconnect")]
 [JsonDerivedType(typeof(Disconnected), "disconnected")]
@@ -24,24 +21,10 @@ namespace SteamViewer.Common.Protocol;
 [JsonDerivedType(typeof(Error), "error")]
 [JsonDerivedType(typeof(Ping), "ping")]
 [JsonDerivedType(typeof(Pong), "pong")]
-// Collaboration session messages
-[JsonDerivedType(typeof(CreateSession), "create_session")]
-[JsonDerivedType(typeof(SessionCreated), "session_created")]
-[JsonDerivedType(typeof(JoinSession), "join_session")]
-[JsonDerivedType(typeof(JoinedSession), "joined_session")]
-[JsonDerivedType(typeof(JoinSessionFailed), "join_session_failed")]
-[JsonDerivedType(typeof(ParticipantJoined), "participant_joined")]
-[JsonDerivedType(typeof(ParticipantLeft), "participant_left")]
-[JsonDerivedType(typeof(LeaveSession), "leave_session")]
-[JsonDerivedType(typeof(ScreenShareStateChanged), "screen_share_state_changed")]
-// Direct transport endpoint exchange (FFmpeg transport, replaces SDP/ICE)
+// Direct transport endpoint exchange for the custom UDP transport.
 [JsonDerivedType(typeof(TransportEndpoint), "transport_endpoint")]
 [JsonDerivedType(typeof(RelayReady), "relay_ready")]
 [JsonDerivedType(typeof(TransportConfirmed), "transport_confirmed")]
-// Mesh WebRTC signaling (within session)
-[JsonDerivedType(typeof(MeshSdpOffer), "mesh_sdp_offer")]
-[JsonDerivedType(typeof(MeshSdpAnswer), "mesh_sdp_answer")]
-[JsonDerivedType(typeof(MeshIceCandidate), "mesh_ice_candidate")]
 public abstract record SignalingMessage
 {
     /// <summary>Client registers with signaling server</summary>
@@ -76,26 +59,6 @@ public abstract record SignalingMessage
     public sealed record ConnectionResponse(
         [property: JsonPropertyName("target_id")] string TargetId,
         [property: JsonPropertyName("approved")] bool Approved
-    ) : SignalingMessage;
-
-    /// <summary>WebRTC SDP offer</summary>
-    public sealed record SdpOffer(
-        [property: JsonPropertyName("target_id")] string TargetId,
-        [property: JsonPropertyName("sdp")] string Sdp
-    ) : SignalingMessage;
-
-    /// <summary>WebRTC SDP answer</summary>
-    public sealed record SdpAnswer(
-        [property: JsonPropertyName("target_id")] string TargetId,
-        [property: JsonPropertyName("sdp")] string Sdp
-    ) : SignalingMessage;
-
-    /// <summary>ICE candidate</summary>
-    public sealed record IceCandidate(
-        [property: JsonPropertyName("target_id")] string TargetId,
-        [property: JsonPropertyName("candidate")] string Candidate,
-        [property: JsonPropertyName("sdp_mid")] string? SdpMid,
-        [property: JsonPropertyName("sdp_m_line_index")] ushort? SdpMLineIndex
     ) : SignalingMessage;
 
     /// <summary>Connection established</summary>
@@ -135,56 +98,6 @@ public abstract record SignalingMessage
     /// <summary>Heartbeat/keepalive pong</summary>
     public sealed record Pong : SignalingMessage;
 
-    // ==================== Collaboration Session Messages ====================
-
-    /// <summary>Create a new collaboration session</summary>
-    public sealed record CreateSession(
-        [property: JsonPropertyName("display_name")] string DisplayName,
-        [property: JsonPropertyName("session_name")] string? SessionName = null
-    ) : SignalingMessage;
-
-    /// <summary>Session created successfully</summary>
-    public sealed record SessionCreated(
-        [property: JsonPropertyName("session_code")] string SessionCode,
-        [property: JsonPropertyName("session_name")] string? SessionName
-    ) : SignalingMessage;
-
-    /// <summary>Join an existing session</summary>
-    public sealed record JoinSession(
-        [property: JsonPropertyName("session_code")] string SessionCode,
-        [property: JsonPropertyName("display_name")] string DisplayName
-    ) : SignalingMessage;
-
-    /// <summary>Successfully joined session</summary>
-    public sealed record JoinedSession(
-        [property: JsonPropertyName("session_code")] string SessionCode,
-        [property: JsonPropertyName("participants")] List<ParticipantInfo> Participants
-    ) : SignalingMessage;
-
-    /// <summary>Failed to join session</summary>
-    public sealed record JoinSessionFailed(
-        [property: JsonPropertyName("reason")] string Reason
-    ) : SignalingMessage;
-
-    /// <summary>New participant joined the session</summary>
-    public sealed record ParticipantJoined(
-        [property: JsonPropertyName("participant")] ParticipantInfo Participant
-    ) : SignalingMessage;
-
-    /// <summary>Participant left the session</summary>
-    public sealed record ParticipantLeft(
-        [property: JsonPropertyName("participant_id")] string ParticipantId
-    ) : SignalingMessage;
-
-    /// <summary>Leave current session</summary>
-    public sealed record LeaveSession : SignalingMessage;
-
-    /// <summary>Screen share state changed for a participant</summary>
-    public sealed record ScreenShareStateChanged(
-        [property: JsonPropertyName("participant_id")] string ParticipantId,
-        [property: JsonPropertyName("is_sharing")] bool IsSharing
-    ) : SignalingMessage;
-
     // ==================== Direct Transport Endpoint Exchange ====================
 
     /// <summary>
@@ -213,28 +126,6 @@ public abstract record SignalingMessage
     /// </summary>
     public sealed record TransportConfirmed(
         [property: JsonPropertyName("target_id")] string TargetId
-    ) : SignalingMessage;
-
-    // ==================== Mesh WebRTC Signaling ====================
-
-    /// <summary>SDP offer to specific peer in session (includes sender ID for routing)</summary>
-    public sealed record MeshSdpOffer(
-        [property: JsonPropertyName("target_id")] string TargetId,
-        [property: JsonPropertyName("sdp")] string Sdp
-    ) : SignalingMessage;
-
-    /// <summary>SDP answer to specific peer in session</summary>
-    public sealed record MeshSdpAnswer(
-        [property: JsonPropertyName("target_id")] string TargetId,
-        [property: JsonPropertyName("sdp")] string Sdp
-    ) : SignalingMessage;
-
-    /// <summary>ICE candidate to specific peer in session</summary>
-    public sealed record MeshIceCandidate(
-        [property: JsonPropertyName("target_id")] string TargetId,
-        [property: JsonPropertyName("candidate")] string Candidate,
-        [property: JsonPropertyName("sdp_mid")] string? SdpMid,
-        [property: JsonPropertyName("sdp_m_line_index")] ushort? SdpMLineIndex
     ) : SignalingMessage;
 }
 
@@ -274,4 +165,17 @@ public static class SignalingSerializer
             return null;
         }
     }
+
+    /// <summary>
+    /// Returns a log-safe view of the message with secret fields masked.
+    /// Use at every log site that emits a SignalingMessage body. NEVER use for wire serialization.
+    /// Non-secret message types are returned unchanged (no allocation).
+    /// </summary>
+    public static SignalingMessage SanitizeForLog(SignalingMessage message) => message switch
+    {
+        SignalingMessage.Register r => r with { PasswordHash = "***" },
+        SignalingMessage.ConnectRequest c => c with { PasswordHash = "***" },
+        SignalingMessage.RelayReady rr => rr with { EncryptionNonce = "***" },
+        _ => message
+    };
 }

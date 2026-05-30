@@ -10,7 +10,6 @@ builder.WebHost.UseUrls($"http://0.0.0.0:{port}");
 
 // Add services
 builder.Services.AddSingleton<ClientRegistry>();
-builder.Services.AddSingleton<SessionRegistry>();
 builder.Services.AddSingleton<SignalingHandler>();
 
 // Configure file logging for multi-dev debugging

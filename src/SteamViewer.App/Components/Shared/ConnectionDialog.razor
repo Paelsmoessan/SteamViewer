@@ -6,7 +6,7 @@
 @inject IJSRuntime JSRuntime
 
 <div class="dialog-overlay @(IsVisible ? "visible" : "")" @onclick="HandleOverlayClick">
-    <div class="dialog" @onclick:stopPropagation="true">
+    <div class="dialog connection-dialog" @onclick:stopPropagation="true">
         <div class="dialog-header">
             <h3>New Connection</h3>
             <button class="close-btn" @onclick="Close">×</button>
@@ -126,25 +126,33 @@
 
         try
         {
-            var session = await SessionManager.CreateSessionAsync(_peerId, _password, JSRuntime);
-            if (session != null)
+            var result = await SessionManager.CreateSessionAsync(_peerId, _password, JSRuntime);
+            switch (result.Outcome)
             {
-                // Add tab to window
-                if (!string.IsNullOrEmpty(WindowId))
-                {
-                    TabManager.AddTab(WindowId, session.SessionId);
-                }
+                case CreateSessionOutcome.Created:
+                    // Add tab to window
+                    if (!string.IsNullOrEmpty(WindowId))
+                    {
+                        TabManager.AddTab(WindowId, result.Session!.SessionId);
+                    }
 
-                await OnConnected.InvokeAsync(session.SessionId);
-                await Close();
-            }
-            else
-            {
-                // Error should have been set by OnConnectionFailed
-                if (string.IsNullOrEmpty(_errorMessage))
-                {
-                    _errorMessage = "Failed to create session";
-                }
+                    await OnConnected.InvokeAsync(result.Session!.SessionId);
+                    await Close();
+                    break;
+
+                case CreateSessionOutcome.AlreadyConnected:
+                    // Existing tab is focused by ViewerTabManager via OnDuplicateConnectRefused
+                    // (single owner). Just close the dialog.
+                    await Close();
+                    break;
+
+                case CreateSessionOutcome.Failed:
+                    // Error should have been set by OnConnectionFailed
+                    if (string.IsNullOrEmpty(_errorMessage))
+                    {
+                        _errorMessage = "Failed to create session";
+                    }
+                    break;
             }
         }
         catch (Exception ex)

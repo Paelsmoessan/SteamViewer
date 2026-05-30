@@ -16,7 +16,7 @@ namespace SteamViewer.Platform.Windows.ScreenCapture;
 ///
 /// Canvas bridge flow:
 ///   DXGI AcquireNextFrame -> BGRA staging texture -> JPEG encode
-///   -> OnFrameCaptured event -> JSInterop -> hidden canvas -> captureStream -> WebRTC
+///   -> OnFrameCaptured event -> NativeFrameBridge -> FFmpeg H.264 encode -> custom UDP transport
 ///
 /// Partial-class layout (concerns split per file):
 ///   DxgiScreenCapture.cs (this file): lifecycle, capture-loop orchestration,

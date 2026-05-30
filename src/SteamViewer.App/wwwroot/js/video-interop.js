@@ -597,10 +597,11 @@ window.SteamViewerInput = {
         this._rawEventCount = 0;
         this._coordLogCount = 0;
 
-        // Focus canvas immediately so keyboard events are captured from the start
-        this.canvas.focus();
-        setTimeout(() => { this.canvas?.focus(); }, 200);
-        setTimeout(() => { this.canvas?.focus(); }, 500);
+        // Focus canvas immediately so keyboard events are captured from the start.
+        // Routed through _focusCanvasSafe so a local modal is never stolen from.
+        this._focusCanvasSafe();
+        setTimeout(() => { this._focusCanvasSafe(); }, 200);
+        setTimeout(() => { this._focusCanvasSafe(); }, 500);
 
         // Start periodic focus watchdog (restores focus if lost while locked)
         this._startFocusWatchdog();
@@ -654,7 +655,7 @@ window.SteamViewerInput = {
         this.isLocked = true;
         this.updateLockIndicator();
         this.notifyLockChange();
-        this.canvas.focus();
+        this._focusCanvasSafe();
         // Apply remote cursor shape — shows the host's current cursor type locally
         this.canvas.style.cursor = this._remoteCursorShape || 'default';
         // Start mouse regulation interval timer (sweep mode sends)
@@ -719,8 +720,7 @@ window.SteamViewerInput = {
         if (this._focusWatchdogId) clearInterval(this._focusWatchdogId);
         this._focusWatchdogId = setInterval(() => {
             if (this.isLocked && this.canvas && document.activeElement !== this.canvas) {
-                if (this._isInteractiveElement(document.activeElement)) return;
-                this.canvas.focus();
+                this._focusCanvasSafe();
             }
         }, 500);
     },
@@ -737,7 +737,7 @@ window.SteamViewerInput = {
         }
         this.ensureCanvas();
         if (this.canvas) {
-            this.canvas.focus();
+            this._focusCanvasSafe();
         }
         if (!this._focusWatchdogId && this.isCapturing) {
             this._startFocusWatchdog();
@@ -766,7 +766,7 @@ window.SteamViewerInput = {
             this.canvas.addEventListener('keydown', this._boundKeyDown);
             this.canvas.addEventListener('keyup', this._boundKeyUp);
             this.isCapturing = true;
-            this.canvas.focus();
+            this._focusCanvasSafe();
         } else if (!this.canvas && this._activeSessionId) {
             this.canvas = document.getElementById('viewerCanvas');
         }
@@ -924,6 +924,20 @@ window.SteamViewerInput = {
         return !!el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA'
             || el.tagName === 'SELECT' || !!el.closest('.menu-dropdown')
             || !!el.closest('.connection-dialog'));
+    },
+
+    // Single canonical canvas-focus path. NEVER steals focus from a local input/dialog/menu.
+    // All focus-grab sites (init, lock, reattach, ensureCanvas, watchdog, and the C#
+    // RefocusCanvasAsync) route through here so a local modal (e.g. ConnectionDialog) can
+    // hold focus and receive typing. See RemoteViewer keyboard-capture focus bug (2026-05-25).
+    _focusCanvasSafe() {
+        if (!this.canvas) return;
+        if (this._isInteractiveElement(document.activeElement)) {
+            console.log('[Input] focusCanvas skipped - interactive element focused ('
+                + (document.activeElement && document.activeElement.tagName) + ')');
+            return;
+        }
+        this.canvas.focus();
     },
 
     // === Mouse Handlers ===

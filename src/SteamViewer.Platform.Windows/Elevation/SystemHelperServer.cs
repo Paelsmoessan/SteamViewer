@@ -6,6 +6,7 @@ using System.Security.Principal;
 using System.Collections.Concurrent;
 using System.Text;
 using System.Text.Json;
+using SteamViewer.Common.Logging;
 using SteamViewer.Common.Protocol;
 using SteamViewer.Platform.Windows.Input;
 
@@ -52,8 +53,14 @@ public static partial class SystemHelperServer
     /// expectedClientPid + allowedUserSid restrict pipe access to one specific process running
     /// as the launching user; without this, any local user could connect (LPE).
     /// </summary>
-    public static void Run(string pipeName, string expectedNonce, uint expectedClientPid, string allowedUserSid, uint adminPid = 0)
+    public static void Run(SystemHelperArgs args)
     {
+        var pipeName = args.PipeName;
+        var expectedNonce = args.ExpectedNonce;
+        var expectedClientPid = args.ExpectedClientPid;
+        var allowedUserSid = args.AllowedUserSid;
+        var adminPid = args.AdminPid;
+
         // Use CommonApplicationData (C:\ProgramData) — SYSTEM user's %LOCALAPPDATA% is different
         _debugPath = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
@@ -262,7 +269,7 @@ public static partial class SystemHelperServer
             // (mouse_move is ~110 chars so it slips under the length cap; coordinates are captured in
             // the input-debug log instead). Key/click events and other commands stay visible.
             if (line.Length < 200 && !line.Contains("mouse_move"))
-                DebugLog($"Received: {line}");
+                DebugLog($"Received: {LogSanitizer.MaskJsonSecrets(line)}");
             commandCount++;
 
             try
@@ -270,7 +277,7 @@ public static partial class SystemHelperServer
                 var response = HandleCommand(line);
                 if (response != null)
                 {
-                    DebugLog($"Sending: {response}");
+                    DebugLog($"Sending: {LogSanitizer.MaskJsonSecrets(response)}");
                     writer.WriteLine(response);
                 }
                 if (_exitRequested)
@@ -326,6 +333,16 @@ public static partial class SystemHelperServer
         _exitRequested = true;
         return JsonSerializer.Serialize(new HelperResponse(true, null));
     }
-
-    private record HelperResponse(bool Success, string? Error);
 }
+
+/// <summary>
+/// Launch arguments for SystemHelperServer.Run. Bundled into a record to keep the entry-point
+/// signature within CS's argument-count budget; the per-field semantics match the cmdline shape
+/// `--system-helper {pipeName} {nonce} {expectedClientPid} {allowedUserSid} {adminPid}`.
+/// </summary>
+public readonly record struct SystemHelperArgs(
+    string PipeName,
+    string ExpectedNonce,
+    uint ExpectedClientPid,
+    string AllowedUserSid,
+    uint AdminPid = 0);

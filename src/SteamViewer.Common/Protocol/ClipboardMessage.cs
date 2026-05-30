@@ -3,7 +3,7 @@ using System.Text.Json.Serialization;
 namespace SteamViewer.Common.Protocol;
 
 /// <summary>
-/// Clipboard sync messages sent over WebRTC data channel.
+/// Clipboard sync messages sent over the custom UDP transport's control channel.
 /// </summary>
 [JsonPolymorphic(TypeDiscriminatorPropertyName = "type")]
 [JsonDerivedType(typeof(Request), "clipboard_request")]

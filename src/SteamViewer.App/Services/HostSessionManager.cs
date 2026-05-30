@@ -511,11 +511,23 @@ public sealed class HostSessionManager : IAsyncDisposable
 
         _incomingPeerId = incoming.FromId;
 
-        if (_isReconnect)
+        // Audit MED close-out (.claude/research/fresh-audit-2026-05-29 "Reconnect auto-accept does
+        // not verify peer identity"): only auto-accept when the incoming peer matches the one we
+        // were previously paired with. Pre-fix, ANY peer's IncomingConnection during the 120s
+        // preserved-elevation window would auto-accept with warm admin/SYSTEM and no UAC click -
+        // a privilege/consent amplification surface. _lastPairedPeerId is set on AcceptConnectionAsync
+        // (line 150 above) and cleared on max-outage expiry (line 297-area). Mismatch falls through
+        // to the consent path (OnIncomingConnection event).
+        if (_isReconnect && _lastPairedPeerId != null && incoming.FromId == _lastPairedPeerId)
         {
-            _logger.LogInformation("Auto-accepting reconnect from {PeerId}", incoming.FromId);
+            _logger.LogInformation("Auto-accepting reconnect from {PeerId} (matches last-paired)", incoming.FromId);
             _ = AcceptConnectionAsync();
             return;
+        }
+        if (_isReconnect)
+        {
+            _logger.LogWarning("Auto-accept REFUSED for {PeerId}: does NOT match last-paired peer {LastPaired} - falling through to consent path",
+                incoming.FromId, _lastPairedPeerId ?? "(null)");
         }
 
         SetState(ConnectionState.Connecting);

@@ -50,6 +50,7 @@ public sealed class ViewerTabManager
         _sessionManager.OnSessionCreated += HandleSessionCreated;
         _sessionManager.OnSessionRemoved += HandleSessionRemoved;
         _sessionManager.OnSessionStateChanged += HandleSessionStateChanged;
+        _sessionManager.OnDuplicateConnectRefused += HandleDuplicateConnectRefused;
     }
 
     /// <summary>
@@ -412,6 +413,16 @@ public sealed class ViewerTabManager
         // Session created but not yet added to a window
         // The caller (e.g., ConnectionDialog) will call AddTab
         _logger.LogDebug("Session {SessionId} created, waiting to be added to window", session.SessionId);
+    }
+
+    // Single canonical owner of the duplicate-connect focus action. Both connect entry points
+    // (Home and ConnectionDialog) route here via OnDuplicateConnectRefused instead of each calling
+    // OpenViewerForSession themselves - avoids duplicating the focus logic across call sites.
+    private void HandleDuplicateConnectRefused(ViewerSession existing)
+    {
+        _logger.LogInformation("Duplicate connect refused for peer {PeerId} - focusing existing session {SessionId}",
+            existing.PeerId, existing.SessionId);
+        OpenViewerForSession(existing.SessionId, existing.PeerId);
     }
 
     private void HandleSessionRemoved(string sessionId)

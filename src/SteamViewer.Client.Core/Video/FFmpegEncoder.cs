@@ -9,7 +9,7 @@ namespace SteamViewer.Client.Core.Video;
 /// Encodes raw BGRA frames to H.264 NAL units for network transport.
 ///
 /// Key config: YUV444P pixel format preserves full chroma (no 4:2:0 subsampling),
-/// giving crisp text rendering that WebRTC H.264 couldn't achieve.
+/// giving crisp text rendering for RDP-style desktop content (text, code, UI chrome).
 ///
 /// Supports server-side resolution negotiation: when viewer requests a different
 /// resolution, the encoder downscales BGRA using Lanczos (RGB-space) before
@@ -296,63 +296,85 @@ public sealed unsafe class FFmpegEncoder : IDisposable
         if (_codecCtx == null || _frame == null || _packet == null || _swsCtx == null)
             return null;
 
-        // Handle resolution changes (capture size changed OR viewer requested new size)
         if (captureWidth > 0 && captureHeight > 0)
-        {
-            bool captureChanged = captureWidth != _captureWidth || captureHeight != _captureHeight;
-            if (captureChanged)
-            {
-                _captureWidth = captureWidth;
-                _captureHeight = captureHeight;
-            }
+            HandleResolutionChange(captureWidth, captureHeight);
 
-            var (encW, encH) = ComputeEncodeResolution(captureWidth, captureHeight);
-            if (encW != _width || encH != _height)
-            {
-                var arError = captureHeight > 0
-                    ? Math.Abs((double)encW / encH - (double)captureWidth / captureHeight) : 0;
-                _logger.LogInformation(
-                    "Re-initializing encoder for new resolution: {W}x{H} (capture: {CW}x{CH}, AR error: {Err:F6})",
-                    encW, encH, captureWidth, captureHeight, arError);
-                Cleanup();
-                Initialize(encW, encH);
-                RebuildDownscaleContext(captureWidth, captureHeight, encW, encH);
-                // Force IDR burst after reinit so viewer decoder can cleanly start the new stream
-                ForceKeyframe(3);
-                _logger.LogInformation("Encoder reinit: forcing IDR burst for new resolution {W}x{H}", encW, encH);
-            }
-            else if (captureChanged && _downscaleCtx != null)
-            {
-                // Same encode size but capture changed — rebuild downscale
-                RebuildDownscaleContext(captureWidth, captureHeight, encW, encH);
-            }
-        }
-
-        byte[] frameData = bgraData;
-        int frameStride = stride;
-
-        // Step 1: Server-side downscale if active (BGRA → BGRA, Lanczos in RGB-space)
-        if (_downscaleCtx != null && _downscaleBuffer != null)
-        {
-            fixed (byte* srcPtr = bgraData)
-            fixed (byte* dstPtr = _downscaleBuffer)
-            {
-                var srcSlice = new byte_ptrArray4 { [0] = srcPtr };
-                var srcStride = new int_array4 { [0] = stride };
-                var dstSlice = new byte_ptrArray4 { [0] = dstPtr };
-                var dstStride = new int_array4 { [0] = _width * 4 };
-
-                ffmpeg.sws_scale(_downscaleCtx,
-                    srcSlice, srcStride, 0, _captureHeight,
-                    dstSlice, dstStride);
-            }
-            frameData = _downscaleBuffer;
-            frameStride = _width * 4;
-        }
-
+        var (frameData, frameStride) = DownscaleIfNeeded(bgraData, stride);
         ffmpeg.av_frame_make_writable(_frame);
+        ConvertBgraToYuv(frameData, frameStride);
+        ApplyPtsAndKeyframeFlags();
+        return TryEncodeAndCopyPacket();
+    }
 
-        // Step 2: Convert BGRA → YUV444P (at encode resolution, no resize)
+    /// <summary>
+    /// Capture-size change OR viewer-requested-resolution change handler. On size change,
+    /// re-initializes the encoder for the new dimensions, rebuilds the downscale context,
+    /// and forces an IDR burst so the viewer decoder can cleanly start the new stream.
+    /// Caller has already null-guarded the encoder state.
+    /// </summary>
+    private void HandleResolutionChange(int captureWidth, int captureHeight)
+    {
+        bool captureChanged = captureWidth != _captureWidth || captureHeight != _captureHeight;
+        if (captureChanged)
+        {
+            _captureWidth = captureWidth;
+            _captureHeight = captureHeight;
+        }
+
+        var (encW, encH) = ComputeEncodeResolution(captureWidth, captureHeight);
+        if (encW != _width || encH != _height)
+        {
+            var arError = captureHeight > 0
+                ? Math.Abs((double)encW / encH - (double)captureWidth / captureHeight) : 0;
+            _logger.LogInformation(
+                "Re-initializing encoder for new resolution: {W}x{H} (capture: {CW}x{CH}, AR error: {Err:F6})",
+                encW, encH, captureWidth, captureHeight, arError);
+            Cleanup();
+            Initialize(encW, encH);
+            RebuildDownscaleContext(captureWidth, captureHeight, encW, encH);
+            // Force IDR burst after reinit so viewer decoder can cleanly start the new stream
+            ForceKeyframe(3);
+            _logger.LogInformation("Encoder reinit: forcing IDR burst for new resolution {W}x{H}", encW, encH);
+        }
+        else if (captureChanged && _downscaleCtx != null)
+        {
+            // Same encode size but capture changed — rebuild downscale
+            RebuildDownscaleContext(captureWidth, captureHeight, encW, encH);
+        }
+    }
+
+    /// <summary>
+    /// Server-side BGRA downscale (Lanczos, RGB-space) if a downscale context is active.
+    /// Returns the source frame data + stride to use for the subsequent BGRA→YUV conversion:
+    /// either the downscaled buffer at the encode resolution, or the original bgraData if no
+    /// downscale is needed.
+    /// </summary>
+    private (byte[] frameData, int frameStride) DownscaleIfNeeded(byte[] bgraData, int stride)
+    {
+        if (_downscaleCtx == null || _downscaleBuffer == null)
+            return (bgraData, stride);
+
+        fixed (byte* srcPtr = bgraData)
+        fixed (byte* dstPtr = _downscaleBuffer)
+        {
+            var srcSlice = new byte_ptrArray4 { [0] = srcPtr };
+            var srcStride = new int_array4 { [0] = stride };
+            var dstSlice = new byte_ptrArray4 { [0] = dstPtr };
+            var dstStride = new int_array4 { [0] = _width * 4 };
+
+            ffmpeg.sws_scale(_downscaleCtx,
+                srcSlice, srcStride, 0, _captureHeight,
+                dstSlice, dstStride);
+        }
+        return (_downscaleBuffer, _width * 4);
+    }
+
+    /// <summary>
+    /// BGRA → YUV444P color conversion at encode resolution (no resize). Writes into _frame's
+    /// data planes via sws_scale.
+    /// </summary>
+    private void ConvertBgraToYuv(byte[] frameData, int frameStride)
+    {
         fixed (byte* srcPtr = frameData)
         {
             var srcSlice = new byte_ptrArray4 { [0] = srcPtr };
@@ -362,7 +384,15 @@ public sealed unsafe class FFmpegEncoder : IDisposable
                 srcSlice, srcStride, 0, _height,
                 _frame->data, _frame->linesize);
         }
+    }
 
+    /// <summary>
+    /// Advance the PTS and apply the force-keyframe state machine. If a keyframe burst was
+    /// requested (ForceKeyframe(N)), marks this frame as IDR and decrements the burst counter;
+    /// otherwise clears the force flags. Logs each forced-keyframe firing.
+    /// </summary>
+    private void ApplyPtsAndKeyframeFlags()
+    {
         _frame->pts = _pts++;
 
         if (_forceKeyframe)
@@ -385,12 +415,38 @@ public sealed unsafe class FFmpegEncoder : IDisposable
             _frame->pict_type = AVPictureType.AV_PICTURE_TYPE_NONE;
             _frame->flags &= ~ffmpeg.AV_FRAME_FLAG_KEY;
         }
+    }
 
+    /// <summary>
+    /// Send the current _frame to the encoder and try to receive a packet. Returns the
+    /// encoded NAL bytes on success, null on either "encoder buffered" (normal) or error.
+    ///
+    /// Gate-logging per the project rule: previously this method silently returned null on
+    /// any negative return code from send_frame or receive_packet (closes audit MED finding
+    /// `.claude/research/fresh-audit-2026-05-29` "FFmpeg encode failure silently dropped on
+    /// the hottest path"). Now logs a Warning for genuine errors. Distinguishes:
+    /// - send_frame negative: ALWAYS an error (no legitimate EAGAIN path in our linear
+    ///   send→receive pattern). Log + return null.
+    /// - receive_packet negative: AVERROR(EAGAIN) is normal "encoder needs more input"
+    ///   (silent); other negative codes are genuine errors (logged).
+    /// </summary>
+    private (byte[] data, int length)? TryEncodeAndCopyPacket()
+    {
         var ret = ffmpeg.avcodec_send_frame(_codecCtx, _frame);
-        if (ret < 0) return null;
+        if (ret < 0)
+        {
+            _logger.LogWarning("avcodec_send_frame failed: ret={Ret} (FFmpeg error code)", ret);
+            return null;
+        }
 
         ret = ffmpeg.avcodec_receive_packet(_codecCtx, _packet);
-        if (ret < 0) return null; // EAGAIN or error — encoder needs more input
+        if (ret < 0)
+        {
+            // AVERROR(EAGAIN) is -11 on POSIX; FFmpeg masks to negative. Compare via the canonical helper.
+            if (ret != ffmpeg.AVERROR(ffmpeg.EAGAIN))
+                _logger.LogWarning("avcodec_receive_packet failed: ret={Ret} (FFmpeg error code; not EAGAIN)", ret);
+            return null;
+        }
 
         var size = _packet->size;
         if (_outputBuffer == null || _outputBuffer.Length < size)
@@ -475,6 +531,21 @@ public sealed unsafe class FFmpegEncoder : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+        Cleanup();
+        GC.SuppressFinalize(this);
+    }
+
+    /// <summary>
+    /// Safety net for missed Dispose() (closes audit unverified-MED finding
+    /// `.claude/research/fresh-audit-2026-05-29` "FFmpegEncoder/FFmpegDecoder have no
+    /// finalizer/SafeHandle - missed Dispose permanently leaks native FFmpeg memory across
+    /// reconnect/resolution cycles"). Cleanup is pointer-only (no managed state read), so it
+    /// is safe to call from the finalizer thread. Normal-path Dispose calls
+    /// GC.SuppressFinalize so this only runs when the object went out of scope without
+    /// explicit disposal.
+    /// </summary>
+    ~FFmpegEncoder()
+    {
         Cleanup();
     }
 }

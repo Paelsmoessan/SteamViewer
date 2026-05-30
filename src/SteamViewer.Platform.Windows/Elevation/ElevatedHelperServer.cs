@@ -7,6 +7,7 @@ using System.Security.Principal;
 using System.Text;
 using System.Text.Json;
 using SteamViewer.Client.Core.Session;
+using SteamViewer.Common.Logging;
 using SteamViewer.Common.Protocol;
 using SteamViewer.Platform.Windows.Input;
 
@@ -65,17 +66,7 @@ public static class ElevatedHelperServer
         DebugLog($"Starting pipe server: {pipeName} (PID {Environment.ProcessId}, expecting client PID {expectedClientPid})");
         _hostClientPid = expectedClientPid;
 
-        // Orphan-proofing: self-terminate if the host dies by any path (crash / taskkill / window-X),
-        // not just the graceful exit-command. Armed before the connect-wait so a host that dies during
-        // the 30s connection window also tears us down. See .claude/research/elevated-helper-lifecycle.
-        ParentDeathWatchdog.Arm(expectedClientPid, DebugLog, "host");
-
-        // B4: reap orphan helpers left by a prior dead session, then register ourselves so a future
-        // admin helper can reap us if we ever orphan. SeDebug (best-effort) lets us kill SYSTEM orphans.
-        var seDebug = ProcessLauncher.EnableDebugPrivilege();
-        DebugLog($"SeDebugPrivilege enabled for orphan reap: {seDebug}");
-        HelperRegistry.ReapOrphans(DebugLog);
-        HelperRegistry.Register(expectedClientPid, "admin", DebugLog);
+        InitializeHelperLifecycle(expectedClientPid);
 
         try
         {
@@ -167,14 +158,14 @@ public static class ElevatedHelperServer
                 // Skip the ~60Hz mouse_move injectInput flood (coordinates are captured in the
                 // input-debug log); everything else stays visible.
                 if (!line.Contains("mouse_move"))
-                    DebugLog($"Received: {line}");
+                    DebugLog($"Received: {LogSanitizer.MaskJsonSecrets(line)}");
 
                 try
                 {
                     var response = HandleCommand(line);
                     if (response != null)
                     {
-                        DebugLog($"Sending: {response}");
+                        DebugLog($"Sending: {LogSanitizer.MaskJsonSecrets(response)}");
                         writer.WriteLine(response);
                     }
                     if (_exitRequested)
@@ -290,99 +281,14 @@ public static class ElevatedHelperServer
         {
             var appPath = Environment.ProcessPath;
 
-            // Save reconnect credentials if provided (with server URL + STUN/TURN for boot relay)
-            var clientId = root.TryGetProperty("clientId", out var cid) ? cid.GetString() : null;
-            var passwordHash = root.TryGetProperty("passwordHash", out var ph) ? ph.GetString() : null;
-            var viewerPeerId = root.TryGetProperty("viewerPeerId", out var vp) ? vp.GetString() : null;
-            var serverUrl = root.TryGetProperty("serverUrl", out var su) ? su.GetString() : null;
-            var turnUsername = root.TryGetProperty("turnUsername", out var tu) ? tu.GetString() : null;
-            var turnCredential = root.TryGetProperty("turnCredential", out var tc) ? tc.GetString() : null;
-
-            string[]? stunUrls = null;
-            if (root.TryGetProperty("stunUrls", out var stunArr) && stunArr.ValueKind == JsonValueKind.Array)
-                stunUrls = stunArr.EnumerateArray().Select(e => e.GetString()!).ToArray();
-
-            string[]? turnUrls = null;
-            if (root.TryGetProperty("turnUrls", out var turnArr) && turnArr.ValueKind == JsonValueKind.Array)
-                turnUrls = turnArr.EnumerateArray().Select(e => e.GetString()!).ToArray();
-
-            if (!string.IsNullOrEmpty(clientId) && !string.IsNullOrEmpty(passwordHash) && !string.IsNullOrEmpty(viewerPeerId))
-            {
-                try
-                {
-                    ReconnectCredentials.Save(clientId, passwordHash, viewerPeerId,
-                        serverUrl, stunUrls, turnUrls, turnUsername, turnCredential);
-                    DebugLog($"Saved reconnect credentials (serverUrl={serverUrl}, stunUrls={stunUrls?.Length ?? 0}, turnUrls={turnUrls?.Length ?? 0})");
-                }
-                catch (Exception ex)
-                {
-                    DebugLog($"Failed to save reconnect credentials: {ex.Message}");
-                }
-            }
-
-            // Disable "Press Ctrl+Alt+Del to log in" — persists across reboots.
-            // Allows login screen to show password field directly.
-            // Domain GPO may overwrite, but survives at least one reboot.
-            try
-            {
-                using var policyKey = Registry.LocalMachine.OpenSubKey(
-                    @"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System", writable: true);
-                policyKey?.SetValue("DisableCAD", 1, RegistryValueKind.DWord);
-                DebugLog("Set DisableCAD=1 (skip Ctrl+Alt+Del at login)");
-            }
-            catch (Exception ex)
-            {
-                DebugLog($"Failed to set DisableCAD: {ex.Message}");
-            }
-
+            SaveRebootReconnectCredentials(root);
+            DisablePressCtrlAltDelAtLogin();
             if (!string.IsNullOrEmpty(appPath))
             {
-                // Create boot relay schtask — runs as SYSTEM at boot (before login)
-                // Streams login screen so viewer can type password
-                try
-                {
-                    var schtaskResult = Process.Start(new ProcessStartInfo
-                    {
-                        FileName = "schtasks",
-                        Arguments = $"/create /tn \"SteamViewerBootRelay\" /tr \"\\\"{appPath}\\\" --boot-relay\" /sc onstart /ru SYSTEM /f",
-                        UseShellExecute = false,
-                        CreateNoWindow = true,
-                        RedirectStandardOutput = true,
-                        RedirectStandardError = true
-                    });
-                    schtaskResult?.WaitForExit(5000);
-                    var schtaskOut = schtaskResult?.StandardOutput.ReadToEnd();
-                    var schtaskErr = schtaskResult?.StandardError.ReadToEnd();
-                    DebugLog($"Boot relay schtask created (exit={schtaskResult?.ExitCode}, out={schtaskOut?.Trim()}, err={schtaskErr?.Trim()})");
-                }
-                catch (Exception ex)
-                {
-                    DebugLog($"Failed to create boot relay schtask: {ex.Message}");
-                }
-
-                // Write RunOnceEx for auto-restart with --sas mode (after user logs in)
-                try
-                {
-                    using var runOnceExKey = Registry.LocalMachine.CreateSubKey(
-                        @"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnceEx\SteamViewer");
-                    runOnceExKey?.SetValue("", $"\"{appPath}\" --sas");
-                    DebugLog("Registered RunOnceEx --sas entry");
-                }
-                catch (Exception ex)
-                {
-                    DebugLog($"Failed to write RunOnceEx: {ex.Message}");
-                }
+                CreateBootRelaySchtask(appPath);
+                RegisterRunOnceExSasEntry(appPath);
             }
-
-            // Initiate reboot
-            DebugLog("Initiating system reboot");
-            Process.Start(new ProcessStartInfo
-            {
-                FileName = "shutdown",
-                Arguments = "/r /t 0",
-                UseShellExecute = false,
-                CreateNoWindow = true
-            });
+            InitiateSystemReboot();
 
             return JsonSerializer.Serialize(new HelperResponse(true, null));
         }
@@ -391,6 +297,136 @@ public static class ElevatedHelperServer
             DebugLog($"Reboot failed: {ex.Message}");
             return JsonSerializer.Serialize(new HelperResponse(false, ex.Message));
         }
+    }
+
+    /// <summary>
+    /// Persist reconnect credentials so the boot relay + post-login SAS path can reconstitute the
+    /// session after the reboot. No-op if the viewer didn't pass the credential fields (e.g. legacy
+    /// caller). Saves serverUrl + STUN/TURN config so the SYSTEM-context boot relay can reach the
+    /// signaling server before any user logs in.
+    /// </summary>
+    private static void SaveRebootReconnectCredentials(JsonElement root)
+    {
+        var creds = ParseRebootRequest(root);
+        if (string.IsNullOrEmpty(creds.ClientId) || string.IsNullOrEmpty(creds.PasswordHash) || string.IsNullOrEmpty(creds.ViewerPeerId))
+            return;
+
+        try
+        {
+            ReconnectCredentials.Save(creds.ClientId, creds.PasswordHash, creds.ViewerPeerId,
+                creds.ServerUrl, creds.StunUrls, creds.TurnUrls, creds.TurnUsername, creds.TurnCredential);
+            DebugLog($"Saved reconnect credentials (serverUrl={creds.ServerUrl}, stunUrls={creds.StunUrls?.Length ?? 0}, turnUrls={creds.TurnUrls?.Length ?? 0})");
+        }
+        catch (Exception ex)
+        {
+            DebugLog($"Failed to save reconnect credentials: {ex.Message}");
+        }
+    }
+
+    private readonly record struct RebootRequestPayload(
+        string? ClientId, string? PasswordHash, string? ViewerPeerId, string? ServerUrl,
+        string? TurnUsername, string? TurnCredential, string[]? StunUrls, string[]? TurnUrls);
+
+    private static RebootRequestPayload ParseRebootRequest(JsonElement root) => new(
+        ClientId: GetString(root, "clientId"),
+        PasswordHash: GetString(root, "passwordHash"),
+        ViewerPeerId: GetString(root, "viewerPeerId"),
+        ServerUrl: GetString(root, "serverUrl"),
+        TurnUsername: GetString(root, "turnUsername"),
+        TurnCredential: GetString(root, "turnCredential"),
+        StunUrls: GetStringArray(root, "stunUrls"),
+        TurnUrls: GetStringArray(root, "turnUrls"));
+
+    private static string? GetString(JsonElement root, string name)
+        => root.TryGetProperty(name, out var v) ? v.GetString() : null;
+
+    private static string[]? GetStringArray(JsonElement root, string name)
+        => root.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Array
+            ? v.EnumerateArray().Select(e => e.GetString()!).ToArray()
+            : null;
+
+    /// <summary>
+    /// Set HKLM DisableCAD=1 so the login screen shows the password field directly. Persists
+    /// across the reboot. Domain GPO may overwrite, but survives at least one reboot.
+    /// </summary>
+    private static void DisablePressCtrlAltDelAtLogin()
+    {
+        try
+        {
+            using var policyKey = Registry.LocalMachine.OpenSubKey(
+                @"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System", writable: true);
+            policyKey?.SetValue("DisableCAD", 1, RegistryValueKind.DWord);
+            DebugLog("Set DisableCAD=1 (skip Ctrl+Alt+Del at login)");
+        }
+        catch (Exception ex)
+        {
+            DebugLog($"Failed to set DisableCAD: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Create the SYSTEM-context boot relay schtask that runs at boot BEFORE any user logs in.
+    /// Streams the login screen so the viewer can type a password remotely.
+    /// </summary>
+    private static void CreateBootRelaySchtask(string appPath)
+    {
+        try
+        {
+            var schtaskResult = Process.Start(new ProcessStartInfo
+            {
+                FileName = "schtasks",
+                Arguments = $"/create /tn \"SteamViewerBootRelay\" /tr \"\\\"{appPath}\\\" --boot-relay\" /sc onstart /ru SYSTEM /f",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            });
+            schtaskResult?.WaitForExit(5000);
+            var schtaskOut = schtaskResult?.StandardOutput.ReadToEnd();
+            var schtaskErr = schtaskResult?.StandardError.ReadToEnd();
+            DebugLog($"Boot relay schtask created (exit={schtaskResult?.ExitCode}, out={schtaskOut?.Trim()}, err={schtaskErr?.Trim()})");
+        }
+        catch (Exception ex)
+        {
+            DebugLog($"Failed to create boot relay schtask: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Register a RunOnceEx entry that auto-launches the app in --sas mode AFTER the user logs in.
+    /// Pairs with the boot-relay schtask: boot-relay covers the login screen, RunOnceEx takes over
+    /// once the user is in.
+    /// </summary>
+    private static void RegisterRunOnceExSasEntry(string appPath)
+    {
+        try
+        {
+            using var runOnceExKey = Registry.LocalMachine.CreateSubKey(
+                @"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnceEx\SteamViewer");
+            runOnceExKey?.SetValue("", $"\"{appPath}\" --sas");
+            DebugLog("Registered RunOnceEx --sas entry");
+        }
+        catch (Exception ex)
+        {
+            DebugLog($"Failed to write RunOnceEx: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Fire `shutdown /r /t 0` to reboot immediately. Caller has already persisted reconnect
+    /// state and registered both the pre-login boot relay schtask and the post-login RunOnceEx
+    /// entry, so the session can re-establish after the OS comes back up.
+    /// </summary>
+    private static void InitiateSystemReboot()
+    {
+        DebugLog("Initiating system reboot");
+        Process.Start(new ProcessStartInfo
+        {
+            FileName = "shutdown",
+            Arguments = "/r /t 0",
+            UseShellExecute = false,
+            CreateNoWindow = true
+        });
     }
 
     private static string? HandleInjectInput(JsonElement root)
@@ -409,36 +445,28 @@ public static class ElevatedHelperServer
         return null;
     }
 
+    private readonly record struct LaunchSystemHelperRequest(
+        string PipeName, string Nonce, string ExePath, uint ExpectedClientPid, string AllowedUserSid);
+
     private static string HandleLaunchSystemHelper(JsonElement root)
     {
         try
         {
-            var pipeName = root.TryGetProperty("pipeName", out var pn) ? pn.GetString() : null;
-            var nonce = root.TryGetProperty("nonce", out var n) ? n.GetString() : null;
+            if (!TryBuildLaunchSystemHelperRequest(root, out var req, out var errorJson))
+                return errorJson;
 
-            if (string.IsNullOrEmpty(pipeName) || string.IsNullOrEmpty(nonce))
-                return JsonSerializer.Serialize(new HelperResponse(false, "Missing pipeName or nonce"));
+            // Off-cmdline nonce delivery (F6 LPE close-out): write nonce to a per-admin-PID file
+            // with SYSTEM+user-only ACL. SYSTEM helper reads + deletes it on startup. The nonce
+            // never appears in the SYSTEM helper's cmdline.
+            var adminHelperPid = (uint)Environment.ProcessId;
+            NonceFile.Write(adminHelperPid, req.Nonce);
 
-            var exePath = Environment.ProcessPath;
-            if (string.IsNullOrEmpty(exePath))
-                return JsonSerializer.Serialize(new HelperResponse(false, "Cannot determine exe path"));
+            DebugLog($"LaunchSystemHelper: pipe={req.PipeName}, exe={req.ExePath}, hostClientPid={req.ExpectedClientPid}, adminHelperPid={adminHelperPid}, userSid={req.AllowedUserSid}, noncePath={NonceFile.PathFor(adminHelperPid)}");
 
-            // SYSTEM helper's PID gate must match the host app (the actual connector), not this admin helper.
-            if (_hostClientPid == 0)
-            {
-                DebugLog("LaunchSystemHelper: _hostClientPid not set — Run() did not initialize");
-                return JsonSerializer.Serialize(new HelperResponse(false, "Admin helper not initialized"));
-            }
-            var expectedClientPid = _hostClientPid;
-            var allowedUserSid = System.Security.Principal.WindowsIdentity.GetCurrent().User?.Value
-                ?? throw new InvalidOperationException("Cannot determine user SID for SYSTEM helper ACL");
-
-            DebugLog($"LaunchSystemHelper: pipe={pipeName}, exe={exePath}, hostClientPid={expectedClientPid}, adminHelperPid={Environment.ProcessId}, userSid={allowedUserSid}");
-
-            // Pass our own PID so the SYSTEM helper can watch the admin helper too (B3): if the admin
-            // helper dies (e.g. host disposes the elevation service), the SYSTEM helper self-terminates.
-            var arguments = $"--system-helper {pipeName} {nonce} {expectedClientPid} {allowedUserSid} {Environment.ProcessId}";
-            if (ProcessLauncher.LaunchAsSystemFromAdmin(exePath, arguments, out var pid, out var launchError))
+            // adminHelperPid in cmdline so the SYSTEM helper can (a) watch our PID for B3 self-terminate,
+            // and (b) derive the off-cmdline nonce-file path. Nonce itself is NOT on the cmdline.
+            var arguments = $"--system-helper {req.PipeName} {req.ExpectedClientPid} {req.AllowedUserSid} {adminHelperPid}";
+            if (ProcessLauncher.LaunchAsSystemFromAdmin(req.ExePath, arguments, out var pid, out var launchError))
             {
                 DebugLog($"SYSTEM helper launched via token duplication: PID {pid}");
                 return JsonSerializer.Serialize(new HelperResponse(true, null));
@@ -454,6 +482,48 @@ public static class ElevatedHelperServer
         }
     }
 
+    /// <summary>
+    /// Parse + validate the launchSystemHelper command in one shot. Returns false with a
+    /// serialized error HelperResponse on any missing field, missing exePath, or uninitialized
+    /// admin-helper state (Run() did not set _hostClientPid). On success, populates a
+    /// LaunchSystemHelperRequest with the parsed fields + the resolved exe path and current user
+    /// SID needed for the SYSTEM helper's ACL.
+    /// </summary>
+    private static bool TryBuildLaunchSystemHelperRequest(JsonElement root, out LaunchSystemHelperRequest req, out string errorJson)
+    {
+        req = default;
+
+        var pipeName = root.TryGetProperty("pipeName", out var pn) ? pn.GetString() : null;
+        var nonce = root.TryGetProperty("nonce", out var n) ? n.GetString() : null;
+        if (string.IsNullOrEmpty(pipeName) || string.IsNullOrEmpty(nonce))
+        {
+            errorJson = JsonSerializer.Serialize(new HelperResponse(false, "Missing pipeName or nonce"));
+            return false;
+        }
+
+        var exePath = Environment.ProcessPath;
+        if (string.IsNullOrEmpty(exePath))
+        {
+            errorJson = JsonSerializer.Serialize(new HelperResponse(false, "Cannot determine exe path"));
+            return false;
+        }
+
+        // SYSTEM helper's PID gate must match the host app (the actual connector), not this admin helper.
+        if (_hostClientPid == 0)
+        {
+            DebugLog("LaunchSystemHelper: _hostClientPid not set - Run() did not initialize");
+            errorJson = JsonSerializer.Serialize(new HelperResponse(false, "Admin helper not initialized"));
+            return false;
+        }
+
+        var allowedUserSid = System.Security.Principal.WindowsIdentity.GetCurrent().User?.Value
+            ?? throw new InvalidOperationException("Cannot determine user SID for SYSTEM helper ACL");
+
+        req = new LaunchSystemHelperRequest(pipeName, nonce, exePath, _hostClientPid, allowedUserSid);
+        errorJson = "";
+        return true;
+    }
+
     private static string HandleExit()
     {
         DebugLog("Exit command received - will terminate after sending acknowledgement.");
@@ -461,5 +531,20 @@ public static class ElevatedHelperServer
         return JsonSerializer.Serialize(new HelperResponse(true, null));
     }
 
-    private record HelperResponse(bool Success, string? Error);
+    /// <summary>
+    /// Lifecycle setup that runs once on Run() entry, before the pipe-server connect-wait.
+    /// Arms the parent-death watchdog so a host that dies during the 30s connect window tears us
+    /// down; enables SeDebug (best-effort) so the orphan reap can terminate SYSTEM-level orphans;
+    /// reaps any orphans left by a prior dead session; registers our own marker so a future admin
+    /// helper can reap us if we ever orphan. See .claude/research/elevated-helper-lifecycle.
+    /// </summary>
+    private static void InitializeHelperLifecycle(uint expectedClientPid)
+    {
+        ParentDeathWatchdog.Arm(expectedClientPid, DebugLog, "host");
+
+        var seDebug = ProcessLauncher.EnableDebugPrivilege();
+        DebugLog($"SeDebugPrivilege enabled for orphan reap: {seDebug}");
+        HelperRegistry.ReapOrphans(DebugLog);
+        HelperRegistry.Register(expectedClientPid, "admin", DebugLog);
+    }
 }

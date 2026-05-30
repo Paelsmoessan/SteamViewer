@@ -1,5 +1,54 @@
 # Changelog
 
+## v0.2.12-alpha (2026-05-30)
+
+### Security
+
+- **F6 LPE close.** SYSTEM helper one-shot nonce no longer travels on the command line; it is
+  written by the admin helper to a per-PID file in `%ProgramData%\SteamViewer\` with a DACL
+  that allows only SYSTEM and the launching user, then read-and-deleted by the SYSTEM helper.
+  Eliminates the local-disclosure window where any process could read the cmdline of an
+  elevated process and impersonate the SYSTEM helper.
+- **Reconnect-hijack peer-identity check.** During the warm reconnect window the host now
+  verifies the incoming peer ID matches the last-paired peer before auto-accepting. A
+  mismatching peer falls through to the normal consent prompt instead of being auto-approved.
+- **Secret redaction in logs (signaling + helper-pipe).** `password_hash`, `encryption_nonce`,
+  `passwordHash`, and `turnCredential` are masked in both the signaling-WS log path
+  (`SignalingSerializer.SanitizeForLog`) and the raw-JSON helper-pipe log path
+  (`LogSanitizer.MaskJsonSecrets`).
+- **Duplicate-connect deny-by-default.** Second connect attempt to a host that already has an
+  active session is now refused with an explicit error instead of racing into an ambiguous
+  state.
+
+### Bug fixes
+
+- **Abrupt host process kill no longer tears down the viewer window.** Grace-timer expiry is
+  no longer used as a tear-down trigger; the overlay holds and the reconnect loop runs until
+  the host returns (max-outage 120 s remains the final teardown gate).
+- **Connect dialog input is typable again.** The canvas no longer steals focus from the
+  dialog, and the OS key hook is suspended while the dialog is open. Duplicate-connect focus
+  rebinds are deduplicated so only one owner refuses focus at a time.
+
+### Removed
+
+- **Collaboration / mesh-WebRTC feature deleted (-3212 LoC).** The unused mesh feature
+  (CollaborationSessionManager, MeshWebRTCManager, mesh-webrtc-interop.js, Collaboration.razor,
+  ScreenGrid, FullscreenViewer) and the 15 mesh/SDP/collab signaling message types it relied
+  on have been removed. SIPSorcery remains as a scoped STUN-only TURN-message helper inside
+  `UdpTransportBackend`.
+
+### Code health (CodeScene)
+
+- ElevatedHelperServer.cs 7.58 → 8.22 (HandleReboot 4-phase decomp + HandleLaunchSystemHelper
+  validation-gate extract).
+- SignalingClient.ReceiveLoopAsync 7.80 → 8.59 (binary-relay + text-dispatch split).
+- FFmpegEncoder.cs 7.51 → 8.02 (EncodeFrame orchestrator + 5 helpers) plus a finalizer for
+  the unmanaged-handle lifetime and Warning logs on previously-silent encode failures.
+- Helper-pipe `HelperResponse` + `ElevatedHelperClient.SendBoolCommandAsync` dedup, removing
+  a parallel maintenance hazard across 4 call sites.
+- Four hot-path methods documented as measured intrinsic-caps (SecureDesktopCapture,
+  Win32Input.Keyboard, QoiCodec, WindowsSystemKeyInterceptor) with inline banners.
+
 ## v0.2.11-alpha (2026-05-24)
 
 ### Security: orphan-proof elevated/SYSTEM helpers
