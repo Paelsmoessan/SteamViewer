@@ -73,7 +73,8 @@ public interface IElevationService : IAsyncDisposable
     /// <summary>
     /// Reboot the host with auto-restart credentials saved for reconnection.
     /// On Windows, writes RunOnceEx registry key and boot relay schtask via admin helper.
-    /// Server URL + STUN/TURN config saved for boot relay WebRTC reconnection.
+    /// Server URL + STUN/TURN config saved so the boot-relay process can reach
+    /// signaling + punch UDP for the custom transport before any user logs in.
     /// </summary>
     Task<bool> RebootAsync(string clientId, string passwordHash, string viewerPeerId,
         string? serverUrl = null, string[]? stunUrls = null,

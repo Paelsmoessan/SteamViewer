@@ -1,6 +1,5 @@
-// video-interop.js — FFmpeg transport video rendering + input capture
-// Replaces webrtc-interop.js (WebRTC removed)
-// Keeps: SharedBuffer rendering, mouse/keyboard capture, stats overlay, logger bridge
+// video-interop.js - FFmpeg transport video rendering + input capture
+// SharedBuffer rendering, mouse/keyboard capture, stats overlay, logger bridge
 //
 // CODE-HEALTH-EXEMPT (intrinsic-cap)
 // Complexity here is bounded by browser-context intrinsics: the WebView2 AltGr
@@ -485,8 +484,7 @@ if (window.chrome?.webview) {
 }
 
 // === Input Capture (mouse/keyboard) ===
-// Ported from webrtc-interop.js SteamViewerInput — adapted for FFmpeg transport
-// (no SteamViewerWebRTC references, uses SteamViewerVideo for letterbox/session data)
+// Uses SteamViewerVideo for letterbox/session data.
 window.SteamViewerInput = {
     canvas: null,
     isCapturing: false,

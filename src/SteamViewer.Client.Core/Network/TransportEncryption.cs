@@ -11,7 +11,7 @@ namespace SteamViewer.Client.Core.Network;
 /// Wire format: [4 bytes session-tag][12 bytes nonce][N bytes ciphertext][16 bytes GCM tag]
 /// Session tag = first 4 bytes of session nonce (shared in RelayReady handshake).
 /// Receiver checks session tag before attempting decryption. Mismatch = stale data, silent drop.
-/// Same pattern as QUIC Connection ID, WireGuard Receiver Index, DTLS Epoch.
+/// Same pattern as QUIC Connection ID and WireGuard Receiver Index.
 ///
 /// Nonce = [1 byte direction][3 bytes zero][8 bytes counter big-endian]
 /// Direction: 0x00 = host->viewer, 0x01 = viewer->host

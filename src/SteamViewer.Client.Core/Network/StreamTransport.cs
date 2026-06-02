@@ -351,9 +351,10 @@ public abstract class StreamTransport : IAsyncDisposable
     }
 
     /// <summary>
-    /// Handle a hard decryption failure (CryptographicException). RFC 9147 (DTLS 1.3) pattern:
-    /// silently drop invalid records, count failures. Stale data from old sessions is expected during
-    /// reconnect and fails decryption because each session derives a unique key via HKDF + session nonce.
+    /// Handle a hard decryption failure (CryptographicException). Silently drop the
+    /// invalid record and count the failure. Stale data from old sessions is expected
+    /// during reconnect and fails decryption because each session derives a unique key
+    /// via HKDF + session nonce.
     /// </summary>
     private void CountHardDecryptionFailure()
     {

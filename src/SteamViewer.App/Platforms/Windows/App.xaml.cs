@@ -35,9 +35,11 @@ public partial class App : MauiWinUIApplication
         // This is critical when running from network shares
         ConfigureWebView2UserDataFolder();
 
-        // Auto-select entire screen for getDisplayMedia (remote desktop = always fullscreen)
-        // Disable mDNS obfuscation so ICE candidates use real local IPs for reliable LAN P2P
-        // Without this, Chromium replaces IPs with .local mDNS names that fail intermittently
+        // Auto-select entire screen for getDisplayMedia (remote desktop = always fullscreen).
+        // Disable Chromium's mDNS local-IP obfuscation. We do not run WebRTC in WebView2
+        // anymore - the custom UDP transport handles its own NAT traversal natively - but
+        // the flag is left in place as a no-op safety in case any browser API path inside
+        // WebView2 still consults it. Remove only after verifying no live consumer.
         Environment.SetEnvironmentVariable("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
             "--auto-select-desktop-capture-source=\"Entire screen\" " +
             "--enable-features=GetDisplayMediaSetAutoSelectAllScreens " +

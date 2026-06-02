@@ -47,7 +47,8 @@ public static class ReconnectCredentials
 
     /// <summary>
     /// Encrypt and save session credentials for post-reboot reconnection.
-    /// Includes signaling server URL and ICE server config for boot relay WebRTC.
+    /// Includes signaling server URL and STUN/TURN config so the boot-relay
+    /// process can reach the signaling server + punch UDP before any user logs in.
     /// </summary>
     [SupportedOSPlatform("windows")]
     public static void Save(string clientId, string passwordHash, string viewerPeerId,
