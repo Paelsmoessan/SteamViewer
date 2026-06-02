@@ -15,7 +15,7 @@ Grab the latest release from [GitHub Releases](https://github.com/Paelsmoessan/S
 - **Native Keyboard Capture** - Win32 low-level hook with raw scan codes (Sunshine pattern), AltGr handled correctly
 - **P2P Connection** - Direct UDP with NAT traversal and TURN relay fallback
 - **Low Latency** - DXGI capture with hardware-accelerated H.264 encoding
-- **Encrypted** - DTLS-SRTP end-to-end encryption, BLAKE3 password hashing
+- **Encrypted** - AES-256-GCM end-to-end encryption (HKDF key derivation, per-frame nonce), BLAKE3 password hashing
 - **File Transfer** - Clipboard sync and chunked file transfers
 - **Multi-Session** - Connect to multiple machines in tabbed sessions
 - **Auto-Reconnect** - Saved credentials with automatic reconnection
@@ -47,7 +47,7 @@ The values live in `Home.razor` behind `#if DEBUG` and are not present in Releas
 3. Host approves the connection
 4. UDP hole-punch establishes a direct peer-to-peer link (with TURN relay fallback)
 5. Host captures the screen via DXGI Desktop Duplication
-6. Video is encoded with FFmpeg (libx264), encrypted via DTLS-SRTP, and streamed over UDP
+6. Video is encoded with FFmpeg (libx264 high444) and QOI (lossless settle frames), encrypted with AES-256-GCM, and streamed over a custom UDP transport
 7. Viewer decodes and renders frames on a canvas via WebView2
 
 ## Architecture
@@ -58,7 +58,7 @@ The values live in `Home.razor` behind `#if DEBUG` and are not present in Releas
 │  (MAUI App) │                    │   (ASP.NET)     │
 └──────┬──────┘                    └────────┬────────┘
        │                                    │
-       │ UDP P2P (DTLS-SRTP)                │ WebSocket
+       │ UDP P2P (AES-256-GCM)              │ WebSocket
        │                                    │
        ▼                                    ▼
 ┌─────────────┐                    ┌─────────────────┐
@@ -87,13 +87,13 @@ SteamViewer.NET/
 
 - **.NET 8** with C# 12
 - **MAUI Blazor** - Cross-platform UI
-- **FFmpeg** (libx264) - Hardware-accelerated H.264 video encoding/decoding
 - **DXGI Desktop Duplication** - Native screen capture
-- **QOI** - Lossless image codec for Secure Desktop capture
-- **ASP.NET Core** - WebSocket signaling server
-- **DTLS-SRTP** - End-to-end transport encryption
+- **FFmpeg** (libx264 high444) - H.264 video encoding/decoding
+- **QOI** - Lossless image codec for settle frames + Secure Desktop capture
+- **Custom UDP transport** - Direct peer-to-peer with NAT traversal and TURN relay fallback
+- **AES-256-GCM** - End-to-end transport encryption (HKDF key derivation, per-frame nonce)
 - **BLAKE3** - Password hashing
-- **UDP P2P** - Direct peer-to-peer with NAT traversal and TURN relay fallback
+- **ASP.NET Core** - WebSocket signaling server (handshake only; no media)
 
 ## Known Limitations
 
@@ -117,15 +117,17 @@ SteamViewer was built by studying and learning from many open-source projects. W
 | [SPICE](https://www.spice-space.org/) | LGPL-2.1 | Per-image auto codec selection, video stream detection |
 | [Apache Guacamole](https://github.com/apache/guacamole-server) | Apache-2.0 | Clipboard text sync, drive redirection |
 
-### WebRTC & Streaming
+### Honorable Mentions (early streaming research)
+
+We started with WebRTC and replaced it with our own DXGI + QOI + FFmpeg stack over a custom UDP transport - the jitter buffer was unmanageable for low-latency remote desktop. SIPSorcery remains in the tree as a scoped STUN-only TURN message helper. These projects shaped the early design and are credited for that.
 
 | Project | License | What We Learned |
 |---------|---------|-----------------|
-| [SIPSorcery](https://github.com/sipsorcery-org/sipsorcery) | BSD-3 | .NET WebRTC, RTP, data channels, TURN client |
-| [Selkies-GStreamer](https://github.com/selkies-project/selkies-gstreamer) | MPL-2.0 | WebRTC latency optimization, playout-delay |
+| [SIPSorcery](https://github.com/sipsorcery-org/sipsorcery) | BSD-3 | .NET STUN/TURN client (still used, STUN-only); WebRTC reference during early prototyping |
+| [Selkies-GStreamer](https://github.com/selkies-project/selkies-gstreamer) | MPL-2.0 | Low-latency streaming techniques, playout-delay handling |
 | [Neko](https://github.com/m1k1o/neko) | Apache-2.0 | Separate A/V streams to bypass browser sync |
 | [Pion WebRTC](https://github.com/pion/webrtc) | MIT | Data channel flow control |
-| [PairDrop](https://github.com/schlagmichdoch/PairDrop) | GPL-3.0 | P2P file transfer over WebRTC data channels |
+| [PairDrop](https://github.com/schlagmichdoch/PairDrop) | GPL-3.0 | P2P file transfer patterns |
 | [Moonlight](https://github.com/moonlight-stream) | GPL-3.0 | RTSP/RTP latency benchmarks |
 
 ### Video & Encoding
