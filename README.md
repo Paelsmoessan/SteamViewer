@@ -126,7 +126,7 @@ We started with WebRTC and replaced it with our own DXGI + QOI + FFmpeg stack ov
 | [SIPSorcery](https://github.com/sipsorcery-org/sipsorcery) | BSD-3 | .NET STUN/TURN client (still used, STUN-only); WebRTC reference during early prototyping |
 | [Selkies-GStreamer](https://github.com/selkies-project/selkies-gstreamer) | MPL-2.0 | Low-latency streaming techniques, playout-delay handling |
 | [Neko](https://github.com/m1k1o/neko) | Apache-2.0 | Separate A/V streams to bypass browser sync |
-| [Pion WebRTC](https://github.com/pion/webrtc) | MIT | Data channel flow control |
+| [Pion WebRTC](https://github.com/pion/webrtc) | MIT | Flow-control design reference during early WebRTC prototyping (no longer in tree) |
 | [PairDrop](https://github.com/schlagmichdoch/PairDrop) | GPL-3.0 | P2P file transfer patterns |
 | [Moonlight](https://github.com/moonlight-stream) | GPL-3.0 | RTSP/RTP latency benchmarks |
 
